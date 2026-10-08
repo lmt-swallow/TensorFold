@@ -3,9 +3,15 @@
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <cstdint>
+// Zig build: the torch extension's headers are not here; the host launch templates below stay uninstantiated (the Zig
+// side launches the __global__ kernels itself), so their check macros only need to parse.
+#ifndef TORCH_CHECK
+#define TORCH_CHECK(cond, ...) do { (void)(cond); } while (0)
+#endif
+#ifndef C10_CUDA_CHECK
+#define C10_CUDA_CHECK(expr) (void)(expr)
+#endif
 
 namespace tf_exl3x {
 

@@ -29,6 +29,7 @@ const usage =
     \\  triton <dir>              a Triton cubin's bits against the Python oracle's fixture
     \\  sample                    sample.cu's keyed draws against the Metal rule's host references (synthetic rows)
     \\  exl3-linear <dir>         DSV4.1 EXL3 linear layers against the Python fork's fixture (dsv41/dump_linear.py)
+    \\  exl3-experts <dir>        DSV4.1 EXL3 routed experts (decode windows) against the fork's fixture (dsv41/dump_experts.py)
     \\
 ;
 
@@ -83,6 +84,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "triton")) return oracle_tests.tritonKernel(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "exl3-linear")) return dsv41_tests.exl3Linear(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "exl3-experts")) return dsv41_tests.exl3Experts(gpu, try arg(rest, 0));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
 }
