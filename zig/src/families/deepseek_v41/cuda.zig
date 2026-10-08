@@ -6,6 +6,7 @@ pub const experts = @import("cuda_experts.zig");
 pub const attention = @import("cuda_attention.zig");
 pub const hc = @import("cuda_hc.zig");
 pub const route = @import("cuda_route.zig");
+pub const dspark = @import("cuda_dspark.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const config = @import("config.zig");
 pub const weights_map = @import("weights_map.zig");

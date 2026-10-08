@@ -10,7 +10,7 @@ const RankCache = @import("rank_cache.zig").RankCache;
 const exl3 = @import("cuda_exl3.zig");
 const experts_mod = @import("cuda_experts.zig");
 
-pub const Error = error{ MissingTensor, BadShape, OutOfMemory } || RankCache.Error || cuda.Error || exl3.Error || experts_mod.Error;
+pub const Error = error{ MissingTensor, BadShape, OutOfMemory, NoSpaceLeft } || RankCache.Error || cuda.Error || exl3.Error || experts_mod.Error;
 
 /// A plain tensor on the device (norm weights, mixes, gates, sinks).
 pub const Plain = struct {
@@ -171,6 +171,69 @@ pub fn loadBlock(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Conf
         l.engram_qk = try engramQk(gpa, d, rc, p);
     }
     return l;
+}
+
+/// The drafter's own weights (weights.py DSparkWeights): the stage blocks (mtp.j, dspark_routed experts each), the
+/// taps' projection and norm, the last stage's norm, the Markov bigram head and the confidence head.
+pub const DSpark = struct {
+    blocks: []Layer,
+    main_proj: exl3.Linear,
+    main_norm: Plain,
+    norm: Plain,
+    markov_embed: Plain, // bf16 [V, rank]
+    markov_head: Plain, // f16 [V, rank]
+    conf: Plain, // f16 [1, d + rank]
+    markov_embed_host: []u16, // the same bf16 bits on the host (the confidence head's rows)
+    conf_host: []u16,
+
+    pub fn deinit(self: *DSpark, gpa: std.mem.Allocator) void {
+        for (self.blocks) |*l| freeLayer(l);
+        gpa.free(self.blocks);
+        self.main_proj.deinit();
+        inline for (.{ "main_norm", "norm", "markov_embed", "markov_head", "conf" }) |f| @field(self, f).buf.free();
+        gpa.free(self.markov_embed_host);
+        gpa.free(self.conf_host);
+    }
+};
+
+/// The DSpark stages and heads for `rank` of `world` (the rank cache holds them when the Python server loaded with
+/// drafts).
+pub fn loadDSpark(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, rc: *const RankCache, kernels: *const exl3.Kernels, rank: usize, world: usize, cb: exl3.Codebook) Error!DSpark {
+    const n = cfg.nextn;
+    if (n == 0) return error.MissingTensor;
+    const blocks = try gpa.alloc(Layer, n);
+    errdefer gpa.free(blocks);
+    var done: usize = 0;
+    errdefer for (blocks[0..done]) |*l| freeLayer(l);
+    for (blocks, 0..) |*l, j| {
+        l.* = try loadBlock(gpa, d, cfg, rc, kernels, cfg.n_layers + j, rank, world, cb);
+        done += 1;
+    }
+    var lb: [32]u8 = undefined;
+    const last = std.fmt.bufPrint(&lb, "mtp.{d}", .{n - 1}) catch unreachable;
+    var main_proj = try linear(gpa, d, rc, kernels, "mtp.0.main_proj", .whole, cb);
+    errdefer main_proj.deinit();
+    var main_norm = try plain(d, rc, "mtp.0.main_norm.weight", null);
+    errdefer main_norm.buf.free();
+    var norm = try plainOf(d, rc, last, "norm.weight", null);
+    errdefer norm.buf.free();
+    var markov_embed = try plainOf(d, rc, last, "markov_head.embed.weight", null);
+    errdefer markov_embed.buf.free();
+    var markov_head = try plainOf(d, rc, last, "markov_head.head.weight", null);
+    errdefer markov_head.buf.free();
+    var conf = try plainOf(d, rc, last, "confidence_head.proj.weight", null);
+    errdefer conf.buf.free();
+    var nb: [96]u8 = undefined;
+    var kb: [160]u8 = undefined;
+    const me = try readAlloc(gpa, rc, plainKey(&kb, std.fmt.bufPrint(&nb, "{s}.markov_head.embed.weight", .{last}) catch unreachable, null));
+    errdefer gpa.free(me);
+    const cf = try readAlloc(gpa, rc, plainKey(&kb, std.fmt.bufPrint(&nb, "{s}.confidence_head.proj.weight", .{last}) catch unreachable, null));
+    errdefer gpa.free(cf);
+    return .{
+        .blocks = blocks, .main_proj = main_proj, .main_norm = main_norm, .norm = norm, .markov_embed = markov_embed,
+        .markov_head = markov_head, .conf = conf,
+        .markov_embed_host = @alignCast(std.mem.bytesAsSlice(u16, me)), .conf_host = @alignCast(std.mem.bytesAsSlice(u16, cf)),
+    };
 }
 
 // -- the rank cache's keys ----------------------------------------------------------------------------------------
