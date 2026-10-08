@@ -1,17 +1,16 @@
 // EXL3 linear, any codebook and width, 1-128 rows: a row's bits depend only on it (mma keeps rows apart, K ranges fixed by (K, N), fixed-order sums).
 
+// Zig build: the fork's kernels verbatim (bertholomus/TensorFold deepseek-v41-tp2, cuda/exl3/linear.cu), the torch
+// extension's host glue dropped; namespace tf_exl3_linear so the fatbin exports every instantiation by name.
+
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <algorithm>
 
 #include "linear_common.cuh"
 
 using namespace tf_exl3;
 
-namespace {
+namespace tf_exl3_linear {
 
 __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype,
                                                      const half* __restrict__ suh, half* __restrict__ xh, int K) {
@@ -182,65 +181,19 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
     }
 }
 
-int dtype_of(const at::Tensor& t) {
-    return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
-}
+#define TF_INST(K2_, CB_)                                                                                            \
+    template __global__ void __launch_bounds__(2 * 32) linear_kernel<K2_, CB_, 2>(                                  \
+        const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,     \
+        int, int, int, int);                                                                                        \
+    template __global__ void __launch_bounds__(4 * 32) linear_kernel<K2_, CB_, 4>(                                  \
+        const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,     \
+        int, int, int, int);                                                                                        \
+    template __global__ void __launch_bounds__(8 * 32) linear_kernel<K2_, CB_, 8>(                                  \
+        const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,     \
+        int, int, int, int);                                                                                        \
+    template __global__ void __launch_bounds__(32) unpack_kernel<K2_, CB_>(const uint32_t*, half*, int, int64_t,    \
+                                                                           int64_t);
+TF_EXL3_ALL(TF_INST)
+#undef TF_INST
 
-}  // namespace
-
-void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh) {
-    const int M = (int)x.size(0), K = (int)x.size(1);
-    dim3 grid((unsigned)((K / 128 + 3) / 4), (unsigned)M);
-    rot_in_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        x.data_ptr(), dtype_of(x), reinterpret_cast<const half*>(suh.data_ptr()),
-        reinterpret_cast<half*>(xh.data_ptr()), K);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb,
-                      const at::Tensor& svh, const c10::optional<at::Tensor>& bias, at::Tensor& y,
-                      const c10::optional<at::Tensor>& Z, at::Tensor& counters, int64_t K2, int64_t cb, int64_t SK,
-                      int64_t WK) {
-    const int M = (int)xh.size(0), K = (int)xh.size(1), N = (int)y.size(1);
-    TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
-    TORCH_CHECK((K / 16) % (SK * WK) == 0, "K / 16 must split evenly over SK * WK warps");
-    dim3 grid((unsigned)(N / 128), (unsigned)SK);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    const half* bptr = bias ? reinterpret_cast<const half*>(bias->data_ptr()) : nullptr;
-    float* zptr = Z ? Z->data_ptr<float>() : nullptr;
-    TORCH_CHECK(SK == 1 || zptr, "Z is needed with more than one split");
-#define TF_LAUNCH(K2_, CB_)                                                                                        \
-    if (K2 == K2_ && cb == CB_) {                                                                               \
-        auto kernel = WK == 2 ? linear_kernel<K2_, CB_, 2>                                                      \
-                              : WK == 4 ? linear_kernel<K2_, CB_, 4> : linear_kernel<K2_, CB_, 8>;              \
-        const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                \
-        if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
-        kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                              \
-            reinterpret_cast<const half*>(xh.data_ptr()), reinterpret_cast<const uint32_t*>(T.data_ptr()),      \
-            stride_k, stride_nb, reinterpret_cast<const half*>(svh.data_ptr()), bptr, y.data_ptr(), dtype_of(y),\
-            zptr, counters.data_ptr<int>(), M, K, N, (int)SK);                                                  \
-        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                         \
-        return;                                                                                                 \
-    }
-    TF_EXL3_ALL(TF_LAUNCH)
-#undef TF_LAUNCH
-    TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
-}
-
-void exl3_unpack_cuda(const at::Tensor& T, at::Tensor& W, int64_t stride_k, int64_t stride_nb, int64_t K2,
-                      int64_t cb) {
-    const int K = (int)W.size(0), N = (int)W.size(1);
-    dim3 grid((unsigned)(N / 16), (unsigned)(K / 16));
-    auto stream = at::cuda::getCurrentCUDAStream();
-#define TF_LAUNCH(K2_, CB_)                                                                                         \
-    if (K2 == K2_ && cb == CB_) {                                                                                \
-        unpack_kernel<K2_, CB_><<<grid, 32, 0, stream>>>(reinterpret_cast<const uint32_t*>(T.data_ptr()),         \
-                                                        reinterpret_cast<half*>(W.data_ptr()), N, stride_k,      \
-                                                        stride_nb);                                              \
-        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                          \
-        return;                                                                                                  \
-    }
-    TF_EXL3_ALL(TF_LAUNCH)
-#undef TF_LAUNCH
-    TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
-}
+}  // namespace tf_exl3_linear
