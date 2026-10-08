@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""A concurrent round from the Python fork (rounds.py RoundDecoder over model.py's PoolCache) as a fixture for the Zig
+engine: two streams in a 4-slot pool (slot 0 at extent [0, 2048), slot 2 at [2048, 4096)), each primed with its own
+prompt through the single-stream prompt path on its pool view, then one round whose windows are a pending token
+and five drafts a stream (12 rows). Both ranks of a TP2 split run in this process, one rank's block resident at a
+time (dump_forward.py's RankBlocks); the gathers stack both ranks' partials, so every intermediate is the served
+one. Unfused launches (TF_DS_HC_FUSED=0, TF_DS_ROT_Q=0, TF_DS_ROT_WOB=0, TF_DS_ROT_ATTN=0; L2 prefetch off).
+
+  python3 -B /w/tools/zig/dsv41/dump_rounds.py --tools /w/tools/zig --model /model --out /out [--layers 4]
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+import torch
+
+for k, v in (("TF_DS_HC_FUSED", "0"), ("TF_DS_ROT_Q", "0"), ("TF_DS_ROT_WOB", "0"), ("TF_DS_ROT_ATTN", "0"), ("TF_DS_L2_PREFETCH", "0")):
+    os.environ.setdefault(k, v)
+HERE = Path(__file__).resolve().parent
+BF16, F32 = torch.bfloat16, torch.float32
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--tools", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--cap", type=int, default=4096)
+    ap.add_argument("--seed", type=int, default=20261009)
+    a = ap.parse_args()
+    ck = load_module("capture_kernel", HERE / "capture_kernel.py")
+    fwd = load_module("dump_forward", HERE / "dump_forward.py")
+    rec = ck.load_recorder(a.tools)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    from tensorfold.families.deepseek_v41.config import Cfg
+    from tensorfold.families.deepseek_v41.cuda import kernels as K
+    from tensorfold.families.deepseek_v41.cuda.model import KV_QUANT, RAW, Comm, Model, mm
+    from tensorfold.families.deepseek_v41.cuda.rounds import RoundDecoder
+    from tensorfold.families.deepseek_v41.cuda.weights import Shards, Weights, linear, load_block
+
+    assert KV_QUANT and not K.on("hc") and not K.on("rot_q") and not K.on("rot_wob") and not K.on("rot_attn")
+    torch.cuda.set_device(0)
+    world = 2
+    L = a.layers
+    c = Cfg.read(a.model)
+    sh = Shards(a.model)
+    vocab_l = c.vocab // world
+    heads = [linear(sh, "head", cols=(r * vocab_l, (r + 1) * vocab_l)) for r in range(world)]
+    w = Weights(c, 0, world, embed=sh.get("embed.weight").contiguous().cuda(), norm=sh.get("norm.weight").contiguous().cuda(),
+                head=heads[0], vocab_lo=0, vocab_hi=vocab_l, model_dir=Path(a.model))
+    m = Model(w, Comm(None, 1))
+    w.layers = [None] * L                             # new_pool / RoundDecoder count the layers
+    slots, cap = 4, a.cap
+    pool = m.new_pool(slots, cap)
+    blocks = fwd.RankBlocks(sh, c, world, load_block)
+
+    def gather(parts: list) -> torch.Tensor:
+        torch.cuda.synchronize()
+        return torch.stack([p.contiguous() for p in parts]).clone()
+
+    def mixes(n: int) -> tuple:
+        dev = "cuda"
+        return (torch.empty((n, c.dim), dtype=BF16, device=dev), torch.empty((n * K.HC_BLOCKS * 32,), dtype=F32, device=dev),
+                torch.empty((n, c.hc), dtype=F32, device=dev), torch.empty((n, c.hc), dtype=F32, device=dev),
+                torch.empty((n, c.hc), dtype=F32, device=dev), torch.empty((n, c.hc, c.hc), dtype=F32, device=dev))
+
+    def prime(sc, ids: torch.Tensor) -> None:
+        """model.py _forward_k's sublayers over a prompt on a pool view (the prompt path), both ranks a sublayer."""
+        n = ids.shape[0]
+        start = sc.length
+        assert start == 0
+        sc.tokens[start:start + n] = ids
+        pos = torch.arange(start, start + n, device="cuda")
+        h = w.embed[ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
+        pre = torch.zeros((n, c.hc), dtype=F32, device="cuda")
+        pre[:, 0] = 1.0
+        x, part, pre_a, pre_f, post, comb = mixes(n)
+        shared = [{} for _ in range(world)]
+        for li in range(L):
+            lay = blocks.get(0, li)
+            fn, scale, base = lay.hc_attn
+            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+            parts = [m.attention_k(blocks.get(r, li), x, sc, start, shared[r], pos) for r in range(world)]
+            K.hc_post(gather(parts), h, post, comb, h)
+            lay = blocks.get(0, li)
+            fn, scale, base = lay.hc_ffn
+            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+            parts = [m.moe(blocks.get(r, li), x) for r in range(world)]
+            K.hc_post(gather(parts), h, post, comb, h)
+            pre, pre_f = pre_f, pre
+        sc.length = start + n
+
+    def pool_planes() -> dict:
+        d = {}
+        for li in range(L):
+            d[f"L{li}.ring"] = pool.ring[li]
+            if li in pool.comp:
+                d[f"L{li}.comp_codes"], d[f"L{li}.comp_scales"] = pool.comp[li]
+            if li in pool.index_k:
+                d[f"L{li}.idxk_codes"], d[f"L{li}.idxk_scales"] = pool.index_k[li]
+            if li in pool.comp_raw:
+                d[f"L{li}.raw_kv"], d[f"L{li}.raw_score"] = pool.comp_raw[li]
+        return d
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(a.seed)
+    streams = [(0, 0, 2048, 40), (2, 2048, 2048, 200)]       # (slot, base, size, prompt length)
+    views, prompts = [], []
+    for slot, base, size, n_prompt in streams:
+        sc = m.pool_view(pool, slot, base, size)
+        ids = torch.randint(0, c.vocab, (n_prompt,), generator=g).to(torch.int64).cuda()
+        with rec.scope(f"prime_slot{slot}", detail=False):
+            prime(sc, ids)
+        views.append(sc)
+        prompts.append(ids)
+    torch.cuda.synchronize()
+    before = {k: v.clone() for k, v in pool_planes().items()}
+    # the round: a pending token and five drafts a stream
+    k = 5
+    windows = []
+    ids_all, pos_all, slot_all, base_all, end_all = [], [], [], [], []
+    for (slot, base, size, n_prompt), sc in zip(streams, views):
+        toks = torch.randint(0, c.vocab, (k + 1,), generator=g).tolist()
+        windows.append((slot, base, size, sc.length, toks))
+        ids_all += toks
+        pos_all += list(range(sc.length, sc.length + k + 1))
+        slot_all += [slot] * (k + 1)
+        base_all += [base] * (k + 1)
+        end_all += [base + size] * (k + 1)
+    R = len(ids_all)
+    deepest = max(p + 1 for p in pos_all)
+    from tensorfold.families.deepseek_v41.cuda.graph import bucket_for
+    bucket = bucket_for(deepest, cap)
+    dec = RoundDecoder(m, pool, R, bucket, taps=False, out=None)
+    dec.set(ids_all, pos_all, slot_all, base_all, end_all)
+    torch.cuda.synchronize()
+    table = dec.table
+    arrays = {"ids": torch.tensor(ids_all, dtype=torch.int64), "pos": torch.tensor(pos_all, dtype=torch.int64),
+              "slots": torch.tensor(slot_all, dtype=torch.int64), "base": torch.tensor(base_all, dtype=torch.int64),
+              "end": torch.tensor(end_all, dtype=torch.int64), "prompt0": prompts[0], "prompt1": prompts[1]}
+    arrays.update({f"before_{k_}": v for k_, v in before.items()})
+    cos_c, sin_c = m._cs(min(2, L - 1), table)
+    cos_w, sin_w = m._cs(0, table)
+    arrays.update({"cos_c": cos_c, "sin_c": sin_c, "cos_w": cos_w, "sin_w": sin_w})
+
+    # the round's body (rounds.py _stretch, the unfused loop), each sublayer on both ranks' weights
+    dec._idx = {}
+    h, pre = K.embed_init(w.embed, dec.ids, c.hc)
+    x, part, pre_a, pre_f, post, comb = mixes(R)
+    shared = [{} for _ in range(world)]
+    for li in range(L):
+        lay = blocks.get(0, li)
+        cos, sin = m._cs(lay.idx, table)
+        fn, scale, base = lay.hc_attn
+        with rec.scope(f"L{li}_hc_pre_attn", detail=True):
+            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+        arrays[f"L{li}.x_attn"] = x.clone()
+        parts = []
+        for r in range(world):
+            with rec.scope(f"L{li}_attention_r{r}", detail=True):
+                parts.append(dec._attention(blocks.get(r, li), x, shared[r], cos, sin))
+            arrays[f"L{li}.p_attn.r{r}"] = parts[r].clone()
+        with rec.scope(f"L{li}_hc_post_attn", detail=True):
+            K.hc_post(gather(parts), h, post, comb, h)
+        arrays[f"L{li}.h_attn"] = h.clone()
+        lay = blocks.get(0, li)
+        fn, scale, base = lay.hc_ffn
+        with rec.scope(f"L{li}_hc_pre_ffn", detail=True):
+            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+        arrays[f"L{li}.x_ffn"] = x.clone()
+        parts = []
+        for r in range(world):
+            with rec.scope(f"L{li}_moe_r{r}", detail=True):
+                parts.append(m.moe(blocks.get(r, li), x, shared_side=False))
+            arrays[f"L{li}.p_moe.r{r}"] = parts[r].clone()
+        with rec.scope(f"L{li}_hc_post_ffn", detail=True):
+            K.hc_post(gather(parts), h, post, comb, h)
+        arrays[f"L{li}.h_moe"] = h.clone()
+        pre, pre_f = pre_f, pre
+    with rec.scope("head", detail=True):
+        xc = K.collapse_norm(h, pre.contiguous(), w.norm, c.eps)
+    arrays["head.xc"] = xc.clone()
+    parts = [mm(heads[r], xc, F32) for r in range(world)]
+    for r in range(world):
+        arrays[f"head.local.r{r}"] = parts[r].clone()
+    gth = gather(parts)
+    logits = gth.permute(1, 0, 2).reshape(R, -1).contiguous()
+    arrays["logits"] = logits
+    torch.cuda.synchronize()
+    arrays.update({f"after_{k_}": v.clone() for k_, v in pool_planes().items()})
+    params = {"layers": L, "world": world, "slots": slots, "cap": cap, "bucket": bucket, "ring_size": pool.ring_size,
+              "raw": RAW, "rows": R, "n_windows": len(windows), "rope_rows": cos_c.shape[0], "vocab_local": vocab_l,
+              "k": k}
+    for i, (slot, base, size, p0, toks) in enumerate(windows):
+        params.update({f"w{i}_slot": slot, f"w{i}_base": base, f"w{i}_size": size, f"w{i}_pos": p0, f"w{i}_rows": len(toks)})
+    ck.save(out / "fixture", params, arrays)
+    rec.dump(out / "launches.json")
+    import json
+    (out / "jit.json").write_text(json.dumps(ck.specialization(), indent=1, sort_keys=True) + "\n")
+    print(f"round of {R} rows over {len(windows)} streams at bucket {bucket}: argmax {logits.argmax(-1).tolist()}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

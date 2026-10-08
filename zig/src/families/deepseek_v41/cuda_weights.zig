@@ -140,8 +140,16 @@ pub fn loadBlock(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Conf
     l.wq_b = try linearOf(gpa, d, rc, kernels, p, "attn.wq_b", .{ .cols = .{ rank * hl, (rank + 1) * hl } }, cb);
     l.wkv = try linearOf(gpa, d, rc, kernels, p, "attn.wkv", .whole, cb);
     l.kv_norm = try plainOf(d, rc, p, "attn.kv_norm.weight", null);
-    // the sink was sliced on the host before caching: its key is the plain one, its shape this rank's heads
+    // the cache holds every head's sink (weights.py slices after `_kept`): this rank's heads' slice
     l.sink = try plainOf(d, rc, p, "attn.attn_sink", "torch.float32");
+    if (l.sink.count == cfg.n_heads and world > 1) {
+        const hl_heads = cfg.n_heads / world;
+        var part = try cuda.DeviceBuffer.alloc(d, hl_heads * 4);
+        errdefer part.free();
+        try part.copyFrom(0, l.sink.buf.ptr + rank * hl_heads * 4, hl_heads * 4, null);
+        l.sink.buf.free();
+        l.sink = .{ .buf = part, .bytes = hl_heads * 4, .count = hl_heads };
+    }
     for (0..gl) |g| {
         var nb: [48]u8 = undefined;
         const name = std.fmt.bufPrint(&nb, "attn.wo_a.slice.{d}", .{rank * gl + g}) catch unreachable;

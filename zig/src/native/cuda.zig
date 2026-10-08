@@ -4,12 +4,13 @@ const cuda = @import("cuda");
 const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
+const dsv41 = @import("dsv41");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const Pool = budget.Pool;
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{nemotron.native};
+const registry = .{ nemotron.native, dsv41.native };
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
@@ -333,7 +334,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
-    const weights = weightBytes(io, o.dir);
+    // a tensor-parallel family loads its rank's share, not the pack (the directory holds every rank's shards)
+    const weights = if (@hasDecl(F, "weightBytes")) F.weightBytes(a, io, o.dir) else weightBytes(io, o.dir);
     const held0 = cuda.usage(false).device;
     if (weights > before.room(held0)) {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
@@ -344,6 +346,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
+    if (@hasDecl(F, "follow") and F.isFollower()) {
+        // a follower rank runs rank 0's steps here and never serves HTTP; this call returns when rank 0 stops
+        F.follow(loaded.ctx) catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "follower rank stopped ({s})", .{@errorName(e)});
+            return null;
+        };
+        problem.* = "follower rank finished: rank 0 stopped";
+        return null;
+    }
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
     const room = after.room(model);

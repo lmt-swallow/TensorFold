@@ -27,10 +27,13 @@ const kernels = [_]Kernel{
     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+    .{ .name = "dsv41_attn_glue", .src = "dsv41/attn_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the decode attention's torch glue (softmax pool, bf16 scaling, column copies, fp16 cast)
     .{ .name = "dsv41_exl3_linear", .src = "dsv41/linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // the DSV4.1 fork's cuda/exl3/linear.py, tensorfold_exl3_linear_v6
     .{ .name = "dsv41_exl3_experts", .src = "dsv41/experts", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v18: grouping, rot_in, epilogues, decode_prep
     .{ .name = "dsv41_exl3_experts_decode", .src = "dsv41/experts_decode", .flags = &.{ "-O3", "-lineinfo" } }, // the same extension's grouped_cp_kernel (decode windows)
     .{ .name = "dsv41_engram", .src = "dsv41/engram", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: model.py Engram._decode and Comm.sum as kernels
+    .{ .name = "dsv41_exl3_experts_prompt", .src = "dsv41/experts_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // the experts extension's prompt-chunk kernels (grouped_mma, grouped_rows)
+    .{ .name = "dsv41_prompt_glue", .src = "dsv41/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue (row copies, the compressor's pair pool, fp32 casts)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -112,25 +115,25 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("lanes", mods.lanes);
     runner.addImport("dsv41", mods.dsv41);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
-    _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true);
+    _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.tokenizer, build_options, true);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, dsv41: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "dsv41", .module = dsv41 } },
     });
     return .{ .api = api, .engines = mod };
 }
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
-    const m = engines(b, target, optimize, cuda, lanes, nemotron);
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, dsv41: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
+    const m = engines(b, target, optimize, cuda, lanes, nemotron, dsv41);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
@@ -155,7 +158,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
+    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.dsv41).engines;
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.dsv41, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
@@ -190,7 +193,7 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
     };
     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
     const mods = family(b, target, .fast, cuda, draft_ids);
-    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, false);
+    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.tokenizer, build_options, false);
 }
 
 /// Validate the complete named input set, including images unused by today's server.

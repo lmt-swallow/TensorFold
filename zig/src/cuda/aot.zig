@@ -102,7 +102,20 @@ pub const Set = struct {
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
+            if (matches(v.spec, args, consts, false)) return v;
+        }
+        // no variant compiled for exactly this specialization: one compiled with fewer assumptions (an argument
+        // Triton would mark 16-divisible or equal to 1 here, but was neither when captured) runs the same source
+        // on these values; only the capture's alignment and ==1 shortcuts are missing
+        for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            if (matches(v.spec, args, consts, true)) {
+                if (!loose_logged) {
+                    loose_logged = true;
+                    std.log.info("{s}: no variant for this launch's specialization; a less specialized capture serves it (the first such launch)", .{function});
+                }
+                return v;
+            }
         }
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
@@ -147,7 +160,10 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
     return null;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+var loose_logged: bool = false;
+
+/// `loose`: a variant captured without the divisibility or ==1 specialization of an argument that has it now.
+fn matches(k: KernelJson, args: []const Arg, consts: []const Const, loose: bool) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
@@ -168,12 +184,15 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
                 }
                 const p = param.?;
                 if (!std.mem.eql(u8, p.type, "i32")) return false;
-                if (!p.nospec and x == 1) return false;
-                if (p.div16 != (!p.nospec and @mod(x, 16) == 0)) return false;
+                if (!p.nospec and x == 1 and !loose) return false;
+                const div = !p.nospec and @mod(x, 16) == 0;
+                if (p.div16 != div and !(loose and !p.div16)) return false;
             },
             .ptr => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, x.ty) or p.div16 != (x.addr % 16 == 0)) return false;
+                if (!std.mem.eql(u8, p.type, x.ty)) return false;
+                const div = x.addr % 16 == 0;
+                if (p.div16 != div and !(loose and !p.div16)) return false;
             },
             .f32 => {
                 const p = param orelse return false;
@@ -181,7 +200,9 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
             },
             .u64 => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, "u64") or p.div16 != (x % 16 == 0)) return false;
+                if (!std.mem.eql(u8, p.type, "u64")) return false;
+                const div = x % 16 == 0;
+                if (p.div16 != div and !(loose and !p.div16)) return false;
             },
         }
         runtime += 1;

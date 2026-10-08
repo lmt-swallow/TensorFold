@@ -53,8 +53,16 @@ pub const Glue = struct {
     comp_pool2: cuda.Function,
     bf16_scale: cuda.Function,
     copy_cols: cuda.Function,
+    f32_to_f16: cuda.Function,
 
-    pub fn load(d: *const cuda.Driver, cubin: []const u8) !Glue {
+    /// The fatbin built into the binary (zig/build/cuda.zig: dsv41_attn_glue).
+    pub fn load(d: *const cuda.Driver) !Glue {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        return loadBytes(d, cuda.kernels.dsv41_attn_glue);
+    }
+
+    /// A cubin of attn_glue.cu read from disk (tools/zig/dsv41/attn_capture.sh writes one).
+    pub fn loadBytes(d: *const cuda.Driver, cubin: []const u8) !Glue {
         var module = try cuda.Module.load(d, cubin);
         errdefer module.unload();
         return .{
@@ -62,6 +70,7 @@ pub const Glue = struct {
             .comp_pool2 = try module.function("comp_pool2"),
             .bf16_scale = try module.function("bf16_scale"),
             .copy_cols = try module.function("copy_cols"),
+            .f32_to_f16 = try module.function("f32_to_f16"),
         };
     }
 
@@ -101,15 +110,59 @@ pub const Layer = struct {
         inline for (.{ "comp_norm", "idx_k_norm", "idx_proj_h" }) |f| if (@field(self, f)) |*b| b.free();
     }
 
-    /// fp32 words of split-K scratch the widest of these layers needs for `rows` rows.
     pub fn scratchWords(self: *const Layer, rows: usize) usize {
+        return self.params().scratchWords(rows);
+    }
+
+    pub fn params(self: *const Layer) Params {
+        return .{
+            .wq_a = &self.wq_a,
+            .wq_b = &self.wq_b,
+            .wkv = &self.wkv,
+            .wo_b = &self.wo_b,
+            .wo_a = .{ &self.wo_a[0], &self.wo_a[1], &self.wo_a[2], &self.wo_a[3] },
+            .comp_wkv = if (self.comp_wkv) |*l| l else null,
+            .comp_wgate = if (self.comp_wgate) |*l| l else null,
+            .idx_wq_b = if (self.idx_wq_b) |*l| l else null,
+            .idx_wk = if (self.idx_wk) |*l| l else null,
+            .q_norm = self.q_norm.ptr,
+            .kv_norm = self.kv_norm.ptr,
+            .sink = self.sink.ptr,
+            .comp_norm = if (self.comp_norm) |b| b.ptr else 0,
+            .idx_k_norm = if (self.idx_k_norm) |b| b.ptr else 0,
+            .idx_proj_h = if (self.idx_proj_h) |b| b.ptr else 0,
+        };
+    }
+};
+
+/// What a forward reads of a layer: a view over an owned `Layer` or over cuda_weights' layer (the loader's), the
+/// EXL3 layers by pointer and the plain tensors by address.
+pub const Params = struct {
+    wq_a: *const exl3.Linear,
+    wq_b: *const exl3.Linear,
+    wkv: *const exl3.Linear,
+    wo_b: *const exl3.Linear,
+    wo_a: [4]*const exl3.Linear,
+    comp_wkv: ?*const exl3.Linear = null,
+    comp_wgate: ?*const exl3.Linear = null,
+    idx_wq_b: ?*const exl3.Linear = null,
+    idx_wk: ?*const exl3.Linear = null,
+    q_norm: Ptr,
+    kv_norm: Ptr,
+    sink: Ptr,
+    comp_norm: Ptr = 0,
+    idx_k_norm: Ptr = 0,
+    idx_proj_h: Ptr = 0, // fp16 [idx_heads, d]
+
+    /// fp32 words of split-K scratch the widest of these layers needs for `rows` rows.
+    pub fn scratchWords(self: Params, rows: usize) usize {
         var most: usize = 0;
         most = @max(most, self.wq_a.scratchWords(rows));
         most = @max(most, self.wq_b.scratchWords(rows));
         most = @max(most, self.wkv.scratchWords(rows));
         most = @max(most, self.wo_b.scratchWords(rows));
-        for (&self.wo_a) |*w| most = @max(most, w.scratchWords(rows));
-        inline for (.{ "comp_wkv", "comp_wgate", "idx_wq_b", "idx_wk" }) |f| if (@field(self, f)) |*l| {
+        for (self.wo_a) |w| most = @max(most, w.scratchWords(rows));
+        inline for (.{ "comp_wkv", "comp_wgate", "idx_wq_b", "idx_wk" }) |f| if (@field(self, f)) |l| {
             most = @max(most, l.scratchWords(rows));
         };
         return most;
@@ -141,6 +194,10 @@ pub const Caches = struct {
 
 /// (cos, sin) fp32 [rows, rd / 2] of this layer's rope kind (ops.py `rope_cs`; here loaded, not computed).
 pub const Rope = struct { cos: cuda.DeviceBuffer, sin: cuda.DeviceBuffer, rows: usize };
+
+/// The picks a compressed layer attends through: its own (an index source) or the latest index layer's before it
+/// (the fork's shared["topk"]): cidx [n, kk] int64 (-1: none).
+pub const Picks = struct { cidx: Ptr, kk: usize };
 
 /// The sublayer's launcher and its scratch for up to `dims.max_rows` rows.
 pub const Attention = struct {
@@ -191,7 +248,9 @@ pub const Attention = struct {
     keys_h: []i64,
     cidx_h: []i64,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const Glue, lay: *const Layer) !Attention {
+    /// `z_words`: fp32 words of split-K scratch the widest EXL3 layer of this kind needs at `dims.max_rows` rows
+    /// (`Params.scratchWords`).
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const Glue, z_words: usize) !Attention {
         const r = dims.max_rows;
         if (r > 16) return error.TooManyRows;
         const groups_h = dims.heads / 16;
@@ -211,7 +270,7 @@ pub const Attention = struct {
         self.zero = try cuda.DeviceBuffer.alloc(d, 8);
         try self.zero.fill8(0, null);
         self.xh = try cuda.DeviceBuffer.alloc(d, r * dims.d * 2);
-        self.z = try cuda.DeviceBuffer.alloc(d, @max(16, lay.scratchWords(r) * 4));
+        self.z = try cuda.DeviceBuffer.alloc(d, @max(16, z_words * 4));
         self.qa = try cuda.DeviceBuffer.alloc(d, r * dims.q_rank * 2);
         self.qr = try cuda.DeviceBuffer.alloc(d, r * dims.q_rank * 2);
         self.q = try cuda.DeviceBuffer.alloc(d, r * dims.heads * dims.hd * 2);
@@ -255,7 +314,9 @@ pub const Attention = struct {
 
     /// Rows x bf16 [n, d] at positions start .. start + n - 1 -> this rank's fp32 partial [n, d] (`self.out`),
     /// the caches updated as the fork's; `self.cidx` holds the picks. Synchronous at the top-k (a host read).
-    pub fn forward(self: *Attention, lay: *const Layer, c: *const Caches, rope: Rope, x: Ptr, n: usize, start: usize, stream: cuda.Stream) !Ptr {
+    /// `picks`: the index layer's picks a layer without an indexer reads (required when the layer is compressed and
+    /// not an index source); an index source makes its own (`self.picks()`).
+    pub fn forward(self: *Attention, p: Params, c: *const Caches, rope: Rope, x: Ptr, n: usize, start: usize, picks: ?Picks, stream: cuda.Stream) !Ptr {
         const dm = self.dims;
         if (n < 1 or n > dm.max_rows) return error.TooManyRows;
         const ratio = dm.ratio;
@@ -268,15 +329,15 @@ pub const Attention = struct {
         const target = self.tab[4 * r .. 5 * r];
         const scratch_row: i64 = @intCast(c.rows - 1);
         for (0..n) |i| {
-            const p: i64 = @intCast(start + i);
-            pos[i] = p;
-            slots[i] = @mod(p, @as(i64, @intCast(dm.ring)));
+            const pv: i64 = @intCast(start + i);
+            pos[i] = pv;
+            slots[i] = @mod(pv, @as(i64, @intCast(dm.ring)));
             if (ratio > 0) {
                 const rt: i64 = @intCast(ratio);
-                vis[i] = @divFloor(p + 1, rt);
-                const g = @divFloor(p, rt);
+                vis[i] = @divFloor(pv + 1, rt);
+                const g = @divFloor(pv, rt);
                 first[i] = g * rt;
-                target[i] = if (@mod(p + 1, rt) == 0) g else scratch_row;
+                target[i] = if (@mod(pv + 1, rt) == 0) g else scratch_row;
             }
         }
         try self.pos.upload(0, std.mem.sliceAsBytes(pos[0..n]));
@@ -287,19 +348,19 @@ pub const Attention = struct {
             try self.target.upload(0, std.mem.sliceAsBytes(target[0..n]));
         }
         // -- attn_in: wq_a, wkv (and the compressor's) on x ------------------------------------------------------
-        try lay.wq_a.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
-        try lay.wkv.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.ykv.ptr, .bf16, stream);
+        try p.wq_a.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
+        try p.wkv.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.ykv.ptr, .bf16, stream);
         if (ratio > 0 and dm.kv_source) {
-            try lay.comp_wkv.?.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.ckv.ptr, if (ratio == 1) .bf16 else .f32, stream);
-            if (ratio > 1) try lay.comp_wgate.?.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.cgate.ptr, .f32, stream);
+            try p.comp_wkv.?.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.ckv.ptr, if (ratio == 1) .bf16 else .f32, stream);
+            if (ratio > 1) try p.comp_wgate.?.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.cgate.ptr, .f32, stream);
         }
         // -- q: RMSNorm, wq_b, RoPE on this rank's heads ----------------------------------------------------------
-        try self.rmsnorm(self.qa.ptr, lay.q_norm.ptr, self.qr.ptr, n, dm.q_rank, stream);
-        try lay.wq_b.run(self.qr.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
+        try self.rmsnorm(self.qa.ptr, p.q_norm, self.qr.ptr, n, dm.q_rank, stream);
+        try p.wq_b.run(self.qr.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
         try self.ropeHeads(self.q.ptr, rope, self.pos.ptr, n, dm.heads, dm.hd, false, stream);
         // -- the window KV into the ring ------------------------------------------------------------------------
         try self.set.run(stream, "_kv_norm_rope", .{ @intCast(n), 1, 1 }, &.{
-            aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", lay.kv_norm.ptr), aot.ptr("COS", "*fp32", rope.cos.ptr),
+            aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", p.kv_norm), aot.ptr("COS", "*fp32", rope.cos.ptr),
             aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", self.pos.ptr),     aot.ptr("OUT", "*bf16", self.kv.ptr),
             aot.ptr("RING", "*bf16", c.ring.ptr),  aot.ptr("SLOT_OF", "*i64", self.slots.ptr), aot.int("ring_size", @intCast(dm.ring)),
             aot.float("eps", dm.eps),
@@ -308,7 +369,7 @@ pub const Attention = struct {
             // -- the kv source: compressed latents (and index keys) of the rows' groups --------------------------
             if (dm.kv_source) {
                 if (ratio == 1) {
-                    try self.rmsnorm(self.ckv.ptr, lay.comp_norm.?.ptr, self.lat.ptr, n, dm.hd, stream);
+                    try self.rmsnorm(self.ckv.ptr, p.comp_norm, self.lat.ptr, n, dm.hd, stream);
                 } else {
                     // the rows' compressor inputs by position, then each group's softmax pool (attn_glue comp_pool2)
                     for (0..n) |i| {
@@ -325,11 +386,11 @@ pub const Attention = struct {
                     a.add(@as(c_int, @intCast(dm.hd)));
                     a.add(self.pooled.ptr);
                     try cuda.launch.launch(self.glue.comp_pool2, .{ .grid = .{ .x = @intCast((dm.hd + 255) / 256), .y = @intCast(n) }, .block = .{ .x = 256 } }, stream, &a);
-                    try self.rmsnorm(self.pooled.ptr, lay.comp_norm.?.ptr, self.lat.ptr, n, dm.hd, stream);
+                    try self.rmsnorm(self.pooled.ptr, p.comp_norm, self.lat.ptr, n, dm.hd, stream);
                 }
                 if (dm.has_idx_wk) {
-                    try lay.idx_wk.?.run(self.lat.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.kraw.ptr, .bf16, stream);
-                    try self.rmsnorm(self.kraw.ptr, lay.idx_k_norm.?.ptr, self.k.ptr, n, dm.idx_dim, stream);
+                    try p.idx_wk.?.run(self.lat.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.kraw.ptr, .bf16, stream);
+                    try self.rmsnorm(self.kraw.ptr, p.idx_k_norm, self.k.ptr, n, dm.idx_dim, stream);
                     try self.ropeHeads(self.k.ptr, rope, self.first.ptr, n, 1, dm.idx_dim, false, stream);
                     try self.fp4Store(self.k.ptr, dm.idx_dim, c.idxk_codes.ptr, c.idxk_scales.ptr, self.target.ptr, n, 32, false, stream);
                 }
@@ -341,14 +402,14 @@ pub const Attention = struct {
             if (dm.index_source) {
                 const nb = dm.nb();
                 const kk = dm.kk();
-                try lay.idx_wq_b.?.run(self.qr.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
+                try p.idx_wq_b.?.run(self.qr.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
                 try self.ropeHeads(self.iq.ptr, rope, self.pos.ptr, n, dm.idx_heads, dm.idx_dim, false, stream);
                 const nblk: usize = n * dm.idx_heads * dm.idx_dim / 32;
                 try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
                     aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
                 }, &.{ aot.ci("BLKS", 32), aot.ci("PDL", 1) });
                 try self.set.run(stream, "_rowmm", .{ @intCast(n), @intCast((dm.idx_heads + 7) / 8), 1 }, &.{
-                    aot.ptr("X", "*bf16", x), aot.int("xs", @intCast(dm.d)), aot.ptr("W", "*fp16", lay.idx_proj_h.?.ptr), aot.ptr("OUT", "*fp32", self.wl.ptr),
+                    aot.ptr("X", "*bf16", x), aot.int("xs", @intCast(dm.d)), aot.ptr("W", "*fp16", p.idx_proj_h), aot.ptr("OUT", "*fp32", self.wl.ptr),
                 }, &.{ aot.ci("K", @intCast(dm.d)), aot.ci("N", @intCast(dm.idx_heads)), aot.ci("BN", 8), aot.ci("BK", 256), aot.ci("PDL", 1) });
                 {
                     const scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(dm.idx_dim))) * @sqrt(@as(f64, @floatFromInt(dm.idx_heads)))));
@@ -377,18 +438,19 @@ pub const Attention = struct {
         // -- sparse attention over the window ring and the picks, 8 key splits a head group, then the merge --------
         {
             const groups_h = dm.heads / 16;
-            const has = ratio > 0;
-            const kk = dm.kk();
+            const has = ratio > 0; // no compressed source: the wrapper passes the window source (bf16) for COMP and CSC
+            const pk: Picks = if (dm.index_source) .{ .cidx = self.cidx.ptr, .kk = dm.kk() } else if (has) (picks orelse return error.BadShape) else .{ .cidx = self.pos.ptr, .kk = 0 };
+            const kk = pk.kk;
             const picks: usize = if (has) (kk + 31) / 32 else 0;
             const nblk: usize = dm.window / 32 + picks;
             const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dm.hd))));
             try self.set.run(stream, "_sparse_attn_part", .{ @intCast(n), @intCast(groups_h), 8 }, &.{
                 aot.ptr("Q", "*bf16", self.q.ptr),       aot.ptr("WSRC", "*bf16", c.ring.ptr),
-                aot.ptr("WLO", "*i64", self.zero.ptr),   aot.ptr("COMP", "*u8", if (has) c.comp_codes.ptr else c.ring.ptr),
-                aot.ptr("CSC", "*u8", if (has) c.comp_scales.ptr else c.ring.ptr), aot.ptr("IDX", "*i64", if (has) self.cidx.ptr else self.pos.ptr),
+                aot.ptr("WLO", "*i64", self.zero.ptr),   aot.ptr("COMP", if (has) "*u8" else "*bf16", if (has) c.comp_codes.ptr else c.ring.ptr),
+                aot.ptr("CSC", if (has) "*u8" else "*bf16", if (has) c.comp_scales.ptr else c.ring.ptr), aot.ptr("IDX", "*i64", if (has) pk.cidx else self.pos.ptr),
                 aot.ptr("POS", "*i64", self.pos.ptr),    aot.ptr("PM", "*fp32", self.pm.ptr),
                 aot.ptr("PL", "*fp32", self.pl.ptr),     aot.ptr("PO", "*fp32", self.po.ptr),
-                aot.ptr("SINK", "*fp32", lay.sink.ptr),  aot.ptr("OUT", "*bf16", self.o.ptr),
+                aot.ptr("SINK", "*fp32", p.sink),  aot.ptr("OUT", "*bf16", self.o.ptr),
                 aot.float("scale", scale),               aot.int("ring_size", @intCast(dm.ring)),
                 aot.int("n_idx", @intCast(kk)),          aot.ptr("RBASE", "*i64", self.pos.ptr),
                 aot.ptr("CBASE", "*i64", self.pos.ptr),
@@ -400,7 +462,7 @@ pub const Attention = struct {
             });
             try self.set.run(stream, "_sparse_attn_merge", .{ @intCast(n), @intCast(groups_h), 1 }, &.{
                 aot.ptr("PM", "*fp32", self.pm.ptr), aot.ptr("PL", "*fp32", self.pl.ptr), aot.ptr("PO", "*fp32", self.po.ptr),
-                aot.ptr("SINK", "*fp32", lay.sink.ptr), aot.ptr("OUT", "*bf16", self.o.ptr),
+                aot.ptr("SINK", "*fp32", p.sink), aot.ptr("OUT", "*bf16", self.o.ptr),
             }, &.{ aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
         }
         try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, n, dm.heads, dm.hd, true, stream);
@@ -409,11 +471,16 @@ pub const Attention = struct {
         const g_cols = o_cols / dm.groups;
         for (0..dm.groups) |g| {
             try self.copyCols(self.o.ptr + g * g_cols * 2, o_cols, self.og.ptr, g_cols, n, g_cols, stream);
-            try lay.wo_a[g].run(self.og.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.ug.ptr, .bf16, stream);
+            try p.wo_a[g].run(self.og.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.ug.ptr, .bf16, stream);
             try self.copyCols(self.ug.ptr, dm.o_rank, self.u.ptr + g * dm.o_rank * 2, dm.groups * dm.o_rank, n, dm.o_rank, stream);
         }
-        try lay.wo_b.run(self.u.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.out.ptr, .f32, stream);
+        try p.wo_b.run(self.u.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.out.ptr, .f32, stream);
         return self.out.ptr;
+    }
+
+    /// The picks this index layer made in its last forward, for the layers after it.
+    pub fn picks(self: *const Attention) Picks {
+        return .{ .cidx = self.cidx.ptr, .kk = self.dims.kk() };
     }
 
     fn rmsnorm(self: *Attention, x: Ptr, w: Ptr, out: Ptr, n: usize, d: usize, stream: cuda.Stream) !void {

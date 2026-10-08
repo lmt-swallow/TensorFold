@@ -4,9 +4,14 @@
 pub const exl3 = @import("cuda_exl3.zig");
 pub const experts = @import("cuda_experts.zig");
 pub const attention = @import("cuda_attention.zig");
+pub const forward = @import("cuda_forward.zig");
+pub const prompt = @import("cuda_prompt.zig");
 pub const hc = @import("cuda_hc.zig");
 pub const route = @import("cuda_route.zig");
+pub const native = @import("cuda_native.zig");
+pub const serve_lanes = @import("cuda_lanes.zig");
 pub const dspark = @import("cuda_dspark.zig");
+pub const rounds = @import("cuda_rounds.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const config = @import("config.zig");
 pub const weights_map = @import("weights_map.zig");

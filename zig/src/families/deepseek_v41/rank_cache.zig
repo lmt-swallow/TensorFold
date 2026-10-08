@@ -26,9 +26,11 @@ pub const Entry = struct {
     }
 };
 
-pub const Error = error{ OpenFailed, ReadFailed, BadFooter, BadIndex, NotFound, OutOfMemory, ShortRead };
+pub const RankCacheError = error{ OpenFailed, ReadFailed, BadFooter, BadIndex, NotFound, OutOfMemory, ShortRead };
 
 pub const RankCache = struct {
+    pub const Error = RankCacheError;
+
     gpa: std.mem.Allocator,
     fd: i32,
     entries: []Entry,
@@ -96,7 +98,7 @@ pub const RankCache = struct {
     }
 };
 
-fn preadAll(fd: i32, buf: []u8, offset: u64) Error!void {
+fn preadAll(fd: i32, buf: []u8, offset: u64) RankCacheError!void {
     var done: usize = 0;
     while (done < buf.len) {
         const rc = linux.pread(fd, buf[done..].ptr, buf.len - done, @intCast(offset + done));
@@ -117,7 +119,7 @@ fn dtypeOf(s: []const u8) DType {
 }
 
 /// `[[key, dtype, [shape...], offset, bytes], ...]`; keys stay slices of `json`.
-fn parseIndex(gpa: std.mem.Allocator, json: []const u8) Error![]Entry {
+fn parseIndex(gpa: std.mem.Allocator, json: []const u8) RankCacheError![]Entry {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch return error.BadIndex;
     defer parsed.deinit();
     if (parsed.value != .array) return error.BadIndex;

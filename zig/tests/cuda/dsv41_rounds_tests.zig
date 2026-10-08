@@ -167,3 +167,147 @@ pub fn draftPool(gpu: Gpu, dir: []const u8, aot_override: ?[]const u8) !void {
     }
     try check.expect(h.failures == 0, "dsv41-draft-pool: {d} stage(s) differ from the Python fork", .{h.failures});
 }
+
+// -- the backbone round ----------------------------------------------------------------------------------------
+
+const F = dsv41.forward;
+const Rounds = dsv41.rounds;
+
+/// The other rank's partials, in gather order, from the fixture; this rank's own copied in beside them (the forward
+/// test's Supply), and every probed buffer kept for the comparison after the run.
+const Supply = struct {
+    gpu: Gpu,
+    rank1: std.ArrayList(cuda.DeviceBuffer),
+    next: usize = 0,
+    names: std.ArrayList([]const u8),
+    probes: std.ArrayList(cuda.DeviceBuffer),
+
+    fn gather(ctx: *anyopaque, partial: cuda.abi.DevicePtr, words: usize, out: cuda.abi.DevicePtr, stream: cuda.Stream) anyerror!void {
+        const self: *Supply = @ptrCast(@alignCast(ctx));
+        if (self.next >= self.rank1.items.len) return error.GatherOverrun;
+        const other = self.rank1.items[self.next];
+        self.next += 1;
+        if (other.len != words * 4) return error.GatherShape;
+        const dst: cuda.DeviceBuffer = .{ .d = self.gpu.d, .ptr = out, .len = 2 * words * 4 };
+        try dst.copyFrom(0, partial, words * 4, stream.handle);
+        try dst.copyFrom(words * 4, other.ptr, words * 4, stream.handle);
+    }
+
+    fn probe(ctx: *anyopaque, name: []const u8, ptr: cuda.abi.DevicePtr, bytes: usize, stream: cuda.Stream) anyerror!void {
+        const self: *Supply = @ptrCast(@alignCast(ctx));
+        var buf = try cuda.DeviceBuffer.alloc(self.gpu.d, bytes);
+        try buf.copyFrom(0, ptr, bytes, stream.handle);
+        try self.names.append(self.gpu.gpa, try self.gpu.gpa.dupe(u8, name));
+        try self.probes.append(self.gpu.gpa, buf);
+    }
+
+    fn deinit(self: *Supply) void {
+        for (self.rank1.items) |*b| b.free();
+        self.rank1.deinit(self.gpu.gpa);
+        for (self.names.items) |n| self.gpu.gpa.free(n);
+        self.names.deinit(self.gpu.gpa);
+        for (self.probes.items) |*b| b.free();
+        self.probes.deinit(self.gpu.gpa);
+    }
+};
+
+/// `dsv41-rounds <dir> <rank-cache-dir> <model-dir> [aot-dir]`: one round over two streams' windows in a pool,
+/// rank 0's weights from the Python rank cache, the other rank's partials from the fixture.
+pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, aot_override: ?[]const u8) !void {
+    const gpa = gpu.gpa;
+    const io = gpu.io;
+    const aot_dir = if (aot_override) |a| try gpa.dupe(u8, a) else try std.fs.path.join(gpa, &.{ dir, "aot" });
+    defer gpa.free(aot_dir);
+    var set = try cuda.aot.Set.load(gpa, io, gpu.d, gpu.ctx.device, aot_dir);
+    defer set.deinit();
+    const fx_path = try std.fs.path.join(gpa, &.{ dir, "out", "fixture" });
+    defer gpa.free(fx_path);
+    var h: base.Harness = .{ .gpu = gpu, .fx = try fixture.Fixture.open(gpa, io, fx_path), .stream = try cuda.Stream.init(gpu.d, true) };
+    defer h.fx.deinit();
+    defer h.stream.deinit();
+    const fx = h.fx;
+    const layers: usize = @intCast(try fx.int("layers"));
+    const world: u32 = @intCast(try fx.int("world"));
+    try check.expect(world == 2, "the fixture's world is {d}; this test supplies one other rank", .{world});
+    const slots: usize = @intCast(try fx.int("slots"));
+    const cap: usize = @intCast(try fx.int("cap"));
+    const bucket: usize = @intCast(try fx.int("bucket"));
+    var kernels = try exl3.Kernels.load(gpu.d);
+    defer kernels.deinit();
+    var ek = try dsv41.experts.Kernels.load(gpu.d);
+    defer ek.deinit();
+    var glue = try dsv41.attention.Glue.load(gpu.d);
+    defer glue.deinit();
+    var cfg = try dsv41.config.Config.read(gpa, io, model_dir);
+    const rc_path = (try dsv41.rank_cache.RankCache.locate(gpa, io, cache_dir, 0, world)) orelse return error.NoRankCache;
+    defer gpa.free(rc_path);
+    var rc = try dsv41.rank_cache.RankCache.open(gpa, rc_path);
+    defer rc.close();
+    var w = try dsv41.weights.load(gpa, gpu.d, &cfg, &rc, &kernels, 0, world, .mul1, layers);
+    defer w.deinit();
+    check.pass("dsv41 rounds: {d} layers of rank 0 loaded from {s}", .{ layers, rc_path });
+    var rope_c: dsv41.attention.Rope = .{ .cos = try h.upload("cos_c"), .sin = try h.upload("sin_c"), .rows = @intCast(try fx.int("rope_rows")) };
+    defer rope_c.cos.free();
+    defer rope_c.sin.free();
+    var rope_w: dsv41.attention.Rope = .{ .cos = try h.upload("cos_w"), .sin = try h.upload("sin_w"), .rows = @intCast(try fx.int("rope_rows")) };
+    defer rope_w.cos.free();
+    defer rope_w.sin.free();
+    var pool = try Rounds.Pool.init(gpa, gpu.d, &cfg, layers, slots, cap);
+    defer pool.deinit();
+    var nb: [96]u8 = undefined;
+    const plane_names = [_][]const u8{ "comp_codes", "comp_scales", "idxk_codes", "idxk_scales", "raw_kv", "raw_score" };
+    for (0..layers) |li| {
+        const ring = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.ring", .{li}));
+        defer gpa.free(ring);
+        try pool.rings[li].upload(0, ring);
+        if (pool.planes[li]) |*p| {
+            inline for (plane_names) |pn| {
+                const bytes = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.{s}", .{ li, pn }));
+                defer gpa.free(bytes);
+                if (bytes.len > 0) try @field(p, pn).upload(0, bytes);
+            }
+        }
+    }
+    var runner = try Rounds.RoundRunner.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, bucket, rope_c, rope_w, &pool);
+    defer runner.deinit();
+    var supply: Supply = .{ .gpu = gpu, .rank1 = .empty, .names = .empty, .probes = .empty };
+    defer supply.deinit();
+    runner.probe = .{ .ctx = &supply, .call = Supply.probe };
+    for (0..layers) |li| {
+        try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r1", .{li})));
+        try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r1", .{li})));
+    }
+    try supply.rank1.append(gpa, try h.upload("head.local.r1"));
+    // the windows
+    const ids_bytes = try fx.bytes("ids");
+    defer gpa.free(ids_bytes);
+    const ids = std.mem.bytesAsSlice(i64, @as([]align(8) const u8, @alignCast(ids_bytes)));
+    const n_windows: usize = @intCast(try fx.int("n_windows"));
+    var windows: [8]Rounds.Window = undefined;
+    var at: usize = 0;
+    for (0..n_windows) |i| {
+        const rows: usize = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_rows", .{i})));
+        windows[i] = .{
+            .slot = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_slot", .{i}))),
+            .base = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_base", .{i}))),
+            .size = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_size", .{i}))),
+            .position = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_pos", .{i}))),
+            .ids = ids[at .. at + rows],
+        };
+        at += rows;
+    }
+    const gather: F.Gather = .{ .ctx = &supply, .call = Supply.gather };
+    const logits = try runner.forward(windows[0..n_windows], gather, h.stream);
+    try h.stream.synchronize();
+    for (supply.names.items, supply.probes.items) |name, buf| try h.stage(name, buf.ptr);
+    try h.stage("logits", logits);
+    for (0..layers) |li| {
+        try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.ring", .{li}), pool.rings[li].ptr);
+        if (pool.planes[li]) |*p| {
+            inline for (plane_names) |pn| {
+                if (@field(p, pn).len > 0) try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.{s}", .{ li, pn }), @field(p, pn).ptr);
+            }
+        }
+    }
+    try check.expect(h.failures == 0, "dsv41-rounds: {d} stage(s) differ from the Python fork", .{h.failures});
+}

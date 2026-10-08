@@ -3,6 +3,7 @@
 // (torch's spatial softmax then the fp32 product sum, rounded to bf16), the indexer weights' bf16 scaling, and
 // strided bf16 column copies (the views the Python passes). Built to a cubin by tools/zig/dsv41/attn_capture.sh.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 
 extern "C" {
@@ -36,6 +37,13 @@ __global__ void bf16_scale(const float* __restrict__ in, __nv_bfloat16* __restri
     if (i >= count) return;
     float a = __bfloat162float(__float2bfloat16_rn(in[i]));
     out[i] = __float2bfloat16_rn(a * scale);
+}
+
+// out[i] = half(in[i]): torch's .to(torch.float16) (round to nearest even).
+__global__ void f32_to_f16(const float* __restrict__ in, __half* __restrict__ out, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    out[i] = __float2half_rn(in[i]);
 }
 
 // dst[r * dld + c] = src[r * sld + c] for c < cols (16-bit elements): a column block view made contiguous.

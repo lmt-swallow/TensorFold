@@ -53,11 +53,7 @@ pub fn attention(gpu: Gpu, dir: []const u8) !void {
     defer gpa.free(aot_dir);
     var set = try cuda.aot.Set.load(gpa, gpu.io, gpu.d, gpu.ctx.device, aot_dir);
     defer set.deinit();
-    const glue_path = try std.fs.path.join(gpa, &.{ dir, "out", "glue.cubin" });
-    defer gpa.free(glue_path);
-    const cubin = try std.Io.Dir.cwd().readFileAlloc(gpu.io, glue_path, gpa, .limited(1 << 26));
-    defer gpa.free(cubin);
-    var glue = try A.Glue.load(gpu.d, cubin);
+    var glue = try A.Glue.load(gpu.d);
     defer glue.deinit();
     var kernels = try dsv41.exl3.Kernels.load(gpu.d);
     defer kernels.deinit();
@@ -137,7 +133,7 @@ pub fn attention(gpu: Gpu, dir: []const u8) !void {
                 .eps = @floatCast(try wf.float("eps")),
                 .bucket = bucket,
             };
-            attn = try A.Attention.init(gpa, gpu.d, dims, &set, &glue, &lay);
+            attn = try A.Attention.init(gpa, gpu.d, dims, &set, &glue, lay.scratchWords(dims.max_rows));
         } else if (attn.?.dims.bucket != bucket) return error.BucketMismatch;
         var caches: A.Caches = .{
             .ring = try upload(gpu, fx, "ring"),
@@ -152,7 +148,7 @@ pub fn attention(gpu: Gpu, dir: []const u8) !void {
         defer caches.deinit();
         var x = try upload(gpu, fx, "x");
         defer x.free();
-        const out = try attn.?.forward(&lay, &caches, rope, x.ptr, n, start, stream);
+        const out = try attn.?.forward(lay.params(), &caches, rope, x.ptr, n, start, null, stream);
         try stream.synchronize();
         var label_buf: [64]u8 = undefined;
         const label = try std.fmt.bufPrint(&label_buf, "dsv41-attn n={d}", .{n});

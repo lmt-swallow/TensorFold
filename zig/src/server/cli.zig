@@ -78,10 +78,10 @@ pub const flags = [_]Flag{
     .{ .name = "--ple-on-ssd", .kind = .store_true },
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda" }, .native = true, .native_values = backend_values },
-    .{ .name = "--tp", .choices = &.{ "1", "2" } },
-    .{ .name = "--rank", .choices = &.{ "0", "1" } },
-    .{ .name = "--master" },
-    .{ .name = "--master-port" },
+    .{ .name = "--tp", .choices = &.{ "1", "2" }, .native = cuda_build },
+    .{ .name = "--rank", .choices = &.{ "0", "1" }, .native = cuda_build },
+    .{ .name = "--master", .native = cuda_build },
+    .{ .name = "--master-port", .native = cuda_build },
     .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" } },
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
@@ -236,6 +236,8 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     } else if (is(name, "--compact-memory")) out.compact_memory = v else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v;
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 /// The CUDA build's --device and --segments; false for any other flag.
 fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
     if (std.mem.eql(u8, name, "--device")) {
@@ -243,6 +245,12 @@ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage
     } else if (std.mem.eql(u8, name, "--segments")) {
         const n = try int(u, a, name, v);
         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
+    } else if (std.mem.eql(u8, name, "--tp") or std.mem.eql(u8, name, "--rank") or std.mem.eql(u8, name, "--master") or std.mem.eql(u8, name, "--master-port")) {
+        // the tensor-parallel family reads its rank settings from the environment (TF_TP_*)
+        const key = if (std.mem.eql(u8, name, "--tp")) "TF_TP_WORLD" else if (std.mem.eql(u8, name, "--rank")) "TF_TP_RANK" else if (std.mem.eql(u8, name, "--master")) "TF_TP_MASTER" else "TF_TP_PORT";
+        const value = try a.allocSentinel(u8, v.len, 0);
+        @memcpy(value, v);
+        if (setenv(key, value, 1) != 0) return fail(u, a, "argument {s}: cannot export {s}", .{ name, key });
     } else return false;
     return true;
 }
