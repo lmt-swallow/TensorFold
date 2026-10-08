@@ -30,6 +30,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_exl3_linear", .src = "dsv41/linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // the DSV4.1 fork's cuda/exl3/linear.py, tensorfold_exl3_linear_v6
     .{ .name = "dsv41_exl3_experts", .src = "dsv41/experts", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v18: grouping, rot_in, epilogues, decode_prep
     .{ .name = "dsv41_exl3_experts_decode", .src = "dsv41/experts_decode", .flags = &.{ "-O3", "-lineinfo" } }, // the same extension's grouped_cp_kernel (decode windows)
+    .{ .name = "dsv41_engram", .src = "dsv41/engram", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: model.py Engram._decode and Comm.sum as kernels
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

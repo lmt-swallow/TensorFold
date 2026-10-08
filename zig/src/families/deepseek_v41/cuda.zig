@@ -11,6 +11,7 @@ pub const config = @import("config.zig");
 pub const weights_map = @import("weights_map.zig");
 pub const rank_cache = @import("rank_cache.zig");
 pub const engram_hash = @import("engram_hash.zig");
+pub const engram_rows = @import("engram_rows.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

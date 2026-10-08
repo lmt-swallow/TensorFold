@@ -33,6 +33,7 @@ pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_to
 pub const dsv41_exl3_linear: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_linear").bytes else &.{};
 pub const dsv41_exl3_experts: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_experts").bytes else &.{};
 pub const dsv41_exl3_experts_decode: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_experts_decode").bytes else &.{};
+pub const dsv41_engram: []const u8 = if (available) &Blob("fatbin_dsv41_engram").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
