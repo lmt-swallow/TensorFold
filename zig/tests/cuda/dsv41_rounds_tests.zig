@@ -304,10 +304,45 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     for (0..layers) |li| {
         try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.ring", .{li}), pool.rings[li].ptr);
         if (pool.planes[li]) |*p| {
-            inline for (plane_names) |pn| {
-                if (@field(p, pn).len > 0) try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.{s}", .{ li, pn }), @field(p, pn).ptr);
+            const ratio = cfg.ratio(li);
+            // every extent's scratch row is written by every row of its window whose group is not complete, in no
+            // fixed order (the fork's own bytes there depend on the launch's scheduling): left out, as the forward test
+            var skip: [8]usize = undefined;
+            for (windows[0..n_windows], 0..) |wd, i| skip[i] = wd.base / ratio + wd.size / ratio - 1;
+            try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.comp_codes", .{li}), p.comp_codes.ptr, cfg.head_dim / 2, skip[0..n_windows]);
+            try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.comp_scales", .{li}), p.comp_scales.ptr, cfg.head_dim / 16, skip[0..n_windows]);
+            if (p.idxk_codes.len > 0) {
+                try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.idxk_codes", .{li}), p.idxk_codes.ptr, cfg.idx_dim / 2, skip[0..n_windows]);
+                try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.idxk_scales", .{li}), p.idxk_scales.ptr, cfg.idx_dim / 32, skip[0..n_windows]);
+            }
+            if (p.raw_kv.len > 0) {
+                try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.raw_kv", .{li}), p.raw_kv.ptr);
+                try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.raw_score", .{li}), p.raw_score.ptr);
             }
         }
     }
     try check.expect(h.failures == 0, "dsv41-rounds: {d} stage(s) differ from the Python fork", .{h.failures});
+}
+
+/// `stage` with the rows `skip` (of `row_bytes` each) zeroed on both sides before the comparison.
+fn stageExcept(h: *base.Harness, what: []const u8, got: cuda.abi.DevicePtr, row_bytes: usize, skip: []const usize) !void {
+    try h.stream.synchronize();
+    const gpa = h.gpu.gpa;
+    const want = try h.fx.bytes(what);
+    defer gpa.free(want);
+    const bytes = try gpa.alloc(u8, want.len);
+    defer gpa.free(bytes);
+    const view: cuda.DeviceBuffer = .{ .d = h.gpu.d, .ptr = got, .len = want.len };
+    try view.download(0, bytes);
+    for (skip) |row| if ((row + 1) * row_bytes <= want.len) {
+        @memset(want[row * row_bytes .. (row + 1) * row_bytes], 0);
+        @memset(bytes[row * row_bytes .. (row + 1) * row_bytes], 0);
+    };
+    var label: [96]u8 = undefined;
+    const text = try std.fmt.bufPrint(&label, "dsv41 rounds {s} (scratch rows left out)", .{what});
+    check.sameBytes(text, bytes, want) catch {
+        h.failures += 1;
+        return;
+    };
+    check.pass("BITEXACT {s}: {d} bytes equal to the Python fork's", .{ text, want.len });
 }
