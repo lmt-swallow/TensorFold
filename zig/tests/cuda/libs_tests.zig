@@ -98,3 +98,48 @@ pub fn nccl(gpu: Gpu) !void {
     try check.sameBytes("one-rank all-gather", got, std.mem.sliceAsBytes(src));
     check.pass("NCCL {d}: one-rank communicator, all-reduce and all-gather exact", .{version});
 }
+
+/// Two ranks on two machines: the unique id over TCP, one f32 all-gather in rank order, then a control-link
+/// round trip. `master` is rank 0's IPv4; both ranks print the gathered values.
+pub fn comm(gpu: Gpu, rank: u32, world: u32, master: []const u8, port: u16) !void {
+    const d = gpu.d;
+    var ip: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, master, '.');
+    for (&ip) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadAddress, 10);
+    var c = try cuda.comm.Comm.init(rank, world, ip, port, 120_000);
+    defer c.deinit();
+    const count: usize = 4;
+    var host: [4]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(rank * 100 + i));
+    var send = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(&host));
+    defer send.free();
+    var recv = try cuda.DeviceBuffer.alloc(d, count * 4 * world);
+    defer recv.free();
+    var stream = try cuda.Stream.init(d, true);
+    defer stream.deinit();
+    try c.allGather(send.ptr, recv.ptr, count, .f32, stream.handle);
+    try stream.synchronize();
+    const got = try check.download(gpu, recv);
+    defer gpu.gpa.free(got);
+    const vals = std.mem.bytesAsSlice(f32, got);
+    for (vals, 0..) |v, i| {
+        const want: f32 = @floatFromInt((i / count) * 100 + i % count);
+        if (v != want) {
+            std.debug.print("rank {d}: gathered[{d}] = {d}, want {d}\n", .{ rank, i, v, want });
+            return error.Mismatch;
+        }
+    }
+    var buf: [64]u8 = undefined;
+    if (rank == 0) {
+        for (1..world) |peer| {
+            try c.sendTo(@intCast(peer), "ping");
+            const reply = try c.recvFrom(@intCast(peer), &buf);
+            if (!std.mem.eql(u8, reply, "pong")) return error.Mismatch;
+        }
+    } else {
+        const msg = try c.recvFrom(0, &buf);
+        if (!std.mem.eql(u8, msg, "ping")) return error.Mismatch;
+        try c.sendTo(0, "pong");
+    }
+    std.debug.print("RESULT comm rank {d} of {d}: all-gather of {d} f32 in rank order and the control link round trip\n", .{ rank, world, count * world });
+}

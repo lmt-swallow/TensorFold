@@ -93,11 +93,11 @@ pub const Comm = struct {
     fn acceptPeers(self: *Comm, port: u16, timeout_ms: u32) Error!void {
         const lfd = try listen(port);
         defer _ = posix.system.close(lfd);
-        var deadline = std.time.milliTimestamp() + @as(i64, timeout_ms);
+        var deadline = nowMs() + @as(i64, timeout_ms);
         var got: u32 = 0;
         while (got + 1 < self.world) {
             var fds = [_]posix.pollfd{.{ .fd = lfd, .events = posix.POLL.IN, .revents = 0 }};
-            const left = deadline - std.time.milliTimestamp();
+            const left = deadline - nowMs();
             if (left <= 0) return error.ConnectTimeout;
             const ready = posix.poll(&fds, @intCast(@min(left, 1000))) catch return error.AcceptFailed;
             if (ready == 0) continue;
@@ -119,14 +119,14 @@ pub const Comm = struct {
             }
             self.links[peer - 1] = fd;
             got += 1;
-            deadline = std.time.milliTimestamp() + @as(i64, timeout_ms);
+            deadline = nowMs() + @as(i64, timeout_ms);
         }
     }
 
     /// Connects to rank 0, retrying every 200 ms until `timeout_ms` (rank 0 may still be loading), then names
     /// this rank.
     fn connectRetry(rank: u32, master: [4]u8, port: u16, timeout_ms: u32) Error!posix.socket_t {
-        const deadline = std.time.milliTimestamp() + @as(i64, timeout_ms);
+        const deadline = nowMs() + @as(i64, timeout_ms);
         while (true) {
             if (connectOnce(master, port)) |fd| {
                 var rank_bytes: [4]u8 = undefined;
@@ -134,8 +134,8 @@ pub const Comm = struct {
                 try writeAll(fd, &rank_bytes);
                 return fd;
             }
-            if (std.time.milliTimestamp() >= deadline) return error.ConnectTimeout;
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+            if (nowMs() >= deadline) return error.ConnectTimeout;
+            sleepMs(200);
         }
     }
 };
@@ -193,4 +193,18 @@ fn readAll(fd: posix.socket_t, buf: []u8) Error!void {
         if (rc == 0) return error.LinkClosed;
         done += @intCast(rc);
     }
+}
+
+const linux = std.os.linux;
+
+fn nowMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+fn sleepMs(ms: u32) void {
+    var req: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    var rem: linux.timespec = undefined;
+    _ = linux.nanosleep(&req, &rem);
 }
