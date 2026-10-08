@@ -14,20 +14,20 @@ const Gpu = check.Gpu;
 const dsp = dsv41.dspark;
 const exl3 = dsv41.exl3;
 
-const Harness = struct {
+pub const Harness = struct {
     gpu: Gpu,
     fx: fixture.Fixture,
     stream: cuda.Stream,
     failures: usize = 0,
     nb: [96]u8 = undefined,
 
-    fn upload(self: *Harness, what: []const u8) !cuda.DeviceBuffer {
+    pub fn upload(self: *Harness, what: []const u8) !cuda.DeviceBuffer {
         const bytes = try self.fx.bytes(what);
         defer self.gpu.gpa.free(bytes);
         return cuda.DeviceBuffer.fromHost(self.gpu.d, bytes);
     }
 
-    fn stage(self: *Harness, what: []const u8, got: cuda.abi.DevicePtr) !void {
+    pub fn stage(self: *Harness, what: []const u8, got: cuda.abi.DevicePtr) !void {
         try self.stream.synchronize();
         const want = try self.fx.bytes(what);
         defer self.gpu.gpa.free(want);
@@ -44,17 +44,17 @@ const Harness = struct {
         check.pass("BITEXACT {s}: {d} bytes equal to the Python fork's", .{ text, want.len });
     }
 
-    fn name(self: *Harness, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    pub fn name(self: *Harness, comptime fmt: []const u8, args: anytype) ![]const u8 {
         return std.fmt.bufPrint(&self.nb, fmt, args);
     }
 };
 
-fn codebook(s: []const u8) exl3.Codebook {
+pub fn codebook(s: []const u8) exl3.Codebook {
     return if (std.mem.eql(u8, s, "mul1")) .mul1 else if (std.mem.eql(u8, s, "mcg")) .mcg else .inst3;
 }
 
 /// An EXL3 group of the fixture by `name` (`<name>_trellis/_suh/_svh`, params `<name>_kt/_nt/_w16/_cb`).
-fn linearOf(h: *Harness, kernels: *const exl3.Kernels, comptime fmt: []const u8, args: anytype) !exl3.Linear {
+pub fn linearOf(h: *Harness, kernels: *const exl3.Kernels, comptime fmt: []const u8, args: anytype) !exl3.Linear {
     const gpa = h.gpu.gpa;
     var nb: [96]u8 = undefined;
     const base = try std.fmt.bufPrint(&nb, fmt, args);
@@ -72,7 +72,7 @@ fn linearOf(h: *Harness, kernels: *const exl3.Kernels, comptime fmt: []const u8,
     return exl3.Linear.init(gpa, kernels, tr, kt, nt, w16, suh, svh, cb);
 }
 
-const StageOwned = struct {
+pub const StageOwned = struct {
     plains: [13]cuda.DeviceBuffer,
     wq_a: exl3.Linear,
     wq_b: exl3.Linear,
@@ -82,7 +82,7 @@ const StageOwned = struct {
     wo_b: exl3.Linear,
     experts: dsv41.experts.Experts,
 
-    fn view(self: *const StageOwned) dsp.Stage {
+    pub fn view(self: *const StageOwned) dsp.Stage {
         const p = &self.plains;
         return .{
             .hc_attn_fn = p[0].ptr, .hc_attn_scale = p[1].ptr, .hc_attn_base = p[2].ptr, .hc_ffn_fn = p[3].ptr,
@@ -93,7 +93,7 @@ const StageOwned = struct {
         };
     }
 
-    fn deinit(self: *StageOwned) void {
+    pub fn deinit(self: *StageOwned) void {
         for (&self.plains) |*b| b.free();
         self.wq_a.deinit();
         self.wq_b.deinit();
@@ -106,7 +106,7 @@ const StageOwned = struct {
 
 const plain_names = [_][]const u8{ "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "attn_norm", "ffn_norm", "q_norm", "kv_norm", "sink", "gate_w", "gate_b" };
 
-fn loadStage(h: *Harness, kernels: *const exl3.Kernels, j: usize, groups: usize, n_routed: usize) !StageOwned {
+pub fn loadStage(h: *Harness, kernels: *const exl3.Kernels, j: usize, groups: usize, n_routed: usize) !StageOwned {
     const gpa = h.gpu.gpa;
     var s: StageOwned = undefined;
     s.groups = groups;

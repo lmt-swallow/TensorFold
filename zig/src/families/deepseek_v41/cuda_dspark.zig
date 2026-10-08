@@ -149,6 +149,7 @@ pub const Drafter = struct {
     pos: cuda.DeviceBuffer,
     wpos: cuda.DeviceBuffer,
     bidx: cuda.DeviceBuffer,
+    rbase: cuda.DeviceBuffer, // [rows] i64: each row's stream's ring rows start (slot x ring), batched drafts
     neg: cuda.DeviceBuffer,
     zero: cuda.DeviceBuffer,
     emb_ids: cuda.DeviceBuffer, // [block] i64: rows of `emb2` (0 = token, 1 = noise)
@@ -199,10 +200,12 @@ pub const Drafter = struct {
     emb_pair: []u16,
 
     pub const max_absorb = 2048;
+    /// Rows a draft pass holds at most (kernels.DECODE_ROWS): N streams x the block.
+    pub const max_rows = 16;
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const attention.Glue, ex_kernels: *const experts_mod.Kernels, stages: []const Stage, head: Head, comm: ?*const cuda.comm.Comm) !*Drafter {
-        const n = dims.block;
-        if (n > 16 or n < 1) return error.TooManyRows;
+        const n = max_rows; // every per-row buffer holds a batched draft's rows (N streams x the block)
+        if (dims.block > max_rows or dims.block < 1) return error.TooManyRows;
         if (dims.world > 1 and comm == null) return error.NoComm;
         const self = try gpa.create(Drafter);
         errdefer gpa.destroy(self);
@@ -230,21 +233,14 @@ pub const Drafter = struct {
         self.pos = try cuda.DeviceBuffer.alloc(d, n * 8);
         self.wpos = try cuda.DeviceBuffer.alloc(d, n * 8);
         self.bidx = try cuda.DeviceBuffer.alloc(d, n * n * 8);
-        var bi: [256]i64 = @splat(0);
-        for (0..n) |r| for (0..n) |c| {
-            bi[r * n + c] = @intCast(c);
-        };
-        try self.bidx.upload(0, std.mem.sliceAsBytes(bi[0 .. n * n]));
+        self.rbase = try cuda.DeviceBuffer.alloc(d, n * 8);
         self.neg = try cuda.DeviceBuffer.alloc(d, n * 8);
         for (0..n) |i| tab[i] = -1;
         try self.neg.upload(0, std.mem.sliceAsBytes(tab[0..n]));
-        self.zero = try cuda.DeviceBuffer.alloc(d, 8);
+        self.zero = try cuda.DeviceBuffer.alloc(d, n * 8);
         try self.zero.fill8(0, null);
         self.emb_ids = try cuda.DeviceBuffer.alloc(d, n * 8);
-        tab[0] = 0;
-        for (1..n) |i| tab[i] = 1;
-        try self.emb_ids.upload(0, std.mem.sliceAsBytes(tab[0..n]));
-        self.emb2 = try cuda.DeviceBuffer.alloc(d, 2 * D * 2);
+        self.emb2 = try cuda.DeviceBuffer.alloc(d, (max_rows + 1) * D * 2);
         // activations
         self.h = try cuda.DeviceBuffer.alloc(d, nd * hc_mod.hc_streams * 2);
         self.pre = try cuda.DeviceBuffer.alloc(d, n * 4 * 4);
@@ -294,14 +290,14 @@ pub const Drafter = struct {
         self.main_y = try cuda.DeviceBuffer.alloc(d, max_absorb * D * 2);
         self.abs_kv = try cuda.DeviceBuffer.alloc(d, max_absorb * dims.hd * 2);
         self.abs_rows = max_absorb;
-        self.host_out = try gpa.alloc(i64, n + 1);
+        self.host_out = try gpa.alloc(i64, Markov.np * (dims.block + 1));
         self.host_xc = try gpa.alloc(u16, nd);
         self.emb_pair = try gpa.alloc(u16, 2 * D);
         return self;
     }
 
     pub fn deinit(self: *Drafter) void {
-        inline for (.{ "ids", "pos", "wpos", "bidx", "neg", "zero", "emb_ids", "emb2", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kvb", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe_out", "xc", "xn", "local", "lg", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(self, f).free();
+        inline for (.{ "ids", "pos", "wpos", "bidx", "rbase", "neg", "zero", "emb_ids", "emb2", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kvb", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe_out", "xc", "xn", "local", "lg", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(self, f).free();
         self.ex_scratch.deinit();
         self.markov.deinit();
         self.gpa.free(self.host_out);
@@ -367,93 +363,133 @@ pub const Drafter = struct {
     /// Greedy drafts after `token` (which sits at position q0, every position before it absorbed); `embed` is the
     /// target's embedding table bf16 [V, d] on the device, read for the token and the noise.
     pub fn draft(self: *Drafter, cache: *const Cache, token: u32, q0: usize, embed: Ptr, rope: Rope, stream: cuda.Stream) !Drafts {
-        return self.draftHooked(cache, token, q0, embed, rope, stream, null, null);
+        if (cache.absorbed != q0) return error.BadShape;
+        const D = self.dims.d;
+        try self.emb2.copyFrom(0, embed + @as(u64, token) * D * 2, D * 2, stream.handle);
+        try self.emb2.copyFrom(D * 2, embed + @as(u64, self.dims.noise) * D * 2, D * 2, stream.handle);
+        var out: [1]Drafts = undefined;
+        try self.runRows(1, &.{token}, &.{q0}, null, cache.rings, rope, stream, null, null, &out);
+        return out[0];
     }
 
-    /// `draft` with `embed` a two-row table (row 0 the token's embedding, row 1 the noise's) and a hook after each
+    /// `draft` with `table2` a two-row table (row 0 the token's embedding, row 1 the noise's) and a hook after each
     /// step: what a fixture test needs.
     pub fn draftWithTable(self: *Drafter, cache: *const Cache, token: u32, q0: usize, table2: Ptr, rope: Rope, stream: cuda.Stream, ctx: *anyopaque, hook: Hook) !Drafts {
-        return self.draftHooked(cache, token, q0, table2, rope, stream, ctx, hook);
+        if (cache.absorbed != q0) return error.BadShape;
+        try self.emb2.copyFrom(0, table2, 2 * self.dims.d * 2, stream.handle);
+        var out: [1]Drafts = undefined;
+        try self.runRows(1, &.{token}, &.{q0}, null, cache.rings, rope, stream, ctx, hook, &out);
+        return out[0];
     }
 
-    fn draftHooked(self: *Drafter, cache: *const Cache, token: u32, q0: usize, embed: Ptr, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook) !Drafts {
+    /// dspark.py `BatchDraftGraph`: drafts for N streams in one pass, each stream's block at its own positions in its
+    /// own slot's rings (`pool`), the Markov loop batched. `embed`: the target's table; N x block rows <= max_rows.
+    pub fn batchDraft(self: *Drafter, pool: *const DraftPool, tokens: []const u32, q0: []const usize, slots: []const usize, embed: Ptr, rope: Rope, stream: cuda.Stream, out: []Drafts) !void {
+        const N = tokens.len;
+        if (N == 0 or N * self.dims.block > max_rows or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
+        const D = self.dims.d;
+        for (tokens, 0..) |t, s| try self.emb2.copyFrom(s * D * 2, embed + @as(u64, t) * D * 2, D * 2, stream.handle);
+        try self.emb2.copyFrom(N * D * 2, embed + @as(u64, self.dims.noise) * D * 2, D * 2, stream.handle);
+        try self.runRows(N, tokens, q0, slots, pool.rings, rope, stream, null, null, out);
+    }
+
+    /// `batchDraft` with the embedding rows given as a table [N + 1, d] (the tokens' rows, then the noise's) and a
+    /// hook (tests).
+    pub fn batchDraftWithTable(self: *Drafter, pool: *const DraftPool, tokens: []const u32, q0: []const usize, slots: []const usize, table: Ptr, rope: Rope, stream: cuda.Stream, ctx: *anyopaque, hook: Hook, out: []Drafts) !void {
+        const N = tokens.len;
+        if (N == 0 or N * self.dims.block > max_rows or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
+        try self.emb2.copyFrom(0, table, (N + 1) * self.dims.d * 2, stream.handle);
+        try self.runRows(N, tokens, q0, slots, pool.rings, rope, stream, ctx, hook, out);
+    }
+
+    /// The pass over N streams' blocks (R = N x block rows): `slots` null = one stream on its own rings (`rings` a
+    /// cache's, every row's ring base 0, HAS_BASE off), else each row addresses its stream's rows of the pool's ring
+    /// planes through per-row bases. `self.emb2` holds the embedding rows: stream s's token at row s, the noise at
+    /// row N.
+    fn runRows(self: *Drafter, N: usize, tokens: []const u32, q0: []const usize, slots: ?[]const usize, rings: []const cuda.DeviceBuffer, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook, out: []Drafts) !void {
         const dm = self.dims;
         const n = dm.block;
-        if (cache.absorbed != q0) return error.BadShape;
+        const R = N * n;
         const D = dm.d;
-        // the block's ids, positions, the window position every row sees (q0 - 1)
-        var tab: [16]i64 = undefined;
-        tab[0] = token;
-        for (1..n) |i| tab[i] = dm.noise;
-        try self.ids.upload(0, std.mem.sliceAsBytes(tab[0..n]));
-        for (0..n) |i| tab[i] = @intCast(q0 + i);
-        try self.pos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
-        for (0..n) |i| tab[i] = @as(i64, @intCast(q0)) - 1;
-        try self.wpos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
-        // h = embed[ids] on every stream, pre = [1, 0, 0, 0]: two rows of the table, gathered by embed_init
-        if (hook == null) {
-            try self.emb2.copyFrom(0, embed + @as(u64, token) * D * 2, D * 2, stream.handle);
-            try self.emb2.copyFrom(D * 2, embed + @as(u64, dm.noise) * D * 2, D * 2, stream.handle);
-        } else {
-            try self.emb2.copyFrom(0, embed, 2 * D * 2, stream.handle);
+        const batched = slots != null;
+        // the row tables: embedding rows, positions, the window position every row sees (q0 - 1), the ring bases
+        var tab: [max_rows]i64 = undefined;
+        for (0..R) |r| tab[r] = if (r % n == 0) @intCast(r / n) else @intCast(N);
+        try self.emb_ids.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+        for (0..R) |r| tab[r] = @intCast(q0[r / n] + r % n);
+        try self.pos.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+        for (0..R) |r| tab[r] = @as(i64, @intCast(q0[r / n])) - 1;
+        try self.wpos.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+        if (batched) {
+            for (0..R) |r| tab[r] = @intCast(slots.?[r / n] * dm.ring);
+            try self.rbase.upload(0, std.mem.sliceAsBytes(tab[0..R]));
         }
-        try self.hc.embedInit(stream, self.emb2.ptr, self.emb_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(n));
+        // every row of a stream's block sees that stream's block rows (the keys as `comp`, no mask inside the block)
+        var bi: [max_rows * max_rows]i64 = undefined;
+        for (0..R) |r| for (0..n) |c| {
+            bi[r * n + c] = @intCast((r / n) * n + c);
+        };
+        try self.bidx.upload(0, std.mem.sliceAsBytes(bi[0 .. R * n]));
+        try self.hc.embedInit(stream, self.emb2.ptr, self.emb_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(R));
         if (hook) |f| try f(ctx.?, "h0", self.h.ptr);
         var pre = self.pre.ptr;
         var pre_f = self.pre_f.ptr;
         var nb: [32]u8 = undefined;
-        for (self.stages, cache.rings, 0..) |s, ring, j| {
-            try self.hc.pre(stream, self.h.ptr, s.hc_attn_fn, s.hc_attn_scale, s.hc_attn_base, pre, s.attn_norm, self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(n));
+        for (self.stages, rings, 0..) |s, ring, j| {
+            try self.hc.pre(stream, self.h.ptr, s.hc_attn_fn, s.hc_attn_scale, s.hc_attn_base, pre, s.attn_norm, self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x1", .{j}), self.x.ptr);
-            const pa = try self.stageAttention(s, ring.ptr, rope, stream);
+            const pa = try self.stageAttention(s, ring.ptr, R, batched, rope, stream);
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_attn", .{j}), pa);
-            const ga = try self.gather(pa, n * D, stream);
-            try self.hc.post(stream, ga, @intCast(dm.world), self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(n));
+            const ga = try self.gather(pa, R * D, stream);
+            try self.hc.post(stream, ga, @intCast(dm.world), self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(R));
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_h1", .{j}), self.h.ptr);
-            try self.hc.pre(stream, self.h.ptr, s.hc_ffn_fn, s.hc_ffn_scale, s.hc_ffn_base, self.pre_a.ptr, s.ffn_norm, self.x.ptr, pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(n));
+            try self.hc.pre(stream, self.h.ptr, s.hc_ffn_fn, s.hc_ffn_scale, s.hc_ffn_base, self.pre_a.ptr, s.ffn_norm, self.x.ptr, pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x2", .{j}), self.x.ptr);
-            const pmo = try self.stageMoe(s, stream);
+            const pmo = try self.stageMoe(s, R, stream);
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_moe", .{j}), pmo);
-            const gm = try self.gather(pmo, n * D, stream);
-            try self.hc.post(stream, gm, @intCast(dm.world), self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(n));
+            const gm = try self.gather(pmo, R * D, stream);
+            try self.hc.post(stream, gm, @intCast(dm.world), self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(R));
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_h2", .{j}), self.h.ptr);
             const t = pre;
             pre = pre_f;
             pre_f = t;
         }
         // xc = collapse(h, pre); local = head(rmsnorm(xc, norm))
-        try self.set.run(stream, "_collapse", .{ @intCast(n), @intCast(D / 1024), 1 }, &.{
+        try self.set.run(stream, "_collapse", .{ @intCast(R), @intCast(D / 1024), 1 }, &.{
             aot.ptr("X", "*bf16", self.h.ptr), aot.ptr("PRE", "*fp32", pre), aot.ptr("OUT", "*bf16", self.xc.ptr),
         }, &.{ aot.ci("D", @intCast(D)), aot.ci("BLOCK", 1024) });
-        try self.rmsnorm(self.xc.ptr, self.head.norm, self.xn.ptr, n, D, stream);
-        try self.head.head.run(self.xn.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.local.ptr, .f32, stream);
-        // the Markov loop: out[0] = token, out[1..] the drafts
+        try self.rmsnorm(self.xc.ptr, self.head.norm, self.xn.ptr, R, D, stream);
+        try self.head.head.run(self.xn.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.local.ptr, .f32, stream);
+        // the Markov loop: out[s, 0] = token, out[s, 1..] the drafts
         const lg: Ptr = if (self.markov.split) self.local.ptr else blk: {
             if (dm.world == 1) break :blk self.local.ptr;
-            try self.comm.?.allGather(self.local.ptr, self.lg.ptr, n * dm.vocab_local, .f32, stream.handle);
+            try self.comm.?.allGather(self.local.ptr, self.lg.ptr, R * dm.vocab_local, .f32, stream.handle);
             break :blk self.lg.ptr;
         };
-        try self.markov.steps(lg, self.head, token, n, n, self.comm, stream);
+        try self.markov.steps(lg, self.head, tokens, N, n, n, self.comm, stream);
         try stream.synchronize();
-        try self.markov.out.download(0, std.mem.sliceAsBytes(self.host_out[0 .. n + 1]));
-        var out: Drafts = .{ .tokens = undefined, .conf = undefined, .len = n };
-        for (0..n) |i| out.tokens[i] = @intCast(self.host_out[i + 1]);
-        try self.confidence(&out, n, stream);
-        return out;
+        try self.markov.out.download(0, std.mem.sliceAsBytes(self.host_out[0 .. N * (n + 1)]));
+        try self.xc.download(0, std.mem.sliceAsBytes(self.host_xc[0 .. R * D]));
+        for (0..N) |s_| {
+            var o: Drafts = .{ .tokens = undefined, .conf = undefined, .len = n };
+            for (0..n) |i| o.tokens[i] = @intCast(self.host_out[s_ * (n + 1) + i + 1]);
+            self.confidence(&o, s_, n, N);
+            out[s_] = o;
+        }
     }
 
-    /// conf[i] = conf_w . [xc[i] (f32), markov_embed[out[i]] (f32)] (the fork: a cuBLAS fp32 matmul; here a host
-    /// dot in the row's order, so the last bits may differ: the confidence feeds depth policies, never a token).
-    fn confidence(self: *Drafter, out: *Drafts, n: usize, stream: cuda.Stream) !void {
-        _ = stream;
+    /// conf[i] = conf_w . [xc[row] (f32), markov_embed[out[s, i]] (f32)] (the fork: a cuBLAS fp32 matmul; here a
+    /// host dot in the row's order, so the last bits may differ: the confidence feeds depth policies, never a token).
+    fn confidence(self: *Drafter, o: *Drafts, s_: usize, n: usize, N: usize) void {
+        _ = N;
         const dm = self.dims;
-        try self.xc.download(0, std.mem.sliceAsBytes(self.host_xc[0 .. n * dm.d]));
         for (0..n) |i| {
+            const row = s_ * n + i;
             var acc: f64 = 0;
-            for (0..dm.d) |j| acc += @as(f64, bf16ToF32(self.host_xc[i * dm.d + j])) * @as(f64, f16ToF32(self.head.conf[j]));
-            const tok: usize = @intCast(self.host_out[i]); // the token before draft i (out[i]), as the fork's embs
+            for (0..dm.d) |j| acc += @as(f64, bf16ToF32(self.host_xc[row * dm.d + j])) * @as(f64, f16ToF32(self.head.conf[j]));
+            const tok: usize = @intCast(self.host_out[s_ * (n + 1) + i]); // the token before draft i, as the fork's embs
             for (0..dm.markov_rank) |k| acc += @as(f64, bf16ToF32(self.head.markov_embed_host[tok * dm.markov_rank + k])) * @as(f64, f16ToF32(self.head.conf[dm.d + k]));
-            out.conf[i] = @floatCast(acc);
+            o.conf[i] = @floatCast(acc);
         }
     }
 
@@ -463,23 +499,25 @@ pub const Drafter = struct {
         return self.gathered.ptr;
     }
 
-    /// dspark.py `Drafter._attention`: the block's rows attend the ring's newest 128 absorbed positions (ending at
-    /// q0 - 1) and every block row (its keys as `comp`, no mask inside the block); this rank's fp32 partial.
-    fn stageAttention(self: *Drafter, s: Stage, ring: Ptr, rope: Rope, stream: cuda.Stream) !Ptr {
+    /// dspark.py `Drafter._attention` / `BatchDraftGraph._attention` (unfused): the rows attend their stream's ring's
+    /// newest 128 absorbed positions (ending at q0 - 1) and their block's rows (its keys as `comp`, no mask inside
+    /// the block); this rank's fp32 partial. `batched`: per-row ring bases into the pool's plane (HAS_BASE).
+    fn stageAttention(self: *Drafter, s: Stage, ring: Ptr, R: usize, batched: bool, rope: Rope, stream: cuda.Stream) !Ptr {
         const dm = self.dims;
         const n = dm.block;
-        try s.wq_a.run(self.x.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
-        try s.wkv.run(self.x.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.ykv.ptr, .bf16, stream);
-        try self.rmsnorm(self.qa.ptr, s.q_norm, self.qr.ptr, n, dm.q_rank, stream);
-        try s.wq_b.run(self.qr.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
-        try self.ropeHeads(self.q.ptr, rope, self.pos.ptr, n, dm.heads, dm.hd, false, stream);
+        try s.wq_a.run(self.x.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
+        try s.wkv.run(self.x.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.ykv.ptr, .bf16, stream);
+        try self.rmsnorm(self.qa.ptr, s.q_norm, self.qr.ptr, R, dm.q_rank, stream);
+        try s.wq_b.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
+        try self.ropeHeads(self.q.ptr, rope, self.pos.ptr, R, dm.heads, dm.hd, false, stream);
         // the block's keys, normalized, roped and quantized like the ring's, not stored (slots -1)
-        try self.kvNormRope(self.ykv.ptr, s.kv_norm, rope, self.pos.ptr, self.neg.ptr, ring, self.kvb.ptr, n, stream);
+        try self.kvNormRope(self.ykv.ptr, s.kv_norm, rope, self.pos.ptr, self.neg.ptr, ring, self.kvb.ptr, R, stream);
+        if (R > max_rows) return error.TooManyRows;
         const groups_h = dm.heads / 16;
         const picks: usize = (n + 31) / 32;
         const nblk: usize = dm.window / 32 + picks;
         const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dm.hd))));
-        try self.set.run(stream, "_sparse_attn_part", .{ @intCast(n), @intCast(groups_h), 8 }, &.{
+        try self.set.run(stream, "_sparse_attn_part", .{ @intCast(R), @intCast(groups_h), 8 }, &.{
             aot.ptr("Q", "*bf16", self.q.ptr),      aot.ptr("WSRC", "*bf16", ring),
             aot.ptr("WLO", "*i64", self.zero.ptr),  aot.ptr("COMP", "*bf16", self.kvb.ptr),
             aot.ptr("CSC", "*bf16", ring),          aot.ptr("IDX", "*i64", self.bidx.ptr),
@@ -487,36 +525,35 @@ pub const Drafter = struct {
             aot.ptr("PL", "*fp32", self.pl.ptr),    aot.ptr("PO", "*fp32", self.po.ptr),
             aot.ptr("SINK", "*fp32", s.sink),       aot.ptr("OUT", "*bf16", self.o.ptr),
             aot.float("scale", scale),              aot.int("ring_size", @intCast(dm.ring)),
-            aot.int("n_idx", @intCast(n)),          aot.ptr("RBASE", "*i64", self.wpos.ptr),
-            aot.ptr("CBASE", "*i64", self.wpos.ptr),
+            aot.int("n_idx", @intCast(n)),          aot.ptr("RBASE", "*i64", if (batched) self.rbase.ptr else self.wpos.ptr),
+            aot.ptr("CBASE", "*i64", if (batched) self.zero.ptr else self.wpos.ptr),
         }, &.{
             aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16),      aot.ci("WIN", @intCast(dm.window)),
             aot.ci("BN", 32),                aot.ci("RING", 1),               aot.ci("HAS_COMP", 1), aot.ci("PACKED", 0),
-            aot.ci("SPLITS", 8),             aot.ci("NBLK", @intCast(nblk)),  aot.ci("FINAL", 0),    aot.ci("HAS_BASE", 0),
+            aot.ci("SPLITS", 8),             aot.ci("NBLK", @intCast(nblk)),  aot.ci("FINAL", 0),    aot.ci("HAS_BASE", @intFromBool(batched)),
             aot.ci("PDL", 1),                aot.ci("WPF", 1),
         });
-        try self.set.run(stream, "_sparse_attn_merge", .{ @intCast(n), @intCast(groups_h), 1 }, &.{
+        try self.set.run(stream, "_sparse_attn_merge", .{ @intCast(R), @intCast(groups_h), 1 }, &.{
             aot.ptr("PM", "*fp32", self.pm.ptr), aot.ptr("PL", "*fp32", self.pl.ptr), aot.ptr("PO", "*fp32", self.po.ptr),
             aot.ptr("SINK", "*fp32", s.sink),   aot.ptr("OUT", "*bf16", self.o.ptr),
         }, &.{ aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
-        try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, n, dm.heads, dm.hd, true, stream);
+        try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, R, dm.heads, dm.hd, true, stream);
         const o_cols = dm.heads * dm.hd;
         const g_cols = o_cols / dm.groups;
         for (0..dm.groups) |g| {
-            try self.copyCols(self.o.ptr + g * g_cols * 2, o_cols, self.og.ptr, g_cols, n, g_cols, stream);
-            try s.wo_a[g].run(self.og.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.ug.ptr, .bf16, stream);
-            try self.copyCols(self.ug.ptr, dm.o_rank, self.u.ptr + g * dm.o_rank * 2, dm.groups * dm.o_rank, n, dm.o_rank, stream);
+            try self.copyCols(self.o.ptr + g * g_cols * 2, o_cols, self.og.ptr, g_cols, R, g_cols, stream);
+            try s.wo_a[g].run(self.og.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.ug.ptr, .bf16, stream);
+            try self.copyCols(self.ug.ptr, dm.o_rank, self.u.ptr + g * dm.o_rank * 2, dm.groups * dm.o_rank, R, dm.o_rank, stream);
         }
-        try s.wo_b.run(self.u.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.attn_out.ptr, .f32, stream);
+        try s.wo_b.run(self.u.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.attn_out.ptr, .f32, stream);
         return self.attn_out.ptr;
     }
 
     /// model.py `Model.moe` at the drafter's top-k: the gate's chunk sums, the picks, the routed experts' fp32 partial.
-    fn stageMoe(self: *Drafter, s: Stage, stream: cuda.Stream) !Ptr {
-        const n = self.dims.block;
-        try self.route.gate(stream, self.x.ptr, s.gate_w, self.parts.ptr, @intCast(n));
-        try self.route.pick(stream, self.parts.ptr, s.gate_b, self.pick.ptr, self.wts.ptr, @intCast(n));
-        try experts_mod.routed(self.ex_kernels, s.experts, &self.ex_scratch, self.x.ptr, self.pick.ptr, self.wts.ptr, n, self.dims.swiglu_limit, self.moe_out.ptr, stream);
+    fn stageMoe(self: *Drafter, s: Stage, R: usize, stream: cuda.Stream) !Ptr {
+        try self.route.gate(stream, self.x.ptr, s.gate_w, self.parts.ptr, @intCast(R));
+        try self.route.pick(stream, self.parts.ptr, s.gate_b, self.pick.ptr, self.wts.ptr, @intCast(R));
+        try experts_mod.routed(self.ex_kernels, s.experts, &self.ex_scratch, self.x.ptr, self.pick.ptr, self.wts.ptr, R, self.dims.swiglu_limit, self.moe_out.ptr, stream);
         return self.moe_out.ptr;
     }
 
@@ -536,7 +573,7 @@ pub const Drafter = struct {
     }
 
     /// kernels.kv_norm_rope: y [n, hd] -> out (normalized, roped, FP8 quantize-dequantized), and into ring[slots]
-    /// where a slot is >= 0.
+    /// where a slot is >= 0 (`ring_rows`: the plane's rows, a pool's slots x ring).
     fn kvNormRope(self: *Drafter, y: Ptr, w: Ptr, rope: Rope, pos: Ptr, slots: Ptr, ring: Ptr, out: Ptr, n: usize, stream: cuda.Stream) !void {
         const dm = self.dims;
         try self.set.run(stream, "_kv_norm_rope", .{ @intCast(n), 1, 1 }, &.{
@@ -557,10 +594,77 @@ pub const Drafter = struct {
         a.add(@as(c_int, @intCast(cols)));
         try cuda.launch.launch(self.glue.copy_cols, .{ .grid = .{ .x = @intCast((cols + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
     }
+
+    // -- the pool's rings (concurrent streams) -------------------------------------------------------------------
+
+    /// dspark.py `absorb_many` for one slot: the taps of positions start .. start + n - 1 into slot `slot`'s rows of
+    /// every stage's ring plane (row = slot x ring + position % ring); the slot's `absorbed` is the caller's.
+    pub fn absorbSlot(self: *Drafter, pool: *DraftPool, slot: usize, taps: Ptr, start: usize, n_in: usize, rope: Rope, stream: cuda.Stream) !void {
+        const dm = self.dims;
+        var n = n_in;
+        var first = start;
+        var tap_ptr = taps;
+        if (n > dm.ring) {
+            first = start + n - dm.ring;
+            tap_ptr = taps + (n - dm.ring) * 3 * dm.d * 2;
+            n = dm.ring;
+        }
+        if (n > 0) {
+            if (n > self.abs_rows) return error.TooManyRows;
+            var tab: [max_absorb]i64 = undefined;
+            for (0..n) |i| tab[i] = @intCast(first + i);
+            try self.abs_pos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+            for (0..n) |i| tab[i] = @intCast(slot * dm.ring + (first + i) % dm.ring);
+            try self.abs_slots.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+            var at: usize = 0;
+            while (at < n) : (at += 128) {
+                const m = @min(128, n - at);
+                try self.head.main_proj.run(tap_ptr + at * 3 * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.main_y.ptr + at * dm.d * 2, .bf16, stream);
+                try self.rmsnorm(self.main_y.ptr + at * dm.d * 2, self.head.main_norm, self.main_x.ptr + at * dm.d * 2, m, dm.d, stream);
+            }
+            for (self.stages, pool.rings) |s, ring| {
+                at = 0;
+                while (at < n) : (at += 128) {
+                    const m = @min(128, n - at);
+                    try s.wkv.run(self.main_x.ptr + at * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.abs_kv.ptr + at * dm.hd * 2, .bf16, stream);
+                    try self.kvNormRope(self.abs_kv.ptr + at * dm.hd * 2, s.kv_norm, rope, self.abs_pos.ptr + at * 8, self.abs_slots.ptr + at * 8, ring.ptr, self.abs_kv.ptr + at * dm.hd * 2, m, stream);
+                }
+            }
+        }
+        pool.absorbed[slot] = start + n_in;
+    }
 };
 
-/// markov.py `Markov` for one stream (N = 1): the head rows this rank scores, no cached rows yet (every token's bias
-/// row is computed into the staging row: the same bits as a cached one, markov.py's own words).
+/// dspark.py `DraftPool`: `slots` drafter caches in one ring plane a stage (slot s: rows [s x ring, (s + 1) x ring)).
+pub const DraftPool = struct {
+    rings: []cuda.DeviceBuffer, // per stage [slots x ring, hd] bf16
+    absorbed: []usize,
+    slots: usize,
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, stages: usize, slots: usize, dims: Dims) !DraftPool {
+        const rings = try gpa.alloc(cuda.DeviceBuffer, stages);
+        errdefer gpa.free(rings);
+        var made: usize = 0;
+        errdefer for (rings[0..made]) |*r| r.free();
+        for (rings) |*r| {
+            r.* = try cuda.DeviceBuffer.alloc(d, slots * dims.ring * dims.hd * 2);
+            try r.fill8(0, null);
+            made += 1;
+        }
+        const absorbed = try gpa.alloc(usize, slots);
+        @memset(absorbed, 0);
+        return .{ .rings = rings, .absorbed = absorbed, .slots = slots };
+    }
+
+    pub fn deinit(self: *DraftPool, gpa: std.mem.Allocator) void {
+        for (self.rings) |*r| r.free();
+        gpa.free(self.rings);
+        gpa.free(self.absorbed);
+    }
+};
+
+/// markov.py `Markov` for up to NP streams: the head rows this rank scores, no cached rows yet (every token's bias
+/// row is computed into its staging row: the same bits as a cached one, markov.py's own words).
 pub const Markov = struct {
     gpa: std.mem.Allocator,
     set: *const aot.Set,
@@ -573,16 +677,17 @@ pub const Markov = struct {
     seg0: usize,
     cols: usize, // segs * n_cols
     rank_dim: usize,
+    block: usize,
     b_tiles: usize,
     s_tiles: usize,
     n_part: usize,
     bp: usize,
-    out: cuda.DeviceBuffer, // i64 [NP, block + 1]; row 0 used
-    st: cuda.DeviceBuffer, // f16 [cols]: the staging row
-    pv: cuda.DeviceBuffer,
-    pi: cuda.DeviceBuffer,
-    send: cuda.DeviceBuffer, // f32 [4]
-    recv: cuda.DeviceBuffer, // f32 [world, 4]
+    out: cuda.DeviceBuffer, // i64 [NP, block + 1]
+    st: cuda.DeviceBuffer, // f16 [NP, cols]: the staging rows
+    pv: cuda.DeviceBuffer, // f32 [NP, n_part]
+    pi: cuda.DeviceBuffer, // i32 [NP, n_part]
+    send: cuda.DeviceBuffer, // f32 [NP, 4]
+    recv: cuda.DeviceBuffer, // f32 [world, NP, 4]
     slot: cuda.DeviceBuffer, // i32 [V] = -1
     cache: cuda.DeviceBuffer, // f16 [1]: no cached rows
 
@@ -602,17 +707,17 @@ pub const Markov = struct {
         const n_part = s_tiles * segs;
         var self: Markov = .{
             .gpa = gpa, .set = set, .split = split, .world = dims.world, .rank = dims.rank, .vocab = dims.vocab,
-            .n_cols = n_cols, .segs = segs, .seg0 = seg0, .cols = cols, .rank_dim = dims.markov_rank,
+            .n_cols = n_cols, .segs = segs, .seg0 = seg0, .cols = cols, .rank_dim = dims.markov_rank, .block = dims.block,
             .b_tiles = (n_cols + bn * sub - 1) / (bn * sub), .s_tiles = s_tiles, .n_part = n_part,
             .bp = std.math.ceilPowerOfTwo(usize, n_part) catch return error.BadShape,
             .out = undefined, .st = undefined, .pv = undefined, .pi = undefined, .send = undefined, .recv = undefined, .slot = undefined, .cache = undefined,
         };
-        self.out = try cuda.DeviceBuffer.alloc(d, np * 17 * 8);
-        self.st = try cuda.DeviceBuffer.alloc(d, cols * 2);
-        self.pv = try cuda.DeviceBuffer.alloc(d, n_part * 4);
-        self.pi = try cuda.DeviceBuffer.alloc(d, n_part * 4);
-        self.send = try cuda.DeviceBuffer.alloc(d, 16);
-        self.recv = try cuda.DeviceBuffer.alloc(d, dims.world * 16);
+        self.out = try cuda.DeviceBuffer.alloc(d, np * (dims.block + 1) * 8);
+        self.st = try cuda.DeviceBuffer.alloc(d, np * cols * 2);
+        self.pv = try cuda.DeviceBuffer.alloc(d, np * n_part * 4);
+        self.pi = try cuda.DeviceBuffer.alloc(d, np * n_part * 4);
+        self.send = try cuda.DeviceBuffer.alloc(d, np * 16);
+        self.recv = try cuda.DeviceBuffer.alloc(d, dims.world * np * 16);
         self.slot = try cuda.DeviceBuffer.alloc(d, dims.vocab * 4);
         try self.slot.fill32(0xFFFFFFFF, null);
         self.cache = try cuda.DeviceBuffer.alloc(d, 16);
@@ -624,38 +729,41 @@ pub const Markov = struct {
         inline for (.{ "out", "st", "pv", "pi", "send", "recv", "slot", "cache" }) |f| @field(self, f).free();
     }
 
-    /// `lg`: the drafter head's logits this loop reads (this rank's [block, n_cols] with split, else [world, block,
-    /// n_cols]); out[0] = token, out[1 .. steps] the drafts (device, `self.out`).
-    pub fn steps(self: *Markov, lg: Ptr, head: Head, token: u32, block: usize, n_steps: usize, comm: ?*const cuda.comm.Comm, stream: cuda.Stream) !void {
-        const ts: usize = block + 1; // out.stride(0) of [1, block + 1]
-        var first: [1]i64 = .{token};
-        try self.out.upload(0, std.mem.sliceAsBytes(&first));
+    /// `lg`: the drafter head's logits this loop reads for N streams of `block` rows (stream s's step i at row
+    /// s x block + i): this rank's [R, n_cols] with split, else [world, R, n_cols]. out[s, 0] = tokens[s], out[s,
+    /// 1 .. steps] the drafts (device, `self.out`, row stride block + 1).
+    pub fn steps(self: *Markov, lg: Ptr, head: Head, tokens: []const u32, N: usize, block: usize, n_steps: usize, comm: ?*const cuda.comm.Comm, stream: cuda.Stream) !void {
+        if (N > np or block != self.block or n_steps > block) return error.TooManyRows;
+        const ts: usize = block + 1; // out.stride(0)
+        var first: [np * 17]i64 = undefined;
+        for (0..N) |s_| first[s_ * ts] = tokens[s_];
+        for (0..N) |s_| try self.out.upload(s_ * ts * 8, std.mem.sliceAsBytes(first[s_ * ts .. s_ * ts + 1]));
         const nc = self.n_cols;
         for (0..n_steps) |i| {
             const tok = self.out.ptr + i * 8;
             try self.set.run(stream, "_bias", .{ @intCast(self.b_tiles), @intCast(self.segs), 1 }, &.{
                 aot.ptr("TOK", "*i64", tok),           aot.int("t_stride", @intCast(ts)),     aot.ptr("SLOT", "*i32", self.slot.ptr),
                 aot.ptr("EMB", "*bf16", head.markov_embed), aot.ptr("HEAD", "*fp16", head.markov_head), aot.ptr("OUT", "*fp16", self.st.ptr),
-                aot.int("o_row", @intCast(self.cols)), aot.int("n_rows", 1),                   aot.int("n_cols", @intCast(nc)),
+                aot.int("o_row", @intCast(self.cols)), aot.int("n_rows", @intCast(N)),         aot.int("n_cols", @intCast(nc)),
                 aot.int("seg0", @intCast(self.seg0)),
             }, &.{ aot.ci("BN", bn), aot.ci("SUB", sub), aot.ci("RANK", @intCast(self.rank_dim)), aot.ci("NP", np), aot.ci("PDL", 1) });
             try self.set.run(stream, "_score", .{ @intCast(self.s_tiles), @intCast(self.segs), 1 }, &.{
-                aot.ptr("LG", "*fp32", lg + i * nc * 4), aot.int("l_seg", @intCast(block * nc)), aot.int("l_row", @intCast(block * nc)),
+                aot.ptr("LG", "*fp32", lg + i * nc * 4), aot.int("l_seg", @intCast(N * block * nc)), aot.int("l_row", @intCast(block * nc)),
                 aot.ptr("TOK", "*i64", tok),             aot.int("t_stride", @intCast(ts)),      aot.ptr("SLOT", "*i32", self.slot.ptr),
                 aot.ptr("CACHE", "*fp16", self.cache.ptr), aot.int("c_row", @intCast(self.cols)), aot.ptr("STAGE", "*fp16", self.st.ptr),
                 aot.int("s_row", @intCast(self.cols)),   aot.ptr("PV", "*fp32", self.pv.ptr),    aot.ptr("PI", "*i32", self.pi.ptr),
-                aot.int("n_rows", 1),                    aot.int("n_cols", @intCast(nc)),        aot.int("seg0", @intCast(self.seg0)),
+                aot.int("n_rows", @intCast(N)),          aot.int("n_cols", @intCast(nc)),        aot.int("seg0", @intCast(self.seg0)),
                 aot.int("n_part", @intCast(self.n_part)),
             }, &.{ aot.ci("BC", bc), aot.ci("PDL", 1) });
-            try self.set.run(stream, "_finish", .{ 1, 1, 1 }, &.{
+            try self.set.run(stream, "_finish", .{ @intCast(N), 1, 1 }, &.{
                 aot.ptr("PV", "*fp32", self.pv.ptr), aot.ptr("PI", "*i32", self.pi.ptr), aot.int("n_part", @intCast(self.n_part)),
                 aot.ptr("OUT", "*i64", self.out.ptr + (i + 1) * 8), aot.int("o_stride", @intCast(ts)), aot.ptr("SEND", "*fp32", self.send.ptr),
                 aot.int("send", @intFromBool(self.split)),
             }, &.{ aot.ci("BP", @intCast(self.bp)), aot.ci("PDL", 1) });
             if (self.split) {
-                try comm.?.allGather(self.send.ptr, self.recv.ptr, 4, .f32, stream.handle);
-                try self.set.run(stream, "_pick", .{ 1, 1, 1 }, &.{
-                    aot.ptr("G", "*fp32", self.recv.ptr), aot.int("n_rows", 1), aot.ptr("OUT", "*i64", self.out.ptr + (i + 1) * 8), aot.int("o_stride", @intCast(ts)),
+                try comm.?.allGather(self.send.ptr, self.recv.ptr, N * 4, .f32, stream.handle);
+                try self.set.run(stream, "_pick", .{ @intCast(N), 1, 1 }, &.{
+                    aot.ptr("G", "*fp32", self.recv.ptr), aot.int("n_rows", @intCast(N)), aot.ptr("OUT", "*i64", self.out.ptr + (i + 1) * 8), aot.int("o_stride", @intCast(ts)),
                 }, &.{ aot.ci("WORLD", @intCast(self.world)), aot.ci("PDL", 1) });
             }
         }
@@ -671,7 +779,6 @@ fn f16ToF32(h: u16) f32 {
 }
 
 test "the Markov loop's tiling follows markov.py" {
-    // world 1: one segment of the whole vocabulary; world 2 split: this rank's half
     const v: usize = 129280;
     try std.testing.expectEqual(@as(usize, 505), (v + 256 - 1) / 256); // b_tiles
     try std.testing.expectEqual(@as(usize, 127), (v + 1023) / 1024); // s_tiles
