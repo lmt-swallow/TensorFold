@@ -10,6 +10,7 @@ const libs_tests = @import("libs_tests.zig");
 const dsv41_triton = @import("dsv41_triton/aot_tests.zig");
 const sample_tests = @import("sample_tests.zig");
 const dsv41_tests = @import("dsv41_tests.zig");
+const dsv41_hc_tests = @import("dsv41_hc_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -78,6 +79,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "nccl")) return libs_tests.nccl(gpu);
     if (std.mem.eql(u8, cmd, "dsv41-aot-rmsnorm")) return dsv41_triton.rmsnorm(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "dsv41-aot-kv-norm-rope")) return dsv41_triton.kvNormRope(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "dsv41-hc")) return dsv41_hc_tests.hc(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "dsv41-route")) return dsv41_hc_tests.route(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "comm")) return libs_tests.comm(gpu, try std.fmt.parseInt(u32, try arg(rest, 0), 10), try std.fmt.parseInt(u32, try arg(rest, 1), 10), try arg(rest, 2), try std.fmt.parseInt(u16, try arg(rest, 3), 10));
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "gdn-tree")) return oracle_tests.gdnTree(gpu, try arg(rest, 0));

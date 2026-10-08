@@ -3,6 +3,8 @@
 
 pub const exl3 = @import("cuda_exl3.zig");
 pub const experts = @import("cuda_experts.zig");
+pub const hc = @import("cuda_hc.zig");
+pub const route = @import("cuda_route.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
