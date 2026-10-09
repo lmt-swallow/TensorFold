@@ -5,8 +5,12 @@ prompt through the single-stream prompt path on its pool view, then one round wh
 and five drafts a stream (12 rows). Both ranks of a TP2 split run in this process, one rank's block resident at a
 time (dump_forward.py's RankBlocks); the gathers stack both ranks' partials, so every intermediate is the served
 one. Unfused launches (TF_DS_HC_FUSED=0, TF_DS_ROT_Q=0, TF_DS_ROT_WOB=0, TF_DS_ROT_ATTN=0; L2 prefetch off).
+`--engram <dir>` runs Engram on its layers (dump_forward.py's EngramRef): the primes on each stream's prompt, the
+round on every stream's rows hashed from that stream's own ids (rounds.py `forward`), one projection, sum and gate
+over the round's rows; each rank's partial `L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded.
 
-  python3 -B /w/tools/zig/dsv41/dump_rounds.py --tools /w/tools/zig --model /model --out /out [--layers 4]
+  python3 -B /w/tools/zig/dsv41/dump_rounds.py --tools /w/tools/zig --model /model --out /out [--layers 4] \
+      [--engram /models/DeepSeek-V4.1-Flash-Engram --token-map /aot/token_map.json]
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ def main() -> int:
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--cap", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=20261009)
+    ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
+    ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     fwd = load_module("dump_forward", HERE / "dump_forward.py")
@@ -68,6 +74,7 @@ def main() -> int:
     slots, cap = 4, a.cap
     pool = m.new_pool(slots, cap)
     blocks = fwd.RankBlocks(sh, c, world, load_block)
+    eng = fwd.engram_ref(a, c, world)
 
     def gather(parts: list) -> torch.Tensor:
         torch.cuda.synchronize()
@@ -92,6 +99,8 @@ def main() -> int:
         x, part, pre_a, pre_f, post, comb = mixes(n)
         shared = [{} for _ in range(world)]
         for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                h = eng.apply(blocks, li, h, ids.tolist(), start, n, gather, lambda name, t: None)
             lay = blocks.get(0, li)
             fn, scale, base = lay.hc_attn
             K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
@@ -134,9 +143,12 @@ def main() -> int:
     k = 5
     windows = []
     ids_all, pos_all, slot_all, base_all, end_all = [], [], [], [], []
-    for (slot, base, size, n_prompt), sc in zip(streams, views):
+    hashes = []                                       # rounds.py forward: each stream's rows from its own host ids
+    for (slot, base, size, n_prompt), sc, prompt in zip(streams, views, prompts):
         toks = torch.randint(0, c.vocab, (k + 1,), generator=g).tolist()
         windows.append((slot, base, size, sc.length, toks))
+        if eng is not None:
+            hashes.append(eng.hashes(prompt.tolist() + toks, sc.length, len(toks)))
         ids_all += toks
         pos_all += list(range(sc.length, sc.length + k + 1))
         slot_all += [slot] * (k + 1)
@@ -163,7 +175,18 @@ def main() -> int:
     h, pre = K.embed_init(w.embed, dec.ids, c.hc)
     x, part, pre_a, pre_f, post, comb = mixes(R)
     shared = [{} for _ in range(world)]
+    if eng is not None:
+        import numpy as np
+
+        hashes = np.concatenate(hashes, 0)
+
+    def record(name: str, t: torch.Tensor) -> None:
+        arrays[name] = t.clone()
+
     for li in range(L):
+        if eng is not None and blocks.get(0, li).engram_wkv is not None:
+            with rec.scope(f"L{li}_engram", detail=True):
+                h = eng.apply_hashes(blocks, li, h, hashes, gather, record)
         lay = blocks.get(0, li)
         cos, sin = m._cs(lay.idx, table)
         fn, scale, base = lay.hc_attn
@@ -205,7 +228,7 @@ def main() -> int:
     arrays.update({f"after_{k_}": v.clone() for k_, v in pool_planes().items()})
     params = {"layers": L, "world": world, "slots": slots, "cap": cap, "bucket": bucket, "ring_size": pool.ring_size,
               "raw": RAW, "rows": R, "n_windows": len(windows), "rope_rows": cos_c.shape[0], "vocab_local": vocab_l,
-              "k": k}
+              "k": k, "engram": int(eng is not None)}
     for i, (slot, base, size, p0, toks) in enumerate(windows):
         params.update({f"w{i}_slot": slot, f"w{i}_base": base, f"w{i}_size": size, f"w{i}_pos": p0, f"w{i}_rows": len(toks)})
     ck.save(out / "fixture", params, arrays)

@@ -8,7 +8,8 @@
 //! The unfused path (TF_DS_HC_FUSED=0, TF_DS_ROT_*=0): plain hc_pre / hc_post, the attention's q path in three
 //! launches, the merge apart from wo_a; the fork documents the fused launches as the same bits. The indexer's
 //! selection is the short-context one (`alltop`: every compressed entry below the row's visible count, bucket /
-//! ratio <= idx_topk); longer buckets' scored top-k is not here yet.
+//! ratio <= idx_topk); longer buckets' scored top-k is not here yet. Engram runs on its layers when a hook is set
+//! (`engram`), each row's n-grams from its own stream's ids (`Window.host`).
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -29,13 +30,27 @@ pub const max_rows = 16;
 pub const raw_rows = 64; // compressor inputs kept by position a slot (model.py RAW)
 
 /// One stream's verify window in a round (multi.py `_round`'s tuple): its slot, its extent, the first row's
-/// position (relative to the extent) and the rows' ids (the pending token, then the drafts).
+/// position (relative to the extent) and the rows' ids (the pending token, then the drafts). `host`: the stream's
+/// ids from position 0 through the window's last row (`position + ids.len` of them at least), the n-gram history
+/// Engram hashes; read only when an Engram hook is set.
 pub const Window = struct {
     slot: usize,
     base: usize,
     size: usize,
     position: usize,
     ids: []const i64,
+    host: []const i32 = &.{},
+};
+
+/// One stream's rows of a round for Engram: positions start .. start + n - 1 of the sequence `ids`.
+pub const EngramSpan = struct { ids: []const i32, start: usize, n: usize };
+
+/// Engram on an Engram layer of a round (rounds.py `_stretch`: `engram_gate(h, Comm.sum(mm(engram_wkv, e_in)))`):
+/// h [R, 4, d] bf16, the rows the spans' in order, gated in place; one gather over the ranks (every rank calls it at
+/// the same layers). null hook: no tables (the fork skips the gate).
+pub const Engram = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, layer: usize, h: Ptr, spans: []const EngramSpan, gather: fwd.Gather, stream: cuda.Stream) anyerror!void,
 };
 
 /// A kv-source layer's compressed planes of the whole window (shared by position) and every slot's compressor inputs.
@@ -48,25 +63,50 @@ pub const PoolPlanes = struct {
     raw_score: cuda.DeviceBuffer,
     rows: usize,
 
-    fn init(d: *const cuda.Driver, cfg: *const Config, li: usize, cap: usize, slots: usize) !PoolPlanes {
+    /// The bytes of each plane of layer `li` for a window of `cap` positions and `slots` slots.
+    pub const Sizes = struct {
+        rows: usize,
+        comp_codes: usize,
+        comp_scales: usize,
+        idxk_codes: usize,
+        idxk_scales: usize,
+        raw: usize, // raw_kv's, and raw_score's
+
+        pub fn total(self: Sizes) usize {
+            return self.comp_codes + self.comp_scales + self.idxk_codes + self.idxk_scales + 2 * self.raw;
+        }
+    };
+
+    pub fn sizes(cfg: *const Config, li: usize, cap: usize, slots: usize) Sizes {
         const ratio = cfg.ratio(li);
         const rows = cap / ratio + 2;
         const hd = cfg.head_dim;
-        var p: PoolPlanes = undefined;
-        p.rows = rows;
-        p.comp_codes = try cuda.DeviceBuffer.alloc(d, rows * hd / 2);
-        errdefer p.comp_codes.free();
-        p.comp_scales = try cuda.DeviceBuffer.alloc(d, rows * hd / 16);
-        errdefer p.comp_scales.free();
         const indexed = cfg.isIndexSource(li);
-        p.idxk_codes = try cuda.DeviceBuffer.alloc(d, if (indexed) rows * cfg.idx_dim / 2 else 0);
+        return .{
+            .rows = rows,
+            .comp_codes = rows * hd / 2,
+            .comp_scales = rows * hd / 16,
+            .idxk_codes = if (indexed) rows * cfg.idx_dim / 2 else 0,
+            .idxk_scales = if (indexed) rows * cfg.idx_dim / 32 else 0,
+            .raw = if (ratio > 1) slots * raw_rows * hd * 4 else 0,
+        };
+    }
+
+    fn init(d: *const cuda.Driver, cfg: *const Config, li: usize, cap: usize, slots: usize) !PoolPlanes {
+        const sz = sizes(cfg, li, cap, slots);
+        var p: PoolPlanes = undefined;
+        p.rows = sz.rows;
+        p.comp_codes = try cuda.DeviceBuffer.alloc(d, sz.comp_codes);
+        errdefer p.comp_codes.free();
+        p.comp_scales = try cuda.DeviceBuffer.alloc(d, sz.comp_scales);
+        errdefer p.comp_scales.free();
+        p.idxk_codes = try cuda.DeviceBuffer.alloc(d, sz.idxk_codes);
         errdefer p.idxk_codes.free();
-        p.idxk_scales = try cuda.DeviceBuffer.alloc(d, if (indexed) rows * cfg.idx_dim / 32 else 0);
+        p.idxk_scales = try cuda.DeviceBuffer.alloc(d, sz.idxk_scales);
         errdefer p.idxk_scales.free();
-        const raw: usize = if (ratio > 1) slots * raw_rows * hd * 4 else 0;
-        p.raw_kv = try cuda.DeviceBuffer.alloc(d, raw);
+        p.raw_kv = try cuda.DeviceBuffer.alloc(d, sz.raw);
         errdefer p.raw_kv.free();
-        p.raw_score = try cuda.DeviceBuffer.alloc(d, raw);
+        p.raw_score = try cuda.DeviceBuffer.alloc(d, sz.raw);
         errdefer p.raw_score.free();
         try p.comp_codes.fill8(0, null);
         try p.comp_scales.fill8(0, null);
@@ -82,6 +122,8 @@ pub const PoolPlanes = struct {
     }
 };
 
+/// One window of `cap` positions shared by up to `slots` streams (model.py `new_pool`). Sizes are usize and the
+/// rows' positions, extents and compressed rows int64, so a window of 2^20 positions and more is addressed whole.
 pub const Pool = struct {
     gpa: std.mem.Allocator,
     slots: usize,
@@ -92,8 +134,24 @@ pub const Pool = struct {
     source: []usize, // per layer: the kv source whose planes it reads
     tokens: cuda.DeviceBuffer, // i64 [cap]
 
+    /// Rows a slot's window ring holds (the window and RING_EXTRA rows).
+    pub fn ringRows(cfg: *const Config) usize {
+        return cfg.window + 16;
+    }
+
+    /// The device bytes `init(.., layers, slots, cap)` allocates, exactly: the rings, the kv sources' planes and the
+    /// token row; what a served engine reserves for its streams' caches at a context of `cap` positions.
+    pub fn bytesFor(cfg: *const Config, layers: usize, cap: usize, slots: usize) usize {
+        var total: usize = cap * 8;
+        for (0..layers) |li| {
+            total += slots * ringRows(cfg) * cfg.head_dim * 2;
+            if (cfg.ratio(li) > 0 and cfg.isKvSource(li)) total += PoolPlanes.sizes(cfg, li, cap, slots).total();
+        }
+        return total;
+    }
+
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, layers: usize, slots: usize, cap: usize) !Pool {
-        const ring = cfg.window + 16;
+        const ring = ringRows(cfg);
         const rings = try gpa.alloc(cuda.DeviceBuffer, layers);
         errdefer gpa.free(rings);
         const planes = try gpa.alloc(?PoolPlanes, layers);
@@ -149,6 +207,7 @@ pub const RoundRunner = struct {
     rope_w: attention.Rope,
     pool: *Pool,
     probe: ?fwd.Probe = null,
+    engram: ?Engram = null,
     idx_proj_h: []cuda.DeviceBuffer, // per layer: fp16 [idx_heads, d] on index layers
     // the round's tables (int64 [R]), host and device
     tab: []i64, // 12 x max_rows: ids pos slot base end wslot cbase ctarget gpos vis rslot first
@@ -226,6 +285,7 @@ pub const RoundRunner = struct {
         self.rope_w = rope_w;
         self.pool = pool;
         self.probe = null;
+        self.engram = null;
         self.hc = hcmod.Hc.init(set, @intCast(D), @intCast(cfg.hc_iters), cfg.eps, cfg.hc_eps);
         self.route = routemod.Route.init(set, @intCast(D), @intCast(cfg.n_routed), @intCast(cfg.topk), cfg.route_scale, @intCast(cfg.n_routed));
         // the index layers' weights_proj as fp16 rows (model.py idx_proj_h), converted on the host
@@ -343,6 +403,13 @@ pub const RoundRunner = struct {
         const slot = self.tab[2 * max_rows .. 3 * max_rows];
         const base = self.tab[3 * max_rows .. 4 * max_rows];
         const end = self.tab[4 * max_rows .. 5 * max_rows];
+        // every row inside its extent, the extent inside the window, its positions inside the RoPE tables
+        const rope_rows = @min(self.rope_c.rows, self.rope_w.rows);
+        for (windows) |wd| {
+            if (wd.ids.len == 0 or wd.slot >= self.pool.slots or wd.base + wd.size > self.pool.cap) return error.BadShape;
+            if (wd.position + wd.ids.len > wd.size or wd.position + wd.ids.len > rope_rows) return error.BadShape;
+            if (self.engram != null and wd.host.len < wd.position + wd.ids.len) return error.BadShape;
+        }
         var r: usize = 0;
         for (windows) |wd| {
             for (wd.ids, 0..) |id, i| {
@@ -372,7 +439,15 @@ pub const RoundRunner = struct {
         var pre_f = self.pre_f.ptr;
         var nb: [48]u8 = undefined;
         var tap: usize = 0;
+        var spans: [max_rows]EngramSpan = undefined;
+        if (self.engram != null) {
+            for (windows, 0..) |wd, i| spans[i] = .{ .ids = wd.host, .start = wd.position, .n = wd.ids.len };
+        }
         for (w.layers, 0..) |*l, li| {
+            if (l.engram_wkv != null) if (self.engram) |e| {
+                try e.call(e.ctx, li, self.h.ptr, spans[0..windows.len], gather, stream);
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), self.h.ptr, R * 4 * D * 2, stream);
+            };
             if (c.dspark_taps.has(@intCast(li))) {
                 try self.hc.tap(stream, self.h.ptr, self.taps.ptr + tap * D * 2, @intCast(@max(self.ntap, 1) * D), @intCast(R));
                 tap += 1;

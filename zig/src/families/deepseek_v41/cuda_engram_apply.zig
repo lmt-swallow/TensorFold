@@ -14,6 +14,7 @@ const weights = @import("cuda_weights.zig");
 const exl3 = @import("cuda_exl3.zig");
 const hcmod = @import("cuda_hc.zig");
 const forward = @import("cuda_forward.zig");
+const rounds = @import("cuda_rounds.zig");
 const hash = @import("engram_hash.zig");
 const rows_mod = @import("engram_rows.zig");
 
@@ -163,11 +164,33 @@ pub const Engram = struct {
         try self.apply(layer, h, self.history, start, n, mm, gather, stream);
     }
 
+    /// The `RoundRunner.engram` hook: every stream's rows of a round with their own histories (`applySpans`).
+    pub fn roundHook(self: *Engram) rounds.Engram {
+        return .{ .ctx = self, .call = roundFn };
+    }
+
+    fn roundFn(ctx: *anyopaque, layer: usize, h: Ptr, spans: []const rounds.EngramSpan, gather: forward.Gather, stream: cuda.Stream) anyerror!void {
+        const self: *Engram = @ptrCast(@alignCast(ctx));
+        try self.applySpans(layer, h, spans, null, gather, stream);
+    }
+
     /// h [n, 4, d] bf16 (positions start .. start + n - 1 of the sequence `ids`, which holds at least start + n ids)
     /// <- engram_gate(h, kv, qk) of layer `layer`, in place, on `stream`. `mm` null: the decode linear (n <= 16).
     pub fn apply(self: *Engram, layer: usize, h: Ptr, ids: []const i32, start: usize, n: usize, mm: ?forward.Mm, gather: forward.Gather, stream: cuda.Stream) !void {
+        try self.applySpans(layer, h, &.{.{ .ids = ids, .start = start, .n = n }}, mm, gather, stream);
+    }
+
+    /// `apply` over rows of several sequences (a round, rounds.py `forward`): h's rows are the spans' rows in span
+    /// order, each span's n-gram ids hashed from its own sequence at its own positions; one projection, one gather and
+    /// one gate over all of them. The bits of a row are those `apply` gives it alone (the decode linear and the gate
+    /// are row-invariant).
+    pub fn applySpans(self: *Engram, layer: usize, h: Ptr, spans: []const rounds.EngramSpan, mm: ?forward.Mm, gather: forward.Gather, stream: cuda.Stream) !void {
+        var n: usize = 0;
+        for (spans) |sp| {
+            if (sp.ids.len < sp.start + sp.n) return error.HistoryShort;
+            n += sp.n;
+        }
         if (n < 1 or n > self.max_rows or (mm == null and n > decode_rows)) return error.TooManyRows;
-        if (ids.len < start + n) return error.HistoryShort;
         if (layer >= self.w.layers.len) return error.NotEngramLayer;
         const l = &self.w.layers[layer];
         const wkv: *const exl3.Linear = if (l.engram_wkv) |*x| x else return error.NotEngramLayer;
@@ -180,8 +203,12 @@ pub const Engram = struct {
         const per = self.cols[1] - lo;
         const kvw = (hcmod.hc_streams + 1) * self.cfg.dim;
 
-        // the row ids of this rank's columns (Engram.hashes(...)[:, layer, lo:hi])
-        try self.hasher.hashes(ids, start, n, self.hashes_h[0 .. n * nl * cols]);
+        // the row ids of this rank's columns (Engram.hashes(...)[:, layer, lo:hi], the spans' concatenated)
+        var at: usize = 0;
+        for (spans) |sp| {
+            try self.hasher.hashes(sp.ids, sp.start, sp.n, self.hashes_h[at * nl * cols .. (at + sp.n) * nl * cols]);
+            at += sp.n;
+        }
         for (0..n) |p| for (0..per) |c| {
             self.idx_h[p * per + c] = self.hashes_h[(p * nl + slot) * cols + lo + c];
         };

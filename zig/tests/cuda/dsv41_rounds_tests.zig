@@ -218,8 +218,13 @@ const Supply = struct {
     }
 };
 
-/// `dsv41-rounds <dir> <rank-cache-dir> <model-dir> [aot-dir]`: one round over two streams' windows in a pool,
-/// rank 0's weights from the Python rank cache, the other rank's partials from the fixture.
+/// `dsv41-rounds <dir> <rank-cache-dir> <model-dir> [aot-dir] [rank]`: one round over two streams' windows in a pool,
+/// this rank's weights from the Python rank cache, the other rank's partials from the fixture. A fixture dumped with
+/// `--engram` runs Engram on its layers (TF_DS_ENGRAM, TF_DS_TOKEN_MAP as dsv41-forward), each window's host ids its
+/// stream's prompt and then its rows. TF_DS_ROUNDS_CAP sizes the pool for that many positions instead of the
+/// fixture's cap (the windows stay where the fixture put them), with the RoPE tables of `ropeRows(cap)` rows from
+/// TF_DS_ROPE_DIR (`rope_{c,w}_<rows>.bin`, dump_rope.py) in place of the fixture's; their first rows are compared
+/// with the fixture's tables.
 pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, aot_override: ?[]const u8, rank_arg: ?[]const u8) !void {
     const rank: usize = if (rank_arg) |r| try std.fmt.parseInt(usize, r, 10) else 0;
     const other: usize = 1 - rank;
@@ -239,7 +244,7 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     const world: u32 = @intCast(try fx.int("world"));
     try check.expect(world == 2, "the fixture's world is {d}; this test supplies one other rank", .{world});
     const slots: usize = @intCast(try fx.int("slots"));
-    const cap: usize = @intCast(try fx.int("cap"));
+    const cap: usize = if (getenv("TF_DS_ROUNDS_CAP")) |v| try std.fmt.parseInt(usize, v, 10) else @intCast(try fx.int("cap"));
     const bucket: usize = @intCast(try fx.int("bucket"));
     var kernels = try exl3.Kernels.load(gpu.d);
     defer kernels.deinit();
@@ -255,14 +260,36 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     var w = try dsv41.weights.load(gpa, gpu.d, &cfg, &rc, &kernels, rank, world, .mul1, layers);
     defer w.deinit();
     check.pass("dsv41 rounds: {d} layers of rank {d} loaded from {s}", .{ layers, rank, rc_path });
-    var rope_c: dsv41.attention.Rope = .{ .cos = try h.upload("cos_c"), .sin = try h.upload("sin_c"), .rows = @intCast(try fx.int("rope_rows")) };
+    var rope_c: dsv41.attention.Rope = undefined;
+    var rope_w: dsv41.attention.Rope = undefined;
+    if (getenv("TF_DS_ROUNDS_CAP") != null) {
+        const dir_r = getenv("TF_DS_ROPE_DIR") orelse return error.NoRopeDir;
+        const rows = dsv41.serve_lanes.ropeRows(cap);
+        rope_c = try loadRope(gpu, dir_r, "rope_c", rows);
+        rope_w = try loadRope(gpu, dir_r, "rope_w", rows);
+        // the fixture's tables are the first rows of these (no row's bits depend on the table's length)
+        try h.stage("cos_c", rope_c.cos.ptr);
+        try h.stage("sin_c", rope_c.sin.ptr);
+        try h.stage("cos_w", rope_w.cos.ptr);
+        try h.stage("sin_w", rope_w.sin.ptr);
+    } else {
+        rope_c = .{ .cos = try h.upload("cos_c"), .sin = try h.upload("sin_c"), .rows = @intCast(try fx.int("rope_rows")) };
+        rope_w = .{ .cos = try h.upload("cos_w"), .sin = try h.upload("sin_w"), .rows = @intCast(try fx.int("rope_rows")) };
+    }
     defer rope_c.cos.free();
     defer rope_c.sin.free();
-    var rope_w: dsv41.attention.Rope = .{ .cos = try h.upload("cos_w"), .sin = try h.upload("sin_w"), .rows = @intCast(try fx.int("rope_rows")) };
     defer rope_w.cos.free();
     defer rope_w.sin.free();
+    const before_alloc = cuda.usage(false);
     var pool = try Rounds.Pool.init(gpa, gpu.d, &cfg, layers, slots, cap);
     defer pool.deinit();
+    {
+        const got = cuda.usage(false).device - before_alloc.device;
+        const want = Rounds.Pool.bytesFor(&cfg, layers, cap, slots);
+        try check.expect(got == want, "dsv41 rounds: the pool holds {d} bytes, bytesFor says {d}", .{ got, want });
+        const full = Rounds.Pool.bytesFor(&cfg, cfg.n_layers, cap, slots);
+        check.pass("dsv41 rounds: pool of {d} positions x {d} slots over {d} layers: {d} bytes (= bytesFor); all {d} layers: {d} bytes ({d:.1} MiB)", .{ cap, slots, layers, got, cfg.n_layers, full, @as(f64, @floatFromInt(full)) / (1 << 20) });
+    }
     var nb: [96]u8 = undefined;
     const plane_names = [_][]const u8{ "comp_codes", "comp_scales", "idxk_codes", "idxk_scales", "raw_kv", "raw_score" };
     for (0..layers) |li| {
@@ -282,7 +309,15 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     var supply: Supply = .{ .gpu = gpu, .rank = rank, .rank1 = .empty, .names = .empty, .probes = .empty };
     defer supply.deinit();
     runner.probe = .{ .ctx = &supply, .call = Supply.probe };
+    const eng = try @import("dsv41_forward_tests.zig").engramFor(gpu, fx, &cfg, &w, &set, aot_dir, Rounds.max_rows);
+    defer if (eng) |e| e.deinit();
+    if (eng) |e| {
+        runner.engram = e.roundHook();
+        e.probe = runner.probe;
+    }
     for (0..layers) |li| {
+        if (eng != null and w.layers[li].engram_wkv != null)
+            try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_engram.r{d}", .{ li, other })));
         try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r{d}", .{ li, other })));
         try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r{d}", .{ li, other })));
     }
@@ -293,10 +328,20 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     const ids = std.mem.bytesAsSlice(i64, @as([]align(8) const u8, @alignCast(ids_bytes)));
     const n_windows: usize = @intCast(try fx.int("n_windows"));
     var windows: [8]Rounds.Window = undefined;
+    var hosts: [8]std.ArrayList(i32) = @splat(.empty);
+    defer for (&hosts) |*hl| hl.deinit(gpa);
     var at: usize = 0;
     for (0..n_windows) |i| {
         const rows: usize = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_rows", .{i})));
+        // the stream's host ids: its prompt, then the window's rows
+        if (eng != null) {
+            const pb = try fx.bytes(try std.fmt.bufPrint(&nb, "prompt{d}", .{i}));
+            defer gpa.free(pb);
+            for (std.mem.bytesAsSlice(i64, @as([]align(8) const u8, @alignCast(pb)))) |t| try hosts[i].append(gpa, @intCast(t));
+            for (ids[at .. at + rows]) |t| try hosts[i].append(gpa, @intCast(t));
+        }
         windows[i] = .{
+            .host = hosts[i].items,
             .slot = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_slot", .{i}))),
             .base = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_base", .{i}))),
             .size = @intCast(try fx.int(try std.fmt.bufPrint(&nb, "w{d}_size", .{i}))),
@@ -331,6 +376,25 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         }
     }
     try check.expect(h.failures == 0, "dsv41-rounds: {d} stage(s) differ from the Python fork", .{h.failures});
+}
+
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    const v = std.mem.span(std.c.getenv(name) orelse return null);
+    return if (v.len == 0) null else v;
+}
+
+/// `<dir>/<name>_<rows>.bin`: cos then sin, f32 [rows, rope_dim / 2] each (tools/zig/dsv41/dump_rope.py).
+fn loadRope(gpu: Gpu, dir: []const u8, name: []const u8, rows: usize) !dsv41.attention.Rope {
+    const half = 32;
+    const path = try std.fmt.allocPrint(gpu.gpa, "{s}/{s}_{d}.bin", .{ dir, name, rows });
+    defer gpu.gpa.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, gpu.gpa, .limited(1 << 31));
+    defer gpu.gpa.free(bytes);
+    if (bytes.len != 2 * rows * half * 4) return error.RopeRowsShort;
+    var cos = try cuda.DeviceBuffer.fromHost(gpu.d, bytes[0 .. rows * half * 4]);
+    errdefer cos.free();
+    const sin = try cuda.DeviceBuffer.fromHost(gpu.d, bytes[rows * half * 4 ..]);
+    return .{ .cos = cos, .sin = sin, .rows = rows };
 }
 
 /// `stage` with the rows `skip` (of `row_bytes` each) zeroed on both sides before the comparison.

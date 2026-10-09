@@ -92,12 +92,20 @@ class EngramRef:
         self.n_cols = (cfg.engram_ngram - 1) * cfg.engram_heads
         self.tabs = de.tables(Path(engram_dir))
 
+    def hashes(self, host: list, start: int, n: int):
+        """Engram.hashes: the row ids [n, L, cols] of positions start .. start + n - 1 of the host ids."""
+        return self.E.hashes(self.stub, host, start, n)
+
     def apply(self, blocks, li: int, h, host: list, start: int, n: int, gather, record):
+        return self.apply_hashes(blocks, li, h, self.hashes(host, start, n), gather, record)
+
+    def apply_hashes(self, blocks, li: int, h, hashes, gather, record):
+        """apply on rows whose row ids are given [n, L, cols] (a round: every stream's rows hashed from its own ids)."""
         from tensorfold.families.deepseek_v41.cuda import kernels as K
         from tensorfold.families.deepseek_v41.cuda.model import mm
 
         np, c = self.np, self.cfg
-        hashes = self.E.hashes(self.stub, host, start, n)                     # [n, L, cols]
+        n = hashes.shape[0]
         slot = list(c.engram_layers).index(li)
         pw, bw, rw = self.tabs[f"layers.{li}.engram.embed.weight"]
         ps, bs, rs = self.tabs[f"layers.{li}.engram.embed.scale"]
