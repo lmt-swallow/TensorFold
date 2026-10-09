@@ -165,9 +165,13 @@ pub fn forward(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
                 try fwd.rings[li].upload(0, ring);
                 if (fwd.planes[li]) |*p| {
                     inline for (.{ "comp_codes", "comp_scales", "idxk_codes", "idxk_scales", "raw_kv", "raw_score" }) |plane| {
-                        const bytes = try fx.bytes(try std.fmt.bufPrint(&nb, "L{d}.{s}", .{ li, plane }));
-                        defer gpa.free(bytes);
-                        try @field(p, plane).upload(0, bytes);
+                        // a ratio-1 source keeps no raw rows and a non-index source no index keys: the fixture omits them
+                        const wanted = if (std.mem.startsWith(u8, plane, "raw_")) cfg.ratio(li) > 1 else if (std.mem.startsWith(u8, plane, "idxk_")) cfg.isIndexSource(li) else true;
+                        if (wanted) {
+                            const bytes = try fx.bytes(try std.fmt.bufPrint(&nb, "L{d}.{s}", .{ li, plane }));
+                            defer gpa.free(bytes);
+                            try @field(p, plane).upload(0, bytes);
+                        }
                     }
                 }
             }
