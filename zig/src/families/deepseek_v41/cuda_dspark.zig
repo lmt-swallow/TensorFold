@@ -19,6 +19,7 @@ const hc_mod = @import("cuda_hc.zig");
 const route_mod = @import("cuda_route.zig");
 const attention = @import("cuda_attention.zig");
 const weights = @import("cuda_weights.zig");
+const Config = @import("config.zig").Config;
 
 const aot = cuda.aot;
 const Ptr = cuda.abi.DevicePtr;
@@ -127,8 +128,134 @@ pub const Cache = struct {
 
 pub const Rope = attention.Rope;
 
+/// model.py `mm` past 128 rows (exl3_prefill.matmul, cuda_prompt.zig's `mm`): the rows rotated by suh to fp16, the
+/// weight unpacked to fp16 [K, N], then the Hadamard-folded `_gemm` (the fork's prompt GEMM, replayed from the AOT
+/// set) into y [m, N].
+pub const Wide = struct {
+    kernels: *const exl3.Kernels,
+    set: *const aot.Set,
+    rows: usize,
+    xh: cuda.DeviceBuffer, // fp16 [rows, K]
+    wq: cuda.DeviceBuffer, // fp16 [K, N]
+    had: cuda.DeviceBuffer, // the 128 x 128 Hadamard, bf16
+
+    const scale: f32 = 0.08838834764831845; // prefill.py HAD_SCALE
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, kernels: *const exl3.Kernels, set: *const aot.Set, rows: usize, kmax: usize, kn: usize) !*Wide {
+        const self = try gpa.create(Wide);
+        errdefer gpa.destroy(self);
+        self.kernels = kernels;
+        self.set = set;
+        self.rows = rows;
+        // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
+        var hh: [128 * 128]u16 = undefined;
+        for (0..128) |i| for (0..128) |j| {
+            const p: u32 = @popCount(@as(u32, @intCast(i & j))) & 1;
+            hh[i * 128 + j] = if (p == 0) 0x3F80 else 0xBF80;
+        };
+        self.had = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(&hh));
+        errdefer self.had.free();
+        self.xh = try cuda.DeviceBuffer.alloc(d, rows * kmax * 2);
+        errdefer self.xh.free();
+        self.wq = try cuda.DeviceBuffer.alloc(d, kn * 2);
+        return self;
+    }
+
+    pub fn deinit(self: *Wide, gpa: std.mem.Allocator) void {
+        self.wq.free();
+        self.xh.free();
+        self.had.free();
+        gpa.destroy(self);
+    }
+
+    pub fn run(self: *const Wide, lin: *const exl3.Linear, x: Ptr, m: usize, y: Ptr, y_dtype: exl3.DType, stream: cuda.Stream) !void {
+        const K = lin.k;
+        const N = lin.n;
+        if (m > self.rows or m * K * 2 > self.xh.len or K * N * 2 > self.wq.len) return error.TooManyRows;
+        {
+            var a: cuda.Args = .{};
+            a.add(x);
+            a.add(@intFromEnum(exl3.DType.bf16));
+            a.add(lin.suh.ptr);
+            a.add(self.xh.ptr);
+            a.add(@as(c_int, @intCast(K)));
+            try cuda.launch.launch(lin.rot_in, .{ .grid = .{ .x = @intCast((K / 128 + 3) / 4), .y = @intCast(m) }, .block = .{ .x = 128 } }, stream, &a);
+        }
+        {
+            const s = lin.strides();
+            const f = try self.kernels.unpack(lin.k2, lin.cb);
+            var a: cuda.Args = .{};
+            a.add(lin.words.ptr);
+            a.add(self.wq.ptr);
+            a.add(@as(c_int, @intCast(N)));
+            a.add(s.k);
+            a.add(s.nb);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(N / 16), .y = @intCast(K / 16) }, .block = .{ .x = 32 } }, stream, &a);
+        }
+        const bm: usize = 128;
+        const grid: u32 = @intCast(((m + bm - 1) / bm) * (N / 128));
+        try self.set.run(stream, "_gemm", .{ grid, 1, 1 }, &.{
+            aot.ptr("X", "*fp16", self.xh.ptr),   aot.ptr("W", "*fp16", self.wq.ptr),    aot.ptr("H", "*bf16", self.had.ptr),
+            aot.ptr("SVH", "*fp16", lin.svh.ptr), aot.ptr("BIAS", "*fp16", lin.svh.ptr), aot.ptr("OUT", if (y_dtype == .f32) "*fp32" else "*bf16", y),
+            aot.int("M", @intCast(m)),            aot.int("o_stride", @intCast(N)),
+        }, &.{ aot.ci("K", @intCast(K)), aot.ci("N", @intCast(N)), aot.ci("BM", 128), aot.ci("BK", 32), aot.ci("GROUP", 8), aot.ci("HAS_BIAS", 0), aot.cf("SCALE", scale) });
+    }
+};
+
 /// What a draft returns: the block's drafts and their confidences (the head's logits, one a draft).
 pub const Drafts = struct { tokens: [16]u32, conf: [16]f32, len: usize };
+
+/// gathered [world, words] f32 <- every rank's `partial` [words] in rank order, on `stream` (cuda_forward.Gather's
+/// shape): a test's stand-in for the communicator.
+pub const GatherHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void,
+};
+
+/// The drafter's dimensions on `rank` of `world` from the checkpoint's config (dspark.py Drafter over model.py's
+/// split: this rank's heads, wo_a groups and vocabulary columns).
+pub fn dimsOf(cfg: *const Config, rank: usize, world: usize) Dims {
+    return .{
+        .d = cfg.dim,
+        .q_rank = cfg.q_rank,
+        .o_rank = cfg.o_rank,
+        .heads = cfg.n_heads / world,
+        .hd = cfg.head_dim,
+        .rd = cfg.rope_dim,
+        .groups = cfg.o_groups / world,
+        .window = cfg.window,
+        .ring = cfg.window + 16,
+        .block = cfg.dspark_block,
+        .noise = cfg.dspark_noise,
+        .vocab = cfg.vocab,
+        .vocab_local = cfg.vocab / world,
+        .rank = rank,
+        .world = world,
+        .markov_rank = cfg.dspark_rank,
+        .n_routed = cfg.dspark_routed,
+        .topk = cfg.dspark_topk,
+        .eps = cfg.eps,
+        .hc_eps = cfg.hc_eps,
+        .hc_iters = @intCast(cfg.hc_iters),
+        .swiglu_limit = cfg.swiglu_limit,
+        .route_scale = cfg.route_scale,
+    };
+}
+
+/// The drafter's head from its loaded weights (cuda_weights.loadDSpark) and the target's head (this rank's
+/// vocabulary columns).
+pub fn headOf(ds: *const weights.DSpark, target_head: *const exl3.Linear) Head {
+    return .{
+        .main_proj = &ds.main_proj,
+        .main_norm = ds.main_norm.ptr(),
+        .norm = ds.norm.ptr(),
+        .head = target_head,
+        .markov_embed = ds.markov_embed.ptr(),
+        .markov_head = ds.markov_head.ptr(),
+        .markov_embed_host = ds.markov_embed_host,
+        .conf = ds.conf_host,
+    };
+}
 
 pub const Drafter = struct {
     gpa: std.mem.Allocator,
@@ -142,6 +269,10 @@ pub const Drafter = struct {
     stages: []const Stage,
     head: Head,
     comm: ?*const cuda.comm.Comm,
+    /// When set, every gather goes here instead of `comm` (a test's supply of the other ranks' partials).
+    gather_hook: ?GatherHook = null,
+    /// The prompt GEMM for absorbs past 128 rows (`enableWide`); null: 128-row pieces of the row kernel.
+    wide: ?*Wide = null,
     ex_scratch: experts_mod.Scratch,
     markov: Markov,
     // the block's row tables (int64)
@@ -204,9 +335,14 @@ pub const Drafter = struct {
     pub const max_rows = 16;
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const attention.Glue, ex_kernels: *const experts_mod.Kernels, stages: []const Stage, head: Head, comm: ?*const cuda.comm.Comm) !*Drafter {
+        return initWith(gpa, d, dims, set, glue, ex_kernels, stages, head, comm, null);
+    }
+
+    /// `init` with the gathers going to `hook` when given (then `comm` may be null at any world).
+    pub fn initWith(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const attention.Glue, ex_kernels: *const experts_mod.Kernels, stages: []const Stage, head: Head, comm: ?*const cuda.comm.Comm, hook: ?GatherHook) !*Drafter {
         const n = max_rows; // every per-row buffer holds a batched draft's rows (N streams x the block)
         if (dims.block > max_rows or dims.block < 1) return error.TooManyRows;
-        if (dims.world > 1 and comm == null) return error.NoComm;
+        if (dims.world > 1 and comm == null and hook == null) return error.NoComm;
         const self = try gpa.create(Drafter);
         errdefer gpa.destroy(self);
         self.* = undefined;
@@ -219,6 +355,8 @@ pub const Drafter = struct {
         self.stages = stages;
         self.head = head;
         self.comm = comm;
+        self.gather_hook = hook;
+        self.wide = null;
         self.hc = hc_mod.Hc.init(set, @intCast(dims.d), dims.hc_iters, dims.eps, dims.hc_eps);
         self.route = route_mod.Route.init(set, @intCast(dims.d), @intCast(dims.n_routed), @intCast(dims.topk), dims.route_scale, @intCast(dims.n_routed));
         self.ex_scratch = try experts_mod.Scratch.init(d, stages[0].experts, n, dims.topk + 1);
@@ -298,12 +436,26 @@ pub const Drafter = struct {
 
     pub fn deinit(self: *Drafter) void {
         inline for (.{ "ids", "pos", "wpos", "bidx", "rbase", "neg", "zero", "emb_ids", "emb2", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kvb", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe_out", "xc", "xn", "local", "lg", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(self, f).free();
+        if (self.wide) |wd| wd.deinit(self.gpa);
         self.ex_scratch.deinit();
         self.markov.deinit();
         self.gpa.free(self.host_out);
         self.gpa.free(self.host_xc);
         self.gpa.free(self.emb_pair);
         self.gpa.destroy(self);
+    }
+
+    /// Absorbs past 128 rows (a prompt chunk's last `ring` rows) through the prompt GEMM, as the fork's `mm` runs
+    /// them; `kernels`: the EXL3 kernels the weights were loaded with (their unpack instantiations).
+    pub fn enableWide(self: *Drafter, kernels: *const exl3.Kernels) !void {
+        if (self.wide != null) return;
+        var kn: usize = self.head.main_proj.k * self.head.main_proj.n;
+        var kmax: usize = self.head.main_proj.k;
+        for (self.stages) |s| {
+            kn = @max(kn, s.wkv.k * s.wkv.n);
+            kmax = @max(kmax, s.wkv.k);
+        }
+        self.wide = try Wide.init(self.gpa, self.d, kernels, self.set, self.dims.ring, kmax, kn);
     }
 
     pub fn newCache(self: *Drafter) !Cache {
@@ -337,17 +489,21 @@ pub const Drafter = struct {
         try self.abs_slots.upload(0, std.mem.sliceAsBytes(tab[0..n]));
         // main_x = rmsnorm(main_proj(taps), main_norm), then every stage's keys into its ring; the EXL3 row kernel
         // takes 128 rows a launch (the fork's prompt GEMM beyond that is a cuBLAS path: pieces here)
+        // model.py `mm`: past 128 rows the prompt GEMM (`wide`), whose bits differ from the row kernel's
+        const wide = if (n > 128) self.wide else null;
+        if (wide) |wd| try wd.run(self.head.main_proj, tap_ptr, n, self.main_y.ptr, .bf16, stream);
         var at: usize = 0;
         while (at < n) : (at += 128) {
             const m = @min(128, n - at);
-            try self.head.main_proj.run(tap_ptr + at * 3 * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.main_y.ptr + at * dm.d * 2, .bf16, stream);
+            if (wide == null) try self.head.main_proj.run(tap_ptr + at * 3 * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.main_y.ptr + at * dm.d * 2, .bf16, stream);
             try self.rmsnorm(self.main_y.ptr + at * dm.d * 2, self.head.main_norm, self.main_x.ptr + at * dm.d * 2, m, dm.d, stream);
         }
         for (self.stages, cache.rings) |s, ring| {
+            if (wide) |wd| try wd.run(s.wkv, self.main_x.ptr, n, self.abs_kv.ptr, .bf16, stream);
             at = 0;
             while (at < n) : (at += 128) {
                 const m = @min(128, n - at);
-                try s.wkv.run(self.main_x.ptr + at * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.abs_kv.ptr + at * dm.hd * 2, .bf16, stream);
+                if (wide == null) try s.wkv.run(self.main_x.ptr + at * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.abs_kv.ptr + at * dm.hd * 2, .bf16, stream);
                 try self.kvNormRope(self.abs_kv.ptr + at * dm.hd * 2, s.kv_norm, rope, self.abs_pos.ptr + at * 8, self.abs_slots.ptr + at * 8, ring.ptr, self.abs_kv.ptr + at * dm.hd * 2, m, stream);
             }
         }
@@ -463,10 +619,10 @@ pub const Drafter = struct {
         // the Markov loop: out[s, 0] = token, out[s, 1..] the drafts
         const lg: Ptr = if (self.markov.split) self.local.ptr else blk: {
             if (dm.world == 1) break :blk self.local.ptr;
-            try self.comm.?.allGather(self.local.ptr, self.lg.ptr, R * dm.vocab_local, .f32, stream.handle);
+            try self.allGather(self.local.ptr, self.lg.ptr, R * dm.vocab_local, stream);
             break :blk self.lg.ptr;
         };
-        try self.markov.steps(lg, self.head, tokens, N, n, n, self.comm, stream);
+        try self.markov.steps(lg, self.head, tokens, N, n, n, self, stream);
         try stream.synchronize();
         try self.markov.out.download(0, std.mem.sliceAsBytes(self.host_out[0 .. N * (n + 1)]));
         try self.xc.download(0, std.mem.sliceAsBytes(self.host_xc[0 .. R * D]));
@@ -495,8 +651,16 @@ pub const Drafter = struct {
 
     fn gather(self: *Drafter, partial: Ptr, count: usize, stream: cuda.Stream) !Ptr {
         if (self.dims.world == 1) return partial;
-        try self.comm.?.allGather(partial, self.gathered.ptr, count, .f32, stream.handle);
+        try self.allGather(partial, self.gathered.ptr, count, stream);
         return self.gathered.ptr;
+    }
+
+    /// out [world, words] f32 <- every rank's `partial` [words] in rank order: through `gather_hook` when set, else
+    /// the communicator. Every gather a draft issues goes through here, in the fork's order.
+    pub fn allGather(self: *const Drafter, partial: Ptr, out: Ptr, words: usize, stream: cuda.Stream) !void {
+        if (self.gather_hook) |g| return g.call(g.ctx, partial, words, out, stream);
+        const comm = self.comm orelse return error.NoComm;
+        try comm.allGather(partial, out, words, .f32, stream.handle);
     }
 
     /// dspark.py `Drafter._attention` / `BatchDraftGraph._attention` (unfused): the rows attend their stream's ring's
@@ -732,7 +896,7 @@ pub const Markov = struct {
     /// `lg`: the drafter head's logits this loop reads for N streams of `block` rows (stream s's step i at row
     /// s x block + i): this rank's [R, n_cols] with split, else [world, R, n_cols]. out[s, 0] = tokens[s], out[s,
     /// 1 .. steps] the drafts (device, `self.out`, row stride block + 1).
-    pub fn steps(self: *Markov, lg: Ptr, head: Head, tokens: []const u32, N: usize, block: usize, n_steps: usize, comm: ?*const cuda.comm.Comm, stream: cuda.Stream) !void {
+    pub fn steps(self: *Markov, lg: Ptr, head: Head, tokens: []const u32, N: usize, block: usize, n_steps: usize, gatherer: *const Drafter, stream: cuda.Stream) !void {
         if (N > np or block != self.block or n_steps > block) return error.TooManyRows;
         const ts: usize = block + 1; // out.stride(0)
         var first: [np * 17]i64 = undefined;
@@ -761,7 +925,7 @@ pub const Markov = struct {
                 aot.int("send", @intFromBool(self.split)),
             }, &.{ aot.ci("BP", @intCast(self.bp)), aot.ci("PDL", 1) });
             if (self.split) {
-                try comm.?.allGather(self.send.ptr, self.recv.ptr, N * 4, .f32, stream.handle);
+                try gatherer.allGather(self.send.ptr, self.recv.ptr, N * 4, stream);
                 try self.set.run(stream, "_pick", .{ @intCast(N), 1, 1 }, &.{
                     aot.ptr("G", "*fp32", self.recv.ptr), aot.int("n_rows", @intCast(N)), aot.ptr("OUT", "*i64", self.out.ptr + (i + 1) * 8), aot.int("o_stride", @intCast(ts)),
                 }, &.{ aot.ci("WORLD", @intCast(self.world)), aot.ci("PDL", 1) });
