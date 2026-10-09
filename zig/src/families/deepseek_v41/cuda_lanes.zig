@@ -174,9 +174,11 @@ pub const Engine = struct {
         e.stepped += 1;
     }
 
-    /// Rank 0 sends the step to every other rank, then every rank agrees on it.
+    /// Rank 0 sends the step to every other rank, then every rank agrees on it. A failure breaks the lane: a
+    /// follower that got the step but not the agreement would otherwise pair its next collective wrongly.
     fn announce(e: *Engine, op: []const u8) !void {
         if (e.broken) return error.OutOfStep;
+        errdefer e.broken = true;
         if (e.settings.rank == 0) for (1..e.settings.world) |peer| try e.comm.sendTo(@intCast(peer), op);
         try e.agree(op);
     }
@@ -194,13 +196,13 @@ pub const Engine = struct {
     // -- the steps (the same on every rank) -------------------------------------------------------------------
 
     /// The prompt's ids into the caches from position 0, in windows of `max_rows`; the last row's logits stay in
-    /// `fwd.logits` (the first token is drawn from them on rank 0).
-    fn runPrefill(e: *Engine, ids: []const i64, cancel: ?*const lanes.Stream) !void {
+    /// `fwd.logits` (the first token is drawn from them on rank 0). Runs every window once started: the follower
+    /// cannot see a cancel, so stopping early on one rank would leave the other in an unpaired all-gather.
+    fn runPrefill(e: *Engine, ids: []const i64) !void {
         if (ids.len + 1 + extra > e.settings.context + extra) return error.PromptTooLong;
         e.pos = 0;
         var i: usize = 0;
         while (i < ids.len) {
-            if (cancel) |s| if (s.isCancelled()) return error.Cancelled;
             const n = @min(max_rows, ids.len - i);
             _ = try e.fwd.rows(e.gather(), ids[i .. i + n], i, n, false, e.stream);
             i += n;
@@ -250,23 +252,30 @@ pub const Engine = struct {
                 error.LinkClosed => return,
                 else => return err,
             };
+            if (op.len == 0) return error.OutOfStep;
+            const code = std.enums.fromInt(Op, op[0]) orelse return error.OutOfStep;
+            // rank 0 sends stop without an agreement (it is tearing its communicator down)
+            if (code == .stop) return;
             try e.agree(op);
-            switch (@as(Op, @enumFromInt(op[0]))) {
+            switch (code) {
                 .prefill => {
+                    if (op.len < 5) return error.OutOfStep;
                     const n = std.mem.readInt(u32, op[1..5], .little);
+                    if (op.len != 5 + 8 * @as(usize, n)) return error.OutOfStep;
                     const ids = try e.gpa.alloc(i64, n);
                     defer e.gpa.free(ids);
                     for (ids, 0..) |*id, i| id.* = std.mem.readInt(i64, op[5 + 8 * i ..][0..8], .little);
-                    try e.step(Engine.runPrefill, .{ e, ids, null });
+                    try e.step(Engine.runPrefill, .{ e, ids });
                 },
                 .round => {
+                    if (op.len != 17) return error.OutOfStep;
                     const token = std.mem.readInt(i64, op[1..9], .little);
                     const pos: usize = @intCast(std.mem.readInt(u64, op[9..17], .little));
                     if (pos != e.pos) return error.PositionMismatch;
                     try e.step(Engine.runRound, .{ e, token });
                 },
                 .release => e.pos = 0,
-                .stop => return,
+                .stop => unreachable,
             }
         }
     }
@@ -348,12 +357,14 @@ pub const Lanes = struct {
         const prompt = s.prompt();
         if (prompt.len == 0 or prompt.len + s.max_new + max_rows > e.settings.context) return error.PromptTooLong;
         if (prompt.len > 16384) return error.PromptTooLong; // the op record's bound for this interim prompt path
+        // a cancel is honoured only before the step is announced (runPrefill)
+        if (s.isCancelled()) return error.Cancelled;
         const ids = try self.gpa.alloc(i64, prompt.len);
         defer self.gpa.free(ids);
         for (ids, prompt) |*id, t| id.* = t;
         self.active = s;
         try e.announce(Engine.encodePrefill(e.op_buf, ids));
-        try e.step(Engine.runPrefill, .{ e, ids, s });
+        try e.step(Engine.runPrefill, .{ e, ids });
         _ = self.take(try e.argmax());
     }
 

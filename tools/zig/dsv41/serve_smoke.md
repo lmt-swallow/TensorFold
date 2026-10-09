@@ -1,5 +1,8 @@
 # DeepSeek-V4.1-Flash on the native server over two DGX Sparks: the smoke
 
+`serve_smoke.sh` runs the steps below end to end (`bash serve_smoke.sh`; `bash serve_smoke.sh stop` removes both
+containers).
+
 Rank 0 (spark-616b, 10.0.1.1) serves HTTP; rank 1 (spark-9e43, 10.0.1.2) follows its steps. Both need: the pack
 (`~/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw`), their own Python rank cache (`~/tfcache/rank/rank{r}of2-*.bin`,
 written by a `tensorfold serve` of the Python fork with `TF_DS_RANK_CACHE`), the captured Triton set with the RoPE
