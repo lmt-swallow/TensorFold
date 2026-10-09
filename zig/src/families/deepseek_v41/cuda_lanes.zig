@@ -52,7 +52,8 @@ pub const rope_align: usize = 4096;
 
 pub const Error = error{ WorldNotTwo, BadMaster, NoRankCache, NoRopeTables, RopeRowsShort, OutOfStep, LinkClosed, SamplingNotSupported, WindowTooWide, PositionMismatch, UnknownStream, StreamBusy, PromptTooLong, Cancelled, NoDraftHead, NotPipelined, TreesNotBuilt, EmptyPath, BadChunk, BadRecord, NoHeldDrafts, NoFirstToken, BadTapLayers, BadSlots, NoRoom };
 
-/// The widest bucket whose round graphs are recorded at load (`Streams.warm`); wider ones are recorded on first use.
+/// The widest bucket whose round graphs are recorded (at load, `Streams.warm`); rounds at wider buckets run eager
+/// (`RoundRunner.graph_bucket_max`: a bucket's graphs take about 0.65 GiB).
 pub const warm_bucket_max: usize = 8192;
 
 /// A drafting round's widest window: the pending token and DSpark's block of drafts (engine.py: drafts + 1 rows).
@@ -1241,9 +1242,11 @@ pub const Streams = struct {
     }
 
     /// Records the round graphs of 1 .. max_rows rows at the buckets bucket_min .. `warm_bucket_max` the runner scans
-    /// and the batched drafts' of 1 .. `draftBatch` streams, ahead of the rounds and drafts that replay them; nothing
-    /// runs (TF_DS_GRAPHS=0: nothing to record). Every rank calls it at the same point with the same streams.
+    /// (wider buckets stay eager) and the batched drafts' of 1 .. `draftBatch` streams, ahead of the rounds and drafts
+    /// that replay them; nothing runs (TF_DS_GRAPHS=0: nothing to record). Every rank calls it at the same point with
+    /// the same streams.
     pub fn warm(self: *Streams, gather: forward.Gather) !void {
+        self.runner.graph_bucket_max = warm_bucket_max;
         var rows: [max_rows]usize = undefined;
         for (&rows, 1..) |*r, i| r.* = i;
         var buckets: [8]usize = undefined;
@@ -1315,6 +1318,9 @@ pub const Engine = struct {
     stream: cuda.Stream,
     agree_send: cuda.DeviceBuffer,
     agree_recv: cuda.DeviceBuffer,
+    /// The digest's page-locked staging: copied to `agree_send` on the stream, in order with the all-gather that
+    /// reads it (a plain upload runs outside that order and may land after the gather has read the last step's).
+    agree_host: cuda.HostBuffer,
     ids_buf: []i64, // a received prompt's ids
     op_buf: []u8,
     stepped: u64 = 0,
@@ -1414,12 +1420,14 @@ pub const Engine = struct {
             const free0 = (try ctx.memInfo()).free;
             try e.streams.warm(e.gather());
             const free1 = (try ctx.memInfo()).free;
-            if (s.rank == 0 and e.streams.runner.graphs) std.log.info("deepseek_v41: {d} round graphs and {d} draft graphs recorded in {d:.1} s, {d:.0} MiB (buckets {d} .. {d}; wider ones on first use)", .{ e.streams.runner.graphCount(), if (e.drafter) |dr| dr.captures else 0, msSince(t0) / 1000, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20), rounds.bucket_min, @min(warm_bucket_max, e.streams.runner.bucket) });
+            if (s.rank == 0 and e.streams.runner.graphs) std.log.info("deepseek_v41: {d} round graphs and {d} draft graphs recorded in {d:.1} s, {d:.0} MiB (buckets {d} .. {d}; wider ones run eager)", .{ e.streams.runner.graphCount(), if (e.drafter) |dr| dr.captures else 0, msSince(t0) / 1000, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20), rounds.bucket_min, @min(warm_bucket_max, e.streams.runner.bucket) });
         }
         e.agree_send = try cuda.DeviceBuffer.alloc(ctx.d, 16);
         errdefer e.agree_send.free();
         e.agree_recv = try cuda.DeviceBuffer.alloc(ctx.d, 16 * s.world);
         errdefer e.agree_recv.free();
+        e.agree_host = try cuda.HostBuffer.alloc(ctx.d, 16);
+        errdefer e.agree_host.free();
         e.ids_buf = try gpa.alloc(i64, s.context + extra);
         errdefer gpa.free(e.ids_buf);
         e.op_buf = try gpa.alloc(u8, maxOpBytes(s.context));
@@ -1430,6 +1438,7 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         e.gpa.free(e.op_buf);
         e.gpa.free(e.ids_buf);
+        e.agree_host.free();
         e.agree_recv.free();
         e.agree_send.free();
         e.streams.deinit();
@@ -1479,16 +1488,29 @@ pub const Engine = struct {
         var mine: [4]f32 = undefined;
         for (&mine, 0..) |*m, i| m.* = @floatFromInt(std.mem.readInt(u16, digest[2 * i ..][0..2], .little));
         if (!can_run) mine[0] = -1;
-        try e.agree_send.upload(0, std.mem.sliceAsBytes(&mine));
+        @memcpy(e.agree_host.bytes[0..16], std.mem.sliceAsBytes(&mine));
+        try e.agree_send.uploadAsync(0, e.agree_host.bytes[0..16], e.stream.handle);
         try e.comm.allGather(e.agree_send.ptr, e.agree_recv.ptr, 4, .f32, e.stream.handle);
         try e.stream.synchronize();
         var every: [4 * cuda.comm.Comm.max_world]f32 = undefined;
         try e.agree_recv.download(0, std.mem.sliceAsBytes(every[0 .. 4 * e.settings.world]));
         for (1..e.settings.world) |r| for (0..4) |i| if (every[r * 4 + i] != every[i]) {
             std.log.err("rank {d}: step {d} differs between the ranks (digest piece {d})", .{ e.settings.rank, e.stepped, i });
+            e.logDivergence(op, can_run, every[0 .. 4 * e.settings.world]);
             return error.OutOfStep;
         };
         e.stepped += 1;
+    }
+
+    /// What a rank saw at a failed agreement: the record's opcode, length and first bytes, whether it could run it,
+    /// every rank's digest pieces (-1 first: that rank could not run the record) and its streams' state.
+    fn logDivergence(e: *Engine, op: []const u8, can_run: bool, every: []const f32) void {
+        const code: []const u8 = if (op.len > 0) (if (std.enums.fromInt(Op, op[0])) |c| @tagName(c) else "?") else "empty";
+        const head = op[0..@min(op.len, 48)];
+        std.log.err("rank {d}: step {d} record {s}, {d} bytes, runnable here {}, first bytes {x}; digests {any}", .{ e.settings.rank, e.stepped, code, op.len, can_run, head, every });
+        for (e.streams.lanes, 0..) |l, i| if (l.busy) {
+            std.log.err("rank {d}:   slot {d}: extent [{d}, +{d}), pos {d}, window {d}+{d} (row {d}), absorbed {d}, held {d}", .{ e.settings.rank, i, l.base, l.size, l.pos, l.verify_start, l.verify_rows, l.row0, l.absorbed, l.held });
+        };
     }
 
     /// Rank 0 sends the step to every other rank, then every rank agrees on it. A failure breaks the lane: a
@@ -1633,7 +1655,7 @@ pub const Engine = struct {
             // rank 0 sends stop without an agreement (it is tearing its communicator down)
             if (code == .stop) return;
             const ok = e.runnable(op);
-            if (!ok) std.log.err("rank {d}: step {d} ({s}) cannot run here", .{ e.settings.rank, e.stepped, @tagName(code) });
+            if (!ok) std.log.err("rank {d}: step {d} ({s}, {d} bytes, first {x}) cannot run here", .{ e.settings.rank, e.stepped, @tagName(code), op.len, op[0..@min(op.len, 48)] });
             try e.agree(op, ok);
             try e.step(Engine.run, .{ e, op });
         }

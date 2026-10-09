@@ -26,8 +26,9 @@
 //! once as CUDA graphs, one a stretch of layers (cut before each Engram layer when Engram runs: its host read and
 //! upload stay eager between the stretches, as the fork's ENGRAM_SPLIT), and replayed; a replay runs the eager path's
 //! launches with the same arguments, so it writes the same bytes. The gathers are recorded with the rest (the
-//! communicator's all-gather runs on the round's stream). The host selection (TF_DS_TOPK=host) and a probe stay
-//! eager. Every rank records the same graphs in the same order: the keys follow from the windows alone.
+//! communicator's all-gather runs on the round's stream). The host selection (TF_DS_TOPK=host), a probe and buckets
+//! past `graph_bucket_max` stay eager. Every rank records the same graphs in the same order: the keys follow from
+//! the windows alone.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -354,6 +355,9 @@ pub const RoundRunner = struct {
     captures: usize,
     /// Called before each graph launch (tests' gather supplies; the communicator needs none).
     launch_hook: ?GraphLaunch = null,
+    /// Rounds at wider buckets run eager: each bucket's graphs hold their recorded all-gathers' resources (about
+    /// 0.65 GiB a bucket for 16 row counts at 43 layers), so recording every bucket of a long context would not fit.
+    graph_bucket_max: usize = std.math.maxInt(usize),
     // the layer loop's state between stretches (`segment`)
     st: SegState,
     // the scored indexer (buckets past idx_topk compressed entries)
@@ -480,6 +484,7 @@ pub const RoundRunner = struct {
         self.execs = .empty;
         self.captures = 0;
         self.launch_hook = null;
+        self.graph_bucket_max = std.math.maxInt(usize);
         self.st = .{};
         self.iq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
         self.iqq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
@@ -614,7 +619,7 @@ pub const RoundRunner = struct {
         if (self.engram != null) {
             for (windows, 0..) |wd, i| spans[i] = .{ .ids = wd.host, .start = wd.position, .n = wd.ids.len };
         }
-        const entry: ?*Graphs = if (self.graphed()) try self.graphsFor(R, self.round_bucket, ns) else null;
+        const entry: ?*Graphs = if (self.graphed() and self.round_bucket <= self.graph_bucket_max) try self.graphsFor(R, self.round_bucket, ns) else null;
         var nb: [48]u8 = undefined;
         for (segs[0..ns], 0..) |sg, k| {
             if (k > 0) {
@@ -646,7 +651,7 @@ pub const RoundRunner = struct {
         var segs: [max_segments]Seg = undefined;
         const ns = try self.segments(&segs);
         for (buckets) |b| {
-            if (b > self.bucket or b < @min(self.least, self.bucket)) continue;
+            if (b > self.bucket or b < @min(self.least, self.bucket) or b > self.graph_bucket_max) continue;
             for (rows) |R| {
                 if (R < 1 or R > max_rows) return error.TooManyRows;
                 self.round_bucket = b;

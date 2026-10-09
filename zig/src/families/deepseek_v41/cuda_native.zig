@@ -113,7 +113,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = own.lanes.windowRows(),
-        .stream_bytes = e.streamBytes(),
+        // every slot's caches (the pool, the drafter's rings) and the round graphs are allocated by the load: the
+        // budget's room is what is left after them, so a stream needs no more (counting the pool again refused
+        // streams the pool already holds)
+        .stream_bytes = 0,
         .ctx = own,
         .deinit = release,
         .lone = null,

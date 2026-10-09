@@ -297,6 +297,9 @@ pub const Drafter = struct {
     /// Called before each graph launch (tests' gather supplies; the communicator needs none).
     launch_hook: ?rounds.GraphLaunch = null,
     counting: ?*usize = null, // a capture's gathers
+    /// The passes' and absorbs' host tables, copied on the caller's stream (in order with the launches that read
+    /// them, which may not have run yet: a plain upload runs outside that order).
+    uploads: attention.Uploads,
     ex_scratch: experts_mod.Scratch,
     markov: Markov,
     // the block's row tables (int64)
@@ -386,6 +389,8 @@ pub const Drafter = struct {
         self.captures = 0;
         self.launch_hook = null;
         self.counting = null;
+        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(2, max_absorb * 8) + attention.Uploads.room(5, max_rows * max_rows * 8) + attention.Uploads.room(Markov.np, 8));
+        errdefer self.uploads.deinit();
         self.hc = hc_mod.Hc.init(set, @intCast(dims.d), dims.hc_iters, dims.eps, dims.hc_eps);
         self.route = route_mod.Route.init(set, @intCast(dims.d), @intCast(dims.n_routed), @intCast(dims.topk), dims.route_scale, @intCast(dims.n_routed));
         self.ex_scratch = try experts_mod.Scratch.init(d, stages[0].experts, n, dims.topk + 1);
@@ -467,6 +472,7 @@ pub const Drafter = struct {
         inline for (.{ "ids", "pos", "wpos", "bidx", "rbase", "neg", "zero", "emb_ids", "emb2", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kvb", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe_out", "xc", "xn", "local", "lg", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(self, f).free();
         if (self.wide) |wd| wd.deinit(self.gpa);
         self.dropGraphs();
+        self.uploads.deinit();
         self.ex_scratch.deinit();
         self.markov.deinit();
         self.gpa.free(self.host_out);
@@ -513,10 +519,11 @@ pub const Drafter = struct {
         }
         if (n > self.abs_rows) return error.TooManyRows;
         var tab: [max_absorb]i64 = undefined;
+        try self.uploads.begin(); // (waits for the last tables' copies: their staging is reused)
         for (0..n) |i| tab[i] = @intCast(first + i);
-        try self.abs_pos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+        try self.uploads.put(self.abs_pos, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         for (0..n) |i| tab[i] = @intCast((first + i) % dm.ring);
-        try self.abs_slots.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+        try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         // main_x = rmsnorm(main_proj(taps), main_norm), then every stage's keys into its ring; the EXL3 row kernel
         // takes 128 rows a launch (the fork's prompt GEMM beyond that is a cuBLAS path: pieces here)
         // model.py `mm`: past 128 rows the prompt GEMM (`wide`), whose bits differ from the row kernel's
@@ -600,23 +607,24 @@ pub const Drafter = struct {
         const batched = slots != null;
         // the row tables: embedding rows, positions, the window position every row sees (q0 - 1), the ring bases
         var tab: [max_rows]i64 = undefined;
+        try self.uploads.begin(); // (waits for the last tables' copies: their staging is reused)
         for (0..R) |r| tab[r] = if (r % n == 0) @intCast(r / n) else @intCast(N);
-        try self.emb_ids.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+        try self.uploads.put(self.emb_ids, 0, std.mem.sliceAsBytes(tab[0..R]), stream);
         for (0..R) |r| tab[r] = @intCast(q0[r / n] + r % n);
-        try self.pos.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+        try self.uploads.put(self.pos, 0, std.mem.sliceAsBytes(tab[0..R]), stream);
         for (0..R) |r| tab[r] = @as(i64, @intCast(q0[r / n])) - 1;
-        try self.wpos.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+        try self.uploads.put(self.wpos, 0, std.mem.sliceAsBytes(tab[0..R]), stream);
         if (batched) {
             for (0..R) |r| tab[r] = @intCast(slots.?[r / n] * dm.ring);
-            try self.rbase.upload(0, std.mem.sliceAsBytes(tab[0..R]));
+            try self.uploads.put(self.rbase, 0, std.mem.sliceAsBytes(tab[0..R]), stream);
         }
         // every row of a stream's block sees that stream's block rows (the keys as `comp`, no mask inside the block)
         var bi: [max_rows * max_rows]i64 = undefined;
         for (0..R) |r| for (0..n) |c| {
             bi[r * n + c] = @intCast((r / n) * n + c);
         };
-        try self.bidx.upload(0, std.mem.sliceAsBytes(bi[0 .. R * n]));
-        try self.markov.seed(tokens, N);
+        try self.uploads.put(self.bidx, 0, std.mem.sliceAsBytes(bi[0 .. R * n]), stream);
+        try self.markov.seed(tokens, N, &self.uploads, stream);
         if (batched and hook == null and self.graphs and rings.len <= BatchGraph.max_rings) {
             const g = try self.batchGraph(N, rings, rope, stream);
             if (self.launch_hook) |hk| try hk.call(hk.ctx, g.gathers, stream);
@@ -867,10 +875,11 @@ pub const Drafter = struct {
         if (n == 0) return;
         if (n > 128 or slots.len != n) return error.TooManyRows;
         var tab: [128]i64 = undefined;
+        try self.uploads.begin(); // (waits for the last tables' copies: their staging is reused)
         for (0..n) |i| tab[i] = @intCast(pos[i]);
-        try self.abs_pos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+        try self.uploads.put(self.abs_pos, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         for (0..n) |i| tab[i] = @intCast(slots[i] * dm.ring + pos[i] % dm.ring);
-        try self.abs_slots.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+        try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         try self.head.main_proj.run(taps, .bf16, n, self.xh.ptr, self.z.ptr, self.main_y.ptr, .bf16, stream);
         try self.rmsnorm(self.main_y.ptr, self.head.main_norm, self.main_x.ptr, n, dm.d, stream);
         for (self.stages, pool.rings) |s, ring| {
@@ -894,10 +903,11 @@ pub const Drafter = struct {
         if (n > 0) {
             if (n > self.abs_rows) return error.TooManyRows;
             var tab: [max_absorb]i64 = undefined;
+            try self.uploads.begin(); // (waits for the last tables' copies: their staging is reused)
             for (0..n) |i| tab[i] = @intCast(first + i);
-            try self.abs_pos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+            try self.uploads.put(self.abs_pos, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
             for (0..n) |i| tab[i] = @intCast(slot * dm.ring + (first + i) % dm.ring);
-            try self.abs_slots.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+            try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
             var at: usize = 0;
             while (at < n) : (at += 128) {
                 const m = @min(128, n - at);
@@ -1014,18 +1024,14 @@ pub const Markov = struct {
     /// `lg`: the drafter head's logits this loop reads for N streams of `block` rows (stream s's step i at row
     /// s x block + i): this rank's [R, n_cols] with split, else [world, R, n_cols]. out[s, 0] = tokens[s], out[s,
     /// 1 .. steps] the drafts (device, `self.out`, row stride block + 1).
-    pub fn steps(self: *Markov, lg: Ptr, head: Head, tokens: []const u32, N: usize, block: usize, n_steps: usize, gatherer: *const Drafter, stream: cuda.Stream) !void {
-        try self.seed(tokens, N);
-        try self.loop(lg, head, N, block, n_steps, gatherer, stream);
-    }
-
-    /// out[s, 0] = tokens[s] for the N streams (a synchronous copy, ahead of `loop`'s launches).
-    pub fn seed(self: *Markov, tokens: []const u32, N: usize) !void {
+    /// out[s, 0] = tokens[s] for the N streams, copied on `stream` ahead of `loop`'s launches.
+    pub fn seed(self: *Markov, tokens: []const u32, N: usize, up: *attention.Uploads, stream: cuda.Stream) !void {
         if (N > np or tokens.len < N) return error.TooManyRows;
         const ts: usize = self.block + 1; // out.stride(0)
-        var first: [np * 17]i64 = undefined;
-        for (0..N) |s_| first[s_ * ts] = tokens[s_];
-        for (0..N) |s_| try self.out.upload(s_ * ts * 8, std.mem.sliceAsBytes(first[s_ * ts .. s_ * ts + 1]));
+        for (0..N) |s_| {
+            const first: i64 = tokens[s_];
+            try up.put(self.out, s_ * ts * 8, std.mem.asBytes(&first), stream);
+        }
     }
 
     /// The Markov steps' launches after `seed`: out[s, 1 .. n_steps] (the drafts).
