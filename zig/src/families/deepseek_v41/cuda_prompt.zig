@@ -288,6 +288,7 @@ pub const Prompt = struct {
     // attention
     pos: cuda.DeviceBuffer, // int64 [rows]
     vis: cuda.DeviceBuffer,
+    vis_blk: cuda.DeviceBuffer, // a row block's vis rows, 16-aligned as the fork's `vis[r0:r1].contiguous()`
     gpos: cuda.DeviceBuffer, // int64 [rows + 1]: the groups' positions (group * ratio) of a kv source
     grows: cuda.DeviceBuffer, // int64 [rows + 1]: the groups' cache rows
     src_idx: cuda.DeviceBuffer, // int64 [ring]: ring rows gathered into wsrc
@@ -409,6 +410,7 @@ pub const Prompt = struct {
         self.z = try cuda.DeviceBuffer.alloc(d, @max(16, zw * 4));
         self.pos = try cuda.DeviceBuffer.alloc(d, r * 8);
         self.vis = try cuda.DeviceBuffer.alloc(d, r * 8);
+        self.vis_blk = try cuda.DeviceBuffer.alloc(d, r * 8);
         self.gpos = try cuda.DeviceBuffer.alloc(d, (r + 1) * 8);
         self.grows = try cuda.DeviceBuffer.alloc(d, (r + 1) * 8);
         self.src_idx = try cuda.DeviceBuffer.alloc(d, (c.window + 16) * 8);
@@ -482,7 +484,7 @@ pub const Prompt = struct {
     pub fn deinit(self: *Prompt) void {
         for (self.gate_w32) |*b| b.free();
         self.gpa.free(self.gate_w32);
-        inline for (.{ "had", "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "xh", "wq", "z", "pos", "vis", "gpos", "grows", "src_idx", "dst_idx", "wlo", "qa", "qr", "q", "ykv", "wsrc", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "x32", "wl", "wts", "score", "tmax", "cidx", "cand", "smax", "o", "og", "ug", "u", "out", "logits", "pick", "wts_moe", "moe", "xc", "local", "glog", "head_logits" }) |f| @field(self, f).free();
+        inline for (.{ "had", "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "xh", "wq", "z", "pos", "vis", "vis_blk", "gpos", "grows", "src_idx", "dst_idx", "wlo", "qa", "qr", "q", "ykv", "wsrc", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "x32", "wl", "wts", "score", "tmax", "cidx", "cand", "smax", "o", "og", "ug", "u", "out", "logits", "pick", "wts_moe", "moe", "xc", "local", "glog", "head_logits" }) |f| @field(self, f).free();
         self.scratch.deinit();
         self.gemm.deinit();
         self.pk.deinit();
@@ -917,7 +919,9 @@ pub const Prompt = struct {
             const rows = r1 - r0;
             const q = self.iqq.ptr + r0 * c.idx_heads * c.idx_dim * 2;
             const wt = self.wts.ptr + r0 * c.idx_heads * 2;
-            const vr = self.vis.ptr + r0 * 8;
+            // the block's vis rows copied to an aligned buffer: the captured kernels were specialized on a 16-aligned VIS
+            try self.vis_blk.copyFrom(0, self.vis.ptr + r0 * 8, rows * 8, stream.handle);
+            const vr = self.vis_blk.ptr;
             if (rows <= decode_rows) {
                 // kernels.index_score: a block of decode rows takes one row a program (the same kernel as a window)
                 try fwd.set.run(stream, "_index_score", .{ @intCast(rows), @intCast(nt), 1 }, &.{
