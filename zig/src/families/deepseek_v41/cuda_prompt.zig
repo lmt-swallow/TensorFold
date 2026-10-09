@@ -382,6 +382,11 @@ pub const Prompt = struct {
     cidx_cols: usize,
     cidx_stride: usize,
     kv_layer: usize, // shared["kv_layer"]
+    /// The rows the last chunk ran through every layer: positions top_start .. top_start + top_rows - 1 (the
+    /// chunk's, or under bounded replay those at or past `replay`; none for an encoder-only chunk). The taps hold
+    /// these rows (model.py `taps_start`).
+    top_start: usize = 0,
+    top_rows: usize = 0,
 
     /// Buffers for chunks of up to `rows` rows (at most max_chunk), sharing `fwd`'s weights and caches.
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, fwd: *Forward, kernels: *const exl3.Kernels, rows: usize) !Prompt {
@@ -506,6 +511,8 @@ pub const Prompt = struct {
         self.cidx_cols = 0;
         self.cidx_stride = 0;
         self.kv_layer = 0;
+        self.top_start = 0;
+        self.top_rows = 0;
         // the gate weights as fp32 (torch's gate_w.float(), once)
         var stream = try cuda.Stream.init(d, true);
         defer stream.deinit();
@@ -513,7 +520,9 @@ pub const Prompt = struct {
             self.gate_w32[li] = try cuda.DeviceBuffer.alloc(d, l.gate_w.count * 4);
             try self.castF16(l.gate_w.ptr(), self.gate_w32[li].ptr, l.gate_w.count, stream);
         }
-        try stream.synchronize();
+        // every setup copy and fill so far (this one's, and the weights' and caches' before it) ran on the legacy
+        // stream, which the chunks' non-blocking stream does not wait for: they complete before the first chunk
+        try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
         return self;
     }
 
@@ -542,12 +551,18 @@ pub const Prompt = struct {
     // -- the chunk -----------------------------------------------------------------------------------------------
 
     /// The prompt's ids at positions start .. start + n - 1 into the caches; returns the last row's logits [1, V]
-    /// f32 (null for a replay chunk that holds no decoder rows). Chunks of 16 rows or fewer go through `Forward.rows`
-    /// (the window kernels), as the fork's.
+    /// f32 (null for a replay chunk that holds no decoder rows, or without `o.logits`). Chunks of 16 rows or fewer go
+    /// through `Forward.rows` (the window kernels), as the fork's: under replay too once the chunk starts at or past
+    /// `replay` (the window kernels read no floor, and the kv source's update runs on the same rows either way).
     pub fn chunk(self: *Prompt, gather: Gather, ids: []const i64, start: usize, o: Options, stream: cuda.Stream) !?Ptr {
         const n = ids.len;
         if (n < 1 or n > self.rows) return error.TooManyRows;
-        if (n <= decode_rows and o.replay == null and o.taps == null and o.logits) return try self.fwd.rows(gather, ids, start, n, false, stream);
+        const whole = if (o.replay) |r| r <= start else true;
+        if (n <= decode_rows and whole and o.taps == null and o.logits) {
+            self.top_start = start;
+            self.top_rows = n;
+            return try self.fwd.rows(gather, ids, start, n, false, stream);
+        }
         const t0 = nowNs();
         var engram_ns: i128 = 0;
         try self.mark(0, stream);
@@ -603,19 +618,28 @@ pub const Prompt = struct {
         self.cidx_cols = 0;
         self.cidx_stride = 0;
         self.cand_rows = 0;
+        self.top_start = start;
+        self.top_rows = n;
+        // the window layers' picks (shared["topk"]) once replay leaves 16 rows or fewer: `attendWindow`
+        var window_picks: ?attention.Picks = null;
         for (w.layers, 0..) |*l, li| {
             if (o.replay) |replay| if (li == c.n_layers / 2) {
                 // CED bounded replay: this layer's kv source over every row, then only the rows at or past `replay`
                 try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
                 try self.kvSourceUpdate(li, self.x.ptr, rows, at, stream);
                 const first = @max(at, replay) - at;
-                if (first >= rows) return null;
+                if (first >= rows) {
+                    self.top_rows = 0;
+                    return null;
+                }
                 h += first * hcmod.hc_streams * dm * 2;
                 pre += first * hcmod.hc_streams * 4;
                 at += first;
                 rows -= first;
                 floor = replay;
                 kv_done = true;
+                self.top_start = at;
+                self.top_rows = rows;
             };
             const m0 = 1 + li * Profile.groups.len;
             if (l.engram_wkv != null) if (fwd.engram) |e| {
@@ -630,7 +654,11 @@ pub const Prompt = struct {
             try self.mark(m0, stream);
             try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, rows * dm * 2, stream);
-            const pa = try self.attend(li, self.x.ptr, rows, at, floor, kv_done and li == c.n_layers / 2, stream);
+            // 16 rows or fewer past a replay cut run model.py attention_k's ring mode: the window kernels
+            const pa = if (kv_done and rows <= decode_rows)
+                try self.attendWindow(li, self.x.ptr, rows, at, li == c.n_layers / 2, &window_picks, stream)
+            else
+                try self.attend(li, self.x.ptr, rows, at, floor, kv_done and li == c.n_layers / 2, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, rows * dm * 4, stream);
             try self.mark(m0 + 1, stream);
             try gather.run(pa, rows * dm, self.gathered.ptr, stream);
@@ -831,6 +859,23 @@ pub const Prompt = struct {
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.u.r0", .{li}), self.u.ptr, n * dims.groups * c.o_rank * 2, stream);
         try self.mm(p.wo_b, self.u.ptr, n, self.out.ptr, .f32, stream);
         return self.out.ptr;
+    }
+
+    /// model.py attention_k at 16 rows or fewer (ring mode, as a decode window: the window keys from the ring, no
+    /// floor) through the decode layer's `Attention`; `kv_done`: the kv source's update already ran for these rows
+    /// (the replay layer), so the window's own is skipped. `picks`: the latest index layer's, carried between layers.
+    fn attendWindow(self: *Prompt, li: usize, x: Ptr, n: usize, start: usize, kv_done: bool, picks: *?attention.Picks, stream: cuda.Stream) !Ptr {
+        const fwd = self.fwd;
+        const c = fwd.cfg;
+        const caches = fwd.cachesOf(li);
+        const rope = if (c.ratio(li) > 0) fwd.rope_c else fwd.rope_w;
+        const a = &fwd.attn[li];
+        const source = a.dims.kv_source;
+        if (kv_done) a.dims.kv_source = false;
+        defer a.dims.kv_source = source;
+        const pa = try a.forward(self.paramsOf(li), &caches, rope, x, n, start, picks.*, stream);
+        if (c.isIndexSource(li)) picks.* = a.picks();
+        return pa;
     }
 
     /// model.py kv_source_update over whole groups: the compressed latents and index keys of the groups the chunk

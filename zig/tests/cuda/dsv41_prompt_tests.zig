@@ -6,7 +6,9 @@
 //! logits, byte-equal to the fork's. A fixture dumped with `--engram` runs Engram on its layers as dsv41-forward does
 //! (TF_DS_ENGRAM, TF_DS_TOKEN_MAP), the host ids the whole prompt's. A lean fixture (`dump_prompt.py --lean`, long
 //! prompts) holds every chunk's other-rank partials and index picks but the rest only for the last chunk: what it
-//! does not hold is not compared (a rank-0 run).
+//! does not hold is not compared (a rank-0 run). A fixture dumped with `--replay` runs CED bounded replay (the upper
+//! layers over the prompt's last window rows): its gathers are the ones the fork made (none from the upper layers
+//! of an encoder-only chunk).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -139,6 +141,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     const cap: usize = @intCast(try cf.int("cap"));
     const world: u32 = @intCast(try cf.int("world"));
     try check.expect(world == 2, "the fixture's world is {d}; this test supplies one other rank", .{world});
+    const replay = dsv41.serve_lanes.replayFrom((cf.int("replay") catch 0) != 0, prompt_len, cfg.window);
 
     const rc_path = (try dsv41.rank_cache.RankCache.locate(gpa, io, cache_dir, rank, world)) orelse return error.NoRankCache;
     defer gpa.free(rc_path);
@@ -201,8 +204,9 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         const n_chunks: usize = @intCast(try fx.int("n_chunks"));
         supply.clear();
         try resetCaches(&fwd);
-        // every chunk's other-rank partials in gather order, then the head's
+        // every chunk's other-rank partials in gather order (the layers the chunk ran), then the head's
         for (0..n_chunks) |ci| for (0..layers) |li| {
+            if (replay != null and !holds(fx, try std.fmt.bufPrint(&nb, "C{d}.L{d}.p_attn.r{d}", .{ ci, li, other }))) continue;
             if (eng != null and w.layers[li].engram_wkv != null)
                 try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_engram.r{d}", .{ ci, li, other })));
             try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_attn.r{d}", .{ ci, li, other })));
@@ -217,10 +221,12 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         var prefix_buf: [16]u8 = undefined;
         var s: usize = 0;
         var ci: usize = 0;
+        // the caches' fills and the partials' uploads above ran on the legacy stream, outside the chunks' order
+        try gpu.ctx.synchronize();
         while (s < prompt_len) : (ci += 1) {
             const e = @min(prompt_len, s + chunk);
             supply.prefix = try std.fmt.bufPrint(&prefix_buf, "C{d}.", .{ci});
-            logits = try pr.chunk(gather, prompt_ids[s..e], s, .{ .logits = whole and e == prompt_len }, stream);
+            logits = try pr.chunk(gather, prompt_ids[s..e], s, .{ .replay = replay, .logits = whole and e == prompt_len }, stream);
             try stream.synchronize();
             // the caches after this chunk: every row but the compressed planes' scratch row
             for (0..layers) |li| {
@@ -260,7 +266,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
                 ok = false;
             }
         }
-        if (ok) check.pass("BITEXACT {s}: {d} chunk(s) over {d} tokens through {d} of {d} layers: the mixes, partials, streams, {d} index layers' picks and caches{s} equal to the Python fork's", .{ label, n_chunks, prompt_len, layers, fixture_layers, picks, if (whole) " and the last row's logits" else "" });
+        if (ok) check.pass("BITEXACT {s}: {d} chunk(s) over {d} tokens through {d} of {d} layers{s}: the mixes, partials, streams, {d} index layers' picks and caches{s} equal to the Python fork's", .{ label, n_chunks, prompt_len, layers, fixture_layers, if (replay != null) " (bounded replay)" else "", picks, if (whole) " and the last row's logits" else "" });
         if (!ok) failures += 1;
     }
     try check.expect(failures == 0, "{d} prompt case(s) differ from the fork", .{failures});

@@ -4,8 +4,10 @@ over a seeded prompt in chunks (engine.py prefill_steps: TF_DS_PREFILL_CHUNK row
 two-rank split, both ranks computed in one process (as dump_forward.py: the fork's `comm.gather` is a stack of the
 ranks' partials, the caches are replicated, so each sublayer runs once per rank on the same input), then the head on
 the prompt's last row. Every chunk records the mixes' inputs, both ranks' partials and the streams after each
-sublayer, the index layers' picks, and the cache planes after the chunk. No replay (TF_DS_REPLAY=0), no taps (the
-fixture's layers hold none); Engram runs on its layers when `--engram <dir>` names the tables (dump_forward.EngramRef:
+sublayer, the index layers' picks, and the cache planes after the chunk. No taps (the fixture's layers hold none);
+with `--replay`, CED bounded replay (engine.py prefill_steps with TF_DS_REPLAY=1: model.py `_forward_k`'s replay
+branch, the layers from n_layers / 2 over the prompt's rows at or past len(prompt) - window; an encoder-only chunk
+records nothing past that layer; the fixture needs more than n_layers / 2 layers); Engram runs on its layers when `--engram <dir>` names the tables (dump_forward.EngramRef:
 each rank's partial `L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded), as without tables it is
 skipped. With `--decode`, each chunk size's fixture also holds one decode row after the prompt (graph.py
 `StaticDecoder._body` at R = 1, as dump_forward.py runs it) on the prompt's greedy token (the argmax of the last row's
@@ -62,6 +64,7 @@ def main() -> int:
     ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
     ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
     ap.add_argument("--decode", action="store_true", help="one greedy decode row after the prompt (D.<name>)")
+    ap.add_argument("--replay", action="store_true", help="CED bounded replay (TF_DS_REPLAY=1)")
     ap.add_argument("--lean", action="store_true",
                     help="chunks before the last: only the .r1 partials and the picks (long prompts, rank-0 runs)")
     a = ap.parse_args()
@@ -110,9 +113,11 @@ def main() -> int:
                 torch.empty((n, c.hc), dtype=F32, device=dev), torch.empty((n, c.hc), dtype=F32, device=dev),
                 torch.empty((n, c.hc), dtype=F32, device=dev), torch.empty((n, c.hc, c.hc), dtype=F32, device=dev))
 
+    replay = max(0, a.prompt - c.window) if a.replay else None
+
     def chunk_forward(sc, ids: torch.Tensor, start: int, shared: list, record) -> tuple:
-        """model.py _forward_k over one chunk (no replay, no taps; Engram with --engram), each sublayer on both ranks' weights;
-        returns (h, pre) after the layers."""
+        """model.py _forward_k over one chunk (no taps; Engram with --engram; bounded replay with --replay), each
+        sublayer on both ranks' weights; returns (h, pre) after the layers, (None, None) for an encoder-only chunk."""
         n = ids.shape[0]
         assert start == sc.length
         sc.tokens[start:start + n] = ids
@@ -121,7 +126,30 @@ def main() -> int:
         pre = torch.zeros((n, c.hc), dtype=F32, device="cuda")
         pre[:, 0] = 1.0
         x, part, pre_a, pre_f, post, comb = mixes(n)
+        floor, kv_done = 0, False
         for li in range(L):
+            if replay is not None and li == c.n_layers // 2:
+                # model.py _forward_k's replay branch: the kv source over every row (each rank from the positional
+                # store before it, as the ranks keep their own caches), then only the rows at or past `replay`
+                lay = blocks.get(0, li)
+                fn, scale, base = lay.hc_attn
+                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+                mutable = list(sc.comp_raw.get(li, ()))
+                before = [t.clone() for t in mutable]
+                for r in range(world):
+                    for t, b in zip(mutable, before):
+                        t.copy_(b)
+                    m.kv_source_update(blocks.get(r, li), x, sc, start, shared[r])
+                first = max(start, replay) - start
+                if first >= n:
+                    sc.length = start + n
+                    return None, None
+                if first:
+                    h, pre = h[first:].contiguous(), pre[first:].contiguous()
+                    start, n = start + first, n - first
+                    pos = pos[first:]
+                    x, part, pre_a, pre_f, post, comb = mixes(n)
+                floor, kv_done = replay, True
             if eng is not None and blocks.get(0, li).engram_wkv is not None:
                 h = eng.apply(blocks, li, h, host, start, n, gather, record)
             lay = blocks.get(0, li)
@@ -140,7 +168,7 @@ def main() -> int:
                     q = mm(lay_r.wq_b, qr).view(n, m.Hl, c.head_dim)
                     K.rope_heads(q, cos, sin, pos, c.rope_dim)
                     y = mm(lay_r.wkv, x)
-                    lo = max(0, start - (c.window - 1))
+                    lo = max(floor, start - (c.window - 1))
                     wsrc = torch.empty((start - lo + n, c.head_dim), dtype=BF16, device="cuda")
                     if start > lo:
                         wsrc[:start - lo] = sc.ring[li][torch.arange(lo, start, device="cuda") % sc.ring_size]
@@ -163,7 +191,8 @@ def main() -> int:
             for r in range(world):
                 for t, b in zip(mutable, before):
                     t.copy_(b)
-                parts.append(m.attention_k(blocks.get(r, li), x, sc, start, shared[r], pos))
+                parts.append(m.attention_k(blocks.get(r, li), x, sc, start, shared[r], pos, floor=floor,
+                                           kv_done=kv_done and li == c.n_layers // 2))
             for r in range(world):
                 record(f"L{li}.p_attn.r{r}", parts[r])
             if "topk" in shared[0] and c.compress_ratios[li] > 0:
@@ -238,7 +267,7 @@ def main() -> int:
             cos_w, sin_w = m._cs(0, sc)
             common = {"prompt": a.prompt, "layers": L, "bucket": a.bucket, "cap": a.cap, "ring_size": sc.ring_size,
                       "raw": RAW, "world": world, "chunks": a.chunks, "rope_rows": cos_c.shape[0], "vocab_local": vocab_l,
-                      "engram": int(eng is not None)}
+                      "engram": int(eng is not None), "replay": int(a.replay)}
             ck.save(out / "fixtures" / "prompt_common", common, {"prompt_ids": prompt_ids, "cos_c": cos_c, "sin_c": sin_c, "cos_w": cos_w, "sin_w": sin_w})
         recorded: dict = {}
         shared = [{} for _ in range(world)]
@@ -258,7 +287,8 @@ def main() -> int:
                 if whole:
                     for k, v in df.planes(sc, L).items():
                         recorded[f"C{ci}.{k}"] = v.detach().clone()
-                last = (h, pre)
+                if h is not None:
+                    last = (h, pre)
             h, pre = last
             xc = K.collapse_norm(h[-1:].contiguous(), pre[-1:].contiguous(), w.norm, c.eps)
             recorded["head.xc"] = xc.clone()
@@ -269,7 +299,7 @@ def main() -> int:
         torch.cuda.synchronize()
         arrays = {"prompt_ids": prompt_ids, "expected_logits": logits.clone()}
         params = {"chunk": chunk, "n_chunks": len(starts), "prompt": a.prompt, "layers": L, "bucket": a.bucket, "cap": a.cap,
-                  "comp_rows": int(sc.comp[2][0].shape[0]) if 2 in sc.comp else 0, "lean": int(a.lean)}
+                  "comp_rows": int(sc.comp[2][0].shape[0]) if 2 in sc.comp else 0, "lean": int(a.lean), "replay": int(a.replay)}
         if a.decode:
             token = int(torch.argmax(logits[0]).item())   # torch's first index of the maximum
 

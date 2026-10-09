@@ -348,7 +348,7 @@ pub fn parallel(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []c
         const a = try L.Admit.parse(op);
         try check.expect(st.admits(a.slot, a.base, a.size, a.len(), a.chunk), "{s}: the record is runnable", .{label});
         const t0 = check.now(io);
-        try st.admit(gather, a.slot, a.base, a.size, a.idsInto(ids_buf), a.chunk);
+        try st.admit(gather, a.slot, a.base, a.size, a.idsInto(ids_buf), a.chunk, a.replay);
         try stream.synchronize();
         const ns = check.now(io) - t0;
         var ok = supply.next == marks[i];

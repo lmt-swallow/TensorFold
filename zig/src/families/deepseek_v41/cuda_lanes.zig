@@ -75,31 +75,32 @@ pub fn maxOpBytes(context: usize) usize {
 }
 
 /// The prefill step's record (little-endian): the opcode, the chunk rows (u32), the flags (u8: bit 0, Engram on;
-/// bit 1, DSpark taps absorbed), the prompt's length (u32), then its ids (i64 each). The record is what the ranks'
+/// bit 1, DSpark taps absorbed; bit 2, CED bounded replay), the prompt's length (u32), then its ids (i64 each). The record is what the ranks'
 /// digests agree on, so ranks that would chunk differently or disagree on Engram or the drafter (and so pair
 /// different gathers) stop before the first gather.
 pub const Prefill = struct {
     chunk: usize,
     engram: bool,
     drafts: bool,
+    replay: bool,
     ids: []const u8, // the ids' little-endian bytes, 8 a token
 
     pub const header: usize = 10;
 
-    pub fn encode(buf: []u8, chunk: usize, engram: bool, drafts: bool, ids: []const i64) []const u8 {
+    pub fn encode(buf: []u8, chunk: usize, engram: bool, drafts: bool, replay: bool, ids: []const i64) []const u8 {
         buf[0] = @intFromEnum(Op.prefill);
         std.mem.writeInt(u32, buf[1..5], @intCast(chunk), .little);
-        buf[5] = @as(u8, @intFromBool(engram)) | @as(u8, @intFromBool(drafts)) << 1;
+        buf[5] = @as(u8, @intFromBool(engram)) | @as(u8, @intFromBool(drafts)) << 1 | @as(u8, @intFromBool(replay)) << 2;
         std.mem.writeInt(u32, buf[6..10], @intCast(ids.len), .little);
         for (ids, 0..) |id, i| std.mem.writeInt(i64, buf[header + 8 * i ..][0..8], id, .little);
         return buf[0 .. header + 8 * ids.len];
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Prefill {
-        if (op.len < header or op[0] != @intFromEnum(Op.prefill) or op[5] > 3) return error.BadRecord;
+        if (op.len < header or op[0] != @intFromEnum(Op.prefill) or op[5] > 7) return error.BadRecord;
         const n = std.mem.readInt(u32, op[6..10], .little);
         if (op.len != header + 8 * @as(usize, n)) return error.BadRecord;
-        return .{ .chunk = std.mem.readInt(u32, op[1..5], .little), .engram = op[5] & 1 != 0, .drafts = op[5] & 2 != 0, .ids = op[header..] };
+        return .{ .chunk = std.mem.readInt(u32, op[1..5], .little), .engram = op[5] & 1 != 0, .drafts = op[5] & 2 != 0, .replay = op[5] & 4 != 0, .ids = op[header..] };
     }
 
     pub fn len(self: Prefill) usize {
@@ -118,7 +119,7 @@ pub const Prefill = struct {
     pub fn run(op: []const u8, seq: *Sequence, gather: forward.Gather, ids_buf: []i64) !void {
         const p = try parse(op);
         if (p.len() > ids_buf.len) return error.PromptTooLong;
-        try seq.prefill(gather, p.idsInto(ids_buf), p.chunk);
+        try seq.prefill(gather, p.idsInto(ids_buf), p.chunk, p.replay);
     }
 };
 
@@ -232,7 +233,15 @@ pub const Settings = struct {
     drafts: bool = false,
     /// Streams at once (the pool's slots), 1 to `max_slots`.
     slots: usize = max_slots,
+    /// CED bounded replay (TF_DS_REPLAY=1): a prompt's layers from n_layers / 2 run only its last `window` rows.
+    replay: bool = false,
 };
+
+/// engine.py prefill_steps' `replay`: with bounded replay, the first position the upper layers run (the prompt's
+/// last `window` rows); null without.
+pub fn replayFrom(replay: bool, prompt_len: usize, window: usize) ?usize {
+    return if (replay) prompt_len -| window else null;
+}
 
 /// One sequence on caches of its own (the fixture tests' path): the prompt path (`pr`) and the decode layer loop (`fwd`) over the same caches
 /// (`fwd`'s rings and compressed planes), the host ids Engram hashes, the drafter's cache and the taps, and the
@@ -312,9 +321,10 @@ pub const Sequence = struct {
     /// The prompt's ids into the caches from position 0 (engine.py prefill_steps from start 0): chunks of `chunk`
     /// rows at positions 0, chunk, 2 chunk, ..., the last one the remainder; the last row's logits in `logits`.
     /// With a drafter, each chunk's taps are absorbed after it (`drafter.absorb(dc, sc, torch.cat(taps, -1),
-    /// m.taps_start)`). Runs every chunk once started: the other ranks cannot see a cancel, so stopping early on one
-    /// rank would leave the others in an unpaired gather.
-    pub fn prefill(self: *Sequence, gather: forward.Gather, ids: []const i64, chunk: usize) !void {
+    /// m.taps_start)`): under bounded replay (`replay`), the rows that reached the upper layers, none from an
+    /// encoder-only chunk. Runs every chunk once started: the other ranks cannot see a cancel, so stopping early on
+    /// one rank would leave the others in an unpaired gather.
+    pub fn prefill(self: *Sequence, gather: forward.Gather, ids: []const i64, chunk: usize, replay: bool) !void {
         if (chunk < 1 or chunk > self.pr.rows) return error.BadChunk;
         if (ids.len == 0 or ids.len + 1 > self.limit()) return error.PromptTooLong;
         self.pos = 0;
@@ -336,14 +346,20 @@ pub const Sequence = struct {
             if (self.engram) |g| if (!last) try g.prefetch(self.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
             // A chunk of max_rows or fewer is a decode window (it runs the head): Prompt.chunk sends it through
             // `Forward.rows` only when it asks for logits; with taps it goes there through `rowsTapped`.
-            const out = if (self.spark != null and e - s <= max_rows)
+            const from = replayFrom(replay, ids.len, self.fwd.cfg.window);
+            var top: [2]usize = .{ s, e - s };
+            const out = if (self.spark != null and e - s <= max_rows and (from orelse 0) <= s)
                 try self.rowsTapped(gather, ids[s..e], s, false)
-            else
-                try self.pr.chunk(gather, ids[s..e], s, .{
+            else blk: {
+                const o = try self.pr.chunk(gather, ids[s..e], s, .{
+                    .replay = from,
                     .logits = last or e - s <= max_rows,
                     .taps = if (self.spark != null) .{ .buf = self.taps.ptr, .stride = self.tapCols() } else null,
                 }, self.stream);
-            if (self.spark) |sp| try sp.absorb(&self.dc.?, self.taps.ptr, s, e - s, self.draftRope(), self.stream);
+                top = .{ self.pr.top_start, self.pr.top_rows };
+                break :blk o;
+            };
+            if (self.spark) |sp| if (top[1] > 0) try sp.absorb(&self.dc.?, self.taps.ptr, top[0], top[1], self.draftRope(), self.stream);
             if (last) self.logits = out orelse return error.BadChunk;
             s = e;
         }
@@ -563,12 +579,13 @@ pub const Extents = struct {
 };
 
 /// The admission step's record: the opcode, the slot (u8), the flags (u8: bit 0 Engram on, bit 1 DSpark taps
-/// absorbed), the chunk rows (u32), the extent's base and size (u64 each), the prompt's length (u32), its ids (i64
+/// absorbed, bit 2 CED bounded replay), the chunk rows (u32), the extent's base and size (u64 each), the prompt's length (u32), its ids (i64
 /// each). Every rank fills the slot's extent from position 0 through the prompt path in the record's chunks.
 pub const Admit = struct {
     slot: usize,
     engram: bool,
     drafts: bool,
+    replay: bool = false,
     chunk: usize,
     base: usize,
     size: usize,
@@ -579,7 +596,7 @@ pub const Admit = struct {
     pub fn encode(buf: []u8, a: Admit, ids: []const i64) []const u8 {
         buf[0] = @intFromEnum(Op.admit);
         buf[1] = @intCast(a.slot);
-        buf[2] = @as(u8, @intFromBool(a.engram)) | @as(u8, @intFromBool(a.drafts)) << 1;
+        buf[2] = @as(u8, @intFromBool(a.engram)) | @as(u8, @intFromBool(a.drafts)) << 1 | @as(u8, @intFromBool(a.replay)) << 2;
         std.mem.writeInt(u32, buf[3..7], @intCast(a.chunk), .little);
         std.mem.writeInt(u64, buf[7..15], @intCast(a.base), .little);
         std.mem.writeInt(u64, buf[15..23], @intCast(a.size), .little);
@@ -589,13 +606,14 @@ pub const Admit = struct {
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Admit {
-        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 3) return error.BadRecord;
+        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 7) return error.BadRecord;
         const n = std.mem.readInt(u32, op[23..27], .little);
         if (op.len != header + 8 * @as(usize, n)) return error.BadRecord;
         return .{
             .slot = op[1],
             .engram = op[2] & 1 != 0,
             .drafts = op[2] & 2 != 0,
+            .replay = op[2] & 4 != 0,
             .chunk = std.mem.readInt(u32, op[3..7], .little),
             .base = @intCast(std.mem.readInt(u64, op[7..15], .little)),
             .size = @intCast(std.mem.readInt(u64, op[15..23], .little)),
@@ -982,7 +1000,7 @@ pub const Streams = struct {
     /// extent taken, the prompt's chunks of `chunk` rows through the prompt path, each chunk's taps absorbed into the
     /// slot's drafter rings; the last row's logits in `logits`. Runs every chunk once started (the other ranks
     /// cannot see a cancel).
-    pub fn admit(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize) !void {
+    pub fn admit(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool) !void {
         if (!self.admits(slot, base, size, ids.len, chunk)) return error.PositionMismatch;
         if (!self.extents.takeAt(base, size)) return error.PositionMismatch;
         const lane = &self.lanes[slot];
@@ -1007,14 +1025,20 @@ pub const Streams = struct {
             const last = e == ids.len;
             // the next chunk's Engram rows read while this one runs (engine.py prefill_steps' `ahead`)
             if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
-            const out = if (self.spark != null and e - s <= max_rows)
+            const from = replayFrom(replay, ids.len, self.cfg.window);
+            var top: [2]usize = .{ s, e - s };
+            const out = if (self.spark != null and e - s <= max_rows and (from orelse 0) <= s)
                 try self.rowsTapped(gather, ids[s..e], s)
-            else
-                try self.pr.chunk(gather, ids[s..e], s, .{
+            else blk: {
+                const o = try self.pr.chunk(gather, ids[s..e], s, .{
+                    .replay = from,
                     .logits = last or e - s <= max_rows,
                     .taps = if (self.spark != null) .{ .buf = self.taps.ptr, .stride = self.tapCols() } else null,
                 }, self.stream);
-            if (self.spark) |sp| try sp.absorb(&dc.?, self.taps.ptr, s, e - s, self.draftRope(), self.stream);
+                top = .{ self.pr.top_start, self.pr.top_rows };
+                break :blk o;
+            };
+            if (self.spark) |sp| if (top[1] > 0) try sp.absorb(&dc.?, self.taps.ptr, top[0], top[1], self.draftRope(), self.stream);
             if (last) self.logits = out orelse return error.BadChunk;
             s = e;
         }
@@ -1406,7 +1430,7 @@ pub const Engine = struct {
         const before = cuda.usage(false).device;
         try e.streams.init(gpa, ctx.d, &e.fwd, &e.kernels, e.engram, e.chunk, e.stream, e.drafter, s.slots, s.context + extra);
         errdefer e.streams.deinit();
-        if (s.rank == 0) std.log.info("deepseek_v41: {d} stream slots over a window of {d} positions ({d:.2} GiB), prompts in chunks of {d} rows", .{ s.slots, e.streams.extents.total, @as(f64, @floatFromInt(cuda.usage(false).device - before)) / (1 << 30), e.chunk });
+        if (s.rank == 0) std.log.info("deepseek_v41: {d} stream slots over a window of {d} positions ({d:.2} GiB), prompts in chunks of {d} rows{s}", .{ s.slots, e.streams.extents.total, @as(f64, @floatFromInt(cuda.usage(false).device - before)) / (1 << 30), e.chunk, if (s.replay) ", bounded replay (TF_DS_REPLAY=1)" else "" });
         clock.mark("the stream pool", .{});
         if (getenv("TF_DS_PROFILE") != null) try e.streams.pr.enableProfile();
         // the communicator after the loads: each rank loads on its own, then they meet (rank 1 retries its
@@ -1546,7 +1570,7 @@ pub const Engine = struct {
             .admit => {
                 const a = try Admit.parse(op);
                 if (a.len() > e.ids_buf.len) return error.PromptTooLong;
-                try e.streams.admit(e.gather(), a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk);
+                try e.streams.admit(e.gather(), a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk, a.replay);
             },
             .rounds => {
                 var r: Round = undefined;
@@ -1870,7 +1894,7 @@ pub const Lanes = struct {
         if (s.isCancelled()) return error.Cancelled;
         const ids = e.ids_buf[0..ptoks.len];
         for (ids, ptoks) |*id, t| id.* = t;
-        const op = Admit.encode(e.op_buf, .{ .slot = free, .engram = e.engram != null, .drafts = e.drafter != null, .chunk = e.chunk, .base = base, .size = Extents.size(need), .ids = &.{} }, ids);
+        const op = Admit.encode(e.op_buf, .{ .slot = free, .engram = e.engram != null, .drafts = e.drafter != null, .replay = e.settings.replay, .chunk = e.chunk, .base = base, .size = Extents.size(need), .ids = &.{} }, ids);
         try e.both(op);
         self.owner[free] = s;
         var first: [1]u32 = undefined;
@@ -1987,13 +2011,20 @@ pub const Lanes = struct {
     }
 };
 
+test "bounded replay starts the upper layers at the prompt's last window rows, at 0 for a prompt within the window" {
+    try std.testing.expectEqual(@as(?usize, null), replayFrom(false, 600, 128));
+    try std.testing.expectEqual(@as(?usize, 472), replayFrom(true, 600, 128));
+    try std.testing.expectEqual(@as(?usize, 0), replayFrom(true, 128, 128));
+    try std.testing.expectEqual(@as(?usize, 0), replayFrom(true, 5, 128));
+}
+
 test "rope rows align up to 4096 past the context and the window's extra rows" {
     try std.testing.expectEqual(@as(usize, 4096), ropeRows(1024));
     try std.testing.expectEqual(@as(usize, 20480), ropeRows(16384));
     try std.testing.expectEqual(@as(usize, 69632), ropeRows(65536));
 }
 
-test "a prefill record parses back to its chunk, Engram and drafter flags and ids; a cut or foreign record is refused" {
+test "a prefill record parses back to its chunk, Engram, drafter and replay flags and ids; a cut or foreign record is refused" {
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const r = prng.random();
     var buf: [Prefill.header + 8 * 64]u8 = undefined;
@@ -2005,10 +2036,12 @@ test "a prefill record parses back to its chunk, Engram and drafter flags and id
         const chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk);
         const engram = r.boolean();
         const drafts = r.boolean();
-        const op = Prefill.encode(&buf, chunk, engram, drafts, ids[0..n]);
+        const replay = r.boolean();
+        const op = Prefill.encode(&buf, chunk, engram, drafts, replay, ids[0..n]);
         try std.testing.expectEqual(Prefill.header + 8 * n, op.len);
         const p = try Prefill.parse(op);
         try std.testing.expectEqual(chunk, p.chunk);
+        try std.testing.expectEqual(replay, p.replay);
         try std.testing.expectEqual(engram, p.engram);
         try std.testing.expectEqual(drafts, p.drafts);
         try std.testing.expectEqualSlices(i64, ids[0..n], p.idsInto(&back));
@@ -2147,10 +2180,10 @@ test "admission, round, drafts, keeps and measure records parse back to what was
     for (0..300) |_| {
         const n = r.intRangeAtMost(usize, 0, ids.len);
         for (ids[0..n]) |*id| id.* = r.int(i64);
-        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .ids = &.{} };
+        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .ids = &.{} };
         const op = Admit.encode(&buf, a, ids[0..n]);
         const p = try Admit.parse(op);
-        try std.testing.expect(p.slot == a.slot and p.engram == a.engram and p.drafts == a.drafts and p.chunk == a.chunk and p.base == a.base and p.size == a.size);
+        try std.testing.expect(p.slot == a.slot and p.engram == a.engram and p.drafts == a.drafts and p.replay == a.replay and p.chunk == a.chunk and p.base == a.base and p.size == a.size);
         try std.testing.expectEqualSlices(i64, ids[0..n], p.idsInto(&back));
         try std.testing.expectError(error.BadRecord, Admit.parse(op[0 .. op.len - 1]));
         try std.testing.expectError(error.BadRecord, Prefill.parse(op));

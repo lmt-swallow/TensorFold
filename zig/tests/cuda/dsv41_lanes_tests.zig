@@ -5,7 +5,7 @@
 //! fork's order; the caches after the prompt and the last row's logits byte-equal to the fork's. A fixture dumped
 //! with `--decode` then has the first token (the logits' argmax) equal to the fork's and one round (`Sequence.round`,
 //! the decode layer loop on the same caches) byte-equal in its logits and caches. A fixture dumped with `--engram`
-//! runs Engram (TF_DS_ENGRAM, TF_DS_TOKEN_MAP).
+//! runs Engram (TF_DS_ENGRAM, TF_DS_TOKEN_MAP); one dumped with `--replay` sends the record's replay flag.
 //!
 //! `dsv41-lanes-spec <dir> <rank-cache-dir> <model-dir> <rank> [aot-dir]`: the served engine's drafted rounds at one
 //! rank on dump_spec.py's fixture (spec_capture.sh's work dir): the prefill record with the drafter (each chunk's
@@ -79,6 +79,12 @@ fn same(gpu: Gpu, fx: Fixture, got: cuda.DeviceBuffer, name: []const u8, label: 
     return true;
 }
 
+/// Whether the fixture holds the array `name` (a replay chunk's encoder-only layers made no gathers).
+fn holds(fx: Fixture, name: []const u8) bool {
+    const arrays = (fx.parsed.value.object.get("arrays") orelse return false).object;
+    return arrays.contains(name);
+}
+
 /// Every layer's cache planes against the fixture's `<prefix>L<i>.<plane>` (all but the compressed planes' scratch row).
 fn planesSame(gpu: Gpu, fx: Fixture, fwd: *const dsv41.forward.Forward, prefix: []const u8, label: []const u8) !bool {
     const cfg = fwd.cfg;
@@ -144,6 +150,7 @@ pub fn prefill(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
     const cap: usize = @intCast(try cf.int("cap"));
     const world: u32 = @intCast(try cf.int("world"));
     try check.expect(world == 2, "the fixture's world is {d}; this test supplies one other rank", .{world});
+    const replay = (cf.int("replay") catch 0) != 0;
 
     const rc_path = (try dsv41.rank_cache.RankCache.locate(gpa, io, cache_dir, rank, world)) orelse return error.NoRankCache;
     defer gpa.free(rc_path);
@@ -208,6 +215,7 @@ pub fn prefill(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
         // the fork's gathers in order: every chunk's layers (Engram's on its layers, attention's, the MoE's), the
         // head's on the last chunk; then the decode row's
         for (0..n_chunks) |ci| for (0..layers) |li| {
+            if (replay and !holds(fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_attn.r{d}", .{ ci, li, other }))) continue;
             if (eng != null and w.layers[li].engram_wkv != null) try supply.add(fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_engram.r{d}", .{ ci, li, other }));
             try supply.add(fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_attn.r{d}", .{ ci, li, other }));
             try supply.add(fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_moe.r{d}", .{ ci, li, other }));
@@ -224,10 +232,11 @@ pub fn prefill(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
         }
 
         // the step as announced and as run on every rank
-        const op = L.Prefill.encode(op_buf, chunk, eng != null, false, prompt_ids);
+        const op = L.Prefill.encode(op_buf, chunk, eng != null, false, replay, prompt_ids);
         const parsed = try L.Prefill.parse(op);
-        try check.expect(parsed.chunk == chunk and parsed.engram == (eng != null) and parsed.len() == prompt_len, "{s}: the record parses back", .{label});
-        try stream.synchronize();
+        try check.expect(parsed.chunk == chunk and parsed.engram == (eng != null) and parsed.replay == replay and parsed.len() == prompt_len, "{s}: the record parses back", .{label});
+        // the caches' fills and the partials' uploads above ran on the legacy stream, outside the step's order
+        try gpu.ctx.synchronize();
         const t0 = check.now(io);
         try L.Prefill.run(op, &seq, gather, ids_buf);
         try stream.synchronize();
@@ -248,6 +257,7 @@ pub fn prefill(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
             const token = try seq.argmax();
             var dok = token == want;
             if (!dok) std.debug.print("FAIL {s}: the first token {d}, the fork's {d}\n", .{ label, token, want });
+            try gpu.ctx.synchronize();
             try seq.round(gather, token);
             try stream.synchronize();
             if (supply.next != supply.other.items.len) {
@@ -410,7 +420,7 @@ pub fn spec(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const
     // the prompt, as announced and as every rank runs it
     {
         const label = "dsv41-lanes-spec prompt";
-        const op = L.Prefill.encode(op_buf, chunk, false, true, prompt_ids);
+        const op = L.Prefill.encode(op_buf, chunk, false, true, false, prompt_ids);
         const parsed = try L.Prefill.parse(op);
         try check.expect(parsed.drafts and !parsed.engram and parsed.chunk == chunk, "{s}: the record parses back", .{label});
         const t0 = check.now(io);

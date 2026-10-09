@@ -2,7 +2,8 @@
 //! first `layers` layers from its rank cache, the RoPE tables of the Triton set's `rope/` dir, Engram when
 //! TF_DS_ENGRAM names the tables, a synthetic prompt of `tokens` ids (a fixed pseudo-random draw a run), and a
 //! gather that stands the rank's own partial in for the other rank's. Every chunk is profiled (`Prompt.Profile`);
-//! the output is timing only, its bits are not checked.
+//! the output is timing only, its bits are not checked. TF_DS_REPLAY=1 runs CED bounded replay (the upper layers
+//! over the prompt's last window rows); TF_DS_PROFILE=0 times the chunks without the per-chunk profile.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
@@ -83,7 +84,8 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
     defer if (eng) |e| e.deinit();
     var seq = try L.Sequence.init(gpa, gpu.d, &fwd, &kernels, eng, L.default_chunk, stream, null);
     defer seq.deinit(gpa);
-    try seq.pr.enableProfile();
+    if (!std.mem.eql(u8, getenv("TF_DS_PROFILE") orelse "1", "0")) try seq.pr.enableProfile();
+    const replay = std.mem.eql(u8, getenv("TF_DS_REPLAY") orelse "0", "1");
     const gather: dsv41.forward.Gather = .{ .ctx = &seq, .call = selfGather };
     const ids = try gpa.alloc(i64, tokens);
     defer gpa.free(ids);
@@ -93,9 +95,9 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
         for (ids) |*id| id.* = prng.random().intRangeLessThan(i64, 3, @intCast(cfg.vocab - 1024));
         try stream.synchronize();
         const t0 = check.now(io);
-        try seq.prefill(gather, ids, L.default_chunk);
+        try seq.prefill(gather, ids, L.default_chunk, replay);
         try stream.synchronize();
         const ms = @as(f64, @floatFromInt(check.now(io) - t0)) / 1e6;
-        std.debug.print("RESULT dsv41-prompt-time run {d}: {d} tokens, {d} layers, Engram {s}: {d:.0} ms, {d:.0} tok/s\n", .{ r, tokens, w.layers.len, if (eng != null) "on" else "off", ms, @as(f64, @floatFromInt(tokens)) * 1000 / ms });
+        std.debug.print("RESULT dsv41-prompt-time run {d}: {d} tokens, {d} layers, Engram {s}, replay {s}: {d:.0} ms, {d:.0} tok/s\n", .{ r, tokens, w.layers.len, if (eng != null) "on" else "off", if (replay) "on" else "off", ms, @as(f64, @floatFromInt(tokens)) * 1000 / ms });
     }
 }
