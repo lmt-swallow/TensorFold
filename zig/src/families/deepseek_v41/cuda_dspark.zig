@@ -761,6 +761,28 @@ pub const Drafter = struct {
 
     // -- the pool's rings (concurrent streams) -------------------------------------------------------------------
 
+    /// dspark.py `absorb_many` over several streams at once: the taps [n, 3 d] (row i at position `pos[i]` of slot
+    /// `slots[i]`) into every stage's ring plane (row slots[i] x ring + pos[i] % ring), the GEMMs over all n rows in one
+    /// pass as the fork concatenates them (a 1-row GEMM's bits are not a 4-row one's); n <= 128, each stream's rows
+    /// fewer than a ring. The slots' `absorbed` are the caller's.
+    pub fn absorbRows(self: *Drafter, pool: *DraftPool, taps: Ptr, pos: []const usize, slots: []const usize, rope: Rope, stream: cuda.Stream) !void {
+        const dm = self.dims;
+        const n = pos.len;
+        if (n == 0) return;
+        if (n > 128 or slots.len != n) return error.TooManyRows;
+        var tab: [128]i64 = undefined;
+        for (0..n) |i| tab[i] = @intCast(pos[i]);
+        try self.abs_pos.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+        for (0..n) |i| tab[i] = @intCast(slots[i] * dm.ring + pos[i] % dm.ring);
+        try self.abs_slots.upload(0, std.mem.sliceAsBytes(tab[0..n]));
+        try self.head.main_proj.run(taps, .bf16, n, self.xh.ptr, self.z.ptr, self.main_y.ptr, .bf16, stream);
+        try self.rmsnorm(self.main_y.ptr, self.head.main_norm, self.main_x.ptr, n, dm.d, stream);
+        for (self.stages, pool.rings) |s, ring| {
+            try s.wkv.run(self.main_x.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.abs_kv.ptr, .bf16, stream);
+            try self.kvNormRope(self.abs_kv.ptr, s.kv_norm, rope, self.abs_pos.ptr, self.abs_slots.ptr, ring.ptr, self.abs_kv.ptr, n, stream);
+        }
+    }
+
     /// dspark.py `absorb_many` for one slot: the taps of positions start .. start + n - 1 into slot `slot`'s rows of
     /// every stage's ring plane (row = slot x ring + position % ring); the slot's `absorbed` is the caller's.
     pub fn absorbSlot(self: *Drafter, pool: *DraftPool, slot: usize, taps: Ptr, start: usize, n_in: usize, rope: Rope, stream: cuda.Stream) !void {

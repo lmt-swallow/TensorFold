@@ -824,6 +824,7 @@ pub const Streams = struct {
     dpool: ?dspark.DraftPool,
     dc_rings: []cuda.DeviceBuffer, // the admitted slot's drafter rings (views of the DraftPool's planes)
     taps: cuda.DeviceBuffer, // a prompt chunk's taps, bf16 [rows, taps x d]
+    kept_taps: cuda.DeviceBuffer, // a drafts step's kept rows' taps, every stream's in request order
     tap_rows: usize = 0,
     prev_probe: ?forward.Probe = null,
     lanes: []Lane,
@@ -845,7 +846,7 @@ pub const Streams = struct {
         self.* = .{
             .gpa = gpa, .d = d, .cfg = cfg, .base = base, .view = base.*, .view_rings = &.{}, .view_planes = &.{}, .pool = undefined,
             .runner = undefined, .pr = undefined, .extents = Extents.init(cap), .engram = engram, .spark = spark, .dpool = null,
-            .dc_rings = &.{}, .taps = .{ .d = d, .ptr = 0, .len = 0 }, .lanes = &.{}, .logits_h = &.{}, .stream = stream,
+            .dc_rings = &.{}, .taps = .{ .d = d, .ptr = 0, .len = 0 }, .kept_taps = .{ .d = d, .ptr = 0, .len = 0 }, .lanes = &.{}, .logits_h = &.{}, .stream = stream,
         };
         self.pool = try rounds.Pool.init(gpa, d, cfg, L, slots, cap);
         errdefer self.pool.deinit();
@@ -879,6 +880,8 @@ pub const Streams = struct {
         if (spark) |sp| {
             self.taps = try cuda.DeviceBuffer.alloc(d, @max(rows, max_rows) * self.tapCols() * 2);
             errdefer self.taps.free();
+            self.kept_taps = try cuda.DeviceBuffer.alloc(d, max_rows * self.tapCols() * 2);
+            errdefer self.kept_taps.free();
             self.dpool = try dspark.DraftPool.init(gpa, d, sp.stages.len, slots, sp.dims);
             errdefer self.dpool.?.deinit(gpa);
             self.dc_rings = try gpa.alloc(cuda.DeviceBuffer, sp.stages.len);
@@ -890,6 +893,7 @@ pub const Streams = struct {
         if (self.dc_rings.len > 0) gpa.free(self.dc_rings);
         if (self.dpool) |*p| p.deinit(gpa);
         if (self.taps.len > 0) self.taps.free();
+        if (self.kept_taps.len > 0) self.kept_taps.free();
         gpa.free(self.logits_h);
         for (self.lanes) |l| gpa.free(l.hist);
         gpa.free(self.lanes);
@@ -1100,23 +1104,33 @@ pub const Streams = struct {
         return true;
     }
 
-    /// The drafts step (multi.py `_round`'s absorb of the kept rows, then `_drafts`): each stream's kept rows' taps
-    /// into its slot's rings (dspark.py `absorb_many`, a slot at a time: the same rows), its length at them; then
-    /// the drafting streams' blocks in batched passes over the DraftPool (dspark.py `BatchDraftGraph`, at most
-    /// `draftBatch` streams a pass), each stream holding its first `depth` drafts.
+    /// The drafts step (multi.py `_round`'s absorb of the kept rows, then `_drafts`): every stream's kept rows' taps
+    /// into its slot's rings in one pass (dspark.py `absorb_many`, the rows in request order), each stream's length
+    /// at them; then the drafting streams' blocks in batched passes over the DraftPool (dspark.py
+    /// `BatchDraftGraph`, at most `draftBatch` streams a pass), each stream holding its first `depth` drafts.
     pub fn draft(self: *Streams, asks: []const DraftAsk) !void {
         if (!self.draftable(asks)) return error.PositionMismatch;
         const sp = self.spark.?;
         const dp = &self.dpool.?;
         const rope = self.draftRope();
+        const row_bytes = self.tapCols() * 2;
+        var pos: [max_rows]usize = undefined;
+        var slot_of: [max_rows]usize = undefined;
+        var k: usize = 0;
         for (asks) |a| {
             const l = &self.lanes[a.slot];
             l.held = 0;
             if (a.absorb == 0) continue;
-            try sp.absorbSlot(dp, a.slot, self.runner.taps.ptr + l.row0 * self.tapCols() * 2, a.start, a.absorb, rope, self.stream);
+            try self.kept_taps.copyFrom(k * row_bytes, self.runner.taps.ptr + l.row0 * row_bytes, a.absorb * row_bytes, self.stream.handle);
+            for (0..a.absorb) |i| {
+                pos[k + i] = a.start + i;
+                slot_of[k + i] = a.slot;
+            }
+            k += a.absorb;
             l.pos = a.start + a.absorb;
             l.absorbed = l.pos;
         }
+        try sp.absorbRows(dp, self.kept_taps.ptr, pos[0..k], slot_of[0..k], rope, self.stream);
         var tokens: [max_slots]u32 = undefined;
         var q0: [max_slots]usize = undefined;
         var slots: [max_slots]usize = undefined;
