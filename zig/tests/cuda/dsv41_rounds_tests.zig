@@ -177,6 +177,7 @@ const Rounds = dsv41.rounds;
 /// test's Supply), and every probed buffer kept for the comparison after the run.
 const Supply = struct {
     gpu: Gpu,
+    rank: usize = 0,
     rank1: std.ArrayList(cuda.DeviceBuffer),
     next: usize = 0,
     names: std.ArrayList([]const u8),
@@ -197,7 +198,10 @@ const Supply = struct {
         const self: *Supply = @ptrCast(@alignCast(ctx));
         var buf = try cuda.DeviceBuffer.alloc(self.gpu.d, bytes);
         try buf.copyFrom(0, ptr, bytes, stream.handle);
-        try self.names.append(self.gpu.gpa, try self.gpu.gpa.dupe(u8, name));
+        // the round names its own partials `.r0`; the fixture's are by rank
+        const key = try self.gpu.gpa.dupe(u8, name);
+        if (self.rank == 1 and std.mem.endsWith(u8, key, ".r0")) key[key.len - 1] = '1';
+        try self.names.append(self.gpu.gpa, key);
         try self.probes.append(self.gpu.gpa, buf);
     }
 
@@ -213,7 +217,9 @@ const Supply = struct {
 
 /// `dsv41-rounds <dir> <rank-cache-dir> <model-dir> [aot-dir]`: one round over two streams' windows in a pool,
 /// rank 0's weights from the Python rank cache, the other rank's partials from the fixture.
-pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, aot_override: ?[]const u8) !void {
+pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, aot_override: ?[]const u8, rank_arg: ?[]const u8) !void {
+    const rank: usize = if (rank_arg) |r| try std.fmt.parseInt(usize, r, 10) else 0;
+    const other: usize = 1 - rank;
     const gpa = gpu.gpa;
     const io = gpu.io;
     const aot_dir = if (aot_override) |a| try gpa.dupe(u8, a) else try std.fs.path.join(gpa, &.{ dir, "aot" });
@@ -239,13 +245,13 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     var glue = try dsv41.attention.Glue.load(gpu.d);
     defer glue.deinit();
     var cfg = try dsv41.config.Config.read(gpa, io, model_dir);
-    const rc_path = (try dsv41.rank_cache.RankCache.locate(gpa, io, cache_dir, 0, world)) orelse return error.NoRankCache;
+    const rc_path = (try dsv41.rank_cache.RankCache.locate(gpa, io, cache_dir, rank, world)) orelse return error.NoRankCache;
     defer gpa.free(rc_path);
     var rc = try dsv41.rank_cache.RankCache.open(gpa, rc_path);
     defer rc.close();
-    var w = try dsv41.weights.load(gpa, gpu.d, &cfg, &rc, &kernels, 0, world, .mul1, layers);
+    var w = try dsv41.weights.load(gpa, gpu.d, &cfg, &rc, &kernels, rank, world, .mul1, layers);
     defer w.deinit();
-    check.pass("dsv41 rounds: {d} layers of rank 0 loaded from {s}", .{ layers, rc_path });
+    check.pass("dsv41 rounds: {d} layers of rank {d} loaded from {s}", .{ layers, rank, rc_path });
     var rope_c: dsv41.attention.Rope = .{ .cos = try h.upload("cos_c"), .sin = try h.upload("sin_c"), .rows = @intCast(try fx.int("rope_rows")) };
     defer rope_c.cos.free();
     defer rope_c.sin.free();
@@ -270,14 +276,14 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     }
     var runner = try Rounds.RoundRunner.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, bucket, rope_c, rope_w, &pool);
     defer runner.deinit();
-    var supply: Supply = .{ .gpu = gpu, .rank1 = .empty, .names = .empty, .probes = .empty };
+    var supply: Supply = .{ .gpu = gpu, .rank = rank, .rank1 = .empty, .names = .empty, .probes = .empty };
     defer supply.deinit();
     runner.probe = .{ .ctx = &supply, .call = Supply.probe };
     for (0..layers) |li| {
-        try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r1", .{li})));
-        try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r1", .{li})));
+        try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r{d}", .{ li, other })));
+        try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r{d}", .{ li, other })));
     }
-    try supply.rank1.append(gpa, try h.upload("head.local.r1"));
+    try supply.rank1.append(gpa, try h.upload(try std.fmt.bufPrint(&nb, "head.local.r{d}", .{other})));
     // the windows
     const ids_bytes = try fx.bytes("ids");
     defer gpa.free(ids_bytes);
