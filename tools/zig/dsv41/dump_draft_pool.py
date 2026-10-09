@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The DSpark drafter for several streams at once, from the Python fork (dspark.py `DraftPool`, `absorb_many`,
 `BatchDraftGraph._body`), as a fixture for the Zig engine's batched drafts: N streams in a 4-slot pool, each
-absorbed to its own length (positions 0 ..), then one batched draft pass, stage by stage, unfused
-(TF_DS_DRAFT_FUSED=0: the plain hc_pre / hc_post launches and `_attention(fused=False)`, which the fork documents as
-the same arithmetic as its fused path). World 1, every column; stages limited by --stages.
+absorbed to its own length (positions 0 ..), then one batched draft pass, stage by stage: with TF_DS_DRAFT_FUSED=1 (the
+fork's default) `_stages_fused` (hc_pre2 with the previous sublayer's post inside, `_attention(fused=True)`: q_proj's
+fused q path, wo_ab), a sublayer's streams recorded where the next posted mixes (or the last post) wrote them; with 0
+the plain hc_pre / hc_post launches and `_attention(fused=False)` (documented as the same arithmetic). World 1, every
+column; stages limited by --stages.
 
-Run inside the fork's image with TRITON_CACHE_DIR set, TF_DS_MARKOV_CACHE=0 and TF_DS_DRAFT_FUSED=0:
+Run inside the fork's image with TRITON_CACHE_DIR set and TF_DS_MARKOV_CACHE=0:
   python3 -B /w/tools/zig/dsv41/dump_draft_pool.py --tools /w/tools/zig --out /out --model /model [--stages 3]
 """
 
@@ -46,7 +48,7 @@ def main() -> int:
     from tensorfold.families.deepseek_v41.cuda.weights import Shards, exl3_parts, load
 
     assert MK.CACHE_ROWS == 0, "run with TF_DS_MARKOV_CACHE=0"
-    assert not D.FUSED, "run with TF_DS_DRAFT_FUSED=0"
+    fused = D.FUSED and K.on("hc")
     w = load(a.model, 0, 1, n_layers=0, dspark=True)
     cfg = w.cfg
     if a.stages < len(w.dspark.blocks):
@@ -97,6 +99,50 @@ def main() -> int:
             group(f"s{j}_e{e}_down", f"{ep}.w2", rows=(0, cfg.inter))
     sh.close()
 
+    def fused_stages(ci, h, pre, x, part, pre_a, pre_f, post, comb, bg, pos, wpos, rbase):
+        """dspark.py BatchDraftGraph._stages_fused stage by stage (no side stream: hc_pre2 without sink)."""
+
+        spare = torch.empty_like(h)
+        pending = None
+
+        def pre_mix(h, params, pre_in, norm, pre_out):
+            nonlocal spare, pending
+            fn, scale, base = params
+            if pending is None:
+                K.hc_pre2(h, fn, scale, base, pre_in, norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, x, pre_out, post, comb,
+                          part)
+                return h
+            out = K.hc_pre2(h, fn, scale, base, pre_in, norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, x, pre_out, post,
+                            comb, part, gathered=pending, h_out=spare)
+            pending = None
+            spare = h
+            return out
+
+        for j, (lay, ring) in enumerate(zip(dw.blocks, dpool.rings)):
+            with rec.scope(f"c{ci}_s{j}_hc_pre_attn", detail=True):
+                posted = pending is not None
+                h = pre_mix(h, lay.hc_attn, pre, lay.attn_norm, pre_a)
+            if posted:
+                arrays[f"c{ci}_s{j - 1}_h2"] = h.clone()
+            arrays[f"c{ci}_s{j}_x1"] = x.clone()
+            with rec.scope(f"c{ci}_s{j}_attention", detail=True):
+                pa = bg._attention(lay, x, ring, pos, wpos, rbase, fused=True)
+            arrays[f"c{ci}_s{j}_attn"] = pa.clone()
+            pending = model.comm.gather(pa)
+            with rec.scope(f"c{ci}_s{j}_hc_pre_ffn", detail=True):
+                h = pre_mix(h, lay.hc_ffn, pre_a, lay.ffn_norm, pre_f)
+            arrays[f"c{ci}_s{j}_h1"] = h.clone()
+            arrays[f"c{ci}_s{j}_x2"] = x.clone()
+            with rec.scope(f"c{ci}_s{j}_moe", detail=True):
+                pm = model.moe(lay, x, topk=drafter.topk)
+            arrays[f"c{ci}_s{j}_moe"] = pm.clone()
+            pending = model.comm.gather(pm)
+            pre, pre_f = pre_f, pre
+        with rec.scope(f"c{ci}_s{len(dw.blocks) - 1}_hc_post_ffn", detail=True):
+            K.hc_post(pending, h, post, comb, h)
+        arrays[f"c{ci}_s{len(dw.blocks) - 1}_h2"] = h.clone()
+        return h, pre
+
     for ci, (N, (lens, tokens, slots)) in enumerate(CASES.items()):
         g = torch.Generator(device=DEV)
         g.manual_seed(20261009 + N)
@@ -136,28 +182,31 @@ def main() -> int:
         pre_f = torch.empty((R, hc), dtype=torch.float32, device=DEV)
         post = torch.empty((R, hc), dtype=torch.float32, device=DEV)
         comb = torch.empty((R, hc, hc), dtype=torch.float32, device=DEV)
-        for j, (lay, ring) in enumerate(zip(dw.blocks, dpool.rings)):
-            fn, scale, base = lay.hc_attn
-            with rec.scope(f"c{ci}_s{j}_hc_pre_attn", detail=True):
-                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, x, pre_a, post, comb, part)
-            arrays[f"c{ci}_s{j}_x1"] = x.clone()
-            with rec.scope(f"c{ci}_s{j}_attention", detail=True):
-                pa = bg._attention(lay, x, ring, pos, wpos, rbase)
-            arrays[f"c{ci}_s{j}_attn"] = pa.clone()
-            with rec.scope(f"c{ci}_s{j}_hc_post_attn", detail=True):
-                K.hc_post(model.comm.gather(pa), h, post, comb, h)
-            arrays[f"c{ci}_s{j}_h1"] = h.clone()
-            fn, scale, base = lay.hc_ffn
-            with rec.scope(f"c{ci}_s{j}_hc_pre_ffn", detail=True):
-                K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, x, pre_f, post, comb, part)
-            arrays[f"c{ci}_s{j}_x2"] = x.clone()
-            with rec.scope(f"c{ci}_s{j}_moe", detail=True):
-                pm = model.moe(lay, x, topk=drafter.topk)
-            arrays[f"c{ci}_s{j}_moe"] = pm.clone()
-            with rec.scope(f"c{ci}_s{j}_hc_post_ffn", detail=True):
-                K.hc_post(model.comm.gather(pm), h, post, comb, h)
-            arrays[f"c{ci}_s{j}_h2"] = h.clone()
-            pre, pre_f = pre_f, pre
+        if fused:
+            h, pre = fused_stages(ci, h, pre, x, part, pre_a, pre_f, post, comb, bg, pos, wpos, rbase)
+        else:
+            for j, (lay, ring) in enumerate(zip(dw.blocks, dpool.rings)):
+                fn, scale, base = lay.hc_attn
+                with rec.scope(f"c{ci}_s{j}_hc_pre_attn", detail=True):
+                    K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, x, pre_a, post, comb, part)
+                arrays[f"c{ci}_s{j}_x1"] = x.clone()
+                with rec.scope(f"c{ci}_s{j}_attention", detail=True):
+                    pa = bg._attention(lay, x, ring, pos, wpos, rbase)
+                arrays[f"c{ci}_s{j}_attn"] = pa.clone()
+                with rec.scope(f"c{ci}_s{j}_hc_post_attn", detail=True):
+                    K.hc_post(model.comm.gather(pa), h, post, comb, h)
+                arrays[f"c{ci}_s{j}_h1"] = h.clone()
+                fn, scale, base = lay.hc_ffn
+                with rec.scope(f"c{ci}_s{j}_hc_pre_ffn", detail=True):
+                    K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, cfg.eps, cfg.hc_eps, cfg.hc_iters, x, pre_f, post, comb, part)
+                arrays[f"c{ci}_s{j}_x2"] = x.clone()
+                with rec.scope(f"c{ci}_s{j}_moe", detail=True):
+                    pm = model.moe(lay, x, topk=drafter.topk)
+                arrays[f"c{ci}_s{j}_moe"] = pm.clone()
+                with rec.scope(f"c{ci}_s{j}_hc_post_ffn", detail=True):
+                    K.hc_post(model.comm.gather(pm), h, post, comb, h)
+                arrays[f"c{ci}_s{j}_h2"] = h.clone()
+                pre, pre_f = pre_f, pre
         with rec.scope(f"c{ci}_collapse", detail=True):
             xc = K.collapse(h, pre)
         with rec.scope(f"c{ci}_final_norm", detail=True):

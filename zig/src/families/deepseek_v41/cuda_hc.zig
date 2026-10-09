@@ -71,6 +71,75 @@ pub const Hc = struct {
         }, &.{ aot.ci("D", self.d), aot.ci("WORLD", world), aot.ci("BLOCK", block), self.pdlConst() });
     }
 
+    // -- the fused mHC (kernels.py hc_pre2, switch "hc" with "hc_split", "hc_rb", "hc_xpf", "hc_defer", "hc_dots") --
+
+    /// Rows a program of `_hc_mix_part` by window rows (kernels.py `_hc_rb`, switch "hc_rb" on).
+    pub fn mixRows(rows: u32) u32 {
+        const table = [_]u32{ 1, 1, 2, 3, 2, 3, 2, 4, 4 };
+        if (rows <= 8) return table[rows];
+        return if (rows <= 12) 4 else 8;
+    }
+
+    /// `_hc_mix_part`: the mixes' partial dots of h (`posted` false: of `h` itself) or of the posted streams
+    /// (`posted`: out_s = post_s y + sum_j comb[j, s] h_j from the gathered partials, written into `h_out`, its dots
+    /// taken from the values kept in registers). `xpf`: the old streams and post / comb into L2 before the PDL wait.
+    pub fn mixPart(self: *const Hc, stream: cuda.Stream, h: Ptr, h_out: Ptr, gathered: ?Ptr, world: u32, post_: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: u32, pdl: bool, xpf: bool) !void {
+        const rb = mixRows(rows);
+        const wide: i64 = 4 * @as(i64, self.d);
+        const posted = gathered != null;
+        const rs: i32 = if (posted) @intCast(rows * self.d) else 0;
+        try self.set.run(stream, "_hc_mix_part", .{ (rows + rb - 1) / rb, hc_blocks, 3 }, &.{
+            aot.ptr("X", "*bf16", h),        aot.ptr("XO", "*bf16", h_out),
+            if (posted) aot.ptr("G", "*fp32", gathered.?) else aot.ptr("G", "*bf16", h), aot.int("RS", rs),
+            aot.ptr("POST", "*fp32", post_), aot.ptr("COMB", "*fp32", comb),
+            aot.ptr("FN", "*fp32", fn_),     aot.ptr("PART", "*fp32", part),
+            aot.int("rows", @intCast(rows)),
+        }, if (xpf) &.{
+            aot.ci("WIDE", wide), aot.ci("D", self.d), aot.ci("NB", hc_blocks), aot.ci("SUB", 128), aot.ci("MB", 8),
+            aot.ci("WORLD", if (posted) world else 1), aot.ci("POSTED", @intFromBool(posted)), aot.ci("RB", rb), aot.ci("PDL", @intFromBool(pdl)), aot.ci("XPF", 1),
+        } else &.{
+            aot.ci("WIDE", wide), aot.ci("D", self.d), aot.ci("NB", hc_blocks), aot.ci("SUB", 128), aot.ci("MB", 8),
+            aot.ci("WORLD", if (posted) world else 1), aot.ci("POSTED", @intFromBool(posted)), aot.ci("RB", rb), aot.ci("PDL", @intFromBool(pdl)), aot.ci("XPF", 0),
+        });
+    }
+
+    /// `_hc_finish_s` without rotations: `sink` (the Sinkhorn half here too: pre_out, post, comb from `part`) and the
+    /// collapse + RMSNorm half (out = RMSNorm(sum_j pre_in[j] h_j) * norm_w), two programs a row side by side; without
+    /// `sink` the collapse + RMSNorm alone (switch "hc_defer": `sinkhorn` runs the other half).
+    pub fn finishS(self: *const Hc, stream: cuda.Stream, h: Ptr, part: Ptr, base: Ptr, scale: Ptr, pre_in: Ptr, norm_w: Ptr, out: Ptr, pre_out: Ptr, post_: Ptr, comb: Ptr, rows: u32, sink: bool) !void {
+        try self.set.run(stream, "_hc_finish_s", .{ rows, if (sink) 2 else 1, 1 }, &.{
+            aot.ptr("X", "*bf16", h),           aot.ptr("PART", "*fp32", part),     aot.ptr("BASE", "*fp32", base),
+            aot.ptr("SCALE", "*fp32", scale),   aot.ptr("PRE_IN", "*fp32", pre_in), aot.ptr("NW", "*bf16", norm_w),
+            aot.ptr("OUT", "*bf16", out),       aot.ptr("PRE_OUT", "*fp32", pre_out), aot.ptr("POST", "*fp32", post_),
+            aot.ptr("COMB", "*fp32", comb),     aot.float("eps", self.eps),         aot.float("hc_eps", self.hc_eps),
+            aot.ptr("S0", "*bf16", out),        aot.ptr("H0", "*bf16", out),        aot.ptr("S1", "*bf16", out),
+            aot.ptr("H1", "*bf16", out),        aot.ptr("S2", "*bf16", out),        aot.ptr("H2", "*bf16", out),
+            aot.ptr("S3", "*bf16", out),        aot.ptr("H3", "*bf16", out),
+        }, &.{
+            aot.ci("D", self.d), aot.ci("NB", hc_blocks), aot.ci("ITERS", self.iters), aot.ci("BLOCK", block), aot.ci("NROT", 0),
+            aot.ci("RSPLIT", 1), self.pdlConst(), aot.ci("SINK", @intFromBool(sink)),
+        });
+    }
+
+    /// `_hc_sinkhorn`: `_hc_finish_s`'s Sinkhorn half alone (pre_out, post, comb from `part`), a program a row.
+    pub fn sinkhorn(self: *const Hc, stream: cuda.Stream, part: Ptr, base: Ptr, scale: Ptr, pre_out: Ptr, post_: Ptr, comb: Ptr, rows: u32) !void {
+        try self.set.run(stream, "_hc_sinkhorn", .{ rows, 1, 1 }, &.{
+            aot.ptr("PART", "*fp32", part),       aot.ptr("BASE", "*fp32", base), aot.ptr("SCALE", "*fp32", scale),
+            aot.ptr("PRE_OUT", "*fp32", pre_out), aot.ptr("POST", "*fp32", post_), aot.ptr("COMB", "*fp32", comb),
+            aot.float("eps", self.eps),           aot.float("hc_eps", self.hc_eps),
+        }, &.{ aot.ci("D", self.d), aot.ci("NB", hc_blocks), aot.ci("ITERS", self.iters) });
+    }
+
+    /// `_hc_post_only` (switch "hc_dots"): the posted streams alone, h_out_s = post_s y + sum_j comb[j, s] h_j (the
+    /// posted mixes' fma chain and bf16 rounding), y = bf16(sum of the gathered [world, rows, D] partials).
+    pub fn postOnly(self: *const Hc, stream: cuda.Stream, h: Ptr, h_out: Ptr, gathered: Ptr, world: u32, post_: Ptr, comb: Ptr, rows: u32) !void {
+        const wide: i64 = 4 * @as(i64, self.d);
+        try self.set.run(stream, "_hc_post_only", .{ rows, hc_blocks, 1 }, &.{
+            aot.ptr("X", "*bf16", h),        aot.ptr("XO", "*bf16", h_out), aot.ptr("G", "*fp32", gathered),
+            aot.int("RS", @intCast(rows * self.d)), aot.ptr("POST", "*fp32", post_), aot.ptr("COMB", "*fp32", comb),
+        }, &.{ aot.ci("WIDE", wide), aot.ci("D", self.d), aot.ci("KB", @divExact(wide, hc_blocks)), aot.ci("WORLD", world), self.pdlConst() });
+    }
+
     /// out [rows, D] bf16 = RMSNorm(sum_j pre[j] h_j) * w: the head's input.
     pub fn collapseNorm(self: *const Hc, stream: cuda.Stream, h: Ptr, pre_: Ptr, w: Ptr, out: Ptr, rows: u32) !void {
         try self.set.run(stream, "_collapse_norm", .{ rows, 1, 1 }, &.{

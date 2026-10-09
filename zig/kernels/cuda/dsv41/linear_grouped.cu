@@ -9,20 +9,20 @@
 // Both kernels are programmatic dependent launches where the GPU has them (sm_90+): each may start while the kernel
 // before it finishes, and reads nothing but weights (glinear: its first trellis step) until that kernel is done.
 
+//
+// Zig build: the fork's kernels verbatim (bertholomus/TensorFold deepseek-v41-tp2, cuda/exl3/linear_grouped.cu), the
+// torch extension's host glue dropped; namespace tf_exl3_grouped so the fatbin exports rot_many_kernel and every
+// glinear_kernel instantiation of the mul1 codebook by name. The launch arguments (RArgs, GArgs) are passed by value
+// (__grid_constant__): cuda_exl3.zig's extern structs mirror them field for field.
+
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <algorithm>
-#include <cstring>
-#include <vector>
 
 #include "linear_common.cuh"
 
 using namespace tf_exl3;
 
-namespace {
+namespace tf_exl3_grouped {
 
 constexpr int GMAX = 8;                 // layers a launch
 
@@ -324,123 +324,10 @@ __global__ void __launch_bounds__(WK * 32, WK == 4 ? 3 : 1) glinear_kernel(const
     }
 }
 
-int gdtype_of(const at::Tensor& t) {
-    return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
-}
+#define TF_INST(K2_, CB_)                                                                                            \
+    template __global__ void __launch_bounds__(4 * 32, 3) glinear_kernel<K2_, CB_, 4>(const __grid_constant__ GArgs); \
+    template __global__ void __launch_bounds__(8 * 32, 1) glinear_kernel<K2_, CB_, 8>(const __grid_constant__ GArgs);
+TF_EXL3_WIDTHS(TF_INST, 2) TF_INST(3, 2) TF_INST(5, 2) TF_INST(7, 2)
+#undef TF_INST
 
-// A launch, as a programmatic dependent launch when asked and the GPU has it (sm_90+).
-template <typename Kernel, typename Args>
-void launch(Kernel kernel, unsigned blocks, unsigned threads, int smem, cudaStream_t stream, bool pdl, const Args& a) {
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(blocks);
-    cfg.blockDim = dim3(threads);
-    cfg.dynamicSmemBytes = (size_t)smem;
-    cfg.stream = stream;
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    if (pdl) {
-        int dev = 0, major = 0;
-        C10_CUDA_CHECK(cudaGetDevice(&dev));
-        C10_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
-        if (major >= 9) {
-            cfg.attrs = attr;
-            cfg.numAttrs = 1;
-        }
-    }
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, a));
-}
-
-}  // namespace
-
-int exl3_glinear_max() { return GMAX; }
-
-void exl3_rot_many_cuda(const std::vector<at::Tensor>& xs, const std::vector<at::Tensor>& suhs,
-                        const std::vector<at::Tensor>& xhs, bool pdl) {
-    RArgs a;
-    std::memset(&a, 0, sizeof(a));
-    a.n = (int)xs.size();
-    a.M = (int)xs[0].size(0);
-    int warps = 0;
-    for (int i = 0; i < a.n; ++i) {
-        RLayer& l = a.l[i];
-        l.x = xs[i].data_ptr();
-        l.x_dtype = gdtype_of(xs[i]);
-        l.ldx = xs[i].stride(0);
-        l.suh = reinterpret_cast<const half*>(suhs[i].data_ptr());
-        l.xh = reinterpret_cast<half*>(xhs[i].data_ptr());
-        l.K = (int)xs[i].size(1);
-        l.first = warps;
-        warps += a.M * (l.K / 128);
-    }
-    launch(rot_many_kernel, (unsigned)((warps + 3) / 4), 128, 0, at::cuda::getCurrentCUDAStream(), pdl, a);
-}
-
-void exl3_glinear_cuda(const std::vector<at::Tensor>& xhs, const std::vector<at::Tensor>& Ts,
-                       const std::vector<int64_t>& stride_k, const std::vector<int64_t>& stride_nb,
-                       const std::vector<at::Tensor>& svhs, const std::vector<c10::optional<at::Tensor>>& biases,
-                       const std::vector<at::Tensor>& ys, const c10::optional<at::Tensor>& Z,
-                       const std::vector<at::Tensor>& counters, const std::vector<int64_t>& SK, int64_t K2,
-                       int64_t cb, int64_t WK, bool pdl, const std::vector<c10::optional<at::Tensor>>& rsuhs,
-                       const std::vector<c10::optional<at::Tensor>>& rxhs, const std::vector<int64_t>& roffs,
-                       const std::vector<int64_t>& ropes, const c10::optional<at::Tensor>& rcos,
-                       const c10::optional<at::Tensor>& rsin, const c10::optional<at::Tensor>& rpos, int64_t rhd,
-                       int64_t rrd, int64_t discard) {
-    const int n = (int)xhs.size();
-    GArgs a;
-    std::memset(&a, 0, sizeof(a));
-    a.n = n;
-    a.M = (int)xhs[0].size(0);
-    a.discard = (int)discard;
-    float* zp = Z ? Z->data_ptr<float>() : nullptr;
-    size_t zoff = 0;
-    int blocks = 0;
-    for (int i = 0; i < n; ++i) {
-        GLayer& l = a.l[i];
-        l.xh = reinterpret_cast<const half*>(xhs[i].data_ptr());
-        l.ldx = xhs[i].stride(0);
-        l.T = reinterpret_cast<const uint32_t*>(Ts[i].data_ptr());
-        l.stride_k = stride_k[i];
-        l.stride_nb = stride_nb[i];
-        l.svh = reinterpret_cast<const half*>(svhs[i].data_ptr());
-        l.bias = biases[i] ? reinterpret_cast<const half*>(biases[i]->data_ptr()) : nullptr;
-        l.y = ys[i].data_ptr();
-        l.y_dtype = gdtype_of(ys[i]);
-        l.ldy = ys[i].stride(0);
-        l.K = (int)xhs[i].size(1);
-        l.N = (int)ys[i].size(1);
-        l.SK = (int)SK[i];
-        l.counters = counters[i].data_ptr<int>();
-        l.Z = nullptr;
-        if (SK[i] > 1) {
-            l.Z = zp + zoff;
-            zoff += (size_t)SK[i] * a.M * l.N;
-        }
-        l.first = blocks;
-        blocks += (l.N / 128) * l.SK;
-        if (i < (int)rsuhs.size() && rsuhs[i] && rxhs[i]) {
-            l.rsuh = reinterpret_cast<const half*>(rsuhs[i]->data_ptr());
-            l.rxh = reinterpret_cast<half*>(rxhs[i]->data_ptr());
-            l.ldr = rxhs[i]->stride(0);
-            l.roff = (int)roffs[i];
-        }
-        if (i < (int)ropes.size() && ropes[i] && rcos && rsin && rpos) {
-            l.rcos = rcos->data_ptr<float>();
-            l.rsin = rsin->data_ptr<float>();
-            l.rpos = reinterpret_cast<const long long*>(rpos->data_ptr<int64_t>());
-            l.rhd = (int)rhd;
-            l.rrd = (int)rrd;
-        }
-    }
-    auto stream = at::cuda::getCurrentCUDAStream();
-    const int smem = (int)(WK * std::min(a.M, 8) * 128 * sizeof(float));    // at most 32 KiB: no opt-in
-#define TF_LAUNCH(K2_, CB_)                                                                                        \
-    if (K2 == K2_ && cb == CB_) {                                                                               \
-        launch(WK == 4 ? glinear_kernel<K2_, CB_, 4> : glinear_kernel<K2_, CB_, 8>, (unsigned)blocks,          \
-               (unsigned)(WK * 32), smem, stream, pdl, a);                                                      \
-        return;                                                                                                 \
-    }
-    TF_EXL3_ALL(TF_LAUNCH)
-#undef TF_LAUNCH
-    TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
-}
+}  // namespace tf_exl3_grouped

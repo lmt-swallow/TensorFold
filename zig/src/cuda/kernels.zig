@@ -38,6 +38,8 @@ pub const dsv41_exl3_experts_prompt: []const u8 = if (available) &Blob("fatbin_d
 pub const dsv41_prompt_glue: []const u8 = if (available) &Blob("fatbin_dsv41_prompt_glue").bytes else &.{};
 pub const dsv41_attn_glue: []const u8 = if (available) &Blob("fatbin_dsv41_attn_glue").bytes else &.{};
 pub const dsv41_topk_glue: []const u8 = if (available) &Blob("fatbin_dsv41_topk_glue").bytes else &.{};
+pub const dsv41_exl3_grouped: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_grouped").bytes else &.{};
+pub const dsv41_l2_prefetch: []const u8 = if (available) &Blob("fatbin_dsv41_l2_prefetch").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

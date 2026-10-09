@@ -4,7 +4,10 @@ engine: two streams in a 4-slot pool (slot 0 at extent [0, 2048), slot 2 at [204
 prompt through the single-stream prompt path on its pool view, then one round whose windows are a pending token
 and five drafts a stream (12 rows). Both ranks of a TP2 split run in this process, one rank's block resident at a
 time (dump_forward.py's RankBlocks); the gathers stack both ranks' partials, so every intermediate is the served
-one. Unfused launches (TF_DS_HC_FUSED=0, TF_DS_ROT_Q=0, TF_DS_ROT_WOB=0, TF_DS_ROT_ATTN=0; L2 prefetch off).
+one. The fork's switches as the environment sets them (capture_rounds.sh: its defaults, the served decode path:
+rounds.py `_layers_fused` with `_attention2`; UNFUSED=1 there: TF_DS_HC_FUSED=0, TF_DS_ROT_Q=0, TF_DS_ROT_WOB=0,
+TF_DS_ROT_ATTN=0, the plain loop); L2 prefetch off (it moves no bit). With the mHC fused, a sublayer's streams are
+recorded where the next sublayer's posted mixes (or the stretch's last post) wrote them.
 `--engram <dir>` runs Engram on its layers (dump_forward.py's EngramRef): the primes on each stream's prompt, the
 round on every stream's rows hashed from that stream's own ids (rounds.py `forward`), one projection, sum and gate
 over the round's rows; each rank's partial `L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded.
@@ -26,8 +29,7 @@ from pathlib import Path
 
 import torch
 
-for k, v in (("TF_DS_HC_FUSED", "0"), ("TF_DS_ROT_Q", "0"), ("TF_DS_ROT_WOB", "0"), ("TF_DS_ROT_ATTN", "0"), ("TF_DS_L2_PREFETCH", "0")):
-    os.environ.setdefault(k, v)
+os.environ.setdefault("TF_DS_L2_PREFETCH", "0")
 HERE = Path(__file__).resolve().parent
 BF16, F32 = torch.bfloat16, torch.float32
 
@@ -64,7 +66,8 @@ def main() -> int:
     from tensorfold.families.deepseek_v41.cuda.rounds import RoundDecoder
     from tensorfold.families.deepseek_v41.cuda.weights import Shards, Weights, linear, load_block
 
-    assert KV_QUANT and not K.on("hc") and not K.on("rot_q") and not K.on("rot_wob") and not K.on("rot_attn")
+    assert KV_QUANT
+    fused = K.on("hc")
     torch.cuda.set_device(0)
     world = 2
     L = a.layers
@@ -189,38 +192,111 @@ def main() -> int:
     def record(name: str, t: torch.Tensor) -> None:
         arrays[name] = t.clone()
 
-    for li in range(L):
-        if eng is not None and blocks.get(0, li).engram_wkv is not None:
-            with rec.scope(f"L{li}_engram", detail=True):
-                h = eng.apply_hashes(blocks, li, h, hashes, gather, record)
-        lay = blocks.get(0, li)
-        cos, sin = m._cs(lay.idx, table)
-        fn, scale, base = lay.hc_attn
-        with rec.scope(f"L{li}_hc_pre_attn", detail=True):
-            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
-        arrays[f"L{li}.x_attn"] = x.clone()
-        parts = []
-        for r in range(world):
-            with rec.scope(f"L{li}_attention_r{r}", detail=True):
-                parts.append(dec._attention(blocks.get(r, li), x, shared[r], cos, sin))
-            arrays[f"L{li}.p_attn.r{r}"] = parts[r].clone()
-        with rec.scope(f"L{li}_hc_post_attn", detail=True):
-            K.hc_post(gather(parts), h, post, comb, h)
-        arrays[f"L{li}.h_attn"] = h.clone()
-        lay = blocks.get(0, li)
-        fn, scale, base = lay.hc_ffn
-        with rec.scope(f"L{li}_hc_pre_ffn", detail=True):
-            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
-        arrays[f"L{li}.x_ffn"] = x.clone()
-        parts = []
-        for r in range(world):
-            with rec.scope(f"L{li}_moe_r{r}", detail=True):
-                parts.append(m.moe(blocks.get(r, li), x, shared_side=False))
-            arrays[f"L{li}.p_moe.r{r}"] = parts[r].clone()
-        with rec.scope(f"L{li}_hc_post_ffn", detail=True):
-            K.hc_post(gather(parts), h, post, comb, h)
-        arrays[f"L{li}.h_moe"] = h.clone()
-        pre, pre_f = pre_f, pre
+    def fused_body(h, pre, x, part, pre_a, pre_f, post, comb):
+        """rounds.py `_layers_fused` over one stretch of every layer, each sublayer on both ranks' weights: a
+        sublayer's post fused into the next sublayer's mixes (kernels.hc_pre2, the Sinkhorn half on a side stream when
+        hc_defer_on), an Engram layer's post alone before its gate, the last post alone at the end."""
+
+        spare = torch.empty_like(h)
+        pending = None
+        sink = torch.cuda.Stream() if K.hc_defer_on(c.dim) else None
+
+        def join():
+            if sink is not None:
+                torch.cuda.current_stream().wait_stream(sink)
+
+        def pre_mix(h, params, pre_in, norm, pre_out):
+            nonlocal spare, pending
+            fn, scale, base = params
+            if pending is None:
+                K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb, part,
+                          sink=sink)
+                return h
+            out = K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb,
+                            part, gathered=pending, h_out=spare, sink=sink)
+            pending = None
+            spare = h
+            return out
+
+        for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                if pending is not None:
+                    with rec.scope(f"L{li}_hc_post_engram", detail=True):
+                        K.hc_post(pending, h, post, comb, h)
+                    pending = None
+                    arrays[f"L{li - 1}.h_moe"] = h.clone()
+                with rec.scope(f"L{li}_engram", detail=True):
+                    h = eng.apply_hashes(blocks, li, h, hashes, gather, record)
+            lay = blocks.get(0, li)
+            cos, sin = m._cs(lay.idx, table)
+            with rec.scope(f"L{li}_hc_pre_attn", detail=True):
+                posted = pending is not None
+                h = pre_mix(h, lay.hc_attn, pre, lay.attn_norm, pre_a)
+            torch.cuda.synchronize()
+            if posted:
+                arrays[f"L{li - 1}.h_moe"] = h.clone()
+            arrays[f"L{li}.x_attn"] = x.clone()
+            parts = []
+            for r in range(world):
+                with rec.scope(f"L{li}_attention_r{r}", detail=True):
+                    parts.append(dec._attention(blocks.get(r, li), x, shared[r], cos, sin))
+                arrays[f"L{li}.p_attn.r{r}"] = parts[r].clone()
+            join()
+            pending = gather(parts)
+            lay = blocks.get(0, li)
+            with rec.scope(f"L{li}_hc_pre_ffn", detail=True):
+                h = pre_mix(h, lay.hc_ffn, pre_a, lay.ffn_norm, pre_f)
+            torch.cuda.synchronize()
+            arrays[f"L{li}.h_attn"] = h.clone()
+            arrays[f"L{li}.x_ffn"] = x.clone()
+            parts = []
+            for r in range(world):
+                with rec.scope(f"L{li}_moe_r{r}", detail=True):
+                    parts.append(m.moe(blocks.get(r, li), x, shared_side=False))
+                arrays[f"L{li}.p_moe.r{r}"] = parts[r].clone()
+            join()
+            pending = gather(parts)
+            pre, pre_f = pre_f, pre
+        with rec.scope(f"L{L - 1}_hc_post_ffn", detail=True):
+            K.hc_post(pending, h, post, comb, h)
+        arrays[f"L{L - 1}.h_moe"] = h.clone()
+        return h, pre
+
+    if fused:
+        h, pre = fused_body(h, pre, x, part, pre_a, pre_f, post, comb)
+    else:
+        for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                with rec.scope(f"L{li}_engram", detail=True):
+                    h = eng.apply_hashes(blocks, li, h, hashes, gather, record)
+            lay = blocks.get(0, li)
+            cos, sin = m._cs(lay.idx, table)
+            fn, scale, base = lay.hc_attn
+            with rec.scope(f"L{li}_hc_pre_attn", detail=True):
+                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+            arrays[f"L{li}.x_attn"] = x.clone()
+            parts = []
+            for r in range(world):
+                with rec.scope(f"L{li}_attention_r{r}", detail=True):
+                    parts.append(dec._attention(blocks.get(r, li), x, shared[r], cos, sin))
+                arrays[f"L{li}.p_attn.r{r}"] = parts[r].clone()
+            with rec.scope(f"L{li}_hc_post_attn", detail=True):
+                K.hc_post(gather(parts), h, post, comb, h)
+            arrays[f"L{li}.h_attn"] = h.clone()
+            lay = blocks.get(0, li)
+            fn, scale, base = lay.hc_ffn
+            with rec.scope(f"L{li}_hc_pre_ffn", detail=True):
+                K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+            arrays[f"L{li}.x_ffn"] = x.clone()
+            parts = []
+            for r in range(world):
+                with rec.scope(f"L{li}_moe_r{r}", detail=True):
+                    parts.append(m.moe(blocks.get(r, li), x, shared_side=False))
+                arrays[f"L{li}.p_moe.r{r}"] = parts[r].clone()
+            with rec.scope(f"L{li}_hc_post_ffn", detail=True):
+                K.hc_post(gather(parts), h, post, comb, h)
+            arrays[f"L{li}.h_moe"] = h.clone()
+            pre, pre_f = pre_f, pre
     with rec.scope("head", detail=True):
         xc = K.collapse_norm(h, pre.contiguous(), w.norm, c.eps)
     arrays["head.xc"] = xc.clone()
@@ -234,7 +310,7 @@ def main() -> int:
     arrays.update({f"after_{k_}": v.clone() for k_, v in pool_planes().items()})
     params = {"layers": L, "world": world, "slots": slots, "cap": cap, "bucket": bucket, "ring_size": pool.ring_size,
               "raw": RAW, "rows": R, "n_windows": len(windows), "rope_rows": cos_c.shape[0], "vocab_local": vocab_l,
-              "k": k, "engram": int(eng is not None)}
+              "k": k, "engram": int(eng is not None), "fused": int(fused)}
     for i, (slot, base, size, p0, toks) in enumerate(windows):
         params.update({f"w{i}_slot": slot, f"w{i}_base": base, f"w{i}_size": size, f"w{i}_pos": p0, f"w{i}_rows": len(toks)})
     ck.save(out / "fixture", params, arrays)

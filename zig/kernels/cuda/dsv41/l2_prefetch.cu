@@ -6,16 +6,14 @@
 // grows several-fold behind a deep queue, which slows the latency-bound kernels running beside). Nothing is written:
 // it changes no bit of any output, only where the next kernels find their bytes.
 
+//
+// Zig build: the fork's kernel verbatim (cuda/exl3/l2_prefetch.cu), the torch extension's host glue dropped and the
+// kernel extern "C" (cuda_exl3.zig's L2Prefetch mirrors PArgs and fills it as exl3_l2_prefetch_cuda does).
+
 #include <cuda_runtime.h>
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cstring>
-#include <vector>
 
-namespace {
 
-constexpr int PMAX = 24;               // ranges a launch
+static constexpr int PMAX = 24;               // ranges a launch
 
 struct PArgs {
     const char* p[PMAX];               // range starts (16-byte aligned)
@@ -28,13 +26,13 @@ struct PArgs {
     long long wave_ns;                 // > 0 (one block): a wave of blockDim chunks every wave_ns, in range order
 };
 
-__device__ __forceinline__ unsigned long long gtime() {
+static __device__ __forceinline__ unsigned long long gtime() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
 }
 
-__global__ void __launch_bounds__(128) l2_prefetch_kernel(const __grid_constant__ PArgs a) {
+extern "C" __global__ void __launch_bounds__(128) tf_l2_prefetch_kernel(const __grid_constant__ PArgs a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (a.delay_ns > 0) {
         const unsigned long long t0 = gtime();
@@ -64,28 +62,3 @@ __global__ void __launch_bounds__(128) l2_prefetch_kernel(const __grid_constant_
 #endif
 }
 
-}  // namespace
-
-int exl3_l2_prefetch_max() { return PMAX; }
-
-void exl3_l2_prefetch_cuda(const std::vector<int64_t>& ptrs, const std::vector<int64_t>& sizes, int64_t chunk,
-                           int64_t blocks, int64_t delay_ns, int64_t wave_ns) {
-    PArgs a;
-    std::memset(&a, 0, sizeof(a));
-    long long c = 0;
-    for (size_t i = 0; i < ptrs.size(); ++i) {
-        a.p[a.count] = reinterpret_cast<const char*>(ptrs[i]);
-        a.n[a.count] = sizes[i];
-        c += (sizes[i] + chunk - 1) / chunk;
-        a.end[a.count] = c;
-        ++a.count;
-    }
-    a.chunk = (int)chunk;
-    a.delay_ns = delay_ns;
-    a.wave_ns = wave_ns;
-    if (a.count == 0 || c == 0) return;
-    const long long threads = 128, need = (c + threads - 1) / threads;
-    const unsigned grid = wave_ns > 0 ? 1u : (unsigned)(need < blocks ? need : blocks);
-    l2_prefetch_kernel<<<grid, (unsigned)threads, 0, at::cuda::getCurrentCUDAStream()>>>(a);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
