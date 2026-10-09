@@ -301,11 +301,12 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         defer gpa.free(ring);
         try pool.rings[li].upload(0, ring);
         if (pool.planes[li]) |*p| {
-            inline for (plane_names) |pn| {
+            inline for (plane_names) |pn| if (@field(p, pn).len > 0) {
+                // (a ratio-1 kv source keeps no compressor inputs: the fork has no such plane)
                 const bytes = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.{s}", .{ li, pn }));
                 defer gpa.free(bytes);
                 if (bytes.len > 0) try @field(p, pn).upload(0, bytes);
-            }
+            };
         }
     }
     var runner = try Rounds.RoundRunner.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, bucket, rope_c, rope_w, &pool);
