@@ -30,6 +30,7 @@ ENGRAM=${ENGRAM-DeepSeek-V4.1-Flash-Engram}
 KERNELS=${KERNELS:-dsv41-all}   # the captured Triton set under ~/aot (aot.json, cubins, rope/, token_map.json)
 DRAFTS=${DRAFTS:-1}            # 0: --no-drafts
 PARALLEL=${PARALLEL:-1}        # streams decoded together (--parallel)
+RESERVE=${RESERVE:-4}          # TENSORFOLD_MEMORY_RESERVE_GIB
 PORT_TIMEOUT=${PORT_TIMEOUT:-600}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
@@ -125,7 +126,7 @@ say "binary $sum0 on both nodes; context $CONTEXT, RoPE rows $ROWS"
 # -- the ranks ----------------------------------------------------------------------------------------------------
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
 DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/aot/$KERNELS:/k:ro -v \$HOME/bin:/b:ro"
-ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=4"
+ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE"
 ENVS="$ENVS -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
