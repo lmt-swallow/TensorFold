@@ -838,6 +838,32 @@ fn loadRope(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
     return .{ .cos = cos, .sin = sin, .rows = rows };
 }
 
+/// The round loop's facts: with the drafter, drafted windows of up to `draft_width` rows priced by `costs`; else
+/// plain one-token rounds.
+pub fn factsOf(drafting: bool, costs: []const lanes.config.Cost) lanes.Model {
+    if (!drafting) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .drafts = 1, .hidden_rows = false, .batch_rows = 1, .max_streams = 1 };
+    return .{
+        .exact_width = draft_width,
+        .gpu_tokens = false,
+        .mtp = true,
+        .speculate = true,
+        .speculate_early = false,
+        .draft_prior = &draft_prior,
+        .drafts = @intCast(draft_width - 1),
+        .window_costs = costs,
+        .mtp_step_ms = 0,
+        .hidden_rows = false,
+        .batch_rows = draft_width,
+        .max_streams = 1,
+    };
+}
+
+/// `Loaded.rows` (lanes.Config's max_rows): a drafted window's rows with the drafter, else one. Below
+/// `draft_width` the config clips the width, and at one row it turns drafting off.
+pub fn rowsOf(drafting: bool) u32 {
+    return if (drafting) draft_width else 1;
+}
+
 /// The lane backend on rank 0: one stream; with the drafter, drafted windows of up to `draft_width` rows (the
 /// pending token, then held DSpark drafts or host tokens), else plain one-token rounds.
 pub const Lanes = struct {
@@ -876,21 +902,13 @@ pub const Lanes = struct {
     }
 
     pub fn facts(self: *const Lanes) lanes.Model {
-        if (self.e.drafter == null) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .drafts = 1, .hidden_rows = false, .batch_rows = 1, .max_streams = 1 };
-        return .{
-            .exact_width = draft_width,
-            .gpu_tokens = false,
-            .mtp = true,
-            .speculate = true,
-            .speculate_early = false,
-            .draft_prior = &draft_prior,
-            .drafts = @intCast(draft_width - 1),
-            .window_costs = if (self.costs[0].ms > 0) &self.costs else &.{},
-            .mtp_step_ms = 0,
-            .hidden_rows = false,
-            .batch_rows = draft_width,
-            .max_streams = 1,
-        };
+        return factsOf(self.e.drafter != null, if (self.costs[0].ms > 0) &self.costs else &.{});
+    }
+
+    /// The window rows the host sizes the round loop for (`Loaded.rows`: lanes.Config's max_rows, which caps
+    /// `exact_width` and the drafts a round): a drafted window's with the drafter, else one.
+    pub fn windowRows(self: *const Lanes) u32 {
+        return rowsOf(self.e.drafter != null);
     }
 
     fn of(ptr: *anyopaque) *Lanes {

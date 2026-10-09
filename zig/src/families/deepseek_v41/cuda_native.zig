@@ -98,7 +98,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
-        .rows = 1,
+        .rows = own.lanes.windowRows(),
         .stream_bytes = (o.context + lanesmod.extra) * 1024,
         .ctx = own,
         .deinit = release,
@@ -137,4 +137,81 @@ fn release(p: *anyopaque) void {
 test "settings read the environment's rank and world" {
     _ = settings;
     try std.testing.expectEqual(@as(u32, 2048), prompt_rows);
+}
+
+/// A host-only stand-in for `Lanes` (the same facts and rows): records the core's calls, holds 5 drafts a draft
+/// call, and draws each verify row as the held draft (so every draft lands) then a fixed token.
+const Mock = struct {
+    draft_depths: std.ArrayList(u32) = .empty,
+    verify_held: std.ArrayList(u32) = .empty,
+    held: u32 = 0,
+    drafts: [5]u32 = .{ 11, 12, 13, 14, 15 },
+
+    fn backend(m: *Mock) lanes.backend.Backend {
+        return .{ .ptr = m, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = releaseFn } };
+    }
+    fn of(p: *anyopaque) *Mock {
+        return @ptrCast(@alignCast(p));
+    }
+    fn prefill(_: *anyopaque, _: *lanes.Stream) anyerror!void {}
+    fn first(_: *anyopaque, _: *lanes.Stream, _: u64) anyerror!u64 {
+        return 0;
+    }
+    fn queue(_: *anyopaque, _: *lanes.Stream, _: lanes.backend.Feed, _: u64) anyerror!u64 {
+        return error.NotPipelined;
+    }
+    fn read(_: *anyopaque, _: u64) anyerror!u32 {
+        return 10;
+    }
+    fn verify(p: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
+        const m = of(p);
+        const w = windows[0];
+        try m.verify_held.append(std.testing.allocator, w.held);
+        for (out[0].sampled, 0..) |*t, r| t.* = if (r < w.held) m.drafts[r] else 20;
+        @memcpy(out[0].drafts[0..w.held], m.drafts[0..w.held]);
+        @memcpy(out[0].drafts[w.held..][0..w.tokens.len], w.tokens);
+        m.held = 0;
+    }
+    fn keep(_: *anyopaque, _: []const lanes.backend.Window, _: []const []const u32) anyerror!void {}
+    fn draft(p: *anyopaque, requests: []const lanes.backend.DraftRequest) anyerror!void {
+        const m = of(p);
+        for (requests) |r| {
+            try m.draft_depths.append(std.testing.allocator, r.depth);
+            m.held = r.depth;
+        }
+    }
+    fn releaseFn(_: *anyopaque, _: *lanes.Stream) void {}
+};
+
+test "a drafted stream drafts after its first token and verifies the held drafts (the facts and rows the host gets)" {
+    const gpa = std.testing.allocator;
+    // the window costs as measured on the two Sparks (31.3 .. 43.2 ms for 1 .. 6 rows, drafts included)
+    const ms = [_]f64{ 31.3, 34.8 + 4.49, 38.2 + 4.49, 41.4 + 4.49, 41.5 + 4.49, 43.2 + 4.49 };
+    var costs: [lanesmod.draft_width]lanes.config.Cost = undefined;
+    for (&costs, ms, 1..) |*c, v, w| c.* = .{ .width = @intCast(w), .ms = v };
+    const rows = lanesmod.rowsOf(true);
+    var cfg = try lanes.Config.init(gpa, lanesmod.factsOf(true, &costs), rows, rows - 1);
+    defer cfg.deinit(gpa);
+    try std.testing.expect(cfg.family_mtp);
+    try std.testing.expectEqual(@as(u32, lanesmod.draft_width - 1), cfg.most_drafts);
+    var mock: Mock = .{};
+    defer mock.draft_depths.deinit(gpa);
+    defer mock.verify_held.deinit(gpa);
+    var clock: lanes.fake.FixedClock = .{};
+    var engine = lanes.Engine.init(gpa, &cfg, mock.backend(), clock.clock());
+    defer engine.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 24, .drafts = true });
+    defer s.deinit(gpa);
+    try engine.addStream(&s);
+    try std.testing.expect(mock.draft_depths.items.len == 1 and mock.draft_depths.items[0] >= 1);
+    for (0..3) |_| if (engine.activeCount() > 0) try engine.step();
+    try std.testing.expect(mock.verify_held.items.len >= 1);
+    try std.testing.expectEqual(mock.draft_depths.items[0], mock.verify_held.items[0]);
+    for (mock.verify_held.items) |h| try std.testing.expect(h >= 1);
+
+    // the old rows (one) turned drafting off whatever the facts said
+    var one = try lanes.Config.init(gpa, lanesmod.factsOf(true, &costs), 1, 0);
+    defer one.deinit(gpa);
+    try std.testing.expect(!one.family_mtp and one.most_drafts == 0);
 }
