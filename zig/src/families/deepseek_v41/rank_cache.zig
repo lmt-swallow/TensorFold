@@ -262,12 +262,16 @@ fn parseIndex(gpa: std.mem.Allocator, json: []const u8) RankCacheError![]Entry {
     const items = parsed.value.array.items;
     const entries = gpa.alloc(Entry, items.len) catch return error.OutOfMemory;
     errdefer gpa.free(entries);
+    // the parser keeps the entries in the text's order: each key is searched from the previous one's end, so the
+    // index parses in time linear in its length (a search from the start each time took minutes on a 13 MB index)
+    var cursor: usize = 0;
     for (items, entries) |item, *e| {
         if (item != .array or item.array.items.len != 5) return error.BadIndex;
         const f = item.array.items;
         if (f[0] != .string or f[1] != .string or f[2] != .array or f[3] != .integer or f[4] != .integer) return error.BadIndex;
         // the key must point into `json`, not the parser's copy: find it by value (keys are short and unique)
-        const key = findKey(json, f[0].string) orelse return error.BadIndex;
+        const key = findKey(json, f[0].string, cursor) orelse findKey(json, f[0].string, 0) orelse return error.BadIndex;
+        cursor = @intFromPtr(key.ptr) - @intFromPtr(json.ptr) + key.len;
         e.* = .{ .key = key, .dtype = dtypeOf(f[1].string), .shape = .{ 1, 1, 1, 1 }, .rank = f[2].array.items.len, .offset = @intCast(f[3].integer), .bytes = @intCast(f[4].integer) };
         if (e.rank > 4) return error.BadIndex;
         for (f[2].array.items, 0..) |d, i| e.shape[i] = if (d == .integer) @intCast(d.integer) else return error.BadIndex;
@@ -275,9 +279,9 @@ fn parseIndex(gpa: std.mem.Allocator, json: []const u8) RankCacheError![]Entry {
     return entries;
 }
 
-/// The quoted string `s` as it appears in `json` (JSON keys here hold no escapes).
-fn findKey(json: []const u8, s: []const u8) ?[]const u8 {
-    var from: usize = 0;
+/// The quoted string `s` as it appears in `json` at or after `start` (JSON keys here hold no escapes).
+fn findKey(json: []const u8, s: []const u8, start: usize) ?[]const u8 {
+    var from: usize = start;
     while (std.mem.indexOfPos(u8, json, from, s)) |i| {
         if (i > 0 and json[i - 1] == '"' and i + s.len < json.len and json[i + s.len] == '"') return json[i .. i + s.len];
         from = i + 1;
