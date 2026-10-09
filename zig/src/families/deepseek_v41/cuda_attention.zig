@@ -148,8 +148,11 @@ pub const TopkGlue = struct {
     cand_blockmax: cuda.Function,
     cand_mask: cuda.Function,
     apply_cand: cuda.Function,
+    topk_keyset: cuda.Function,
+    cand_blocks: cuda.Function,
 
     pub const threads: u32 = 512; // topk_glue.cu kThreads
+    pub const max_picks: usize = 1024; // topk_glue.cu kMaxPicks
 
     pub fn load(d: *const cuda.Driver) !TopkGlue {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -162,6 +165,8 @@ pub const TopkGlue = struct {
             .cand_blockmax = try module.function("tf_dsv41_cand_blockmax"),
             .cand_mask = try module.function("tf_dsv41_cand_mask"),
             .apply_cand = try module.function("tf_dsv41_apply_cand"),
+            .topk_keyset = try module.function("tf_dsv41_topk_keyset"),
+            .cand_blocks = try module.function("tf_dsv41_cand_blocks"),
         };
     }
 
@@ -180,6 +185,44 @@ pub const TopkGlue = struct {
     /// keys): the picks of the scores that kernel computed.
     pub fn topkKeys(self: *const TopkGlue, keys: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
         return self.select(self.topk_keys, keys, ld, rows, n, kk, vis, out, out_ld, stream);
+    }
+
+    /// kernels.topk_select's torch.topk + `_topk_finish` on int64 keys [rows, n] (row stride `ld`) in any order (the
+    /// pruned selection's gathered tiles, the candidate pool's keys): each row's kk largest keys' indices (decoded
+    /// from the keys) ascending, -1 at or past vis[r] (`vis` 0: no mask). kk <= n, kk <= max_picks.
+    pub fn topkKeyset(self: *const TopkGlue, keys: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
+        if (kk > max_picks) return error.BadShape;
+        return self.select(self.topk_keyset, keys, ld, rows, n, kk, vis, out, out_ld, stream);
+    }
+
+    /// rounds.py `_candidate_blocks` on rows of fp32 scores [rows, n] (row stride `ld`): cblk [rows, min(nblocks,
+    /// ceil(n / bsize))] int32 (row stride `cblk_ld`), the blocks `candidates` marks as ascending block ids, -1 for
+    /// a block whose maximum is not above -inf. `smax`: fp32 scratch [rows, ceil(n / bsize)].
+    pub fn candidateBlocks(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, vis: Ptr, nblocks: usize, bsize: usize, smax: Ptr, cblk: Ptr, cblk_ld: usize, stream: cuda.Stream) !void {
+        if (rows == 0 or n == 0) return;
+        const nblk = (n + bsize - 1) / bsize;
+        try self.blockMax(score, ld, rows, n, vis, bsize, smax, nblk, stream);
+        var a: cuda.Args = .{};
+        a.add(smax);
+        a.add(@as(c_longlong, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(@min(nblocks, nblk))));
+        a.add(cblk);
+        a.add(@as(c_longlong, @intCast(cblk_ld)));
+        try cuda.launch.launch(self.cand_blocks, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
+    }
+
+    fn blockMax(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, vis: Ptr, bsize: usize, smax: Ptr, nblk: usize, stream: cuda.Stream) !void {
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(vis);
+        a.add(@as(c_int, @intCast(bsize)));
+        a.add(smax);
+        a.add(@as(c_longlong, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(nblk)));
+        try cuda.launch.launch(self.cand_blockmax, .{ .grid = .{ .x = @intCast((nblk + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
     }
 
     fn select(self: *const TopkGlue, f: cuda.Function, src: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
@@ -203,18 +246,7 @@ pub const TopkGlue = struct {
     pub fn candidates(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, vis: Ptr, nblocks: usize, bsize: usize, smax: Ptr, mask: Ptr, mask_ld: usize, stream: cuda.Stream) !void {
         if (rows == 0 or n == 0) return;
         const nblk = (n + bsize - 1) / bsize;
-        {
-            var a: cuda.Args = .{};
-            a.add(score);
-            a.add(@as(c_longlong, @intCast(ld)));
-            a.add(@as(c_int, @intCast(n)));
-            a.add(vis);
-            a.add(@as(c_int, @intCast(bsize)));
-            a.add(smax);
-            a.add(@as(c_longlong, @intCast(nblk)));
-            a.add(@as(c_int, @intCast(nblk)));
-            try cuda.launch.launch(self.cand_blockmax, .{ .grid = .{ .x = @intCast((nblk + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
-        }
+        try self.blockMax(score, ld, rows, n, vis, bsize, smax, nblk, stream);
         var a: cuda.Args = .{};
         a.add(smax);
         a.add(@as(c_longlong, @intCast(nblk)));
@@ -265,7 +297,7 @@ pub fn fusedTopk(set: *const aot.Set, score: Ptr, rows: usize, n: usize, kk: usi
 
 /// Whether `set` holds a variant `Set.run` would launch for these arguments (aot.zig's matching, strict or with a
 /// less specialized capture), without its missing-variant report: an optional fast path probes with it.
-fn captured(set: *const aot.Set, function: []const u8, args: []const aot.Arg, consts: []const aot.Const) bool {
+pub fn captured(set: *const aot.Set, function: []const u8, args: []const aot.Arg, consts: []const aot.Const) bool {
     for ([_]bool{ false, true }) |loose| for (set.variants) |v| {
         if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
         if (variantMatches(v.spec, args, consts, loose)) return true;

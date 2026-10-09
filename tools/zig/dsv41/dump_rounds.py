@@ -17,6 +17,10 @@ over the round's rows; each rank's partial `L<i>.p_engram.r<r>` and the gated st
 
 `--streams slot:base:size:prompt,...` places the streams elsewhere (a long stream: a scored indexer, and past the
 candidate pool's width its mask), `--cap` sizes the pool to hold them; the round's bucket is bucket_for(deepest row).
+A fifth field `slot:base:size:prompt:1` fills that stream's caches with seeded noise in place of its prompt (the
+ring, the compressed and index planes over its extent, its compressor inputs; FP4 codes any byte, E4M3 / E8M0 scales
+in a finite range) and gives it random prompt ids: long positions (past the candidate pool's width, the pruned
+selection's) without priming hundreds of thousands of positions; the round reads the caches as they are.
 """
 
 from __future__ import annotations
@@ -52,7 +56,7 @@ def main() -> int:
     ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
     ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
     ap.add_argument("--streams", default="0:0:2048:40,2:2048:2048:200",
-                    help="the streams as slot:base:size:prompt-length, comma separated")
+                    help="the streams as slot:base:size:prompt-length[:1 = noise caches], comma separated")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     fwd = load_module("dump_forward", HERE / "dump_forward.py")
@@ -134,16 +138,56 @@ def main() -> int:
                 d[f"L{li}.raw_kv"], d[f"L{li}.raw_score"] = pool.comp_raw[li]
         return d
 
+    def noise(sc, n: int) -> None:
+        """A stream's caches as seeded noise standing for a prompt of n positions (the round reads them as they are)."""
+        gn = torch.Generator(device="cpu")
+        gn.manual_seed(a.seed + 7919 * (n + 1))
+
+        def fill(t: torch.Tensor, kind: str) -> None:
+            if kind == "codes":                       # FP4 pairs: any byte
+                v = torch.randint(0, 256, t.shape, generator=gn, dtype=torch.int32)
+            elif kind == "e4m3":                      # E4M3 scales 2^-3 .. 2^1 (no NaN bytes)
+                v = torch.randint(0x20, 0x41, t.shape, generator=gn, dtype=torch.int32)
+            elif kind == "e8m0":                      # E8M0 scales 2^-7 .. 2^3
+                v = torch.randint(120, 131, t.shape, generator=gn, dtype=torch.int32)
+            else:
+                v = torch.randn(t.shape, generator=gn)
+            if t.dtype in (torch.uint8, torch.int8):
+                t.copy_(v.to(torch.uint8).view(t.dtype).to(t.device))
+            elif kind in ("codes", "e4m3", "e8m0"):   # 1-byte float views of the same bytes
+                t.view(torch.uint8).copy_(v.to(torch.uint8).to(t.device))
+            else:
+                t.copy_(v.to(t.dtype).to(t.device))
+
+        for li in range(L):
+            fill(sc.ring[li], "normal")
+            if li in sc.comp:
+                fill(sc.comp[li][0], "codes")
+                fill(sc.comp[li][1], "e4m3")
+            if li in sc.index_k:
+                fill(sc.index_k[li][0], "codes")
+                fill(sc.index_k[li][1], "e8m0")
+            if li in sc.comp_raw:
+                fill(sc.comp_raw[li][0], "normal")
+                fill(sc.comp_raw[li][1], "normal")
+        sc.length = n
+
     g = torch.Generator(device="cpu")
     g.manual_seed(a.seed)
-    streams = [tuple(int(v) for v in st.split(":")) for st in a.streams.split(",")]   # (slot, base, size, prompt length)
-    assert all(b + sz <= cap and sl < slots for sl, b, sz, _ in streams), "a stream outside the pool"
+    streams = [tuple(int(v) for v in st.split(":")) for st in a.streams.split(",")]
+    streams = [st if len(st) == 5 else (*st, 0) for st in streams]   # (slot, base, size, prompt length, noise)
+    assert all(b + sz <= cap and sl < slots for sl, b, sz, _, _ in streams), "a stream outside the pool"
     views, prompts = [], []
-    for slot, base, size, n_prompt in streams:
+    for slot, base, size, n_prompt, synthetic in streams:
         sc = m.pool_view(pool, slot, base, size)
         ids = torch.randint(0, c.vocab, (n_prompt,), generator=g).to(torch.int64).cuda()
-        with rec.scope(f"prime_slot{slot}", detail=False):
-            prime(sc, ids)
+        if synthetic:
+            assert eng is None, "noise caches stand for no prompt Engram could hash"
+            sc.tokens[:n_prompt] = ids
+            noise(sc, n_prompt)
+        else:
+            with rec.scope(f"prime_slot{slot}", detail=False):
+                prime(sc, ids)
         views.append(sc)
         prompts.append(ids)
     torch.cuda.synchronize()
@@ -153,7 +197,7 @@ def main() -> int:
     windows = []
     ids_all, pos_all, slot_all, base_all, end_all = [], [], [], [], []
     hashes = []                                       # rounds.py forward: each stream's rows from its own host ids
-    for (slot, base, size, n_prompt), sc, prompt in zip(streams, views, prompts):
+    for (slot, base, size, n_prompt, _), sc, prompt in zip(streams, views, prompts):
         toks = torch.randint(0, c.vocab, (k + 1,), generator=g).tolist()
         windows.append((slot, base, size, sc.length, toks))
         if eng is not None:

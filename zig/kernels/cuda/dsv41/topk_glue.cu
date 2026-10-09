@@ -120,6 +120,14 @@ __device__ void topk_row(const T* row, int n, int k, long long v, long long* out
     }
 }
 
+// kernels.topk_select's picks a row at most (tf_dsv41_topk_keyset's shared sort).
+constexpr int kMaxPicks = 1024;
+
+// An int64 key as an unsigned word in the same order.
+__device__ __forceinline__ unsigned long long key_order(long long k) {
+    return (unsigned long long)k ^ 0x8000000000000000ull;
+}
+
 }  // namespace
 
 extern "C" {
@@ -190,6 +198,117 @@ __global__ void __launch_bounds__(kThreads) tf_dsv41_cand_mask(const float* __re
         const float x = j < nblk ? row[j] : 0.0f;
         if (j < nblk) mask[(size_t)r * mask_ld + j] = (sel && x > -__int_as_float(0x7F800000)) ? 1 : 0;
         eq_seen += eq_total;
+    }
+}
+
+// kernels.topk_select's tail where torch.topk runs (rows of more than TOPK_FUSED_MAX keys, or keys not in position
+// order: the pruned selection's gathered tiles, the candidate pool's keys): each row's k largest int64 keys (k <= n,
+// k <= kMaxPicks), their indices (0xFFFFFFFF - the key's low word) ascending, -1 at or past vis[r] (vis null: no mask).
+// The keys are unique but for PAD_KEY (int64 min, below every key a score makes), whose index is past any vis: so the
+// output is the one torch.topk + _topk_finish write. A radix select of the k-th largest key (eight 8-bit passes), the
+// picks gathered in shared memory, a bitonic sort.
+__global__ void __launch_bounds__(kThreads) tf_dsv41_topk_keyset(const long long* __restrict__ keys, long long ld,
+                                                                 int n, int k, const long long* __restrict__ vis,
+                                                                 long long* __restrict__ out, long long out_ld) {
+    __shared__ uint32_t hist[256];
+    __shared__ unsigned long long s_prefix;
+    __shared__ uint32_t s_remaining;
+    __shared__ long long picks[kMaxPicks];
+    __shared__ int s_taken, s_eq;
+    const int r = blockIdx.x;
+    const long long* row = keys + (size_t)r * ld;
+    if (threadIdx.x == 0) {
+        s_prefix = 0ull;
+        s_remaining = (uint32_t)k;
+        s_taken = 0;
+        s_eq = 0;
+    }
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        const unsigned long long prefix = s_prefix;
+        const unsigned long long high = shift == 56 ? 0ull : (~0ull << (shift + 8));
+        for (int j = threadIdx.x; j < n; j += blockDim.x) {
+            const unsigned long long u = key_order(row[j]);
+            if ((u & high) == (prefix & high)) atomicAdd(&hist[(u >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t rem = s_remaining;
+            uint32_t above = 0u;
+            int d = 255;
+            for (; d > 0; --d) {
+                if (above + hist[d] >= rem) break;
+                above += hist[d];
+            }
+            s_remaining = rem - above;
+            s_prefix = prefix | ((unsigned long long)d << shift);
+        }
+        __syncthreads();
+    }
+    const unsigned long long thr = s_prefix;
+    const int need = (int)s_remaining;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const long long key = row[j];
+        const unsigned long long u = key_order(key);
+        bool take = u > thr;
+        if (!take && u == thr) take = atomicAdd(&s_eq, 1) < need;
+        if (take) picks[atomicAdd(&s_taken, 1)] = 0xFFFFFFFFll - (key & 0xFFFFFFFFll);
+    }
+    int p2 = 1;
+    while (p2 < k) p2 <<= 1;
+    __syncthreads();
+    for (int i = k + threadIdx.x; i < p2; i += blockDim.x) picks[i] = 0x7FFFFFFFFFFFFFFFll;
+    __syncthreads();
+    for (int size = 2; size <= p2; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = threadIdx.x; i < p2; i += blockDim.x) {
+                const int partner = i ^ stride;
+                if (partner > i) {
+                    const bool up = (i & size) == 0;
+                    const long long a = picks[i], b = picks[partner];
+                    if ((a > b) == up) {
+                        picks[i] = b;
+                        picks[partner] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    const long long v = vis ? vis[r] : 0x7FFFFFFFFFFFFFFFll;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const long long idx = picks[i];
+        out[(size_t)r * out_ld + i] = idx < v ? idx : -1LL;
+    }
+}
+
+// rounds.py _candidate_blocks from the block maxima s [rows, nblk] (row stride ld; tf_dsv41_cand_blockmax's, the
+// newest block pinned at +inf): the k blocks with the largest keys (k <= nblk; ties to the lower block), ascending,
+// each block's id or -1 where its maximum is not above -inf, into cblk [rows, k] int32 (row stride cblk_ld): the pool
+// tf_dsv41_cand_mask marks, as the block ids index_keys_cand reads. One block a row (kThreads).
+__global__ void __launch_bounds__(kThreads) tf_dsv41_cand_blocks(const float* __restrict__ s, long long ld, int nblk,
+                                                                 int k, int* __restrict__ cblk, long long cblk_ld) {
+    __shared__ uint32_t scan[kWarps + 1];
+    const int r = blockIdx.x;
+    const float* row = s + (size_t)r * ld;
+    uint32_t thr, need;
+    radix_threshold(row, nblk, k, thr, need);
+    uint32_t eq_seen = 0u, taken = 0u;
+    for (int base = 0; base < nblk; base += blockDim.x) {
+        const int j = base + threadIdx.x;
+        uint32_t u = 0u;
+        if (j < nblk) u = ordered(row[j]);
+        const uint32_t eq = (j < nblk && u == thr) ? 1u : 0u;
+        uint32_t eq_total;
+        const uint32_t eq_before = block_exclusive(eq, scan, eq_total);
+        const uint32_t sel = (j < nblk && (u > thr || (eq && eq_seen + eq_before < need))) ? 1u : 0u;
+        uint32_t sel_total;
+        const uint32_t at = block_exclusive(sel, scan, sel_total);
+        // `where(s.gather(-1, idx) > -inf, idx, -1)`: NaN maxima compare false as well
+        if (sel) cblk[(size_t)r * cblk_ld + taken + at] = row[j] > -__int_as_float(0x7F800000) ? j : -1;
+        eq_seen += eq_total;
+        taken += sel_total;
     }
 }
 

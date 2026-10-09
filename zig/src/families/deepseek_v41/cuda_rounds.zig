@@ -10,9 +10,13 @@
 //! (`_hc_post_only`, `_hc_finish_s`, `_hc_mix_part`, `_hc_sinkhorn`), attn_in, wq_b and wo_a / wo_b as grouped EXL3
 //! launches (`exl3.Group`: rot_many + glinear) with q's RMSNorm writing wq_b's rotated rows beside the window KV's
 //! norm (`_q_kv_norm`), q's RoPE in wq_b's epilogue, the attention merge applying the inverse RoPE and rotating wo_a's
-//! input (`_sparse_attn_merge_rot2`), wo_a's epilogue rotating wo_b's input, and the paced L2 prefetch forks (`L2`,
-//! TF_DS_L2_PREFETCH). TF_DS_FUSED=0 keeps the plain path (the fork's TF_DS_HC_FUSED=0, TF_DS_ROT_*=0: plain hc_pre /
-//! hc_post, the q path in three launches, the merge apart from wo_a); both write the same bits. The indexer's
+//! input (`_sparse_attn_merge_rot2`), wo_a's epilogue rotating wo_b's input, the paced L2 prefetch forks (`L2`,
+//! TF_DS_L2_PREFETCH), and the indexer's glue as the fork's switches "idx", "topk_fused", "topk_prune", "tile_skip"
+//! and "cand_only" make it (`fusedIndex`: the weights in one launch, the scores written as top-k keys with the pool's
+//! mask, the top-k of long rows from their largest tiles, past the pool's width only the pool's blocks scored).
+//! TF_DS_FUSED=0 keeps the plain path (the fork's TF_DS_HC_FUSED=0, TF_DS_ROT_*=0, TF_DS_INDEXER_FUSED=0: plain
+//! hc_pre / hc_post, the q path in three launches, the merge apart from wo_a, fp32 scores and a row select); both
+//! write the same bits. The indexer's
 //! selection: at short buckets (bucket / ratio <= idx_topk) every compressed entry below the row's visible count
 //! (`alltop`, no scores); past them the scores of every row against its own stream's extent (`_index_score` with
 //! per-row bases), the candidate pool at the candidate source and its mask after it, and the top-k on the device
@@ -55,6 +59,9 @@ pub const max_rows = 16;
 pub const raw_rows = 64; // compressor inputs kept by position a slot (model.py RAW)
 /// The smallest context bucket (graph.py BUCKET_MIN).
 pub const bucket_min = 1024;
+/// Keys a row the fork's one-launch selection takes at most (kernels.TOPK_FUSED_MAX); past it the selection is
+/// torch's top-k, pruned to the largest tiles where they are more than k (kernels.prunes).
+pub const topk_fused_max = 4096;
 
 /// graph.py `bucket_for(deepest, cap)`: the smallest power of two >= `deepest`, `least` at least, then at most
 /// max(cap, least). Monotone in `deepest`; >= `deepest` whenever `deepest` <= max(cap, least).
@@ -535,6 +542,7 @@ const SegState = struct {
     tap: usize = 0,
     cidx: Ptr = 0, // the picks the compressed layers read (the last index layer's)
     cand_made: bool = false,
+    cblk_made: bool = false, // the fused path's candidate pool as block ids (`cblk`, switch "cand_only")
 };
 
 /// One key's graphs: a stretch's executable (null until recorded), the gathers it replays, the state at its end.
@@ -616,7 +624,12 @@ pub const RoundRunner = struct {
     wl: cuda.DeviceBuffer, // fp32 [R, idx_heads]
     wts_i: cuda.DeviceBuffer, // bf16 [R, idx_heads]
     score: cuda.DeviceBuffer, // fp32 [R, bucket]
-    keys: cuda.DeviceBuffer, // int64 [R, bucket / ratio] for the fused selection (where it applies)
+    keys: cuda.DeviceBuffer, // int64 [R, bucket] (the fused path; the plain one: [R, min(bucket, 4096)])
+    tmax: cuda.DeviceBuffer, // int64 [R, bucket / 64]: each 64-key tile's largest key (switch "topk_prune")
+    tkeys: cuda.DeviceBuffer, // int64 [R, idx_topk x 64]: the pruned selection's gathered tiles
+    tpos: cuda.DeviceBuffer, // int64 [R, idx_topk]: positions of the largest tile maxima
+    cblk: cuda.DeviceBuffer, // int32 [R, cand_blocks]: the candidate pool's block ids (switch "cand_only")
+    t_every: cuda.DeviceBuffer, // int64 [R], every word 0x0101..01: a visible count past every index (no mask)
     smax: cuda.DeviceBuffer, // fp32 [R, cand cols]
     cand_mask: cuda.DeviceBuffer, // u8 [R, cand cols]: the candidate source's pool this round
     score_h: []f32, // the host selection's
@@ -759,8 +772,17 @@ pub const RoundRunner = struct {
         // the widest scan is the ratio-1 layers' (bucket entries); the smallest is the fused selection's candidate
         const scored = bucket > cfg.idx_topk;
         self.score = try cuda.DeviceBuffer.alloc(d, if (scored) R * bucket * 4 else 16);
-        // the fused selection's keys: scans of up to 4096 entries (fusedTopk's widest), at any round's bucket
-        self.keys = try cuda.DeviceBuffer.alloc(d, if (scored) R * @as(usize, @min(bucket, 4096)) * 8 else 16);
+        // the selection's keys: the plain path's fusedTopk scans up to 4096 entries; the fused path keys whole rows
+        // (the candidate source's scores at ratio 1: bucket entries)
+        self.fused = fusedFromEnv();
+        self.keys = try cuda.DeviceBuffer.alloc(d, if (!scored) 16 else if (self.fused) R * bucket * 8 else R * @as(usize, @min(bucket, 4096)) * 8);
+        const fused_scored = scored and self.fused;
+        self.tmax = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * ((bucket + 63) / 64) * 8 else 16);
+        self.tkeys = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * cfg.idx_topk * 64 * 8 else 16);
+        self.tpos = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * cfg.idx_topk * 8 else 16);
+        self.cblk = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * @max(1, cfg.cand_blocks) * 4 else 16);
+        self.t_every = try cuda.DeviceBuffer.alloc(d, R * 8);
+        try self.t_every.fill8(0x01, null);
         const ccols = (bucket + @max(1, cfg.cand_block) - 1) / @max(1, cfg.cand_block);
         self.smax = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols * 4 else 16);
         self.cand_mask = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols else 16);
@@ -826,7 +848,6 @@ pub const RoundRunner = struct {
         };
         self.ntap = ntap;
         self.taps = try cuda.DeviceBuffer.alloc(d, R * @max(ntap, 1) * D * 2);
-        self.fused = fusedFromEnv();
         self.side_live = false;
         self.gk = try exl3.GroupKernels.load(d);
         self.lg = try gpa.alloc(LayerGroups, w.layers.len);
@@ -872,7 +893,7 @@ pub const RoundRunner = struct {
         self.gpa.free(self.keys_h);
         self.gpa.free(self.cand_h);
         self.uploads.deinit();
-        inline for (.{ "t_all", "t_cidx", "t_zero", "iq", "iqq", "wl", "wts_i", "score", "keys", "smax", "cand_mask", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
+        inline for (.{ "t_all", "t_cidx", "t_zero", "iq", "iqq", "wl", "wts_i", "score", "keys", "tmax", "tkeys", "tpos", "cblk", "t_every", "smax", "cand_mask", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
         self.scratch.deinit();
         for (self.lg) |*g| g.deinit();
         self.gpa.free(self.lg);
@@ -1125,7 +1146,7 @@ pub const RoundRunner = struct {
         const sg = segs[k];
         if (k == 0) {
             try self.hc.embedInit(stream, w.embed.ptr(), self.tab(Tab.row(Tab.ids)), self.h.ptr, self.pre.ptr, @intCast(R));
-            self.st = .{ .h = self.h.ptr, .spare = self.h2.ptr, .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .tap = 0, .cidx = self.t_cidx.ptr, .cand_made = false };
+            self.st = .{ .h = self.h.ptr, .spare = self.h2.ptr, .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .tap = 0, .cidx = self.t_cidx.ptr, .cand_made = false, .cblk_made = false };
         }
         var nb: [48]u8 = undefined;
         if (self.fused) try self.fusedLayers(sg, R, gather, stream) else for (w.layers[sg.first..sg.end], sg.first..) |*l, li| {
@@ -1296,9 +1317,11 @@ pub const RoundRunner = struct {
             try self.ropeHeads(self.k.ptr, rope, t_gpos, R, 1, c.idx_dim, false, stream);
             try self.fp4Store(self.k.ptr, c.idx_dim, src.idxk_codes.ptr, src.idxk_scales.ptr, t_ctarget, R, 32, false, stream);
         }
-        try self.lat2.copyFrom(0, self.lat.ptr, R * hd * 2, stream.handle);
-        try self.ropeHeads(self.lat2.ptr, rope, t_gpos, R, 1, hd, false, stream);
-        try self.fp4Store(self.lat2.ptr, hd, src.comp_codes.ptr, src.comp_scales.ptr, t_ctarget, R, 16, true, stream);
+        // the fused path rotates the latents in place (rounds.py `_kv_idx` with "comp": nothing reads them after)
+        const lat = if (self.fused) self.lat.ptr else self.lat2.ptr;
+        if (!self.fused) try self.lat2.copyFrom(0, self.lat.ptr, R * hd * 2, stream.handle);
+        try self.ropeHeads(lat, rope, t_gpos, R, 1, hd, false, stream);
+        try self.fp4Store(lat, hd, src.comp_codes.ptr, src.comp_scales.ptr, t_ctarget, R, 16, true, stream);
     }
 
     /// rounds.py `_attention`'s scored indexer on layer `li` (an index layer, nb > idx_topk): the rows' index
@@ -1536,7 +1559,10 @@ pub const RoundRunner = struct {
             kk = @min(c.idx_topk, nb_);
             if (c.isIndexSource(li)) {
                 if (nb_ > c.idx_topk) {
-                    try self.roundIndex(li, R, nb_, kk, j, need_iq, stream);
+                    if (self.glue.hostSelect() or !std.math.isPowerOfTwo(kk))
+                        try self.roundIndex(li, R, nb_, kk, j, need_iq, stream)
+                    else
+                        try self.fusedIndex(li, R, nb_, kk, j, need_iq, stream);
                     self.st.cidx = self.t_cidx.ptr;
                 } else self.st.cidx = self.tab(Tab.picks(j, self.kmax));
             }
@@ -1595,6 +1621,132 @@ pub const RoundRunner = struct {
         }
         try self.l2.moe(li, stream);
         return self.attn_out.ptr;
+    }
+
+    /// rounds.py `_kv_idx`'s fused indexer (switches "idx", "topk_fused", "topk_prune", "tile_skip", "cand_only") on
+    /// index layer `li` (nb > idx_topk, kk a power of two): the index queries' RoPE and FP4, the weights in one
+    /// `_rowmm2` (rowmm + bf16 + scale); then by the layer's part in the candidate pool:
+    /// - past the pool's width after the candidate source (`cblk` made): the pool's blocks scored as keys
+    ///   (`_index_score_cand`), their top-k;
+    /// - the candidate source: the fp32 scores, the pool (block ids past its width, else the mask), their keys
+    ///   (`_score_keys`, with each tile's maximum past TOPK_FUSED_MAX) and the (pruned) top-k;
+    /// - any other index layer: the scores as keys in one launch (`_index_score` KEYS, the pool's mask folded in
+    ///   after the source; tile maxima past TOPK_FUSED_MAX, dead tiles written as PAD maxima where the selection
+    ///   prunes), then the (pruned) top-k.
+    /// Every selection is the set of the k largest keys (a total order), so the picks in `t_cidx` are the plain
+    /// path's.
+    fn fusedIndex(self: *RoundRunner, li: usize, R: usize, nb: usize, kk: usize, j: usize, iq_ready: bool, stream: cuda.Stream) !void {
+        const c = self.cfg;
+        const l = &self.w.layers[li];
+        const src = &self.pool.planes[self.pool.source[li]].?;
+        const role = attention.CandRole.of(c.cand_source, li, true);
+        const bsize = @max(1, c.cand_block);
+        const t_vis = self.tab(Tab.ratio(j, Tab.vis));
+        const t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
+        const tg = &self.glue.topk.?;
+        if (!iq_ready) try l.idx_wq_b.?.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
+        try self.ropeHeads(self.iq.ptr, self.rope_c, self.tab(Tab.row(Tab.pos)), R, c.idx_heads, c.idx_dim, false, stream);
+        const nblk: usize = R * c.idx_heads * c.idx_dim / 32;
+        try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
+            aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
+        }, &.{ aot.ci("BLKS", 32), aot.ci("PDL", 1) });
+        {
+            // kernels.rowmm_wts: (rowmm(x, w).to(bf16) * scale) -> bf16, one output (one warp) a program
+            const scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.idx_dim))) * @sqrt(@as(f64, @floatFromInt(c.idx_heads)))));
+            const bn: usize = if (c.idx_heads > 64) 4 else 1;
+            try self.set.run(stream, "_rowmm2", .{ @intCast(R), @intCast((c.idx_heads + bn - 1) / bn), 1 }, &.{
+                aot.ptr("X", "*bf16", self.x.ptr), aot.int("xs", @intCast(c.dim)), aot.ptr("W", "*fp16", self.idx_proj_h[li].ptr),
+                aot.ptr("OUT", "*bf16", self.wts_i.ptr), aot.float("scale", scale),
+            }, &.{ aot.ci("K", @intCast(c.dim)), aot.ci("N", @intCast(c.idx_heads)), aot.ci("BN", @intCast(bn)), aot.ci("BK", 256), aot.ci("PDL", 1), aot.ci("WTS", 1) });
+        }
+        const nt: usize = (nb + 63) / 64;
+        const wide = nb > topk_fused_max; // tile maxima (topk_select_pruned)
+        const prunes = wide and nt > kk;
+        const pool_cols = c.cand_blocks * bsize;
+        if (role == .after and self.st.cblk_made) {
+            // past the pool's width: only the pool's blocks scored (kernels.index_keys_cand), PAD_KEY for -1 blocks
+            try self.set.run(stream, "_index_score_cand", .{ @intCast(R), @intCast((pool_cols + 63) / 64), 1 }, &.{
+                aot.ptr("Q", "*bf16", self.iqq.ptr),    aot.ptr("K", "*u8", src.idxk_codes.ptr), aot.ptr("KS", "*u8", src.idxk_scales.ptr),
+                aot.ptr("Wt", "*bf16", self.wts_i.ptr), aot.ptr("VIS", "*i64", t_vis),           aot.ptr("OUT", "*i64", self.keys.ptr),
+                aot.int("n", @intCast(nb)),             aot.int("nout", @intCast(pool_cols)),    aot.ptr("KB", "*i64", t_cbase),
+                aot.ptr("CBLK", "*i32", self.cblk.ptr), aot.int("cbs", @intCast(c.cand_blocks)),
+            }, &.{
+                aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64), aot.ci("PACKED", 1),
+                aot.ci("HAS_BASE", 1),                aot.ci("CB", @intCast(bsize)),     aot.ci("PDL", 1),
+            });
+            return self.topkSelect(tg, self.keys.ptr, R, pool_cols, kk, t_vis, self.t_cidx.ptr, stream);
+        }
+        if (role != .source) {
+            if (role == .after and !self.st.cand_made) return error.Unsupported; // no candidate source before this layer
+            const has_cand = role == .after;
+            const ccols = (nb + bsize - 1) / bsize;
+            try self.set.run(stream, "_index_score", .{ @intCast(R), @intCast(nt), 1 }, &.{
+                aot.ptr("Q", "*bf16", self.iqq.ptr),    aot.ptr("K", "*u8", src.idxk_codes.ptr), aot.ptr("KS", "*u8", src.idxk_scales.ptr),
+                aot.ptr("Wt", "*bf16", self.wts_i.ptr), aot.ptr("VIS", "*i64", t_vis),           aot.ptr("OUT", "*i64", self.keys.ptr),
+                aot.int("n", @intCast(nb)),             aot.ptr("KB", "*i64", t_cbase),
+                if (has_cand) aot.ptr("CAND", "*u8", self.cand_mask.ptr) else aot.ptr("CAND", "*i64", t_vis),
+                aot.int("cs", if (has_cand) @intCast(ccols) else 0),
+                aot.ptr("TMAX", "*i64", if (wide) self.tmax.ptr else self.keys.ptr), aot.int("nt", @intCast(nt)),
+            }, &.{
+                aot.ci("IH", @intCast(c.idx_heads)),   aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64),                       aot.ci("PACKED", 1),
+                aot.ci("HAS_BASE", 1),                  aot.ci("PDL", 1),                  aot.ci("HAS_CAND", @intFromBool(has_cand)), aot.ci("CB", @intCast(bsize)),
+                aot.ci("KEYS", 1),                      aot.ci("HAS_TMAX", @intFromBool(wide)), aot.ci("SKIP_DEAD", 1),            aot.ci("DEAD_PAD", @intFromBool(prunes)),
+            });
+            if (prunes) return self.topkPruned(tg, R, nb, kk, t_vis, stream);
+            return self.topkSelect(tg, self.keys.ptr, R, nb, kk, t_vis, self.t_cidx.ptr, stream);
+        }
+        // the candidate source: its fp32 scores make the pool, then their keys' top-k
+        try self.set.run(stream, "_index_score", .{ @intCast(R), @intCast(nt), 1 }, &.{
+            aot.ptr("Q", "*bf16", self.iqq.ptr),    aot.ptr("K", "*u8", src.idxk_codes.ptr),  aot.ptr("KS", "*u8", src.idxk_scales.ptr),
+            aot.ptr("Wt", "*bf16", self.wts_i.ptr), aot.ptr("VIS", "*i64", t_vis),            aot.ptr("OUT", "*fp32", self.score.ptr),
+            aot.int("n", @intCast(nb)),             aot.ptr("KB", "*i64", t_cbase),          aot.ptr("CAND", "*i64", t_vis),
+            aot.int("cs", 0),                       aot.ptr("TMAX", "*fp32", self.score.ptr), aot.int("nt", @intCast(nt)),
+        }, &.{
+            aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64),      aot.ci("PACKED", 1),
+            aot.ci("HAS_BASE", 1),                aot.ci("PDL", 1),                  aot.ci("HAS_CAND", 0), aot.ci("CB", 8),
+            aot.ci("KEYS", 0),                    aot.ci("HAS_TMAX", 0),             aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
+        });
+        if (nb > pool_cols) {
+            // switch "cand_only": the pool as block ids for the layers after (rounds.py _candidate_blocks)
+            try tg.candidateBlocks(self.score.ptr, nb, R, nb, t_vis, c.cand_blocks, bsize, self.smax.ptr, self.cblk.ptr, c.cand_blocks, stream);
+            self.st.cblk_made = true;
+        } else {
+            const ccols = (nb + bsize - 1) / bsize;
+            try tg.candidates(self.score.ptr, nb, R, nb, t_vis, c.cand_blocks, bsize, self.smax.ptr, self.cand_mask.ptr, ccols, stream);
+            self.st.cand_made = true;
+        }
+        try self.set.run(stream, "_score_keys", .{ @intCast(R), @intCast((nb + 1023) / 1024), 1 }, &.{
+            aot.ptr("S", "*fp32", self.score.ptr), aot.ptr("OUT", "*i64", self.keys.ptr), aot.int("n", @intCast(nb)),
+            aot.ptr("TMAX", "*i64", if (wide) self.tmax.ptr else self.keys.ptr), aot.int("nt", @intCast(nt)),
+        }, &.{ aot.ci("BN", 1024), aot.ci("PDL", 1), aot.ci("HAS_TMAX", @intFromBool(wide)), aot.ci("TB", 64) });
+        if (prunes) return self.topkPruned(tg, R, nb, kk, t_vis, stream);
+        return self.topkSelect(tg, self.keys.ptr, R, nb, kk, t_vis, self.t_cidx.ptr, stream);
+    }
+
+    /// kernels.topk_select on int64 keys [R, n] into out [R, kk]: `_topk_sel` (one launch a row) where the fork
+    /// takes it (n a power of two, n <= TOPK_FUSED_MAX) and the set holds its variant, else topk_glue.cu's key-set
+    /// selection (torch.topk + `_topk_finish`'s output).
+    fn topkSelect(self: *RoundRunner, tg: *const attention.TopkGlue, keys: Ptr, R: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, stream: cuda.Stream) !void {
+        if (self.glue.select == .auto and std.math.isPowerOfTwo(n) and kk <= n and n <= topk_fused_max) {
+            const args = [_]aot.Arg{ aot.ptr("KEYS", "*i64", keys), aot.ptr("VIS", "*i64", vis), aot.ptr("OUT", "*i64", out) };
+            const consts = [_]aot.Const{ aot.ci("N", @intCast(n)), aot.ci("KK", @intCast(kk)), aot.ci("PDL", 1) };
+            if (attention.captured(self.set, "_topk_sel", &args, &consts))
+                return self.set.run(stream, "_topk_sel", .{ @intCast(R), 1, 1 }, &args, &consts);
+        }
+        try tg.topkKeyset(keys, n, R, n, kk, vis, out, kk, stream);
+    }
+
+    /// kernels.topk_select_pruned on `keys` [R, nb] with the tile maxima in `tmax` [R, ceil(nb / 64)] (more tiles
+    /// than kk): the kk tiles with the largest maxima (their positions unmasked), their keys gathered
+    /// (`_gather_tiles`), the top-k of those into `t_cidx`.
+    fn topkPruned(self: *RoundRunner, tg: *const attention.TopkGlue, R: usize, nb: usize, kk: usize, vis: Ptr, stream: cuda.Stream) !void {
+        const nt = (nb + 63) / 64;
+        try self.topkSelect(tg, self.tmax.ptr, R, nt, kk, self.t_every.ptr, self.tpos.ptr, stream);
+        try self.set.run(stream, "_gather_tiles", .{ @intCast(R), @intCast(kk), 1 }, &.{
+            aot.ptr("KEYS", "*i64", self.keys.ptr), aot.ptr("TPOS", "*i64", self.tpos.ptr), aot.ptr("OUT", "*i64", self.tkeys.ptr),
+            aot.int("n", @intCast(nb)),              aot.int("ks", @intCast(nb)),
+        }, &.{ aot.ci("BN", 64), aot.ci("KK", @intCast(kk)), aot.ci("PDL", 1) });
+        try self.topkSelect(tg, self.tkeys.ptr, R, kk * 64, kk, vis, self.t_cidx.ptr, stream);
     }
 
     fn rmsnorm(self: *RoundRunner, x: Ptr, w: Ptr, out: Ptr, n: usize, d: usize, stream: cuda.Stream) !void {

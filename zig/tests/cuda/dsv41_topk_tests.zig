@@ -1,8 +1,10 @@
 //! `dsv41-topk [aot-dir]`: the DSV4.1 indexer's device selection (cuda_attention.zig: topk_glue.cu's row select,
-//! the candidate pool and its mask, and with an AOT set the captured `_score_keys` + `_topk_sel`) against the host
-//! oracle (kernels.topk_indices / model.py `_candidates` / `apply_candidates` on the host), on seeded scores built to
-//! stress the total order: many ties, -0 beside +0, -inf past each row's visible count, visible counts of 0 and of
-//! the whole row, and candidate pools smaller than the visible blocks (the binding case of long contexts).
+//! the candidate pool and its mask, the key-set selection on keys in any order, the pool as block ids, and with an
+//! AOT set the captured `_score_keys` + `_topk_sel`) against the host oracle (kernels.topk_indices / topk_select /
+//! model.py `_candidates` / `apply_candidates` / rounds.py `_candidate_blocks` on the host), on seeded scores built
+//! to stress the total order: many ties, -0 beside +0, -inf past each row's visible count, visible counts of 0 and
+//! of the whole row, PAD keys, and candidate pools smaller than the visible blocks (the binding case of long
+//! contexts).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -196,6 +198,113 @@ pub fn topk(gpu: Gpu, aot_dir: ?[]const u8) !void {
         if (ok) {
             check.pass("dsv41-topk candidates: {d} rows of {d} scores, a pool of {d} blocks of {d} ({d} rows with more visible blocks than the pool): mask, masked scores and picks equal the host oracle's", .{ cs.rows, cs.n, cs.nblocks, cs.bsize, bound });
         } else failures += 1;
+    }
+
+    // -- topk_select on keys in any order (the pruned selection's gathered tiles, the pool's keys): the key-set
+    // selection against the host's kernels.topk_select, the keys shuffled and PAD_KEY entries mixed in (more PAD keys
+    // than finite ones in some rows, so PAD keys are picked: -1 whatever vis)
+    const set_cases = [_]Case{
+        .{ .rows = 16, .n = 32768, .kk = 512 }, .{ .rows = 5, .n = 16384, .kk = 512 }, .{ .rows = 7, .n = 600, .kk = 512 },
+        .{ .rows = 3, .n = 4096, .kk = 1024 },  .{ .rows = 4, .n = 9001, .kk = 300 },
+    };
+    for (set_cases) |cs| {
+        const sc = try gpa.alloc(f32, cs.rows * cs.n);
+        defer gpa.free(sc);
+        const vis = try gpa.alloc(i64, cs.rows);
+        defer gpa.free(vis);
+        scores(rnd, cs.rows, cs.n, vis, sc);
+        const hk = try gpa.alloc(i64, cs.rows * cs.n);
+        defer gpa.free(hk);
+        const want = try gpa.alloc(i64, cs.rows * cs.kk);
+        defer gpa.free(want);
+        const tmp = try gpa.alloc(i64, cs.n);
+        defer gpa.free(tmp);
+        for (0..cs.rows) |r| {
+            const row = hk[r * cs.n .. (r + 1) * cs.n];
+            // positions spread over a wider row (tiles of a long row), some entries PAD_KEY
+            const pad_share: usize = if (r % 3 == 0) 2 else 9;
+            for (row, 0..) |*kv, t| kv.* = if (rnd.uintLessThan(usize, 10) < 10 - pad_share) A.key(sc[r * cs.n + t], t * 3 + 1) else std.math.minInt(i64);
+            rnd.shuffle(i64, row);
+            @memcpy(tmp, row);
+            A.hostTopkKeys(tmp, cs.kk, vis[r] * 3, want[r * cs.kk .. (r + 1) * cs.kk]);
+            vis[r] *= 3;
+        }
+        var d_k = try upload(gpu.d, std.mem.sliceAsBytes(hk));
+        defer d_k.free();
+        var d_vis = try upload(gpu.d, std.mem.sliceAsBytes(vis));
+        defer d_vis.free();
+        var d_out = try cuda.DeviceBuffer.alloc(gpu.d, cs.rows * cs.kk * 8);
+        defer d_out.free();
+        try d_out.fill8(0xAB, null);
+        try tg.topkKeyset(d_k.ptr, cs.n, cs.rows, cs.n, cs.kk, d_vis.ptr, d_out.ptr, cs.kk, stream);
+        try stream.synchronize();
+        const got = try gpa.alloc(i64, cs.rows * cs.kk);
+        defer gpa.free(got);
+        try d_out.download(0, std.mem.sliceAsBytes(got));
+        var what: [96]u8 = undefined;
+        if (check.sameBytes(try std.fmt.bufPrint(&what, "topk keyset rows {d} n {d} k {d}", .{ cs.rows, cs.n, cs.kk }), std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want))) |_| {
+            check.pass("dsv41-topk key set: {d} rows of {d} shuffled keys with PAD keys, k {d}: kernels.topk_select's picks", .{ cs.rows, cs.n, cs.kk });
+        } else |_| failures += 1;
+    }
+
+    // -- _candidate_blocks: the pool as ascending block ids, -1 for a picked block whose maximum is -inf ----------
+    const blk_cases = [_]struct { rows: usize, n: usize, nblocks: usize }{
+        .{ .rows = 16, .n = 32768, .nblocks = 2048 }, .{ .rows = 9, .n = 262144, .nblocks = 2048 }, .{ .rows = 5, .n = 17000, .nblocks = 2048 },
+    };
+    for (blk_cases) |cs| {
+        const bsize: usize = 8;
+        const nblk = (cs.n + bsize - 1) / bsize;
+        const kb = @min(cs.nblocks, nblk);
+        const sc = try gpa.alloc(f32, cs.rows * cs.n);
+        defer gpa.free(sc);
+        const vis = try gpa.alloc(i64, cs.rows);
+        defer gpa.free(vis);
+        scores(rnd, cs.rows, cs.n, vis, sc);
+        const want = try gpa.alloc(i32, cs.rows * kb);
+        defer gpa.free(want);
+        const keys = try gpa.alloc(i64, nblk);
+        defer gpa.free(keys);
+        const neg_inf_hi = A.key(-std.math.inf(f32), 0) >> 32;
+        const inf_hi = A.key(std.math.inf(f32), 0) >> 32;
+        for (0..cs.rows) |r| {
+            const row = sc[r * cs.n .. (r + 1) * cs.n];
+            const last: i64 = if (vis[r] - 1 >= 0) @divFloor(vis[r] - 1, @as(i64, @intCast(bsize))) else -1;
+            for (0..nblk) |b| {
+                var m: f32 = -std.math.inf(f32);
+                for (row[b * bsize .. @min(cs.n, (b + 1) * bsize)]) |v| m = @max(m, v);
+                if (@as(i64, @intCast(b)) == last) m = std.math.inf(f32);
+                keys[b] = A.key(m, b);
+            }
+            std.sort.pdq(i64, keys, {}, std.sort.desc(i64));
+            const top = keys[0..kb];
+            std.sort.pdq(i64, top, {}, struct {
+                fn lt(_: void, a: i64, b: i64) bool {
+                    return (0xFFFFFFFF - (a & 0xFFFFFFFF)) < (0xFFFFFFFF - (b & 0xFFFFFFFF));
+                }
+            }.lt);
+            for (top, 0..) |kv, i| {
+                const hi = kv >> 32;
+                want[r * kb + i] = if (hi > neg_inf_hi and hi <= inf_hi) @intCast(0xFFFFFFFF - (kv & 0xFFFFFFFF)) else -1;
+            }
+        }
+        var d_sc = try upload(gpu.d, std.mem.sliceAsBytes(sc));
+        defer d_sc.free();
+        var d_vis = try upload(gpu.d, std.mem.sliceAsBytes(vis));
+        defer d_vis.free();
+        var d_smax = try cuda.DeviceBuffer.alloc(gpu.d, cs.rows * nblk * 4);
+        defer d_smax.free();
+        var d_cblk = try cuda.DeviceBuffer.alloc(gpu.d, cs.rows * kb * 4);
+        defer d_cblk.free();
+        try d_cblk.fill8(0xEE, null);
+        try tg.candidateBlocks(d_sc.ptr, cs.n, cs.rows, cs.n, d_vis.ptr, cs.nblocks, bsize, d_smax.ptr, d_cblk.ptr, kb, stream);
+        try stream.synchronize();
+        const got = try gpa.alloc(i32, cs.rows * kb);
+        defer gpa.free(got);
+        try d_cblk.download(0, std.mem.sliceAsBytes(got));
+        var what: [96]u8 = undefined;
+        if (check.sameBytes(try std.fmt.bufPrint(&what, "candidate blocks n {d} pool {d}", .{ cs.n, cs.nblocks }), std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want))) |_| {
+            check.pass("dsv41-topk candidate blocks: {d} rows of {d} scores, a pool of {d} blocks: rounds.py _candidate_blocks' ids", .{ cs.rows, cs.n, cs.nblocks });
+        } else |_| failures += 1;
     }
     try check.expect(failures == 0, "{d} selection case(s) differ from the host oracle", .{failures});
 }
