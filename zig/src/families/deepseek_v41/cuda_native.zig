@@ -1,7 +1,8 @@
 //! DeepSeek-V4.1-Flash (EXL3, two DGX Sparks over NCCL) behind the native family interface: rank 0 serves the lane
 //! core, rank 1 follows its steps. The ranks' settings come from the environment (`--tp/--rank/--master/
 //! --master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT), the weights from the Python
-//! family's rank cache (TF_DS_RANK_CACHE), the RoPE tables from TF_DS_ROPE_DIR (default `<kernels>/rope`).
+//! family's rank cache (TF_DS_RANK_CACHE), the RoPE tables from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
+//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048).
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -14,7 +15,7 @@ pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3"};
 pub const default_context: i64 = 16384;
 pub const max_segments: u32 = 1;
-pub const prompt_rows: u32 = @intCast(lanesmod.max_rows);
+pub const prompt_rows: u32 = @intCast(lanesmod.default_chunk);
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 
@@ -56,7 +57,12 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
     const bucket: usize = if (getenv("TF_DS_BUCKET")) |b| (std.fmt.parseInt(usize, b, 10) catch return error.BadEnvironment) else bucket_default;
     const rope_dir = if (getenv("TF_DS_ROPE_DIR")) |r| try gpa.dupe(u8, r) else try std.fs.path.join(gpa, &.{ kernels_dir, "rope" });
     const cache_dir = try gpa.dupe(u8, getenv("TF_DS_RANK_CACHE") orelse return error.NoRankCache);
-    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir };
+    const chunk = try envInt("TF_DS_PREFILL_CHUNK", @intCast(lanesmod.default_chunk));
+    if (chunk < 1 or chunk > lanesmod.default_chunk) {
+        std.log.err("TF_DS_PREFILL_CHUNK is {d}: it takes 1 to {d} rows", .{ chunk, lanesmod.default_chunk });
+        return error.BadEnvironment;
+    }
+    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk };
 }
 
 /// This rank's device bytes: the rank cache's backbone entries (the DSpark blocks are not loaded yet).
@@ -113,7 +119,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.SamplingNotSupported => "this engine decodes greedily for now: send temperature 0",
         error.WindowTooWide, error.NoDraftHead => "this engine serves one plain stream for now: no drafts, no concurrent rounds",
-        error.OutOfStep => "the two ranks planned different steps; restart both ranks",
+        error.OutOfStep => "the two ranks planned different steps (or one cannot run a step: check both ranks' TF_DS_PREFILL_CHUNK and TF_DS_ENGRAM); restart both ranks",
         else => null,
     };
 }
@@ -127,5 +133,5 @@ fn release(p: *anyopaque) void {
 
 test "settings read the environment's rank and world" {
     _ = settings;
-    try std.testing.expectEqual(@as(u32, 16), prompt_rows);
+    try std.testing.expectEqual(@as(u32, 2048), prompt_rows);
 }

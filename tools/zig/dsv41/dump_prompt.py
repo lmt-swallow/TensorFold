@@ -7,14 +7,16 @@ the prompt's last row. Every chunk records the mixes' inputs, both ranks' partia
 sublayer, the index layers' picks, and the cache planes after the chunk. No replay (TF_DS_REPLAY=0), no taps (the
 fixture's layers hold none); Engram runs on its layers when `--engram <dir>` names the tables (dump_forward.EngramRef:
 each rank's partial `L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded), as without tables it is
-skipped.
+skipped. With `--decode`, each chunk size's fixture also holds one decode row after the prompt (graph.py
+`StaticDecoder._body` at R = 1, as dump_forward.py runs it) on the prompt's greedy token (the argmax of the last row's
+logits): its partials, streams, head, logits (`D.<name>`) and the cache planes after it.
 
 Written: fixtures/prompt_common (dims, the prompt ids, rope tables), fixtures/prompt_c<chunk> per chunk size,
 launches.json / jit.json for tools/zig/dsv41/prompt_capture.sh.
 
 Run inside the fork's image:
   python3 -B /w/tools/zig/dsv41/dump_prompt.py --tools /w/tools/zig --model /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw \
-      --out /aot/out --layers 4 --prompt 600 --chunks 2048,512 [--engram /models/DeepSeek-V4.1-Flash-Engram]
+      --out /aot/out --layers 4 --prompt 600 --chunks 2048,512 [--engram /models/DeepSeek-V4.1-Flash-Engram] [--decode]
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20261009)
     ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
     ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
+    ap.add_argument("--decode", action="store_true", help="one greedy decode row after the prompt (D.<name>)")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     df = load_module("dump_forward", HERE / "dump_forward.py")
@@ -67,6 +70,7 @@ def main() -> int:
     from tensorfold.families.deepseek_v41 import fp32_gemms
     from tensorfold.families.deepseek_v41.config import Cfg
     from tensorfold.families.deepseek_v41.cuda import kernels as K
+    from tensorfold.families.deepseek_v41.cuda.graph import StaticDecoder
     from tensorfold.families.deepseek_v41.cuda.model import KV_QUANT, RAW, Comm, Model, mm
     from tensorfold.families.deepseek_v41.cuda.weights import Shards, Weights, linear, load_block
 
@@ -176,6 +180,49 @@ def main() -> int:
         sc.length = start + n
         return h, pre
 
+    def decode_row(sc, token: int, record) -> torch.Tensor:
+        """graph.py StaticDecoder._body at R = 1 on `token` at the cache's end (dump_forward.py's body: no L2 forks, no
+        taps), each sublayer on both ranks' weights -> the row's logits [1, V]."""
+        dec = StaticDecoder(m, sc, 1, a.bucket, False)
+        start = sc.length
+        dec.ids.fill_(token)
+        dec.pos.fill_(start)
+        sc.tokens[start] = token
+        h = w.embed[dec.ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
+        pre = torch.zeros((1, c.hc), dtype=F32, device="cuda")
+        pre[:, 0] = 1.0
+        x, part, pre_a, pre_f, post, comb = mixes(1)
+        shared = [{} for _ in range(world)]
+        for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                h = eng.apply(blocks, li, h, host + [token], start, 1, gather, record)
+            lay = blocks.get(0, li)
+            fn, scale, base = lay.hc_attn
+            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+            record(f"L{li}.x_attn", x)
+            parts = [dec._attention(blocks.get(r, li), x, shared[r]) for r in range(world)]
+            for r in range(world):
+                record(f"L{li}.p_attn.r{r}", parts[r])
+            K.hc_post(gather(parts), h, post, comb, h)
+            record(f"L{li}.h_attn", h)
+            lay = blocks.get(0, li)
+            fn, scale, base = lay.hc_ffn
+            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+            record(f"L{li}.x_ffn", x)
+            parts = [m.moe(blocks.get(r, li), x, shared_side=False) for r in range(world)]
+            for r in range(world):
+                record(f"L{li}.p_moe.r{r}", parts[r])
+            K.hc_post(gather(parts), h, post, comb, h)
+            record(f"L{li}.h_moe", h)
+            pre, pre_f = pre_f, pre
+        xc = K.collapse_norm(h, pre.contiguous(), w.norm, c.eps)
+        record("head.xc", xc)
+        parts = [mm(heads[r], xc, F32) for r in range(world)]
+        for r in range(world):
+            record(f"head.local.r{r}", parts[r])
+        sc.length = start + 1
+        return gather(parts).permute(1, 0, 2).reshape(1, -1)
+
     cos_c, sin_c = None, None
     for chunk in chunks:
         w.layers = [None] * L                             # new_cache counts the layers
@@ -214,10 +261,23 @@ def main() -> int:
             logits = gather(parts).permute(1, 0, 2).reshape(1, -1)
         torch.cuda.synchronize()
         arrays = {"prompt_ids": prompt_ids, "expected_logits": logits.clone()}
-        for k, v in recorded.items():
-            arrays[f"expected_{k}"] = v
         params = {"chunk": chunk, "n_chunks": len(starts), "prompt": a.prompt, "layers": L, "bucket": a.bucket, "cap": a.cap,
                   "comp_rows": int(sc.comp[2][0].shape[0]) if 2 in sc.comp else 0}
+        if a.decode:
+            token = int(torch.argmax(logits[0]).item())   # torch's first index of the maximum
+
+            def record_d(name: str, t: torch.Tensor, recorded=recorded) -> None:
+                recorded[f"D.{name}"] = t.detach().clone()
+
+            with rec.scope(f"prompt_c{chunk}_decode", detail=True):
+                d_logits = decode_row(sc, token, record_d)
+            torch.cuda.synchronize()
+            for k, v in df.planes(sc, L).items():
+                recorded[f"D.{k}"] = v.detach().clone()
+            arrays["expected_D.logits"] = d_logits.clone()
+            params["decode_token"] = token
+        for k, v in recorded.items():
+            arrays[f"expected_{k}"] = v
         ck.save(out / "fixtures" / f"prompt_c{chunk}", params, arrays)
         print(f"chunk {chunk}: {len(starts)} chunk(s) over {a.prompt} tokens, {blocks.loads} block loads so far", flush=True)
         del sc

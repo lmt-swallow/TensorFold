@@ -17,6 +17,7 @@ const dsv41_hc_tests = @import("dsv41_hc_tests.zig");
 const dsv41_engram_tests = @import("dsv41_engram_tests.zig");
 const dsv41_dspark_tests = @import("dsv41_dspark_tests.zig");
 const dsv41_rounds_tests = @import("dsv41_rounds_tests.zig");
+const dsv41_lanes_tests = @import("dsv41_lanes_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -34,6 +35,7 @@ const usage =
     \\  dsv41-attn <dir>          DSV4.1 attention sublayer (decode rows) against the fork's fixture (dsv41/dump_attention.py)
     \\  dsv41-forward <dir> <rank-cache-dir> <model-dir> [rank] [layers|all] [aot-dir]  DSV4.1 layer loop against the fork's fixture (dsv41/dump_forward.py)
     \\  dsv41-prompt <dir> <rank-cache-dir> <model-dir> [rank] [layers]  DSV4.1 prompt path (chunks of 2048 and 512) against the fork's fixture (dsv41/dump_prompt.py)
+    \\  dsv41-lanes-prefill <dir> <rank-cache-dir> <model-dir> <rank> [aot-dir]  DSV4.1 served engine's prefill step and a round against the fork's fixture (dsv41/dump_prompt.py --decode)
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
     \\  gdn-tree <dir>            tree_kernel bits against the Python oracle's fixture
     \\  triton <dir>              a Triton cubin's bits against the Python oracle's fixture
@@ -97,6 +99,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "dsv41-dspark")) return dsv41_dspark_tests.dspark(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "dsv41-draft-pool")) return dsv41_rounds_tests.draftPool(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "dsv41-rounds")) return dsv41_rounds_tests.rounds(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), if (rest.len > 3) rest[3] else null, if (rest.len > 4) rest[4] else null);
+    if (std.mem.eql(u8, cmd, "dsv41-lanes-prefill")) return dsv41_lanes_tests.prefill(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);
     if (std.mem.eql(u8, cmd, "comm")) return libs_tests.comm(gpu, try std.fmt.parseInt(u32, try arg(rest, 0), 10), try std.fmt.parseInt(u32, try arg(rest, 1), 10), try arg(rest, 2), try std.fmt.parseInt(u16, try arg(rest, 3), 10));
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "gdn-tree")) return oracle_tests.gdnTree(gpu, try arg(rest, 0));
