@@ -265,12 +265,17 @@ pub const Options = struct {
 /// host's time inside the chunk call. `chunk` logs one `info:` line a profiled chunk.
 pub const Profile = struct {
     pub const groups = [_][]const u8{ "engram", "attention", "attention gather", "moe", "moe gather" };
+    /// The MoE group's parts: the FFN mix, the gate's logits and the route, the member and work lists, the experts'
+    /// input rotation, gate/up, their epilogue, down, the combine (the decode path's experts count as the combine).
+    pub const moe_parts = [_][]const u8{ "mix", "gate", "lists", "rot_in", "gate/up", "epilogue", "down", "combine" };
     /// [1 + layers * groups.len + 1]: before the embedding, after each layer's groups, after the head.
     marks: []cuda.Event,
+    /// [layers * (moe_parts.len - 1)]: between the MoE group's parts.
+    moe: []cuda.Event,
     gpa: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, layers: usize) !Profile {
-        const marks = try gpa.alloc(cuda.Event, 2 + layers * groups.len);
+        const marks = try gpa.alloc(cuda.Event, 2 + layers * groups.len + layers * (moe_parts.len - 1));
         errdefer gpa.free(marks);
         var made: usize = 0;
         errdefer for (marks[0..made]) |*e| e.deinit();
@@ -278,12 +283,14 @@ pub const Profile = struct {
             e.* = try cuda.Event.init(d, true);
             made += 1;
         }
-        return .{ .marks = marks, .gpa = gpa };
+        const n = 2 + layers * groups.len;
+        return .{ .marks = marks[0..n], .moe = marks[n..], .gpa = gpa };
     }
 
     pub fn deinit(self: *Profile) void {
-        for (self.marks) |*e| e.deinit();
-        self.gpa.free(self.marks);
+        const all = self.marks.ptr[0 .. self.marks.len + self.moe.len];
+        for (all) |*e| e.deinit();
+        self.gpa.free(all);
     }
 };
 
@@ -520,6 +527,13 @@ pub const Prompt = struct {
             self.gate_w32[li] = try cuda.DeviceBuffer.alloc(d, l.gate_w.count * 4);
             try self.castF16(l.gate_w.ptr(), self.gate_w32[li].ptr, l.gate_w.count, stream);
         }
+        // the fp32 GEMMs once at full chunk rows (the gate's, the indexer weights'): cuBLAS loads their kernels on
+        // first use, which would otherwise land in the first prompt's first chunk (~170 ms); the outputs are scratch
+        try self.gemm.run(self.x32.ptr, self.gate_w32[0].ptr, self.logits.ptr, r, c.n_routed, dm, stream);
+        for (w.layers) |*l| if (l.idx_proj) |ip| {
+            try self.gemm.run(self.x32.ptr, ip.ptr(), self.wl.ptr, r, c.idx_heads, dm, stream);
+            break;
+        };
         // every setup copy and fill so far (this one's, and the weights' and caches' before it) ran on the legacy
         // stream, which the chunks' non-blocking stream does not wait for: they complete before the first chunk
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
@@ -576,6 +590,11 @@ pub const Prompt = struct {
         if (self.profile) |p| try p.marks[i].record(stream);
     }
 
+    /// The end of the MoE part `k` (Profile.moe_parts, the last excluded) of layer `li`.
+    fn moeMark(self: *const Prompt, li: usize, k: usize, stream: cuda.Stream) !void {
+        if (self.profile) |p| try p.moe[li * (Profile.moe_parts.len - 1) + k].record(stream);
+    }
+
     /// The profiled chunk's line: the GPU's ms by sublayer group (summed over the layers), the head's, and the host's
     /// ms in the call (and in the Engram hook: hashing, row reads, uploads).
     fn report(self: *const Prompt, start: usize, n: usize, host_ns: i128, engram_ns: i128, stream: cuda.Stream) !void {
@@ -589,9 +608,20 @@ pub const Prompt = struct {
         for (0..L * ng) |i| sum[i % ng] += try cuda.Event.elapsedMs(p.marks[i], p.marks[i + 1]);
         const head = try cuda.Event.elapsedMs(p.marks[L * ng], p.marks[L * ng + 1]);
         const total = try cuda.Event.elapsedMs(p.marks[0], p.marks[L * ng + 1]);
+        const nm = Profile.moe_parts.len;
+        var moe: [nm]f64 = @splat(0);
+        for (0..L) |li| {
+            const ms = p.moe[li * (nm - 1) ..][0 .. nm - 1];
+            moe[0] += try cuda.Event.elapsedMs(p.marks[1 + li * ng + 2], ms[0]);
+            for (1..nm - 1) |k| moe[k] += try cuda.Event.elapsedMs(ms[k - 1], ms[k]);
+            moe[nm - 1] += try cuda.Event.elapsedMs(ms[nm - 2], p.marks[1 + li * ng + 3]);
+        }
         std.log.info("deepseek_v41 rank {d}: chunk at {d} ({d} rows): GPU {d:.0} ms (engram {d:.0}, attention {d:.0}, attention gather {d:.0}, moe {d:.0}, moe gather {d:.0}, head {d:.1}); host {d:.0} ms in the call ({d:.0} in Engram), then {d:.0} ms waiting for the GPU", .{
             self.fwd.w.rank, start, n, total, sum[0], sum[1], sum[2], sum[3], sum[4], head,
             @as(f64, @floatFromInt(host_ns)) / 1e6, @as(f64, @floatFromInt(engram_ns)) / 1e6, wait_ms,
+        });
+        std.log.info("deepseek_v41 rank {d}: chunk at {d}: moe ms by part: mix {d:.1}, gate {d:.1}, lists {d:.1}, rot_in {d:.1}, gate/up {d:.1}, epilogue {d:.1}, down {d:.1}, combine {d:.1}", .{
+            self.fwd.w.rank, start, moe[0], moe[1], moe[2], moe[3], moe[4], moe[5], moe[6], moe[7],
         });
     }
 
@@ -1138,6 +1168,7 @@ pub const Prompt = struct {
         const l = &fwd.w.layers[li];
         const E = c.n_routed;
         const slots = c.topk + 1;
+        try self.moeMark(li, 0, stream);
         if (n <= decode_rows) {
             try fwd.route.gate(stream, x, l.gate_w.ptr(), fwd.parts.ptr, @intCast(n));
             try fwd.route.pick(stream, fwd.parts.ptr, l.gate_b.ptr(), self.pick.ptr, self.wts_moe.ptr, @intCast(n));
@@ -1151,17 +1182,19 @@ pub const Prompt = struct {
                 aot.ptr("WTS", "*fp32", self.wts_moe.ptr), aot.float("scale", c.route_scale),    aot.int("shared_id", @intCast(l.experts.count - 1)),
             }, &.{ aot.ci("NE", @intCast(E)), aot.ci("NB", @intCast(nb)), aot.ci("TOPK", @intCast(c.topk)), aot.ci("SLOTS", @intCast(slots)), aot.ci("SP", @intCast(sp)), aot.ci("PDL", 1) });
         }
+        try self.moeMark(li, 1, stream);
         if (n < exact_rows) {
+            for (2..Profile.moe_parts.len - 1) |k| try self.moeMark(li, k, stream);
             try experts.routed(fwd.ek, &l.experts, &fwd.scratch, x, self.pick.ptr, self.wts_moe.ptr, n, c.swiglu_limit, self.moe.ptr, stream);
             return self.moe.ptr;
         }
-        try self.routedPrompt(&l.experts, x, n, c.swiglu_limit, stream);
+        try self.routedPrompt(li, &l.experts, x, n, c.swiglu_limit, stream);
         return self.moe.ptr;
     }
 
     /// experts.py routed() for a prompt chunk (the fork's defaults): member lists and work lists on the device, the
     /// rotated inputs, gate/up on grouped_mma (splits folded), the epilogue, down on grouped_rows, the combine.
-    fn routedPrompt(self: *Prompt, ex: *const experts.Experts, x: Ptr, R: usize, limit: f32, stream: cuda.Stream) !void {
+    fn routedPrompt(self: *Prompt, li: usize, ex: *const experts.Experts, x: Ptr, R: usize, limit: f32, stream: cuda.Stream) !void {
         const s = &self.scratch;
         const D = ex.dims;
         const I = ex.width;
@@ -1214,6 +1247,7 @@ pub const Prompt = struct {
             a.add(ci(len_d));
             try cuda.launch.launch(self.pk.work_list, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
         }
+        try self.moeMark(li, 2, stream);
         {
             // rot_in: every (row, slot)'s input rotated by its expert's suh (gate and up)
             var a: cuda.Args = .{};
@@ -1229,6 +1263,7 @@ pub const Prompt = struct {
             a.add(ci(E));
             try cuda.launch.launch(self.pk.rot_in, .{ .grid = .{ .x = @intCast(P), .y = @intCast(D / 128), .z = 2 }, .block = .{ .x = 32 } }, stream, &a);
         }
+        try self.moeMark(li, 3, stream);
         const cfg_gu = s_cfg(D, I, true);
         const cfg_d = s_cfg(I, D, false);
         {
@@ -1256,6 +1291,7 @@ pub const Prompt = struct {
             a.add(s.work_gu.ptr);
             try cuda.launch.launch(self.pk.mma[@intFromEnum(range)], .{ .grid = .{ .x = 1, .y = @intCast(I / 64), .z = @intCast(len_gu * 2) }, .block = .{ .x = 256 } }, stream, &a);
         }
+        try self.moeMark(li, 4, stream);
         {
             var a: cuda.Args = .{};
             a.add(s.z.ptr);
@@ -1272,6 +1308,7 @@ pub const Prompt = struct {
             a.add(experts.act_f32);
             try cuda.launch.launch(self.pk.gateup_epilogue, .{ .grid = .{ .x = @intCast(P), .y = @intCast(I / 128) }, .block = .{ .x = 32 } }, stream, &a);
         }
+        try self.moeMark(li, 5, stream);
         {
             // down: grouped_rows over its work list (Z [1, 1, P, D])
             const range = experts.rangeOf(ex.k2_d[0], ex.k2_d[1]);
@@ -1296,6 +1333,7 @@ pub const Prompt = struct {
             a.add(s.work_d.ptr);
             try cuda.launch.launch(self.pk.rows[@intFromEnum(range)], .{ .grid = .{ .x = 1, .y = @intCast(D / 128), .z = @intCast(len_d * cfg_d.sk) }, .block = .{ .x = 128 } }, stream, &a);
         }
+        try self.moeMark(li, 6, stream);
         {
             var a: cuda.Args = .{};
             a.add(s.z.ptr);
