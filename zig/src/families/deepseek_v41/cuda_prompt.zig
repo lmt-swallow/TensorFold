@@ -517,8 +517,8 @@ pub const Prompt = struct {
                 kv_done = true;
             };
             if (l.engram_wkv != null) if (fwd.engram) |e| {
-                try e.call(e.ctx, li, ids[n - rows ..], at, fwd.ekv.ptr, stream);
-                try fwd.hc.engramGate(stream, h, fwd.ekv.ptr, l.engram_qk.?.ptr(), h, @intCast(rows));
+                try e.call(e.ctx, li, h, at, rows, .{ .ctx = self, .call = mmF32 }, gather, stream);
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
             };
             if (o.taps) |t| if (c.dspark_taps.indexOf(@intCast(li))) |ti| {
                 try fwd.hc.tap(stream, h, t.buf + ti * dm * 2, @intCast(t.stride), @intCast(rows));
@@ -596,6 +596,12 @@ pub const Prompt = struct {
             aot.ptr("SVH", "*fp16", lin.svh.ptr),   aot.ptr("BIAS", "*fp16", lin.svh.ptr), aot.ptr("OUT", if (y_dtype == .f32) "*fp32" else "*bf16", y),
             aot.int("M", @intCast(m)),              aot.int("o_stride", @intCast(N)),
         }, &.{ aot.ci("K", @intCast(K)), aot.ci("N", @intCast(N)), aot.ci("BM", 128), aot.ci("BK", 32), aot.ci("GROUP", 8), aot.ci("HAS_BIAS", 0), aot.cf("SCALE", prompt_bias_scale) });
+    }
+
+    /// `mm` to fp32 for a hook (Engram's projection at the chunk's rows).
+    fn mmF32(ctx: *anyopaque, lin: *const exl3.Linear, x: Ptr, m: usize, y: Ptr, stream: cuda.Stream) anyerror!void {
+        const self: *Prompt = @ptrCast(@alignCast(ctx));
+        try self.mm(lin, x, m, y, .f32, stream);
     }
 
     // -- attention at chunk rows ----------------------------------------------------------------------------------

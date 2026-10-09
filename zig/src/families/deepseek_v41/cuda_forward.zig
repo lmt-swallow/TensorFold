@@ -3,8 +3,8 @@
 //! attention -> gather -> mHC post, mHC pre -> MoE (gate, pick, routed experts) -> gather -> mHC post, then the head
 //! (collapse_norm -> this rank's vocabulary columns -> gather -> the rows' logits). The gathers go through `Gather`:
 //! the communicator's all-gather over the ranks, or a test's supply of the other rank's partials. No replay, no
-//! vision, no DSpark taps; Engram's gate runs only when the layer's rows are supplied (`engram`), as the fork skips
-//! it without tables.
+//! vision, no DSpark taps; Engram runs on its layers when a hook is set (`engram`, cuda_engram_apply.zig), as the fork
+//! skips it without tables.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -30,10 +30,19 @@ pub const Gather = struct {
     }
 };
 
-/// Engram's rows for a layer: fills kv [rows, 5 d] bf16 (4 keys, the value) for the window's ids; null: no tables.
+/// A linear at the caller's row count: y [m, N] (fp32) = x [m, K] bf16 @ W (model.py `mm`; the prompt path's GEMM
+/// past 128 rows).
+pub const Mm = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, lin: *const exl3.Linear, x: Ptr, m: usize, y: Ptr, stream: cuda.Stream) anyerror!void,
+};
+
+/// Engram on an Engram layer (model.py `engram_apply`): h [rows, 4, d] bf16 at positions start .. start + rows - 1,
+/// gated in place by the rows the tables hold for the sequence's n-grams; one gather over the ranks (every rank calls
+/// it at the same layers). `mm` null: the row-invariant decode linear. null hook: no tables (the fork skips the gate).
 pub const Engram = struct {
     ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, layer: usize, ids: []const i64, start: usize, kv: Ptr, stream: cuda.Stream) anyerror!void,
+    call: *const fn (ctx: *anyopaque, layer: usize, h: Ptr, start: usize, rows: usize, mm: ?Mm, gather: Gather, stream: cuda.Stream) anyerror!void,
 };
 
 /// A probe for tests: called after each sublayer with the buffer's name, its device address and bytes.
@@ -126,7 +135,6 @@ pub const Forward = struct {
     wts: cuda.DeviceBuffer,
     moe: cuda.DeviceBuffer,
     scratch: experts.Scratch,
-    ekv: cuda.DeviceBuffer, // Engram's rows [rows, 5 d] bf16
     xc: cuda.DeviceBuffer,
     xh: cuda.DeviceBuffer, // the head's rotated input, fp16
     z: cuda.DeviceBuffer, // the head's split-K scratch
@@ -200,7 +208,6 @@ pub const Forward = struct {
         self.wts = try cuda.DeviceBuffer.alloc(d, r * slots * 4);
         self.moe = try cuda.DeviceBuffer.alloc(d, r * dm * 4);
         self.scratch = try experts.Scratch.init(d, &w.layers[0].experts, 64, slots);
-        self.ekv = try cuda.DeviceBuffer.alloc(d, r * 5 * dm * 2);
         self.xc = try cuda.DeviceBuffer.alloc(d, r * dm * 2);
         self.xh = try cuda.DeviceBuffer.alloc(d, r * dm * 2);
         self.z = try cuda.DeviceBuffer.alloc(d, @max(16, w.head.scratchWords(r) * 4));
@@ -222,7 +229,7 @@ pub const Forward = struct {
         self.gpa.free(self.source);
         self.gpa.free(self.attn);
         self.gpa.free(self.idx_proj_h);
-        inline for (.{ "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "parts", "pick", "wts", "moe", "ekv", "xc", "xh", "z", "local", "glog", "logits" }) |f| @field(self, f).free();
+        inline for (.{ "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "parts", "pick", "wts", "moe", "xc", "xh", "z", "local", "glog", "logits" }) |f| @field(self, f).free();
         self.scratch.deinit();
         self.gpa.free(self.ids_h);
     }
@@ -310,8 +317,8 @@ pub const Forward = struct {
         var nb: [32]u8 = undefined;
         for (w.layers, 0..) |*l, li| {
             if (l.engram_wkv != null) if (self.engram) |e| {
-                try e.call(e.ctx, li, ids, start, self.ekv.ptr, stream);
-                try self.hc.engramGate(stream, self.h.ptr, self.ekv.ptr, l.engram_qk.?.ptr(), self.h.ptr, @intCast(n));
+                try e.call(e.ctx, li, self.h.ptr, start, n, null, gather, stream);
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), self.h.ptr, n * hcmod.hc_streams * dm * 2, stream);
             };
             try self.hc.pre(stream, self.h.ptr, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(n));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, n * dm * 2, stream);

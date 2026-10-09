@@ -4,15 +4,17 @@ over a seeded prompt in chunks (engine.py prefill_steps: TF_DS_PREFILL_CHUNK row
 two-rank split, both ranks computed in one process (as dump_forward.py: the fork's `comm.gather` is a stack of the
 ranks' partials, the caches are replicated, so each sublayer runs once per rank on the same input), then the head on
 the prompt's last row. Every chunk records the mixes' inputs, both ranks' partials and the streams after each
-sublayer, the index layers' picks, and the cache planes after the chunk. No replay (TF_DS_REPLAY=0), no Engram
-tables, no taps (the fixture's layers hold none).
+sublayer, the index layers' picks, and the cache planes after the chunk. No replay (TF_DS_REPLAY=0), no taps (the
+fixture's layers hold none); Engram runs on its layers when `--engram <dir>` names the tables (dump_forward.EngramRef:
+each rank's partial `L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded), as without tables it is
+skipped.
 
 Written: fixtures/prompt_common (dims, the prompt ids, rope tables), fixtures/prompt_c<chunk> per chunk size,
 launches.json / jit.json for tools/zig/dsv41/prompt_capture.sh.
 
 Run inside the fork's image:
   python3 -B /w/tools/zig/dsv41/dump_prompt.py --tools /w/tools/zig --model /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw \
-      --out /aot/out --layers 4 --prompt 600 --chunks 2048,512
+      --out /aot/out --layers 4 --prompt 600 --chunks 2048,512 [--engram /models/DeepSeek-V4.1-Flash-Engram]
 """
 
 from __future__ import annotations
@@ -53,6 +55,8 @@ def main() -> int:
     ap.add_argument("--bucket", type=int, default=1024)
     ap.add_argument("--cap", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=20261009)
+    ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
+    ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     df = load_module("dump_forward", HERE / "dump_forward.py")
@@ -85,6 +89,8 @@ def main() -> int:
     w.layers = []
     m = Model(w, Comm(None, 1))
     blocks = df.RankBlocks(sh, c, world, load_block)
+    eng = df.engram_ref(a, c, world)
+    host = prompt_ids.tolist()                        # the prompt's host ids (SeqCache.host) for Engram's hashes
 
     def gather(parts: list) -> torch.Tensor:
         torch.cuda.synchronize()
@@ -97,7 +103,7 @@ def main() -> int:
                 torch.empty((n, c.hc), dtype=F32, device=dev), torch.empty((n, c.hc, c.hc), dtype=F32, device=dev))
 
     def chunk_forward(sc, ids: torch.Tensor, start: int, shared: list, record) -> tuple:
-        """model.py _forward_k over one chunk (no replay, no Engram, no taps), each sublayer on both ranks' weights;
+        """model.py _forward_k over one chunk (no replay, no taps; Engram with --engram), each sublayer on both ranks' weights;
         returns (h, pre) after the layers."""
         n = ids.shape[0]
         assert start == sc.length
@@ -108,6 +114,8 @@ def main() -> int:
         pre[:, 0] = 1.0
         x, part, pre_a, pre_f, post, comb = mixes(n)
         for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                h = eng.apply(blocks, li, h, host, start, n, gather, record)
             lay = blocks.get(0, li)
             assert lay.engram_wkv is None or m.engram is None
             fn, scale, base = lay.hc_attn
@@ -178,7 +186,8 @@ def main() -> int:
             cos_c, sin_c = m._cs(min(2, L - 1), sc)
             cos_w, sin_w = m._cs(0, sc)
             common = {"prompt": a.prompt, "layers": L, "bucket": a.bucket, "cap": a.cap, "ring_size": sc.ring_size,
-                      "raw": RAW, "world": world, "chunks": a.chunks, "rope_rows": cos_c.shape[0], "vocab_local": vocab_l}
+                      "raw": RAW, "world": world, "chunks": a.chunks, "rope_rows": cos_c.shape[0], "vocab_local": vocab_l,
+                      "engram": int(eng is not None)}
             ck.save(out / "fixtures" / "prompt_common", common, {"prompt_ids": prompt_ids, "cos_c": cos_c, "sin_c": sin_c, "cos_w": cos_w, "sin_w": sin_w})
         recorded: dict = {}
         shared = [{} for _ in range(world)]

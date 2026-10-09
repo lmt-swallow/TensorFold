@@ -7,6 +7,11 @@
 //! Interim: the prompt runs through the decode layer loop in windows of up to 16 rows (`Forward.rows`), not the
 //! fork's prompt kernels, so a prompt's cache bits may differ from the Python prompt path until cuda_prompt lands;
 //! sampling above temperature 0 is refused (the keyed draw is not ported).
+//!
+//! Engram (cuda_engram_apply.zig) runs on its layers when TF_DS_ENGRAM names the tables' dir (the token map from
+//! TF_DS_TOKEN_MAP, default `<kernels>/token_map.json`; TF_DS_ENGRAM_THREADS reader threads, default 32): every rank
+//! keeps the sequence's ids on the host (`hist`) and hashes them the same way, so the ranks' Engram gathers pair.
+//! Without the tables the gate is skipped, as the fork does, and the output is degraded.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -16,6 +21,7 @@ const exl3 = @import("cuda_exl3.zig");
 const experts = @import("cuda_experts.zig");
 const attention = @import("cuda_attention.zig");
 const forward = @import("cuda_forward.zig");
+const engram_apply = @import("cuda_engram_apply.zig");
 const RankCache = @import("rank_cache.zig").RankCache;
 
 const be = lanes.backend;
@@ -64,6 +70,8 @@ pub const Engine = struct {
     rope_c: attention.Rope,
     rope_w: attention.Rope,
     fwd: forward.Forward,
+    engram: ?*engram_apply.Engram,
+    hist: []i32, // the sequence's ids from position 0 (Engram's hashes)
     comm: cuda.comm.Comm,
     stream: cuda.Stream,
     agree_send: cuda.DeviceBuffer,
@@ -115,6 +123,20 @@ pub const Engine = struct {
         errdefer freeRope(&e.rope_w);
         e.fwd = try forward.Forward.init(gpa, ctx.d, &e.cfg, &e.w, &e.set, &e.glue, &e.ek, s.world, max_rows, s.context + extra, s.bucket, e.rope_c, e.rope_w, e.stream);
         errdefer e.fwd.deinit();
+        e.hist = try gpa.alloc(i32, s.context + extra);
+        errdefer gpa.free(e.hist);
+        e.engram = null;
+        if (getenv("TF_DS_ENGRAM")) |engram_dir| {
+            const tm = if (getenv("TF_DS_TOKEN_MAP")) |p| try gpa.dupe(u8, p) else try std.fs.path.join(gpa, &.{ s.kernels_dir, "token_map.json" });
+            defer gpa.free(tm);
+            const threads: usize = if (getenv("TF_DS_ENGRAM_THREADS")) |t| std.fmt.parseInt(usize, t, 10) catch 32 else 32;
+            e.engram = try engram_apply.Engram.init(gpa, io, ctx.d, &e.cfg, &e.w, &e.set, engram_dir, tm, max_rows, threads);
+            e.fwd.engram = e.engram.?.hook();
+            std.log.info("deepseek_v41 rank {d}: Engram tables {s}, token map {s}, {d} reader threads", .{ s.rank, engram_dir, tm, threads });
+        } else if (s.rank == 0) {
+            std.log.warn("deepseek_v41: no Engram tables (TF_DS_ENGRAM): output will be degraded", .{});
+        }
+        errdefer if (e.engram) |g| g.deinit();
         e.agree_send = try cuda.DeviceBuffer.alloc(ctx.d, 16);
         errdefer e.agree_send.free();
         e.agree_recv = try cuda.DeviceBuffer.alloc(ctx.d, 16 * s.world);
@@ -134,6 +156,8 @@ pub const Engine = struct {
         e.gpa.free(e.logits_h);
         e.agree_recv.free();
         e.agree_send.free();
+        if (e.engram) |g| g.deinit();
+        e.gpa.free(e.hist);
         e.fwd.deinit();
         freeRope(&e.rope_w);
         freeRope(&e.rope_c);
@@ -201,6 +225,8 @@ pub const Engine = struct {
     fn runPrefill(e: *Engine, ids: []const i64) !void {
         if (ids.len + 1 + extra > e.settings.context + extra) return error.PromptTooLong;
         e.pos = 0;
+        for (e.hist[0..ids.len], ids) |*hv, id| hv.* = @intCast(id);
+        if (e.engram) |g| g.history = e.hist[0..ids.len];
         var i: usize = 0;
         while (i < ids.len) {
             const n = @min(max_rows, ids.len - i);
@@ -214,6 +240,8 @@ pub const Engine = struct {
     fn runRound(e: *Engine, token: i64) !void {
         if (e.pos + 1 + extra > e.settings.context + extra) return error.PromptTooLong;
         e.ids_h[0] = token;
+        e.hist[e.pos] = @intCast(token);
+        if (e.engram) |g| g.history = e.hist[0 .. e.pos + 1];
         _ = try e.fwd.rows(e.gather(), e.ids_h[0..1], e.pos, 1, false, e.stream);
         e.pos += 1;
     }
@@ -286,6 +314,11 @@ pub const Engine = struct {
         for (1..e.settings.world) |peer| e.comm.sendTo(@intCast(peer), &op) catch {};
     }
 };
+
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    const v = std.mem.span(std.c.getenv(name) orelse return null);
+    return if (v.len == 0) null else v;
+}
 
 fn freeRope(r: *attention.Rope) void {
     r.cos.free();

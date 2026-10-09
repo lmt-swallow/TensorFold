@@ -15,7 +15,7 @@ GB10 (`zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=safe native
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1
       -v $HOME/models:/models:ro -v $HOME/tfcache/rank:/rc:ro -v $HOME/aot/dsv41-all:/k:ro -v $HOME/bin:/b:ro"
 ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=4
-      -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
+      -e TF_DS_ENGRAM=/models/DeepSeek-V4.1-Flash-Engram -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
 SERVE="/b/tensorfold-native serve /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw --tp 2 --master 10.0.1.1 --master-port 29551
       --context 16384 --parallel 1 --temperature 0 --no-thinking --no-drafts --no-update-check --name dsv41
       --host 0.0.0.0 --port 8000"
@@ -23,6 +23,12 @@ SERVE="/b/tensorfold-native serve /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw --tp 2
 docker run -d --name tfz0 $DOCK $ENVS nvcr.io/nvidia/pytorch:26.07-py3 bash -c "$SERVE --rank 0"
 ssh 10.0.1.2 docker run -d --name tfz1 $DOCK $ENVS nvcr.io/nvidia/pytorch:26.07-py3 bash -c "$SERVE --rank 1"
 ```
+
+Engram (`TF_DS_ENGRAM`, the original FP8 tables beside the pack) needs the Python engine's compressed token map: it
+is `~/aot/dsv41-all/token_map.json` on both nodes (`<kernels>/token_map.json`, the default; `TF_DS_TOKEN_MAP`
+overrides), written once by the fork's `ops.compressed_token_map` from the pack's tokenizer.json (sha256
+de40bcdd...5dc28, 129,280 ids to 99,092 classes). Without `TF_DS_ENGRAM` the ranks skip Engram as the fork does
+without tables, and the output is degraded.
 
 `--tp/--rank/--master/--master-port` export `TF_TP_WORLD/RANK/MASTER/PORT`, which the family reads (environment
 alone works too). Rank 1's process opens the engine and runs the follower loop inside `open`; it never listens.

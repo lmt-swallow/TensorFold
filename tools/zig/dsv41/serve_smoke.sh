@@ -10,7 +10,8 @@
 #
 # Environment: R0/R1 (ssh names, default spark-616b/spark-9e43), MASTER (rank 0's address on the NCCL link, 10.0.1.1),
 # BUILD_HOST and BUILD_BIN (where the built binary is: spark-9e43, ~/src/TensorFold/zig-out/native/bin/tensorfold-native),
-# CONTEXT (16384), MAX_TOKENS (64), LOG_DIR (where both ranks' logs are kept), FORCE=1 (start even when the GPU
+# CONTEXT (16384), MAX_TOKENS (64), ENGRAM (the Engram tables under ~/models, DeepSeek-V4.1-Flash-Engram; empty: run
+# without them, degraded; the token map is ~/aot/dsv41-all/token_map.json on both nodes), LOG_DIR (where both ranks' logs are kept), FORCE=1 (start even when the GPU
 # already has compute processes), NO_COPY=1 (use the ~/bin/tensorfold-native already on each node).
 set -euo pipefail
 
@@ -25,6 +26,7 @@ IMAGE=${IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}
 MODEL=${MODEL:-DeepSeek-V4.1-Flash-EXL3-2.9bpw}
 CONTEXT=${CONTEXT:-16384}
 MAX_TOKENS=${MAX_TOKENS:-64}
+ENGRAM=${ENGRAM-DeepSeek-V4.1-Flash-Engram}
 PORT_TIMEOUT=${PORT_TIMEOUT:-600}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
@@ -122,6 +124,7 @@ DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband -
 DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/aot/dsv41-all:/k:ro -v \$HOME/bin:/b:ro"
 ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=4"
 ENVS="$ENVS -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
+[ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
 SERVE="$SERVE --context $CONTEXT --parallel 1 --temperature 0 --no-thinking --no-drafts --no-update-check --name dsv41"
 SERVE="$SERVE --host 0.0.0.0 --port $HTTP_PORT"

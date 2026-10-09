@@ -3,7 +3,8 @@
 //! cache, the fork's Triton kernels from the captured AOT set, the other rank's partials supplied from the fixture at
 //! every gather; for each chunk size the fixture holds (2048: one chunk, 512: a chunk and a tail), every chunk's
 //! mixes' inputs, both sublayers' streams, this rank's partials and the cache planes after it, then the last row's
-//! logits, byte-equal to the fork's.
+//! logits, byte-equal to the fork's. A fixture dumped with `--engram` runs Engram on its layers as dsv41-forward does
+//! (TF_DS_ENGRAM, TF_DS_TOKEN_MAP), the host ids the whole prompt's.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -163,6 +164,16 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     defer gpa.free(ids_bytes);
     const prompt_ids = std.mem.bytesAsSlice(i64, @as([]align(8) const u8, @alignCast(ids_bytes)));
     try check.expect(prompt_ids.len == prompt_len, "the fixture's prompt has {d} ids for {d}", .{ prompt_ids.len, prompt_len });
+    const eng = try @import("dsv41_forward_tests.zig").engramFor(gpu, cf, &cfg, &w, &set, aot_dir, @min(dsv41.prompt.max_chunk, prompt_len));
+    defer if (eng) |e| e.deinit();
+    const history = try gpa.alloc(i32, prompt_len);
+    defer gpa.free(history);
+    for (history, prompt_ids) |*hv, t| hv.* = @intCast(t);
+    if (eng) |e| {
+        fwd.engram = e.hook();
+        e.probe = fwd.probe;
+        e.history = history;
+    }
 
     const chunks_text = try gpa.dupe(u8, try cf.string("chunks"));
     defer gpa.free(chunks_text);
@@ -183,6 +194,8 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         try resetCaches(&fwd);
         // every chunk's other-rank partials in gather order, then the head's
         for (0..n_chunks) |ci| for (0..layers) |li| {
+            if (eng != null and w.layers[li].engram_wkv != null)
+                try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_engram.r{d}", .{ ci, li, other })));
             try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_attn.r{d}", .{ ci, li, other })));
             try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_moe.r{d}", .{ ci, li, other })));
         };

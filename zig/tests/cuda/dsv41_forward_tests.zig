@@ -5,6 +5,11 @@
 //! sublayers' h, this rank's partials, the logits (every row, then the last row alone) and the cache planes after,
 //! byte-equal to the fork's. `layers` (default the fixture's) runs the loop over the first layers only, comparing
 //! their sublayers and skipping the logits: for a machine without room for every layer's weights.
+//!
+//! A fixture dumped with `--engram` runs Engram on its layers (cuda_engram_apply.zig): the tables from TF_DS_ENGRAM,
+//! the token map from TF_DS_TOKEN_MAP (default `<aot-dir>/token_map.json`), the host ids the prompt's then the
+//! window's; the other rank's Engram partial is supplied at its gather like the sublayers' and the gated streams
+//! (`L<i>.h_engram`) and this rank's partial are compared too.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -64,6 +69,25 @@ const Supply = struct {
         self.probes.clearRetainingCapacity();
     }
 };
+
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    const v = std.mem.span(std.c.getenv(name) orelse return null);
+    return if (v.len == 0) null else v;
+}
+
+/// The Engram a fixture dumped with `--engram` needs (its common params' `engram`), from TF_DS_ENGRAM and
+/// TF_DS_TOKEN_MAP (default `<aot_dir>/token_map.json`); null for a fixture without.
+pub fn engramFor(gpu: Gpu, common: Fixture, cfg: *const dsv41.config.Config, w: *const dsv41.weights.Weights, set: *const cuda.aot.Set, aot_dir: []const u8, max_rows: usize) !?*dsv41.engram_apply.Engram {
+    if ((common.int("engram") catch 0) == 0) return null;
+    const dir = getenv("TF_DS_ENGRAM") orelse {
+        std.debug.print("FAIL the fixture runs Engram: set TF_DS_ENGRAM to the tables' dir\n", .{});
+        return error.NoEngramTables;
+    };
+    const tm = if (getenv("TF_DS_TOKEN_MAP")) |p| try gpu.gpa.dupe(u8, p) else try std.fs.path.join(gpu.gpa, &.{ aot_dir, "token_map.json" });
+    defer gpu.gpa.free(tm);
+    std.debug.print("Engram: tables {s}, token map {s}\n", .{ dir, tm });
+    return try dsv41.engram_apply.Engram.init(gpu.gpa, gpu.io, gpu.d, cfg, w, set, dir, tm, max_rows, 32);
+}
 
 fn same(gpu: Gpu, fx: Fixture, got: cuda.DeviceBuffer, name: []const u8, label: []const u8, limit: usize) bool {
     var nb: [96]u8 = undefined;
@@ -141,6 +165,18 @@ pub fn forward(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
     }
     fwd.probe = .{ .ctx = &supply, .call = Supply.probe };
     const gather: F.Gather = .{ .ctx = &supply, .call = Supply.gather };
+    const eng = try engramFor(gpu, cf, &cfg, &w, &set, aot_dir, 16);
+    defer if (eng) |e| e.deinit();
+    if (eng) |e| {
+        fwd.engram = e.hook();
+        e.probe = fwd.probe;
+    }
+    // the sequence's host ids: the prompt's, then the window's
+    const prompt_bytes = try cf.bytes("prompt_ids");
+    defer gpa.free(prompt_bytes);
+    const prompt_ids = std.mem.bytesAsSlice(i64, @as([]align(8) const u8, @alignCast(prompt_bytes)));
+    var history: std.ArrayList(i32) = .empty;
+    defer history.deinit(gpa);
 
     const rows_text = try gpa.dupe(u8, try cf.string("rows"));
     defer gpa.free(rows_text);
@@ -177,6 +213,8 @@ pub fn forward(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
             }
             // the other rank's partials in gather order
             for (0..layers) |li| {
+                if (eng != null and w.layers[li].engram_wkv != null)
+                    try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_L{d}.p_engram.r{d}", .{ li, other })));
                 try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_L{d}.p_attn.r{d}", .{ li, other })));
                 try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_L{d}.p_moe.r{d}", .{ li, other })));
             }
@@ -191,6 +229,10 @@ pub fn forward(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []co
             const ids_bytes = try fx.bytes("ids");
             defer gpa.free(ids_bytes);
             const ids = std.mem.bytesAsSlice(i64, @as([]align(8) const u8, @alignCast(ids_bytes)));
+            history.clearRetainingCapacity();
+            for (prompt_ids) |t| try history.append(gpa, @intCast(t));
+            for (ids) |t| try history.append(gpa, @intCast(t));
+            if (eng) |e| e.history = history.items;
             const logits = try fwd.rows(gather, ids, start, n, all, stream);
             try stream.synchronize();
             var ok = true;

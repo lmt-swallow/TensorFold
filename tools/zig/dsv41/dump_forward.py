@@ -7,7 +7,9 @@ with rank 0's weights and once with rank 1's on the same input (the caches are r
 rank 0's bytes), and the gathered pair goes into mHC post as the fork's does.
 
 Memory: one block of one rank is resident at a time (the blocks load on demand from the shards), so the run fits
-beside a serving engine. Layers with Engram run as the fork runs them without tables (no gate). L2 prefetch is off
+beside a serving engine. Layers with Engram run as the fork runs them without tables (no gate), or with them when
+`--engram <dir>` names the shards (model.py `engram_apply` on the host ids prompt + window: each rank's partial
+`L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded). L2 prefetch is off
 (TF_DS_L2_PREFETCH=0: no data moves, the same bits). The caches are primed by the fork's prompt-path sublayers
 (`attention_k`, `moe`) over a seeded prompt in the same two-rank manner.
 
@@ -17,7 +19,7 @@ sublayer, the logits), launches.json / jit.json for tools/zig/dsv41/forward_capt
 
 Run inside the fork's image:
   python3 -B /w/tools/zig/dsv41/dump_forward.py --tools /w/tools/zig --model /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw \
-      --out /aot/out --layers 4 --prompt 40 --rows 1,5
+      --out /aot/out --layers 4 --prompt 40 --rows 1,5 [--engram /models/DeepSeek-V4.1-Flash-Engram]
 """
 
 from __future__ import annotations
@@ -64,6 +66,74 @@ class RankBlocks:
         return self.lay
 
 
+class EngramRef:
+    """model.py Engram + engram_apply for both ranks of a two-rank split in one process: the row ids from the host ids
+    (Engram.hashes), each rank's columns read by offset from the shards and dequantized (Engram._decode), each rank's
+    partial mm(engram_wkv, e, F32), their Comm.sum in rank order to bf16, then engram_gate."""
+
+    def __init__(self, engram_dir: str, cfg, token_map: list, world: int):
+        import types
+
+        import numpy as np
+
+        from tensorfold.families.deepseek_v41.cuda.model import Engram
+        from tensorfold.families.deepseek_v41.ops import engram_multipliers, engram_primes
+
+        de = load_module("dump_engram", HERE / "dump_engram.py")
+        self.np, self.E, self.read_rows = np, Engram, de.read_rows
+        self.cfg, self.world = cfg, world
+        primes = engram_primes(cfg)
+        flat = [[p for per in layer for p in per] for layer in primes]
+        self.stub = types.SimpleNamespace(
+            cfg=cfg, np_primes=np.array(flat, dtype=np.int64),
+            np_offsets=np.array([np.cumsum([0, *f[:-1]]) for f in flat], dtype=np.int64),
+            np_mult=engram_multipliers(cfg).numpy().astype(np.int64), np_map=np.asarray(token_map, dtype=np.int64),
+            pad=int(token_map[cfg.engram_pad]))
+        self.n_cols = (cfg.engram_ngram - 1) * cfg.engram_heads
+        self.tabs = de.tables(Path(engram_dir))
+
+    def apply(self, blocks, li: int, h, host: list, start: int, n: int, gather, record):
+        from tensorfold.families.deepseek_v41.cuda import kernels as K
+        from tensorfold.families.deepseek_v41.cuda.model import mm
+
+        np, c = self.np, self.cfg
+        hashes = self.E.hashes(self.stub, host, start, n)                     # [n, L, cols]
+        slot = list(c.engram_layers).index(li)
+        pw, bw, rw = self.tabs[f"layers.{li}.engram.embed.weight"]
+        ps, bs, rs = self.tabs[f"layers.{li}.engram.embed.scale"]
+        parts = []
+        for r in range(self.world):
+            lo, hi = r * self.n_cols // self.world, (r + 1) * self.n_cols // self.world
+            idx = np.ascontiguousarray(hashes[:, slot, lo:hi].reshape(-1), dtype=np.int64)
+            codes = self.read_rows(pw, bw, rw, idx).cuda()
+            scales = self.read_rows(ps, bs, rs, idx).cuda()
+            e = self.E._decode(codes, scales, idx.shape[0], rw, n)
+            parts.append(mm(blocks.get(r, li).engram_wkv, e, F32))
+            record(f"L{li}.p_engram.r{r}", parts[r])
+        g = gather(parts)
+        acc = g[0].clone()
+        for r in range(1, self.world):
+            acc += g[r]
+        kv = acc.to(BF16)
+        h = K.engram_gate(h, kv.contiguous(), blocks.get(0, li).engram_qk, c.eps)
+        record(f"L{li}.h_engram", h)
+        return h
+
+
+def engram_ref(a, cfg, world: int):
+    """--engram/--token-map -> an EngramRef (the token map read from --token-map, else built from tokenizer.json), or None."""
+    if not a.engram:
+        return None
+    from tensorfold.families.deepseek_v41.ops import compressed_token_map
+
+    if a.token_map:
+        tm = json.loads(Path(a.token_map).read_text())
+    else:
+        tm, n = compressed_token_map(Path(a.model) / "tokenizer.json")
+        assert n == cfg.engram_cvocab, (n, cfg.engram_cvocab)
+    return EngramRef(a.engram, cfg, tm, world)
+
+
 def planes(sc, L: int) -> dict:
     out = {}
     for li in range(L):
@@ -88,6 +158,8 @@ def main() -> int:
     ap.add_argument("--bucket", type=int, default=1024)
     ap.add_argument("--cap", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=20261009)
+    ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
+    ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     rec = ck.load_recorder(a.tools)
@@ -122,6 +194,8 @@ def main() -> int:
     sc = m.new_cache(a.cap)
     w.layers = []
     blocks = RankBlocks(sh, c, world, load_block)
+    eng = engram_ref(a, c, world)
+    host = prompt_ids.tolist()                        # the sequence's host ids (SeqCache.host) for Engram's hashes
 
     def gather(parts: list) -> torch.Tensor:
         """The fork's comm.gather: every rank's partial, rank order."""
@@ -147,6 +221,8 @@ def main() -> int:
         x, part, pre_a, pre_f, post, comb = mixes(n)
         shared = [{} for _ in range(world)]
         for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                h = eng.apply(blocks, li, h, host, start, n, gather, lambda name, t: None)
             lay = blocks.get(0, li)
             fn, scale, base = lay.hc_attn
             K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
@@ -161,8 +237,8 @@ def main() -> int:
         sc.length = start + n
 
     def body(dec, record) -> torch.Tensor:
-        """graph.py StaticDecoder._body without the L2 forks, the taps and the Engram rows (none without tables),
-        each sublayer on both ranks' weights."""
+        """graph.py StaticDecoder._body without the L2 forks and the taps (Engram's rows when --engram names the
+        tables), each sublayer on both ranks' weights."""
         n = dec.R
         dec.sc.tokens[dec.pos] = dec.ids
         h = w.embed[dec.ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
@@ -171,6 +247,8 @@ def main() -> int:
         x, part, pre_a, pre_f, post, comb = mixes(n)
         shared = [{} for _ in range(world)]
         for li in range(L):
+            if eng is not None and blocks.get(0, li).engram_wkv is not None:
+                h = eng.apply(blocks, li, h, host + dec.ids.tolist(), start, n, gather, record)
             lay = blocks.get(0, li)
             assert lay.engram_wkv is None or m.engram is None
             fn, scale, base = lay.hc_attn
@@ -211,7 +289,8 @@ def main() -> int:
     cos_c, sin_c = m._cs(min(2, L - 1), sc)
     cos_w, sin_w = m._cs(0, sc)
     common = {"prompt": a.prompt, "layers": L, "start": start, "bucket": a.bucket, "cap": a.cap, "ring_size": sc.ring_size,
-              "raw": RAW, "world": world, "rows": a.rows, "rope_rows": cos_c.shape[0], "vocab_local": vocab_l}
+              "raw": RAW, "world": world, "rows": a.rows, "rope_rows": cos_c.shape[0], "vocab_local": vocab_l,
+              "engram": int(eng is not None)}
     ck.save(out / "fixtures" / "fwd_common", common, {"prompt_ids": prompt_ids, "cos_c": cos_c, "sin_c": sin_c, "cos_w": cos_w, "sin_w": sin_w})
 
     for n in rows:
