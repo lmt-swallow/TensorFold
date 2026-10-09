@@ -164,6 +164,28 @@ pub fn draftPool(gpu: Gpu, dir: []const u8, aot_override: ?[]const u8) !void {
             h.failures += 1;
             std.debug.print("FAIL dsv41 draft-pool c{d} conf: worst relative difference {e}\n", .{ ci, worst });
         } else check.pass("dsv41 draft-pool c{d} conf: within {e} of the fork's", .{ ci, worst });
+        if (drafter.graphs) {
+            // the same pass through its graph (recorded, then replayed): the eager pass's drafts, confidences and rows
+            for (0..2) |pass| {
+                const before = drafter.captures;
+                var again: [16]dsp.Drafts = undefined;
+                try drafter.batchDraftWithTable(&pool, tokens[0..N], q0[0..N], slots[0..N], emb.ptr, rope, h.stream, null, null, again[0..N]);
+                if (pass == 1) try check.expect(drafter.captures == before, "dsv41 draft-pool c{d}: the replay recorded a graph", .{ci});
+                var same = true;
+                for (0..N) |s_| {
+                    if (!std.mem.eql(u32, again[s_].tokens[0..steps], out[s_].tokens[0..steps])) same = false;
+                    if (!std.mem.eql(u8, std.mem.sliceAsBytes(again[s_].conf[0..steps]), std.mem.sliceAsBytes(out[s_].conf[0..steps]))) same = false;
+                }
+                const fails = h.failures;
+                try h.stage(try std.fmt.bufPrint(&nb, "c{d}_xc", .{ci}), drafter.xc.ptr);
+                try h.stage(try std.fmt.bufPrint(&nb, "c{d}_xn", .{ci}), drafter.xn.ptr);
+                try h.stage(try std.fmt.bufPrint(&nb, "c{d}_local", .{ci}), drafter.local.ptr);
+                if (!same) {
+                    h.failures += 1;
+                    std.debug.print("FAIL dsv41 draft-pool c{d} graph: drafts or confidences differ from the eager pass's\n", .{ci});
+                } else if (h.failures == fails) check.pass("BITEXACT dsv41 draft-pool c{d} graph ({s}): {d} streams' drafts, confidences, xc, xn and the head's logits equal to the eager pass's and the fork's", .{ ci, if (pass == 0) "recorded" else "replayed", N });
+            }
+        }
     }
     try check.expect(h.failures == 0, "dsv41-draft-pool: {d} stage(s) differ from the Python fork", .{h.failures});
 }
@@ -174,7 +196,9 @@ const F = dsv41.forward;
 const Rounds = dsv41.rounds;
 
 /// The other rank's partials, in gather order, from the fixture; this rank's own copied in beside them (the forward
-/// test's Supply), and every probed buffer kept for the comparison after the run.
+/// test's Supply), and every probed buffer kept for the comparison after the run. A gather recorded into a graph
+/// copies the other rank's partial from its place in `mailbox`; `launched` (the runner's launch hook) puts the next
+/// partials there before each launch, in the graph's gather order.
 const Supply = struct {
     gpu: Gpu,
     rank: usize = 0,
@@ -182,9 +206,23 @@ const Supply = struct {
     next: usize = 0,
     names: std.ArrayList([]const u8),
     probes: std.ArrayList(cuda.DeviceBuffer),
+    mailbox: ?cuda.DeviceBuffer = null,
+    cap_off: usize = 0,
+
+    const box_align = 256;
 
     fn gather(ctx: *anyopaque, partial: cuda.abi.DevicePtr, words: usize, out: cuda.abi.DevicePtr, stream: cuda.Stream) anyerror!void {
         const self: *Supply = @ptrCast(@alignCast(ctx));
+        if (try cuda.graph.captureStatus(stream) == .active) {
+            const box = self.mailbox orelse return error.NoMailbox;
+            const off = self.cap_off;
+            self.cap_off += std.mem.alignForward(usize, words * 4, box_align);
+            if (self.cap_off > box.len) return error.GatherOverrun;
+            const dst: cuda.DeviceBuffer = .{ .d = self.gpu.d, .ptr = out, .len = 2 * words * 4 };
+            try dst.copyFrom(self.rank * words * 4, partial, words * 4, stream.handle);
+            try dst.copyFrom((1 - self.rank) * words * 4, box.ptr + off, words * 4, stream.handle);
+            return;
+        }
         if (self.next >= self.rank1.items.len) return error.GatherOverrun;
         const other = self.rank1.items[self.next];
         self.next += 1;
@@ -195,6 +233,28 @@ const Supply = struct {
         const theirs: usize = (1 - self.rank) * words * 4;
         try dst.copyFrom(mine, partial, words * 4, stream.handle);
         try dst.copyFrom(theirs, other.ptr, words * 4, stream.handle);
+    }
+
+    /// Before a graph launch of `gathers` recorded gathers: the next partials into the mailbox.
+    fn launched(ctx: *anyopaque, gathers: usize, stream: cuda.Stream) anyerror!void {
+        const self: *Supply = @ptrCast(@alignCast(ctx));
+        self.cap_off = 0;
+        const box = self.mailbox orelse return error.NoMailbox;
+        var off: usize = 0;
+        for (0..gathers) |_| {
+            if (self.next >= self.rank1.items.len) return error.GatherOverrun;
+            const o = self.rank1.items[self.next];
+            self.next += 1;
+            try box.copyFrom(off, o.ptr, o.len, stream.handle);
+            off += std.mem.alignForward(usize, o.len, box_align);
+        }
+    }
+
+    /// The mailbox: room for every partial at once.
+    fn makeMailbox(self: *Supply) !void {
+        var total: usize = 0;
+        for (self.rank1.items) |b| total += std.mem.alignForward(usize, b.len, box_align);
+        self.mailbox = try cuda.DeviceBuffer.alloc(self.gpu.d, @max(total, box_align));
     }
 
     fn probe(ctx: *anyopaque, name: []const u8, ptr: cuda.abi.DevicePtr, bytes: usize, stream: cuda.Stream) anyerror!void {
@@ -209,6 +269,7 @@ const Supply = struct {
     }
 
     fn deinit(self: *Supply) void {
+        if (self.mailbox) |*b| b.free();
         for (self.rank1.items) |*b| b.free();
         self.rank1.deinit(self.gpu.gpa);
         for (self.names.items) |n| self.gpu.gpa.free(n);
@@ -295,20 +356,7 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         check.pass("dsv41 rounds: pool of {d} positions x {d} slots over {d} layers: {d} bytes (= bytesFor); all {d} layers: {d} bytes ({d:.1} MiB)", .{ cap, slots, layers, got, cfg.n_layers, full, @as(f64, @floatFromInt(full)) / (1 << 20) });
     }
     var nb: [96]u8 = undefined;
-    const plane_names = [_][]const u8{ "comp_codes", "comp_scales", "idxk_codes", "idxk_scales", "raw_kv", "raw_score" };
-    for (0..layers) |li| {
-        const ring = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.ring", .{li}));
-        defer gpa.free(ring);
-        try pool.rings[li].upload(0, ring);
-        if (pool.planes[li]) |*p| {
-            inline for (plane_names) |pn| if (@field(p, pn).len > 0) {
-                // (a ratio-1 kv source keeps no compressor inputs: the fork has no such plane)
-                const bytes = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.{s}", .{ li, pn }));
-                defer gpa.free(bytes);
-                if (bytes.len > 0) try @field(p, pn).upload(0, bytes);
-            };
-        }
-    }
+    try loadBefore(&h, &pool, layers);
     var runner = try Rounds.RoundRunner.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, bucket, rope_c, rope_w, &pool);
     defer runner.deinit();
     var supply: Supply = .{ .gpu = gpu, .rank = rank, .rank1 = .empty, .names = .empty, .probes = .empty };
@@ -356,12 +404,71 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         at += rows;
     }
     const gather: F.Gather = .{ .ctx = &supply, .call = Supply.gather };
+    // the eager round with every sublayer probed
     const logits = try runner.forward(windows[0..n_windows], gather, h.stream);
     try h.stream.synchronize();
     try check.expect(runner.round_bucket == fx_bucket, "dsv41 rounds: the round scanned a bucket of {d} positions, the fork's {d}", .{ runner.round_bucket, fx_bucket });
     check.pass("dsv41 rounds: the round scans the fork's bucket of {d} positions (the runner's widest {d})", .{ runner.round_bucket, runner.bucket });
+    try check.expect(supply.next == supply.rank1.items.len, "dsv41 rounds: {d} of the fork's {d} gathers ran", .{ supply.next, supply.rank1.items.len });
     for (supply.names.items, supply.probes.items) |name, buf| try h.stage(name, buf.ptr);
     try h.stage("logits", logits);
+    try stageAfter(&h, &cfg, &pool, layers, windows[0..n_windows]);
+    if (runner.graphs) {
+        // the same round from the same caches through the graphs (recorded, then replayed): the same bytes
+        try loadBefore(&h, &pool, layers);
+        supply.next = 0;
+        try supply.makeMailbox();
+        runner.probe = null;
+        if (eng) |e| e.probe = null;
+        runner.launch_hook = .{ .ctx = &supply, .call = Supply.launched };
+        defer runner.launch_hook = null;
+        for (0..2) |pass| {
+            if (pass == 1) {
+                // a replay of the recorded graphs (nothing recorded again) from the same caches
+                try loadBefore(&h, &pool, layers);
+                supply.next = 0;
+            }
+            const before = runner.captures;
+            const lg = try runner.forward(windows[0..n_windows], gather, h.stream);
+            try h.stream.synchronize();
+            try check.expect(supply.next == supply.rank1.items.len, "dsv41 rounds graphs: {d} of the fork's {d} gathers ran", .{ supply.next, supply.rank1.items.len });
+            if (pass == 1) try check.expect(runner.captures == before, "dsv41 rounds graphs: the replay recorded {d} graph(s)", .{runner.captures - before});
+            const fails = h.failures;
+            try h.stage("logits", lg);
+            try stageAfter(&h, &cfg, &pool, layers, windows[0..n_windows]);
+            if (h.failures == fails) check.pass("BITEXACT dsv41 rounds graphs ({s}): {d} stretch graph(s), the logits and the caches after equal to the Python fork's", .{ if (pass == 0) "recorded" else "replayed", runner.graphCount() });
+        }
+    } else check.pass("dsv41 rounds: graphs off (TF_DS_GRAPHS=0)", .{});
+    try check.expect(h.failures == 0, "dsv41-rounds: {d} stage(s) differ from the Python fork", .{h.failures});
+    if (getenv("TF_DS_ROUNDS_TIME")) |v| try timeRounds(gpu, &runner, cap, try std.fmt.parseInt(usize, v, 10), h.stream);
+}
+
+/// The pool's caches before the round (the fixture's).
+fn loadBefore(h: *base.Harness, pool: *Rounds.Pool, layers: usize) !void {
+    const gpa = h.gpu.gpa;
+    const fx = h.fx;
+    var nb: [96]u8 = undefined;
+    const plane_names = [_][]const u8{ "comp_codes", "comp_scales", "idxk_codes", "idxk_scales", "raw_kv", "raw_score" };
+    try h.stream.synchronize();
+    for (0..layers) |li| {
+        const ring = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.ring", .{li}));
+        defer gpa.free(ring);
+        try pool.rings[li].upload(0, ring);
+        if (pool.planes[li]) |*p| {
+            inline for (plane_names) |pn| if (@field(p, pn).len > 0) {
+                // (a ratio-1 kv source keeps no compressor inputs: the fork has no such plane)
+                const bytes = try fx.bytes(try std.fmt.bufPrint(&nb, "before_L{d}.{s}", .{ li, pn }));
+                defer gpa.free(bytes);
+                if (bytes.len > 0) try @field(p, pn).upload(0, bytes);
+            };
+        }
+    }
+}
+
+/// The pool's caches after the round against the fixture's.
+fn stageAfter(h: *base.Harness, cfg: *const dsv41.config.Config, pool: *Rounds.Pool, layers: usize, windows: []const Rounds.Window) !void {
+    var nb: [96]u8 = undefined;
+    const n_windows = windows.len;
     for (0..layers) |li| {
         try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.ring", .{li}), pool.rings[li].ptr);
         if (pool.planes[li]) |*p| {
@@ -370,11 +477,11 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
             // fixed order (the fork's own bytes there depend on the launch's scheduling): left out, as the forward test
             var skip: [8]usize = undefined;
             for (windows[0..n_windows], 0..) |wd, i| skip[i] = wd.base / ratio + wd.size / ratio - 1;
-            try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.comp_codes", .{li}), p.comp_codes.ptr, cfg.head_dim / 2, skip[0..n_windows]);
-            try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.comp_scales", .{li}), p.comp_scales.ptr, cfg.head_dim / 16, skip[0..n_windows]);
+            try stageExcept(h, try std.fmt.bufPrint(&nb, "after_L{d}.comp_codes", .{li}), p.comp_codes.ptr, cfg.head_dim / 2, skip[0..n_windows]);
+            try stageExcept(h, try std.fmt.bufPrint(&nb, "after_L{d}.comp_scales", .{li}), p.comp_scales.ptr, cfg.head_dim / 16, skip[0..n_windows]);
             if (p.idxk_codes.len > 0) {
-                try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.idxk_codes", .{li}), p.idxk_codes.ptr, cfg.idx_dim / 2, skip[0..n_windows]);
-                try stageExcept(&h, try std.fmt.bufPrint(&nb, "after_L{d}.idxk_scales", .{li}), p.idxk_scales.ptr, cfg.idx_dim / 32, skip[0..n_windows]);
+                try stageExcept(h, try std.fmt.bufPrint(&nb, "after_L{d}.idxk_codes", .{li}), p.idxk_codes.ptr, cfg.idx_dim / 2, skip[0..n_windows]);
+                try stageExcept(h, try std.fmt.bufPrint(&nb, "after_L{d}.idxk_scales", .{li}), p.idxk_scales.ptr, cfg.idx_dim / 32, skip[0..n_windows]);
             }
             if (p.raw_kv.len > 0) {
                 try h.stage(try std.fmt.bufPrint(&nb, "after_L{d}.raw_kv", .{li}), p.raw_kv.ptr);
@@ -382,8 +489,6 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
             }
         }
     }
-    try check.expect(h.failures == 0, "dsv41-rounds: {d} stage(s) differ from the Python fork", .{h.failures});
-    if (getenv("TF_DS_ROUNDS_TIME")) |v| try timeRounds(gpu, &runner, cap, try std.fmt.parseInt(usize, v, 10), h.stream);
 }
 
 /// A gather of one rank's partial into both ranks' places (timing only: the bits are not compared).
@@ -404,6 +509,7 @@ const Echo = struct {
 fn timeRounds(gpu: Gpu, runner: *Rounds.RoundRunner, cap: usize, reps: usize, stream: cuda.Stream) !void {
     runner.probe = null;
     runner.engram = null;
+    runner.launch_hook = null;
     var echo: Echo = .{ .d = gpu.d };
     const gather: F.Gather = .{ .ctx = &echo, .call = Echo.gather };
     const ids: [Rounds.max_rows]i64 = @splat(1);

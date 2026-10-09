@@ -26,17 +26,32 @@ const L = dsv41.serve_lanes;
 const F = dsv41.forward;
 
 /// The other rank's partials in gather order from the fixture, this rank's copied in beside them; once they run
-/// out with `loose` set, this rank's partial twice (timing runs only).
+/// out with `loose` set, this rank's partial twice (timing runs only). A gather recorded into a graph copies the
+/// other rank's partial from its place in `mailbox`; `launched` (the round's and the drafter's launch hook) puts
+/// the next partials there before each launch, in the graph's gather order.
 const Supply = struct {
     gpu: Gpu,
     rank: usize,
     other: std.ArrayList(cuda.DeviceBuffer) = .empty,
     next: usize = 0,
     loose: bool = false,
+    mailbox: ?cuda.DeviceBuffer = null,
+    cap_off: usize = 0,
+
+    const box_align = 256;
 
     fn gather(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
         const self: *Supply = @ptrCast(@alignCast(ctx));
         const dst: cuda.DeviceBuffer = .{ .d = self.gpu.d, .ptr = out, .len = 2 * words * 4 };
+        if (!self.loose and try cuda.graph.captureStatus(stream) == .active) {
+            const box = self.mailbox orelse return error.NoMailbox;
+            const off = self.cap_off;
+            self.cap_off += std.mem.alignForward(usize, words * 4, box_align);
+            if (self.cap_off > box.len) return error.GatherOverrun;
+            try dst.copyFrom(self.rank * words * 4, partial, words * 4, stream.handle);
+            try dst.copyFrom((1 - self.rank) * words * 4, box.ptr + off, words * 4, stream.handle);
+            return;
+        }
         if (self.loose) {
             try dst.copyFrom(0, partial, words * 4, stream.handle);
             try dst.copyFrom(words * 4, partial, words * 4, stream.handle);
@@ -50,6 +65,29 @@ const Supply = struct {
         try dst.copyFrom((1 - self.rank) * words * 4, o.ptr, words * 4, stream.handle);
     }
 
+    /// Before a graph launch of `gathers` recorded gathers: the next partials into the mailbox (none once loose).
+    fn launched(ctx: *anyopaque, gathers: usize, stream: cuda.Stream) anyerror!void {
+        const self: *Supply = @ptrCast(@alignCast(ctx));
+        self.cap_off = 0;
+        if (self.loose) return;
+        const box = self.mailbox orelse return error.NoMailbox;
+        var off: usize = 0;
+        for (0..gathers) |_| {
+            if (self.next >= self.other.items.len) return error.GatherOverrun;
+            const o = self.other.items[self.next];
+            self.next += 1;
+            try box.copyFrom(off, o.ptr, o.len, stream.handle);
+            off += std.mem.alignForward(usize, o.len, box_align);
+        }
+    }
+
+    /// The mailbox: room for every partial at once.
+    fn makeMailbox(self: *Supply) !void {
+        var total: usize = 0;
+        for (self.other.items) |b| total += std.mem.alignForward(usize, b.len, box_align);
+        self.mailbox = try cuda.DeviceBuffer.alloc(self.gpu.d, @max(total, box_align));
+    }
+
     fn add(self: *Supply, fx: Fixture, name: []const u8) !void {
         const bytes = try fx.bytes(name);
         defer self.gpu.gpa.free(bytes);
@@ -57,6 +95,7 @@ const Supply = struct {
     }
 
     fn deinit(self: *Supply) void {
+        if (self.mailbox) |*b| b.free();
         for (self.other.items) |*b| b.free();
         self.other.deinit(self.gpu.gpa);
     }
@@ -273,6 +312,10 @@ pub fn parallel(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []c
     marks[3] = supply.other.items.len;
     try addDraft(&supply, fx, 1, stages, block, other);
     marks[4] = supply.other.items.len;
+    try supply.makeMailbox();
+    st.runner.launch_hook = .{ .ctx = &supply, .call = Supply.launched };
+    drafter.launch_hook = .{ .ctx = &supply, .call = Supply.launched };
+    std.debug.print("dsv41-lanes-parallel: graphs {s}\n", .{if (st.runner.graphs) "on" else "off (TF_DS_GRAPHS=0)"});
 
     const op_buf = try gpa.alloc(u8, L.maxOpBytes(cap));
     defer gpa.free(op_buf);
@@ -427,6 +470,17 @@ pub fn parallel(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []c
 
     // -- timing (this rank's layers, gathers local) and a stream's bytes at 1M positions ---------------------------
     supply.loose = true;
+    // the graphs recorded with the fixture's partials read the mailbox: the timed ones are recorded with the local gathers
+    st.runner.dropGraphs();
+    drafter.dropGraphs();
+    if (st.runner.graphs) {
+        // the served engine's warm-up at load (Streams.warm): every round and batched draft graph it replays
+        const t0 = check.now(io);
+        const free0 = (try gpu.ctx.memInfo()).free;
+        try st.warm(gather);
+        const free1 = (try gpu.ctx.memInfo()).free;
+        std.debug.print("dsv41-lanes-parallel rank {d}: warm-up recorded {d} round graphs (1..16 rows, buckets up to {d}) and {d} draft graphs in {d} ms through {d} layers ({d:.1} MiB less free memory)\n", .{ rank, st.runner.graphCount(), @min(L.warm_bucket_max, st.runner.bucket), drafter.captures, @divTrunc(check.now(io) - t0, 1_000_000), layers, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20) });
+    }
     var round_ms: [L.max_rows]f64 = undefined;
     for (1..L.max_rows + 1) |n| {
         var best: f64 = std.math.inf(f64);

@@ -18,6 +18,16 @@
 //! streams' lengths. Every row's bits are the same at any bucket holding it (the scans mask past a row's visible
 //! count); the fork's round runs at this bucket, so its launches do too. The bucket depends only on the windows,
 //! so ranks running the same windows run the same shapes.
+//!
+//! Graphs (rounds.py `RoundDecoder.capture`, TF_DS_GRAPHS=0 keeps every round eager): a round's launches depend on the
+//! host only through its row count R and its bucket; every per-row value (ids, positions, ring and raw rows, extents,
+//! each ratio's compressed rows and visible counts, the short buckets' picks) is a device table filled by one copy
+//! before the launches (`setTables`, the fork's `inputs.copy_`). So the launches of a key (R, bucket) are recorded
+//! once as CUDA graphs, one a stretch of layers (cut before each Engram layer when Engram runs: its host read and
+//! upload stay eager between the stretches, as the fork's ENGRAM_SPLIT), and replayed; a replay runs the eager path's
+//! launches with the same arguments, so it writes the same bytes. The gathers are recorded with the rest (the
+//! communicator's all-gather runs on the round's stream). The host selection (TF_DS_TOPK=host) and a probe stay
+//! eager. Every rank records the same graphs in the same order: the keys follow from the windows alone.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -208,7 +218,95 @@ pub const Pool = struct {
     }
 };
 
-/// A round's forward over one pool: R <= 16 rows of several streams, the fork's `RoundDecoder` without graphs.
+/// Called before each graph launch with the gathers the graph replays, on the stream it launches on: what a test's
+/// supply of the other rank's partials needs to put the next partials where the recorded gathers read them (the
+/// communicator's all-gathers need nothing).
+pub const GraphLaunch = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, gathers: usize, stream: cuda.Stream) anyerror!void,
+};
+
+/// Whether rounds and drafts replay CUDA graphs: TF_DS_GRAPHS unset or anything but "0".
+pub fn graphsFromEnv() bool {
+    const v = std.mem.span(std.c.getenv("TF_DS_GRAPHS") orelse return true);
+    return !std.mem.eql(u8, v, "0");
+}
+
+/// The distinct compress ratios a runner keeps tables for.
+pub const max_ratios = 4;
+/// The stretches a round is cut into at most (one, plus one an Engram layer).
+pub const max_segments = 9;
+
+/// The round's device tables, int64 words: `rows` tables of max_rows words, then `per_ratio` a ratio, then each
+/// ratio's picks table [max_rows, kmax].
+pub const Tab = struct {
+    pub const ids = 0;
+    pub const pos = 1;
+    pub const wslot = 2; // slot x ring + pos % ring: the row's ring row
+    pub const wbase = 3; // slot x ring
+    pub const rslot = 4; // slot x RAW + pos % RAW: the row's raw compressor row
+    pub const rows = 5;
+    // a ratio's
+    pub const cbase = 0; // base / ratio: the extent's first compressed row
+    pub const ctarget = 1; // the compressed row this row writes
+    pub const gpos = 2; // the group's first position (its RoPE position)
+    pub const gfirst = 3; // slot x RAW + gpos % RAW: the group's first raw row
+    pub const vis = 4; // (pos + 1) / ratio: the compressed rows the row sees
+    pub const per_ratio = 5;
+
+    /// The word offset of table `t` of the rows.
+    pub fn row(t: usize) usize {
+        return t * max_rows;
+    }
+
+    /// The word offset of table `t` of ratio slot `j`.
+    pub fn ratio(j: usize, t: usize) usize {
+        return (rows + j * per_ratio + t) * max_rows;
+    }
+
+    /// The word offset of ratio slot `j`'s picks table.
+    pub fn picks(j: usize, kmax: usize) usize {
+        return (rows + max_ratios * per_ratio) * max_rows + j * max_rows * kmax;
+    }
+
+    pub fn words(kmax: usize) usize {
+        return picks(max_ratios, kmax);
+    }
+};
+
+/// Layers [first, end) of a round: the embedding before layer 0 in the first, the head after the last layer in the last.
+const Seg = struct { first: usize, end: usize };
+
+/// The layer loop's host state at a stretch's end (the next stretch starts from it).
+const SegState = struct {
+    pre: Ptr = 0,
+    pre_f: Ptr = 0,
+    tap: usize = 0,
+    cidx: Ptr = 0, // the picks the compressed layers read (the last index layer's)
+    cand_made: bool = false,
+};
+
+/// One key's graphs: a stretch's executable (null until recorded), the gathers it replays, the state at its end.
+const Graphs = struct {
+    n: usize,
+    execs: [max_segments]?cuda.graph.Exec = @splat(null),
+    gathers: [max_segments]usize = @splat(0),
+    after: [max_segments]SegState = @splat(.{}),
+};
+
+/// A gather that counts its calls (a capture's).
+const Counted = struct {
+    inner: fwd.Gather,
+    n: usize = 0,
+
+    fn call(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
+        const self: *Counted = @ptrCast(@alignCast(ctx));
+        self.n += 1;
+        return self.inner.run(partial, words, out, stream);
+    }
+};
+
+/// A round's forward over one pool: R <= 16 rows of several streams, the fork's `RoundDecoder`.
 pub const RoundRunner = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -232,20 +330,32 @@ pub const RoundRunner = struct {
     probe: ?fwd.Probe = null,
     engram: ?Engram = null,
     idx_proj_h: []cuda.DeviceBuffer, // per layer: fp16 [idx_heads, d] on index layers
-    // the round's tables (int64 [R]), host and device
-    tab: []i64, // 12 x max_rows: ids pos slot base end wslot cbase ctarget gpos vis rslot first
+    // the round's tables (int64), host and device, one layout (`Tab`): the rows' (ids, positions, ring and raw rows),
+    // each compress ratio's (compressed base, target row, group position, first raw row, visible count) and its picks
+    // at short buckets; filled by one copy a round
+    tab_h: []i64,
+    end_h: []i64, // the rows' extent ends (host only)
+    base_h: []i64, // the rows' extent bases (host only)
+    slot_h: []i64, // the rows' slots (host only)
+    t_all: cuda.DeviceBuffer,
+    ratios: [max_ratios]usize, // the compress ratios of the layers (0 not among them)
+    n_ratios: usize,
+    kmax: usize, // the widest selection (columns of a ratio's picks table)
     cidx_h: []i64,
-    uploads: attention.Uploads, // the tables' copies: 4 a round, then 3 and the picks a compressed layer
-    t_ids: cuda.DeviceBuffer,
-    t_pos: cuda.DeviceBuffer,
-    t_wslot: cuda.DeviceBuffer,
-    t_wbase: cuda.DeviceBuffer,
-    t_cbase: cuda.DeviceBuffer,
-    t_ctarget: cuda.DeviceBuffer,
-    t_gpos: cuda.DeviceBuffer,
-    t_cidx: cuda.DeviceBuffer,
+    uploads: attention.Uploads, // the tables' copy a round (and the picks of the host selection)
+    t_cidx: cuda.DeviceBuffer, // the device selection's picks [R, kk]
     t_zero: cuda.DeviceBuffer,
-    t_vis: cuda.DeviceBuffer,
+    rows_glue: cuda.Module, // prompt_glue.cu: tf_dsv41_copy_rows (the compressor inputs into their raw rows)
+    copy_rows: cuda.Function,
+    // graphs (TF_DS_GRAPHS, default on): the stretches of each (rows, bucket, Engram split), captured on first use or
+    // by `warm`
+    graphs: bool,
+    execs: std.AutoHashMapUnmanaged(u64, *Graphs),
+    captures: usize,
+    /// Called before each graph launch (tests' gather supplies; the communicator needs none).
+    launch_hook: ?GraphLaunch = null,
+    // the layer loop's state between stretches (`segment`)
+    st: SegState,
     // the scored indexer (buckets past idx_topk compressed entries)
     iq: cuda.DeviceBuffer, // bf16 [R, idx_heads, idx_dim]
     iqq: cuda.DeviceBuffer,
@@ -255,7 +365,6 @@ pub const RoundRunner = struct {
     keys: cuda.DeviceBuffer, // int64 [R, bucket / ratio] for the fused selection (where it applies)
     smax: cuda.DeviceBuffer, // fp32 [R, cand cols]
     cand_mask: cuda.DeviceBuffer, // u8 [R, cand cols]: the candidate source's pool this round
-    cand_made: bool, // the pool exists this round
     score_h: []f32, // the host selection's
     keys_h: []i64,
     cand_h: []u8,
@@ -341,21 +450,37 @@ pub const RoundRunner = struct {
                 b.* = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(f16s));
             } else b.* = .{ .d = d, .ptr = 0, .len = 0 };
         }
-        self.tab = try gpa.alloc(i64, 12 * R);
         const kk = @min(cfg.idx_topk, bucket); // the widest selection (ratio 1)
+        self.kmax = kk;
+        self.n_ratios = 0;
+        self.ratios = @splat(0);
+        for (0..w.layers.len) |li| {
+            const r = cfg.ratio(li);
+            if (r == 0 or std.mem.indexOfScalar(usize, self.ratios[0..self.n_ratios], r) != null) continue;
+            if (self.n_ratios == max_ratios) return error.Unsupported;
+            self.ratios[self.n_ratios] = r;
+            self.n_ratios += 1;
+        }
+        self.tab_h = try gpa.alloc(i64, Tab.words(kk));
+        @memset(self.tab_h, 0);
+        self.end_h = try gpa.alloc(i64, R);
+        self.base_h = try gpa.alloc(i64, R);
+        self.slot_h = try gpa.alloc(i64, R);
         self.cidx_h = try gpa.alloc(i64, R * kk);
-        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(4 + 4 * w.layers.len, R * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
-        self.t_ids = try cuda.DeviceBuffer.alloc(d, R * 8);
-        self.t_pos = try cuda.DeviceBuffer.alloc(d, R * 8);
-        self.t_wslot = try cuda.DeviceBuffer.alloc(d, R * 8);
-        self.t_wbase = try cuda.DeviceBuffer.alloc(d, R * 8);
-        self.t_cbase = try cuda.DeviceBuffer.alloc(d, R * 8);
-        self.t_ctarget = try cuda.DeviceBuffer.alloc(d, R * 8);
-        self.t_gpos = try cuda.DeviceBuffer.alloc(d, R * 8);
+        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(1, Tab.words(kk) * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
+        self.t_all = try cuda.DeviceBuffer.alloc(d, Tab.words(kk) * 8);
+        try self.t_all.fill8(0, null);
         self.t_cidx = try cuda.DeviceBuffer.alloc(d, R * kk * 8);
         self.t_zero = try cuda.DeviceBuffer.alloc(d, R * 8);
         try self.t_zero.fill8(0, null);
-        self.t_vis = try cuda.DeviceBuffer.alloc(d, R * 8);
+        if (!cuda.kernels.available) return error.Unsupported;
+        self.rows_glue = try cuda.Module.load(d, cuda.kernels.dsv41_prompt_glue);
+        self.copy_rows = try self.rows_glue.function("tf_dsv41_copy_rows");
+        self.graphs = graphsFromEnv();
+        self.execs = .empty;
+        self.captures = 0;
+        self.launch_hook = null;
+        self.st = .{};
         self.iq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
         self.iqq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
         self.wl = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 4);
@@ -368,7 +493,6 @@ pub const RoundRunner = struct {
         const ccols = (bucket + @max(1, cfg.cand_block) - 1) / @max(1, cfg.cand_block);
         self.smax = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols * 4 else 16);
         self.cand_mask = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols else 16);
-        self.cand_made = false;
         self.score_h = try gpa.alloc(f32, if (scored) R * bucket else 1);
         self.keys_h = try gpa.alloc(i64, if (scored) bucket else 1);
         self.cand_h = try gpa.alloc(u8, if (scored) R * ccols else 1);
@@ -437,13 +561,19 @@ pub const RoundRunner = struct {
     pub fn deinit(self: *RoundRunner) void {
         for (self.idx_proj_h) |*b| if (b.len > 0) b.free();
         self.gpa.free(self.idx_proj_h);
-        self.gpa.free(self.tab);
+        self.dropGraphs();
+        self.execs.deinit(self.gpa);
+        self.rows_glue.unload();
+        self.gpa.free(self.tab_h);
+        self.gpa.free(self.end_h);
+        self.gpa.free(self.base_h);
+        self.gpa.free(self.slot_h);
         self.gpa.free(self.cidx_h);
         self.gpa.free(self.score_h);
         self.gpa.free(self.keys_h);
         self.gpa.free(self.cand_h);
         self.uploads.deinit();
-        inline for (.{ "t_ids", "t_pos", "t_wslot", "t_wbase", "t_cbase", "t_ctarget", "t_gpos", "t_cidx", "t_zero", "t_vis", "iq", "iqq", "wl", "wts_i", "score", "keys", "smax", "cand_mask", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
+        inline for (.{ "t_all", "t_cidx", "t_zero", "iq", "iqq", "wl", "wts_i", "score", "keys", "smax", "cand_mask", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
         self.scratch.deinit();
     }
 
@@ -462,19 +592,13 @@ pub const RoundRunner = struct {
     }
 
     /// Every window's rows in one forward: logits [R, V] f32 (`self.logits`, row order = the windows'), the taps
-    /// in `self.taps` [R, ntap x d]; the pool holds the rows' keys after.
+    /// in `self.taps` [R, ntap x d]; the pool holds the rows' keys after. With graphs, the stretches of the round's
+    /// key are replayed (recorded first when missing); without, launched one by one; the same launches either way.
     pub fn forward(self: *RoundRunner, windows: []const Window, gather: fwd.Gather, stream: cuda.Stream) !Ptr {
-        const c = self.cfg;
-        const D = c.dim;
+        const D = self.cfg.dim;
         var R: usize = 0;
         for (windows) |wd| R += wd.ids.len;
         if (R < 1 or R > max_rows) return error.TooManyRows;
-        // -- the per-row tables (rounds.py RoundDecoder.set and _ix) ----------------------------------------------
-        const ids = self.tab[0..max_rows];
-        const pos = self.tab[max_rows .. 2 * max_rows];
-        const slot = self.tab[2 * max_rows .. 3 * max_rows];
-        const base = self.tab[3 * max_rows .. 4 * max_rows];
-        const end = self.tab[4 * max_rows .. 5 * max_rows];
         // every row inside its extent, the extent inside the window, its positions inside the RoPE tables
         const rope_rows = @min(self.rope_c.rows, self.rope_w.rows);
         for (windows) |wd| {
@@ -483,58 +607,231 @@ pub const RoundRunner = struct {
             if (self.engram != null and wd.host.len < wd.position + wd.ids.len) return error.BadShape;
         }
         self.round_bucket = try self.bucketOf(windows);
+        try self.setTables(windows, R, stream);
+        var segs: [max_segments]Seg = undefined;
+        const ns = try self.segments(&segs);
+        var spans: [max_rows]EngramSpan = undefined;
+        if (self.engram != null) {
+            for (windows, 0..) |wd, i| spans[i] = .{ .ids = wd.host, .start = wd.position, .n = wd.ids.len };
+        }
+        const entry: ?*Graphs = if (self.graphed()) try self.graphsFor(R, self.round_bucket, ns) else null;
+        var nb: [48]u8 = undefined;
+        for (segs[0..ns], 0..) |sg, k| {
+            if (k > 0) {
+                // the stretch starts at an Engram layer: its rows read and gated here, between the graphs
+                const e = self.engram.?;
+                try e.call(e.ctx, sg.first, self.h.ptr, spans[0..windows.len], gather, stream);
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{sg.first}), self.h.ptr, R * 4 * D * 2, stream);
+            }
+            if (entry) |g| {
+                try self.record(g, segs[0..ns], k, R, gather, stream);
+                if (self.launch_hook) |hk| try hk.call(hk.ctx, g.gathers[k], stream);
+                try g.execs[k].?.launchOn(stream);
+                self.st = g.after[k];
+            } else try self.segment(segs[0..ns], k, R, gather, stream);
+        }
+        return self.logits.ptr;
+    }
+
+    /// Whether rounds replay graphs now: on, no probe (its callbacks run per launch), the device selection.
+    fn graphed(self: *const RoundRunner) bool {
+        return self.graphs and self.probe == null and !self.glue.hostSelect();
+    }
+
+    /// Records the graphs of rounds of each row count in `rows` (1 .. max_rows) at each bucket of `buckets` the runner
+    /// scans, ahead of the rounds that replay them; nothing runs. Every rank calls it with the same arguments, so
+    /// the ranks record the same gathers in the same order (none is issued).
+    pub fn warm(self: *RoundRunner, rows: []const usize, buckets: []const usize, gather: fwd.Gather, stream: cuda.Stream) !void {
+        if (!self.graphed()) return;
+        var segs: [max_segments]Seg = undefined;
+        const ns = try self.segments(&segs);
+        for (buckets) |b| {
+            if (b > self.bucket or b < @min(self.least, self.bucket)) continue;
+            for (rows) |R| {
+                if (R < 1 or R > max_rows) return error.TooManyRows;
+                self.round_bucket = b;
+                const g = try self.graphsFor(R, b, ns);
+                for (0..ns) |k| {
+                    try self.record(g, segs[0..ns], k, R, gather, stream);
+                    self.st = g.after[k];
+                }
+            }
+        }
+        try stream.synchronize();
+    }
+
+    /// The graphs this runner holds (each stretch of each key recorded).
+    pub fn graphCount(self: *const RoundRunner) usize {
+        var n: usize = 0;
+        var it = self.execs.valueIterator();
+        while (it.next()) |g| for (g.*.execs[0..g.*.n]) |e| {
+            if (e != null) n += 1;
+        };
+        return n;
+    }
+
+    /// Drops every recorded graph (later rounds record their own again).
+    pub fn dropGraphs(self: *RoundRunner) void {
+        var it = self.execs.valueIterator();
+        while (it.next()) |g| {
+            for (&g.*.execs) |*e| if (e.*) |*x| {
+                x.deinit();
+                e.* = null;
+            };
+            self.gpa.destroy(g.*);
+        }
+        self.execs.clearRetainingCapacity();
+    }
+
+    fn graphsFor(self: *RoundRunner, R: usize, bucket: usize, ns: usize) !*Graphs {
+        const key: u64 = @as(u64, R) | @as(u64, ns) << 5 | @as(u64, bucket) << 9;
+        const got = try self.execs.getOrPut(self.gpa, key);
+        if (!got.found_existing) {
+            got.value_ptr.* = self.gpa.create(Graphs) catch |err| {
+                _ = self.execs.remove(key);
+                return err;
+            };
+            got.value_ptr.*.* = .{ .n = ns };
+        }
+        return got.value_ptr.*;
+    }
+
+    /// Stretch `k` of `g` recorded (from the state the stretch before it left) unless it already is.
+    fn record(self: *RoundRunner, g: *Graphs, segs: []const Seg, k: usize, R: usize, gather: fwd.Gather, stream: cuda.Stream) !void {
+        if (g.execs[k] != null) return;
+        if (k > 0) self.st = g.after[k - 1];
+        var counted: Counted = .{ .inner = gather };
+        const cg: fwd.Gather = .{ .ctx = &counted, .call = Counted.call };
+        try cuda.graph.beginCapture(stream, .thread_local);
+        self.segment(segs, k, R, cg, stream) catch |err| {
+            if (cuda.graph.endCapture(stream)) |gr| {
+                var x = gr;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        var gr = try cuda.graph.endCapture(stream);
+        defer gr.deinit();
+        var exec = try gr.instantiate();
+        errdefer exec.deinit();
+        try exec.upload(stream);
+        g.execs[k] = exec;
+        g.gathers[k] = counted.n;
+        g.after[k] = self.st;
+        self.captures += 1;
+    }
+
+    /// The round's stretches: one, or (an Engram hook set) cut before each Engram layer (layer 0's: after the
+    /// embedding alone). Returns their count.
+    fn segments(self: *const RoundRunner, out: *[max_segments]Seg) error{Unsupported}!usize {
+        var n: usize = 0;
+        var first: usize = 0;
+        if (self.engram != null) for (self.w.layers, 0..) |*l, li| {
+            if (l.engram_wkv == null) continue;
+            if (n + 2 > max_segments) return error.Unsupported;
+            out[n] = .{ .first = first, .end = li };
+            n += 1;
+            first = li;
+        };
+        out[n] = .{ .first = first, .end = self.w.layers.len };
+        return n + 1;
+    }
+
+    /// The round's tables (rounds.py RoundDecoder.set and `_ix`) on the host, then to the device in one copy on
+    /// `stream`, ahead of the round's launches (which read them there).
+    fn setTables(self: *RoundRunner, windows: []const Window, R: usize, stream: cuda.Stream) !void {
+        const t = self.tab_h;
+        const ids = t[Tab.row(Tab.ids)..][0..max_rows];
+        const pos = t[Tab.row(Tab.pos)..][0..max_rows];
+        const wslot = t[Tab.row(Tab.wslot)..][0..max_rows];
+        const wbase = t[Tab.row(Tab.wbase)..][0..max_rows];
+        const rslot = t[Tab.row(Tab.rslot)..][0..max_rows];
+        const RAW: i64 = raw_rows;
         var r: usize = 0;
         for (windows) |wd| {
             for (wd.ids, 0..) |id, i| {
                 ids[r] = id;
                 pos[r] = @intCast(wd.position + i);
-                slot[r] = @intCast(wd.slot);
-                base[r] = @intCast(wd.base);
-                end[r] = @intCast(wd.base + wd.size);
+                self.slot_h[r] = @intCast(wd.slot);
+                self.base_h[r] = @intCast(wd.base);
+                self.end_h[r] = @intCast(wd.base + wd.size);
                 r += 1;
             }
         }
-        const wslot = self.tab[5 * max_rows .. 6 * max_rows];
-        const wbase = self.tab[6 * max_rows .. 7 * max_rows];
         const RS: i64 = @intCast(self.pool.ring);
         for (0..R) |i| {
-            wbase[i] = slot[i] * RS;
+            wbase[i] = self.slot_h[i] * RS;
             wslot[i] = wbase[i] + @mod(pos[i], RS);
+            rslot[i] = self.slot_h[i] * RAW + @mod(pos[i], RAW);
+        }
+        var used: usize = Tab.ratio(self.n_ratios, 0);
+        for (self.ratios[0..self.n_ratios], 0..) |ratio, j| {
+            const rt: i64 = @intCast(ratio);
+            const cbase = t[Tab.ratio(j, Tab.cbase)..][0..max_rows];
+            const ctarget = t[Tab.ratio(j, Tab.ctarget)..][0..max_rows];
+            const gpos = t[Tab.ratio(j, Tab.gpos)..][0..max_rows];
+            const gfirst = t[Tab.ratio(j, Tab.gfirst)..][0..max_rows];
+            const vis = t[Tab.ratio(j, Tab.vis)..][0..max_rows];
+            for (0..R) |i| {
+                cbase[i] = @divFloor(self.base_h[i], rt);
+                const scratch = @divFloor(self.end_h[i], rt) - 1 - cbase[i];
+                const groups_i = @divFloor(pos[i], rt);
+                const target: i64 = if (@mod(pos[i] + 1, rt) == 0) groups_i else scratch;
+                ctarget[i] = cbase[i] + (if (ratio == 1) pos[i] else target);
+                gpos[i] = (if (ratio == 1) pos[i] else groups_i) * rt;
+                gfirst[i] = self.slot_h[i] * RAW + @mod(gpos[i], RAW);
+                vis[i] = @divFloor(pos[i] + 1, rt);
+            }
+            // short buckets: every scanned entry is picked (the top-k of the scores is every index below vis)
+            const nb_ = self.round_bucket / ratio;
+            if (nb_ <= self.cfg.idx_topk) {
+                const kk = @min(self.cfg.idx_topk, nb_);
+                const picks = t[Tab.picks(j, self.kmax)..][0 .. R * kk];
+                for (0..R) |i| for (0..kk) |cc| {
+                    picks[i * kk + cc] = if (@as(i64, @intCast(cc)) < vis[i]) @intCast(cc) else -1;
+                };
+                used = Tab.picks(j, self.kmax) + R * kk;
+            }
         }
         try self.uploads.begin();
-        try self.uploads.put(self.t_ids, 0, std.mem.sliceAsBytes(ids[0..R]), stream);
-        try self.uploads.put(self.t_pos, 0, std.mem.sliceAsBytes(pos[0..R]), stream);
-        try self.uploads.put(self.t_wslot, 0, std.mem.sliceAsBytes(wslot[0..R]), stream);
-        try self.uploads.put(self.t_wbase, 0, std.mem.sliceAsBytes(wbase[0..R]), stream);
-        self.cand_made = false;
-        // -- the layers ------------------------------------------------------------------------------------------
+        try self.uploads.put(self.t_all, 0, std.mem.sliceAsBytes(t[0..used]), stream);
+    }
+
+    /// The device address of word `word` of the tables.
+    fn tab(self: *const RoundRunner, word: usize) Ptr {
+        return self.t_all.ptr + word * 8;
+    }
+
+    fn ratioSlot(self: *const RoundRunner, ratio: usize) usize {
+        return std.mem.indexOfScalar(usize, self.ratios[0..self.n_ratios], ratio).?;
+    }
+
+    /// Stretch `k` of the round's launches (`segs[k]`): the embedding first in stretch 0, the head last in the last;
+    /// the layer loop's state in `self.st` between stretches. Reads the host only for R and the bucket (the host
+    /// selection aside), so its launches can be recorded.
+    fn segment(self: *RoundRunner, segs: []const Seg, k: usize, R: usize, gather: fwd.Gather, stream: cuda.Stream) !void {
+        const c = self.cfg;
+        const D = c.dim;
         const w = self.w;
-        try self.hc.embedInit(stream, w.embed.ptr(), self.t_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(R));
-        var pre = self.pre.ptr;
-        var pre_f = self.pre_f.ptr;
-        var nb: [48]u8 = undefined;
-        var tap: usize = 0;
-        var spans: [max_rows]EngramSpan = undefined;
-        if (self.engram != null) {
-            for (windows, 0..) |wd, i| spans[i] = .{ .ids = wd.host, .start = wd.position, .n = wd.ids.len };
+        const sg = segs[k];
+        if (k == 0) {
+            try self.hc.embedInit(stream, w.embed.ptr(), self.tab(Tab.row(Tab.ids)), self.h.ptr, self.pre.ptr, @intCast(R));
+            self.st = .{ .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .tap = 0, .cidx = self.t_cidx.ptr, .cand_made = false };
         }
-        for (w.layers, 0..) |*l, li| {
-            if (l.engram_wkv != null) if (self.engram) |e| {
-                try e.call(e.ctx, li, self.h.ptr, spans[0..windows.len], gather, stream);
-                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), self.h.ptr, R * 4 * D * 2, stream);
-            };
+        var nb: [48]u8 = undefined;
+        for (w.layers[sg.first..sg.end], sg.first..) |*l, li| {
             if (c.dspark_taps.has(@intCast(li))) {
-                try self.hc.tap(stream, self.h.ptr, self.taps.ptr + tap * D * 2, @intCast(@max(self.ntap, 1) * D), @intCast(R));
-                tap += 1;
+                try self.hc.tap(stream, self.h.ptr, self.taps.ptr + self.st.tap * D * 2, @intCast(@max(self.ntap, 1) * D), @intCast(R));
+                self.st.tap += 1;
             }
-            try self.hc.pre(stream, self.h.ptr, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
+            try self.hc.pre(stream, self.h.ptr, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), self.st.pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, R * D * 2, stream);
-            const pa = try self.roundAttention(li, windows, R, stream);
+            const pa = try self.roundAttention(li, R, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, R * D * 4, stream);
             try gather.run(pa, R * D, self.gathered.ptr, stream);
             try self.hc.post(stream, self.gathered.ptr, self.world, self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(R));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_attn", .{li}), self.h.ptr, R * 4 * D * 2, stream);
-            try self.hc.pre(stream, self.h.ptr, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), self.x.ptr, pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
+            try self.hc.pre(stream, self.h.ptr, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), self.x.ptr, self.st.pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_ffn", .{li}), self.x.ptr, R * D * 2, stream);
             try self.route.gate(stream, self.x.ptr, l.gate_w.ptr(), self.parts.ptr, @intCast(R));
             try self.route.pick(stream, self.parts.ptr, l.gate_b.ptr(), self.pick.ptr, self.wts.ptr, @intCast(R));
@@ -543,12 +840,13 @@ pub const RoundRunner = struct {
             try gather.run(self.moe.ptr, R * D, self.gathered.ptr, stream);
             try self.hc.post(stream, self.gathered.ptr, self.world, self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(R));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li}), self.h.ptr, R * 4 * D * 2, stream);
-            const t = pre;
-            pre = pre_f;
-            pre_f = t;
+            const t = self.st.pre;
+            self.st.pre = self.st.pre_f;
+            self.st.pre_f = t;
         }
+        if (sg.end < w.layers.len) return;
         // -- the head: every rank's vocabulary columns, rank order within a row ----------------------------------
-        try self.hc.collapseNorm(stream, self.h.ptr, pre, w.norm.ptr(), self.xc.ptr, @intCast(R));
+        try self.hc.collapseNorm(stream, self.h.ptr, self.st.pre, w.norm.ptr(), self.xc.ptr, @intCast(R));
         try self.probeOut("head.xc", self.xc.ptr, R * D * 2, stream);
         try w.head.run(self.xc.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.local.ptr, .f32, stream);
         const vl = c.vocab / self.world;
@@ -558,11 +856,10 @@ pub const RoundRunner = struct {
             // [world, R, vl] -> [R, world x vl]: rank rk's columns of every row (f32 moved as pairs of 16-bit words)
             try self.copyCols(self.glog.ptr + rk * R * vl * 4, vl * 2, self.logits.ptr + rk * vl * 4, c.vocab * 2, R, vl * 2, stream);
         }
-        return self.logits.ptr;
     }
 
-    /// rounds.py `RoundDecoder._attention` (unfused) for layer `li` over the window rows: this rank's fp32 partial.
-    fn roundAttention(self: *RoundRunner, li: usize, windows: []const Window, R: usize, stream: cuda.Stream) !Ptr {
+    /// rounds.py `RoundDecoder._attention` (unfused) for layer `li` over the round's rows: this rank's fp32 partial.
+    fn roundAttention(self: *RoundRunner, li: usize, R: usize, stream: cuda.Stream) !Ptr {
         const c = self.cfg;
         const l = &self.w.layers[li];
         const hd = c.head_dim;
@@ -570,9 +867,8 @@ pub const RoundRunner = struct {
         const groups = c.o_groups / self.world;
         const ratio = c.ratio(li);
         const rope = if (ratio > 0) self.rope_c else self.rope_w;
-        const pos = self.tab[max_rows .. 2 * max_rows];
-        const base = self.tab[3 * max_rows .. 4 * max_rows];
-        const end = self.tab[4 * max_rows .. 5 * max_rows];
+        const t_pos = self.tab(Tab.row(Tab.pos));
+        const t_wbase = self.tab(Tab.row(Tab.wbase));
         const ring = self.pool.rings[li];
         // -- attn_in: wq_a, wkv (and the compressor's) on x ------------------------------------------------------
         try l.wq_a.run(self.x.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
@@ -585,87 +881,64 @@ pub const RoundRunner = struct {
         // -- q: RMSNorm, wq_b, RoPE on this rank's heads ----------------------------------------------------------
         try self.rmsnorm(self.qa.ptr, l.q_norm.ptr(), self.qr.ptr, R, c.q_rank, stream);
         try l.wq_b.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
-        try self.ropeHeads(self.q.ptr, rope, self.t_pos.ptr, R, heads, hd, false, stream);
+        try self.ropeHeads(self.q.ptr, rope, t_pos, R, heads, hd, false, stream);
         // -- the window KV into the slot's ring rows ------------------------------------------------------------
         try self.set.run(stream, "_kv_norm_rope", .{ @intCast(R), 1, 1 }, &.{
             aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", l.kv_norm.ptr()), aot.ptr("COS", "*fp32", rope.cos.ptr),
-            aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", self.t_pos.ptr),     aot.ptr("OUT", "*bf16", self.kv.ptr),
-            aot.ptr("RING", "*bf16", ring.ptr),   aot.ptr("SLOT_OF", "*i64", self.t_wslot.ptr), aot.int("ring_size", @intCast(self.pool.slots * self.pool.ring)),
+            aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", t_pos),            aot.ptr("OUT", "*bf16", self.kv.ptr),
+            aot.ptr("RING", "*bf16", ring.ptr),   aot.ptr("SLOT_OF", "*i64", self.tab(Tab.row(Tab.wslot))), aot.int("ring_size", @intCast(self.pool.slots * self.pool.ring)),
             aot.float("eps", c.eps),
         }, &.{ aot.ci("QUANT", 1), aot.ci("D", @intCast(hd)), aot.ci("RD", @intCast(c.rope_dim)), aot.ci("PDL", 1) });
         var comp_codes: Ptr = ring.ptr;
         var comp_scales: Ptr = ring.ptr;
+        var t_cbase: Ptr = t_wbase;
         var kk: usize = 0;
         if (ratio > 0) {
-            const rt: i64 = @intCast(ratio);
-            const cbase = self.tab[7 * max_rows .. 8 * max_rows];
-            const ctarget = self.tab[8 * max_rows .. 9 * max_rows];
-            const gpos = self.tab[9 * max_rows .. 10 * max_rows];
-            const vis = self.tab[10 * max_rows .. 11 * max_rows];
-            for (0..R) |i| {
-                cbase[i] = @divFloor(base[i], rt);
-                const scratch = @divFloor(end[i], rt) - 1 - cbase[i];
-                const groups_i = @divFloor(pos[i], rt);
-                const target: i64 = if (@mod(pos[i] + 1, rt) == 0) groups_i else scratch;
-                ctarget[i] = cbase[i] + (if (ratio == 1) pos[i] else target);
-                gpos[i] = (if (ratio == 1) pos[i] else groups_i) * rt;
-                vis[i] = @divFloor(pos[i] + 1, rt);
-            }
-            try self.uploads.put(self.t_cbase, 0, std.mem.sliceAsBytes(cbase[0..R]), stream);
-            try self.uploads.put(self.t_ctarget, 0, std.mem.sliceAsBytes(ctarget[0..R]), stream);
-            try self.uploads.put(self.t_gpos, 0, std.mem.sliceAsBytes(gpos[0..R]), stream);
+            const j = self.ratioSlot(ratio);
+            t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
+            const t_ctarget = self.tab(Tab.ratio(j, Tab.ctarget));
+            const t_gpos = self.tab(Tab.ratio(j, Tab.gpos));
             const src = &self.pool.planes[self.pool.source[li]].?;
             if (kv_source) {
                 // -- the kv source: compressed latents (and index keys) of the rows' groups ----------------------
                 if (ratio == 1) {
                     try self.rmsnorm(self.ckv.ptr, l.comp_norm.?.ptr(), self.lat.ptr, R, hd, stream);
                 } else {
-                    if (ratio != 2) return error.Unsupported;
-                    // the rows' compressor inputs by position into the slot's raw rows, then each stream's groups'
-                    // softmax pool (the raw rows of one slot a launch)
-                    var r0: usize = 0;
-                    for (windows) |wd| {
-                        const rb: usize = wd.slot * raw_rows;
-                        for (0..wd.ids.len) |i| {
-                            const rs: usize = rb + @as(usize, @intCast(@mod(pos[r0 + i], @as(i64, raw_rows))));
-                            try src.raw_kv.copyFrom(rs * hd * 4, try self.ckv.at((r0 + i) * hd * 4), hd * 4, stream.handle);
-                            try src.raw_score.copyFrom(rs * hd * 4, try self.cgate.at((r0 + i) * hd * 4), hd * 4, stream.handle);
-                        }
-                        var a: cuda.Args = .{};
-                        a.add(src.raw_kv.ptr + rb * hd * 4);
-                        a.add(src.raw_score.ptr + rb * hd * 4);
-                        a.add(self.t_gpos.ptr + r0 * 8);
-                        a.add(@as(c_int, raw_rows));
-                        a.add(@as(c_int, @intCast(hd)));
-                        a.add(self.pooled.ptr + r0 * hd * 2);
-                        try cuda.launch.launch(self.glue.comp_pool2, .{ .grid = .{ .x = @intCast((hd + 255) / 256), .y = @intCast(wd.ids.len) }, .block = .{ .x = 256 } }, stream, &a);
-                        r0 += wd.ids.len;
-                    }
+                    if (ratio != 2 or raw_rows % 2 != 0) return error.Unsupported;
+                    // the rows' compressor inputs into their slots' raw rows by position (rows of different streams
+                    // write different slots, a stream's rows different positions), then each row's group's softmax
+                    // pool from its slot's raw rows: comp_pool2 over the whole plane (raw = slots x RAW), each row's
+                    // first raw row its slot's (a group starts at an even position, so its pair stays in the slot)
+                    try self.copyRows(self.ckv.ptr, src.raw_kv.ptr, self.tab(Tab.row(Tab.rslot)), R, hd, stream);
+                    try self.copyRows(self.cgate.ptr, src.raw_score.ptr, self.tab(Tab.row(Tab.rslot)), R, hd, stream);
+                    var a: cuda.Args = .{};
+                    a.add(src.raw_kv.ptr);
+                    a.add(src.raw_score.ptr);
+                    a.add(self.tab(Tab.ratio(j, Tab.gfirst)));
+                    a.add(@as(c_int, @intCast(self.pool.slots * raw_rows)));
+                    a.add(@as(c_int, @intCast(hd)));
+                    a.add(self.pooled.ptr);
+                    try cuda.launch.launch(self.glue.comp_pool2, .{ .grid = .{ .x = @intCast((hd + 255) / 256), .y = @intCast(R) }, .block = .{ .x = 256 } }, stream, &a);
                     try self.rmsnorm(self.pooled.ptr, l.comp_norm.?.ptr(), self.lat.ptr, R, hd, stream);
                 }
                 if (l.idx_wk) |*wk| {
                     try wk.run(self.lat.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.kraw.ptr, .bf16, stream);
                     try self.rmsnorm(self.kraw.ptr, l.idx_k_norm.?.ptr(), self.k.ptr, R, c.idx_dim, stream);
-                    try self.ropeHeads(self.k.ptr, rope, self.t_gpos.ptr, R, 1, c.idx_dim, false, stream);
-                    try self.fp4Store(self.k.ptr, c.idx_dim, src.idxk_codes.ptr, src.idxk_scales.ptr, self.t_ctarget.ptr, R, 32, false, stream);
+                    try self.ropeHeads(self.k.ptr, rope, t_gpos, R, 1, c.idx_dim, false, stream);
+                    try self.fp4Store(self.k.ptr, c.idx_dim, src.idxk_codes.ptr, src.idxk_scales.ptr, t_ctarget, R, 32, false, stream);
                 }
                 try self.lat2.copyFrom(0, self.lat.ptr, R * hd * 2, stream.handle);
-                try self.ropeHeads(self.lat2.ptr, rope, self.t_gpos.ptr, R, 1, hd, false, stream);
-                try self.fp4Store(self.lat2.ptr, hd, src.comp_codes.ptr, src.comp_scales.ptr, self.t_ctarget.ptr, R, 16, true, stream);
+                try self.ropeHeads(self.lat2.ptr, rope, t_gpos, R, 1, hd, false, stream);
+                try self.fp4Store(self.lat2.ptr, hd, src.comp_codes.ptr, src.comp_scales.ptr, t_ctarget, R, 16, true, stream);
             }
-            // -- the indexer: every visible compressed entry (short buckets: no scores) -------------------------
+            // -- the indexer: every visible compressed entry (short buckets: no scores, the picks table) ---------
             const nb_ = self.round_bucket / ratio;
             kk = @min(c.idx_topk, nb_);
             if (c.isIndexSource(li)) {
                 if (nb_ > c.idx_topk) {
-                    try self.roundIndex(li, R, nb_, kk, vis[0..R], stream);
-                } else {
-                    // every scanned entry is picked: the top-k of the scores is every index below vis
-                    for (0..R) |i| for (0..kk) |j| {
-                        self.cidx_h[i * kk + j] = if (@as(i64, @intCast(j)) < vis[i]) @intCast(j) else -1;
-                    };
-                    try self.uploads.put(self.t_cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. R * kk]), stream);
-                }
+                    try self.roundIndex(li, R, nb_, kk, j, stream);
+                    self.st.cidx = self.t_cidx.ptr;
+                } else self.st.cidx = self.tab(Tab.picks(j, self.kmax));
             }
             comp_codes = src.comp_codes.ptr;
             comp_scales = src.comp_scales.ptr;
@@ -680,13 +953,13 @@ pub const RoundRunner = struct {
             try self.set.run(stream, "_sparse_attn_part", .{ @intCast(R), @intCast(gh), 8 }, &.{
                 aot.ptr("Q", "*bf16", self.q.ptr),       aot.ptr("WSRC", "*bf16", ring.ptr),
                 aot.ptr("WLO", "*i64", self.t_zero.ptr), if (has) aot.ptr("COMP", "*u8", comp_codes) else aot.ptr("COMP", "*bf16", ring.ptr),
-                if (has) aot.ptr("CSC", "*u8", comp_scales) else aot.ptr("CSC", "*bf16", ring.ptr), aot.ptr("IDX", "*i64", if (has) self.t_cidx.ptr else self.t_pos.ptr),
-                aot.ptr("POS", "*i64", self.t_pos.ptr),  aot.ptr("PM", "*fp32", self.pm.ptr),
+                if (has) aot.ptr("CSC", "*u8", comp_scales) else aot.ptr("CSC", "*bf16", ring.ptr), aot.ptr("IDX", "*i64", if (has) self.st.cidx else t_pos),
+                aot.ptr("POS", "*i64", t_pos),           aot.ptr("PM", "*fp32", self.pm.ptr),
                 aot.ptr("PL", "*fp32", self.pl.ptr),     aot.ptr("PO", "*fp32", self.po.ptr),
                 aot.ptr("SINK", "*fp32", l.sink.ptr()),  aot.ptr("OUT", "*bf16", self.o.ptr),
                 aot.float("scale", scale),               aot.int("ring_size", @intCast(self.pool.ring)),
-                aot.int("n_idx", @intCast(kk)),          aot.ptr("RBASE", "*i64", self.t_wbase.ptr),
-                aot.ptr("CBASE", "*i64", if (has) self.t_cbase.ptr else self.t_wbase.ptr),
+                aot.int("n_idx", @intCast(kk)),          aot.ptr("RBASE", "*i64", t_wbase),
+                aot.ptr("CBASE", "*i64", t_cbase),
             }, &.{
                 aot.ci("H", @intCast(heads)), aot.ci("HD", @intCast(hd)),       aot.ci("HB", 16),    aot.ci("WIN", @intCast(c.window)),
                 aot.ci("BN", 32),             aot.ci("RING", 1),                 aot.ci("HAS_COMP", @intFromBool(has)), aot.ci("PACKED", @intFromBool(has)),
@@ -698,7 +971,7 @@ pub const RoundRunner = struct {
                 aot.ptr("SINK", "*fp32", l.sink.ptr()), aot.ptr("OUT", "*bf16", self.o.ptr),
             }, &.{ aot.ci("H", @intCast(heads)), aot.ci("HD", @intCast(hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
         }
-        try self.ropeHeads(self.o.ptr, rope, self.t_pos.ptr, R, heads, hd, true, stream);
+        try self.ropeHeads(self.o.ptr, rope, t_pos, R, heads, hd, true, stream);
         const o_cols = heads * hd;
         const g_cols = o_cols / groups;
         for (0..groups) |g| {
@@ -713,16 +986,18 @@ pub const RoundRunner = struct {
     /// rounds.py `_attention`'s scored indexer on layer `li` (an index layer, nb > idx_topk): the rows' index
     /// queries and weights, `_index_score` against each row's stream's extent (KB = the extent's first compressed
     /// row), the candidate pool made (the candidate source) or applied (after it), then the picks into `t_cidx`.
-    fn roundIndex(self: *RoundRunner, li: usize, R: usize, nb: usize, kk: usize, vis: []const i64, stream: cuda.Stream) !void {
+    fn roundIndex(self: *RoundRunner, li: usize, R: usize, nb: usize, kk: usize, j: usize, stream: cuda.Stream) !void {
         const c = self.cfg;
         const l = &self.w.layers[li];
         const src = &self.pool.planes[self.pool.source[li]].?;
         const role = attention.CandRole.of(c.cand_source, li, true);
         const bsize = @max(1, c.cand_block);
         const ccols = (nb + bsize - 1) / bsize;
-        try self.uploads.put(self.t_vis, 0, std.mem.sliceAsBytes(vis), stream);
+        const t_vis = self.tab(Tab.ratio(j, Tab.vis));
+        const t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
+        const vis = self.tab_h[Tab.ratio(j, Tab.vis)..][0..R];
         try l.idx_wq_b.?.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
-        try self.ropeHeads(self.iq.ptr, self.rope_c, self.t_pos.ptr, R, c.idx_heads, c.idx_dim, false, stream);
+        try self.ropeHeads(self.iq.ptr, self.rope_c, self.tab(Tab.row(Tab.pos)), R, c.idx_heads, c.idx_dim, false, stream);
         const nblk: usize = R * c.idx_heads * c.idx_dim / 32;
         try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
             aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
@@ -742,15 +1017,15 @@ pub const RoundRunner = struct {
         const nt: usize = (nb + 63) / 64;
         try self.set.run(stream, "_index_score", .{ @intCast(R), @intCast(nt), 1 }, &.{
             aot.ptr("Q", "*bf16", self.iqq.ptr),     aot.ptr("K", "*u8", src.idxk_codes.ptr),  aot.ptr("KS", "*u8", src.idxk_scales.ptr),
-            aot.ptr("Wt", "*bf16", self.wts_i.ptr),  aot.ptr("VIS", "*i64", self.t_vis.ptr),  aot.ptr("OUT", "*fp32", self.score.ptr),
-            aot.int("n", @intCast(nb)),              aot.ptr("KB", "*i64", self.t_cbase.ptr), aot.ptr("CAND", "*i64", self.t_vis.ptr),
+            aot.ptr("Wt", "*bf16", self.wts_i.ptr),  aot.ptr("VIS", "*i64", t_vis),            aot.ptr("OUT", "*fp32", self.score.ptr),
+            aot.int("n", @intCast(nb)),              aot.ptr("KB", "*i64", t_cbase),          aot.ptr("CAND", "*i64", t_vis),
             aot.int("cs", 0),                        aot.ptr("TMAX", "*fp32", self.score.ptr), aot.int("nt", @intCast(nt)),
         }, &.{
             aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64),      aot.ci("PACKED", 1),
             aot.ci("HAS_BASE", 1),                aot.ci("PDL", 1),                  aot.ci("HAS_CAND", 0), aot.ci("CB", 8),
             aot.ci("KEYS", 0),                    aot.ci("HAS_TMAX", 0),             aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
         });
-        if (role == .after and !self.cand_made) return error.Unsupported; // no candidate source before this layer
+        if (role == .after and !self.st.cand_made) return error.Unsupported; // no candidate source before this layer
         if (self.glue.hostSelect()) {
             try stream.synchronize();
             try self.score.download(0, std.mem.sliceAsBytes(self.score_h[0 .. R * nb]));
@@ -768,15 +1043,15 @@ pub const RoundRunner = struct {
         } else {
             const tg = &self.glue.topk.?;
             switch (role) {
-                .source => try tg.candidates(self.score.ptr, nb, R, nb, self.t_vis.ptr, c.cand_blocks, bsize, self.smax.ptr, self.cand_mask.ptr, ccols, stream),
+                .source => try tg.candidates(self.score.ptr, nb, R, nb, t_vis, c.cand_blocks, bsize, self.smax.ptr, self.cand_mask.ptr, ccols, stream),
                 .after => try tg.apply(self.score.ptr, nb, R, nb, self.cand_mask.ptr, ccols, bsize, stream),
                 .none => {},
             }
             const fused = self.glue.select == .auto and self.keys.len >= R * nb * 8 and
-                try attention.fusedTopk(self.set, self.score.ptr, R, nb, kk, self.t_vis.ptr, self.keys.ptr, self.t_cidx.ptr, stream);
-            if (!fused) try tg.topk(self.score.ptr, nb, R, nb, kk, self.t_vis.ptr, self.t_cidx.ptr, kk, stream);
+                try attention.fusedTopk(self.set, self.score.ptr, R, nb, kk, t_vis, self.keys.ptr, self.t_cidx.ptr, stream);
+            if (!fused) try tg.topk(self.score.ptr, nb, R, nb, kk, t_vis, self.t_cidx.ptr, kk, stream);
         }
-        if (role == .source) self.cand_made = true;
+        if (role == .source) self.st.cand_made = true;
     }
 
     fn rmsnorm(self: *RoundRunner, x: Ptr, w: Ptr, out: Ptr, n: usize, d: usize, stream: cuda.Stream) !void {
@@ -798,6 +1073,18 @@ pub const RoundRunner = struct {
         try self.set.run(stream, "_fp4_store", .{ @intCast(n), 1, 1 }, &.{
             aot.ptr("X", "*bf16", x), aot.int("xs", @intCast(d)), aot.ptr("CODES", "*u8", codes), aot.ptr("SCALES", "*u8", scales), aot.ptr("ROWS", "*i64", rows),
         }, &.{ aot.ci("D", @intCast(d)), aot.ci("BLOCK", @intCast(block)), aot.ci("E4M3", @intFromBool(e4m3)), aot.ci("PDL", 1) });
+    }
+
+    /// dst[idx[r]] = src[r] for r < rows, rows of `words` 4-byte words (prompt_glue.cu tf_dsv41_copy_rows).
+    fn copyRows(self: *RoundRunner, src: Ptr, dst: Ptr, idx: Ptr, rows: usize, words: usize, stream: cuda.Stream) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(Ptr, 0));
+        a.add(dst);
+        a.add(idx);
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(@as(c_int, @intCast(words)));
+        try cuda.launch.launch(self.copy_rows, .{ .grid = .{ .x = @intCast((words + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
     }
 
     fn copyCols(self: *RoundRunner, src: Ptr, sld: usize, dst: Ptr, dld: usize, rows: usize, cols: usize, stream: cuda.Stream) !void {
@@ -841,4 +1128,45 @@ test "a round's bucket is graph.py bucket_for: a power of two holding the deepes
         try t.expect(b >= last);
         last = b;
     }
+}
+
+test "the round's tables: every table its own 16-aligned words inside the buffer" {
+    const t = std.testing;
+    for ([_]usize{ 1, 64, 512, 1000 }) |kmax| {
+        var spans: [Tab.rows + max_ratios * Tab.per_ratio + max_ratios][2]usize = undefined;
+        var n: usize = 0;
+        for (0..Tab.rows) |k| {
+            spans[n] = .{ Tab.row(k), Tab.row(k) + max_rows };
+            n += 1;
+        }
+        for (0..max_ratios) |j| for (0..Tab.per_ratio) |k| {
+            spans[n] = .{ Tab.ratio(j, k), Tab.ratio(j, k) + max_rows };
+            n += 1;
+        };
+        for (0..max_ratios) |j| {
+            spans[n] = .{ Tab.picks(j, kmax), Tab.picks(j, kmax) + max_rows * kmax };
+            n += 1;
+        }
+        for (spans[0..n], 0..) |a, i| {
+            try t.expect(a[1] <= Tab.words(kmax));
+            try t.expect(a[0] * 8 % 16 == 0);
+            for (spans[0..n][i + 1 ..]) |b| try t.expect(a[1] <= b[0] or b[1] <= a[0]);
+        }
+    }
+}
+
+test "a ratio-2 group's raw rows stay in its slot: comp_pool2 over the whole plane reads the slot's pair" {
+    // gfirst = slot x RAW + gpos % RAW with gpos even: gfirst and gfirst + 1 (comp_pool2's pair, modulo the plane's
+    // slots x RAW rows) are rows of that slot, the pair the per-slot launch read at (gpos % RAW, (gpos + 1) % RAW)
+    const t = std.testing;
+    const RAW: i64 = raw_rows;
+    for (1..9) |slots| for (0..slots) |slot| for (0..300) |p| {
+        const gpos: i64 = @divFloor(@as(i64, @intCast(p)), 2) * 2;
+        const gfirst = @as(i64, @intCast(slot)) * RAW + @mod(gpos, RAW);
+        const plane = @as(i64, @intCast(slots)) * RAW;
+        const a = @mod(gfirst, plane);
+        const b = @mod(gfirst + 1, plane);
+        try t.expectEqual(@as(i64, @intCast(slot)) * RAW + @mod(gpos, RAW), a);
+        try t.expectEqual(@as(i64, @intCast(slot)) * RAW + @mod(gpos + 1, RAW), b);
+    };
 }

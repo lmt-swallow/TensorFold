@@ -11,6 +11,11 @@
 //!
 //! Every kernel is the fork's Triton variant replayed from the captured AOT set, or an EXL3 kernel already ported
 //! (cuda_exl3, cuda_experts); the host loop keeps the fork's order of launches.
+//!
+//! A batched draft over the DraftPool replays a CUDA graph per stream count (dspark.py `BatchDraftGraph`,
+//! TF_DS_GRAPHS=0 keeps it eager): its row tables, embedding rows and the Markov loop's first tokens go to fixed
+//! device buffers before the launch, so the pass's launches (the stages, the head, the Markov steps and their
+//! gathers) depend on the host only through the stream count, the pool's rings and the RoPE tables.
 const std = @import("std");
 const cuda = @import("cuda");
 const exl3 = @import("cuda_exl3.zig");
@@ -19,6 +24,7 @@ const hc_mod = @import("cuda_hc.zig");
 const route_mod = @import("cuda_route.zig");
 const attention = @import("cuda_attention.zig");
 const weights = @import("cuda_weights.zig");
+const rounds = @import("cuda_rounds.zig");
 const Config = @import("config.zig").Config;
 
 const aot = cuda.aot;
@@ -257,6 +263,16 @@ pub fn headOf(ds: *const weights.DSpark, target_head: *const exl3.Linear) Head {
     };
 }
 
+/// A batched pass's graph: its gathers, and the rings and RoPE tables it was recorded for.
+pub const BatchGraph = struct {
+    exec: cuda.graph.Exec,
+    gathers: usize,
+    key: Key,
+
+    pub const max_rings = 4;
+    pub const Key = struct { rings: [max_rings]Ptr = @splat(0), cos: Ptr = 0, sin: Ptr = 0 };
+};
+
 pub const Drafter = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -273,6 +289,14 @@ pub const Drafter = struct {
     gather_hook: ?GatherHook = null,
     /// The prompt GEMM for absorbs past 128 rows (`enableWide`); null: 128-row pieces of the row kernel.
     wide: ?*Wide = null,
+    /// Batched drafts replay graphs (TF_DS_GRAPHS, default on): one a stream count, recorded on first use or by
+    /// `warmBatch`, again when the pool's rings or the RoPE tables differ from the recorded ones.
+    graphs: bool = true,
+    batch_graphs: [max_rows + 1]?BatchGraph = @splat(null),
+    captures: usize = 0,
+    /// Called before each graph launch (tests' gather supplies; the communicator needs none).
+    launch_hook: ?rounds.GraphLaunch = null,
+    counting: ?*usize = null, // a capture's gathers
     ex_scratch: experts_mod.Scratch,
     markov: Markov,
     // the block's row tables (int64)
@@ -357,6 +381,11 @@ pub const Drafter = struct {
         self.comm = comm;
         self.gather_hook = hook;
         self.wide = null;
+        self.graphs = rounds.graphsFromEnv();
+        self.batch_graphs = @splat(null);
+        self.captures = 0;
+        self.launch_hook = null;
+        self.counting = null;
         self.hc = hc_mod.Hc.init(set, @intCast(dims.d), dims.hc_iters, dims.eps, dims.hc_eps);
         self.route = route_mod.Route.init(set, @intCast(dims.d), @intCast(dims.n_routed), @intCast(dims.topk), dims.route_scale, @intCast(dims.n_routed));
         self.ex_scratch = try experts_mod.Scratch.init(d, stages[0].experts, n, dims.topk + 1);
@@ -437,6 +466,7 @@ pub const Drafter = struct {
     pub fn deinit(self: *Drafter) void {
         inline for (.{ "ids", "pos", "wpos", "bidx", "rbase", "neg", "zero", "emb_ids", "emb2", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kvb", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe_out", "xc", "xn", "local", "lg", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(self, f).free();
         if (self.wide) |wd| wd.deinit(self.gpa);
+        self.dropGraphs();
         self.ex_scratch.deinit();
         self.markov.deinit();
         self.gpa.free(self.host_out);
@@ -550,8 +580,8 @@ pub const Drafter = struct {
     }
 
     /// `batchDraft` with the embedding rows given as a table [N + 1, d] (the tokens' rows, then the noise's) and a
-    /// hook (tests).
-    pub fn batchDraftWithTable(self: *Drafter, pool: *const DraftPool, tokens: []const u32, q0: []const usize, slots: []const usize, table: Ptr, rope: Rope, stream: cuda.Stream, ctx: *anyopaque, hook: Hook, out: []Drafts) !void {
+    /// hook (tests; with a hook the pass runs eager, without one it replays its graph as `batchDraft`).
+    pub fn batchDraftWithTable(self: *Drafter, pool: *const DraftPool, tokens: []const u32, q0: []const usize, slots: []const usize, table: Ptr, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook, out: []Drafts) !void {
         const N = tokens.len;
         if (N == 0 or N * self.dims.block > max_rows or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
         try self.emb2.copyFrom(0, table, (N + 1) * self.dims.d * 2, stream.handle);
@@ -586,6 +616,30 @@ pub const Drafter = struct {
             bi[r * n + c] = @intCast((r / n) * n + c);
         };
         try self.bidx.upload(0, std.mem.sliceAsBytes(bi[0 .. R * n]));
+        try self.markov.seed(tokens, N);
+        if (batched and hook == null and self.graphs and rings.len <= BatchGraph.max_rings) {
+            const g = try self.batchGraph(N, rings, rope, stream);
+            if (self.launch_hook) |hk| try hk.call(hk.ctx, g.gathers, stream);
+            try g.exec.launchOn(stream);
+        } else try self.pass(N, rings, batched, rope, stream, ctx, hook);
+        try stream.synchronize();
+        try self.markov.out.download(0, std.mem.sliceAsBytes(self.host_out[0 .. N * (n + 1)]));
+        try self.xc.download(0, std.mem.sliceAsBytes(self.host_xc[0 .. R * D]));
+        for (0..N) |s_| {
+            var o: Drafts = .{ .tokens = undefined, .conf = undefined, .len = n };
+            for (0..n) |i| o.tokens[i] = @intCast(self.host_out[s_ * (n + 1) + i + 1]);
+            self.confidence(&o, s_, n, N);
+            out[s_] = o;
+        }
+    }
+
+    /// The pass's launches after its tables (`runRows`): the embedding rows, every stage, the head, the Markov loop
+    /// into `markov.out` (its first tokens already there).
+    fn pass(self: *Drafter, N: usize, rings: []const cuda.DeviceBuffer, batched: bool, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook) !void {
+        const dm = self.dims;
+        const n = dm.block;
+        const R = N * n;
+        const D = dm.d;
         try self.hc.embedInit(stream, self.emb2.ptr, self.emb_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(R));
         if (hook) |f| try f(ctx.?, "h0", self.h.ptr);
         var pre = self.pre.ptr;
@@ -622,16 +676,57 @@ pub const Drafter = struct {
             try self.allGather(self.local.ptr, self.lg.ptr, R * dm.vocab_local, stream);
             break :blk self.lg.ptr;
         };
-        try self.markov.steps(lg, self.head, tokens, N, n, n, self, stream);
-        try stream.synchronize();
-        try self.markov.out.download(0, std.mem.sliceAsBytes(self.host_out[0 .. N * (n + 1)]));
-        try self.xc.download(0, std.mem.sliceAsBytes(self.host_xc[0 .. R * D]));
-        for (0..N) |s_| {
-            var o: Drafts = .{ .tokens = undefined, .conf = undefined, .len = n };
-            for (0..n) |i| o.tokens[i] = @intCast(self.host_out[s_ * (n + 1) + i + 1]);
-            self.confidence(&o, s_, n, N);
-            out[s_] = o;
+        try self.markov.loop(lg, self.head, N, n, n, self, stream);
+    }
+
+    /// The graph of a batched pass of N streams over `rings` with `rope`, recorded (nothing runs) when missing or
+    /// recorded for other rings or tables.
+    fn batchGraph(self: *Drafter, N: usize, rings: []const cuda.DeviceBuffer, rope: Rope, stream: cuda.Stream) !*BatchGraph {
+        var key: BatchGraph.Key = .{ .cos = rope.cos.ptr, .sin = rope.sin.ptr };
+        for (rings, key.rings[0..rings.len]) |r, *k| k.* = r.ptr;
+        if (self.batch_graphs[N]) |*g| {
+            if (std.meta.eql(g.key, key)) return g;
+            g.exec.deinit();
+            self.batch_graphs[N] = null;
         }
+        var gathers: usize = 0;
+        self.counting = &gathers;
+        defer self.counting = null;
+        try cuda.graph.beginCapture(stream, .thread_local);
+        self.pass(N, rings, true, rope, stream, null, null) catch |err| {
+            if (cuda.graph.endCapture(stream)) |gr| {
+                var x = gr;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        var gr = try cuda.graph.endCapture(stream);
+        defer gr.deinit();
+        var exec = try gr.instantiate();
+        errdefer exec.deinit();
+        try exec.upload(stream);
+        self.batch_graphs[N] = .{ .exec = exec, .gathers = gathers, .key = key };
+        self.captures += 1;
+        return &self.batch_graphs[N].?;
+    }
+
+    /// Records the batched passes of 1 .. `most` streams over `pool` ahead of the drafts that replay them; nothing
+    /// runs. Every rank calls it with the same arguments (the gathers are recorded, not issued).
+    pub fn warmBatch(self: *Drafter, pool: *const DraftPool, most: usize, rope: Rope, stream: cuda.Stream) !void {
+        if (!self.graphs or pool.rings.len > BatchGraph.max_rings) return;
+        for (1..most + 1) |N| {
+            if (N * self.dims.block > max_rows) break;
+            _ = try self.batchGraph(N, pool.rings, rope, stream);
+        }
+        try stream.synchronize();
+    }
+
+    /// Drops every recorded graph.
+    pub fn dropGraphs(self: *Drafter) void {
+        for (&self.batch_graphs) |*g| if (g.*) |*x| {
+            x.exec.deinit();
+            g.* = null;
+        };
     }
 
     /// conf[i] = conf_w . [xc[row] (f32), markov_embed[out[s, i]] (f32)] (the fork: a cuBLAS fp32 matmul; here a
@@ -658,6 +753,7 @@ pub const Drafter = struct {
     /// out [world, words] f32 <- every rank's `partial` [words] in rank order: through `gather_hook` when set, else
     /// the communicator. Every gather a draft issues goes through here, in the fork's order.
     pub fn allGather(self: *const Drafter, partial: Ptr, out: Ptr, words: usize, stream: cuda.Stream) !void {
+        if (self.counting) |c| c.* += 1;
         if (self.gather_hook) |g| return g.call(g.ctx, partial, words, out, stream);
         const comm = self.comm orelse return error.NoComm;
         try comm.allGather(partial, out, words, .f32, stream.handle);
@@ -919,11 +1015,23 @@ pub const Markov = struct {
     /// s x block + i): this rank's [R, n_cols] with split, else [world, R, n_cols]. out[s, 0] = tokens[s], out[s,
     /// 1 .. steps] the drafts (device, `self.out`, row stride block + 1).
     pub fn steps(self: *Markov, lg: Ptr, head: Head, tokens: []const u32, N: usize, block: usize, n_steps: usize, gatherer: *const Drafter, stream: cuda.Stream) !void {
-        if (N > np or block != self.block or n_steps > block) return error.TooManyRows;
-        const ts: usize = block + 1; // out.stride(0)
+        try self.seed(tokens, N);
+        try self.loop(lg, head, N, block, n_steps, gatherer, stream);
+    }
+
+    /// out[s, 0] = tokens[s] for the N streams (a synchronous copy, ahead of `loop`'s launches).
+    pub fn seed(self: *Markov, tokens: []const u32, N: usize) !void {
+        if (N > np or tokens.len < N) return error.TooManyRows;
+        const ts: usize = self.block + 1; // out.stride(0)
         var first: [np * 17]i64 = undefined;
         for (0..N) |s_| first[s_ * ts] = tokens[s_];
         for (0..N) |s_| try self.out.upload(s_ * ts * 8, std.mem.sliceAsBytes(first[s_ * ts .. s_ * ts + 1]));
+    }
+
+    /// The Markov steps' launches after `seed`: out[s, 1 .. n_steps] (the drafts).
+    pub fn loop(self: *Markov, lg: Ptr, head: Head, N: usize, block: usize, n_steps: usize, gatherer: *const Drafter, stream: cuda.Stream) !void {
+        if (N > np or block != self.block or n_steps > block) return error.TooManyRows;
+        const ts: usize = block + 1; // out.stride(0)
         const nc = self.n_cols;
         for (0..n_steps) |i| {
             const tok = self.out.ptr + i * 8;

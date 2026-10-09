@@ -52,6 +52,9 @@ pub const rope_align: usize = 4096;
 
 pub const Error = error{ WorldNotTwo, BadMaster, NoRankCache, NoRopeTables, RopeRowsShort, OutOfStep, LinkClosed, SamplingNotSupported, WindowTooWide, PositionMismatch, UnknownStream, StreamBusy, PromptTooLong, Cancelled, NoDraftHead, NotPipelined, TreesNotBuilt, EmptyPath, BadChunk, BadRecord, NoHeldDrafts, NoFirstToken, BadTapLayers, BadSlots, NoRoom };
 
+/// The widest bucket whose round graphs are recorded at load (`Streams.warm`); wider ones are recorded on first use.
+pub const warm_bucket_max: usize = 8192;
+
 /// A drafting round's widest window: the pending token and DSpark's block of drafts (engine.py: drafts + 1 rows).
 pub const draft_width: usize = 6;
 
@@ -1237,6 +1240,23 @@ pub const Streams = struct {
         } else self.logits = try self.runner.forward(&w, gather, self.stream);
     }
 
+    /// Records the round graphs of 1 .. max_rows rows at the buckets bucket_min .. `warm_bucket_max` the runner scans
+    /// and the batched drafts' of 1 .. `draftBatch` streams, ahead of the rounds and drafts that replay them; nothing
+    /// runs (TF_DS_GRAPHS=0: nothing to record). Every rank calls it at the same point with the same streams.
+    pub fn warm(self: *Streams, gather: forward.Gather) !void {
+        var rows: [max_rows]usize = undefined;
+        for (&rows, 1..) |*r, i| r.* = i;
+        var buckets: [8]usize = undefined;
+        var nb: usize = 0;
+        var b: usize = rounds.bucket_min;
+        while (b <= warm_bucket_max and nb < buckets.len) : (b *= 2) {
+            buckets[nb] = b;
+            nb += 1;
+        }
+        try self.runner.warm(&rows, buckets[0..nb], gather, self.stream);
+        if (self.spark) |sp| try sp.warmBatch(&self.dpool.?, @min(draftBatch(sp.dims.block), self.lanes.len), self.draftRope(), self.stream);
+    }
+
     /// The timing step's drafts: `n` slots (0 ..) absorb the last probe round's first row at position 0, then one
     /// batched draft over them at position 1.
     pub fn probeDrafts(self: *Streams, n: usize) !void {
@@ -1388,6 +1408,14 @@ pub const Engine = struct {
         e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
         errdefer e.comm.deinit();
         clock.mark("the ranks' rendezvous", .{});
+        {
+            // every rank records the same graphs in the same order here (the gathers are recorded, not issued)
+            const t0 = nowNs();
+            const free0 = (try ctx.memInfo()).free;
+            try e.streams.warm(e.gather());
+            const free1 = (try ctx.memInfo()).free;
+            if (s.rank == 0 and e.streams.runner.graphs) std.log.info("deepseek_v41: {d} round graphs and {d} draft graphs recorded in {d:.1} s, {d:.0} MiB (buckets {d} .. {d}; wider ones on first use)", .{ e.streams.runner.graphCount(), if (e.drafter) |dr| dr.captures else 0, msSince(t0) / 1000, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20), rounds.bucket_min, @min(warm_bucket_max, e.streams.runner.bucket) });
+        }
         e.agree_send = try cuda.DeviceBuffer.alloc(ctx.d, 16);
         errdefer e.agree_send.free();
         e.agree_recv = try cuda.DeviceBuffer.alloc(ctx.d, 16 * s.world);
