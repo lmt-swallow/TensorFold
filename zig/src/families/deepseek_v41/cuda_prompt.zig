@@ -49,6 +49,7 @@ pub const Glue = struct {
     bf16_to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
     fill_i64: cuda.Function,
+    rms_norm_torch: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Glue {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -61,11 +62,26 @@ pub const Glue = struct {
             .bf16_to_f32 = try module.function("tf_dsv41_bf16_to_f32"),
             .f16_to_f32 = try module.function("tf_dsv41_f16_to_f32"),
             .fill_i64 = try module.function("tf_dsv41_fill_i64"),
+            .rms_norm_torch = try module.function("tf_dsv41_rms_norm_torch"),
         };
     }
 
     pub fn deinit(self: *Glue) void {
         self.module.unload();
+    }
+
+    /// ops.rms_norm (torch's expression and summation order) on bf16 rows [n, d] -> out bf16 [n, d]; d a multiple
+    /// of 128.
+    pub fn rmsNormTorch(self: *const Glue, x: Ptr, w: Ptr, eps: f32, n: usize, d: usize, out: Ptr, stream: cuda.Stream) !void {
+        if (d % 128 != 0) return error.BadShape;
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(w);
+        a.add(eps);
+        a.add(@as(c_int, @intCast(d)));
+        a.add(out);
+        try cuda.launch.launch(self.rms_norm_torch, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 32 } }, stream, &a);
     }
 };
 
@@ -779,7 +795,8 @@ pub const Prompt = struct {
             a.add(self.pooled.ptr);
             try cuda.launch.launch(self.glue.pool_pairs, .{ .grid = .{ .x = @intCast((hd + 255) / 256), .y = @intCast(full) }, .block = .{ .x = 256 } }, stream, &a);
         }
-        try self.rmsnorm(self.pooled.ptr, p.comp_norm, self.lat.ptr, full, hd, stream);
+        // model.py _compress and kv_source_update normalize with ops.rms_norm (torch), not the Triton kernel
+        try self.glue.rmsNormTorch(self.pooled.ptr, p.comp_norm, c.eps, full, hd, self.lat.ptr, stream);
         // the groups' positions (group * ratio) and cache rows
         const gpos = self.tab[4 * (self.rows + 1) .. 5 * (self.rows + 1)];
         const grows = self.tab[5 * (self.rows + 1) .. 6 * (self.rows + 1)];
@@ -791,7 +808,7 @@ pub const Prompt = struct {
         try self.grows.uploadAsync(0, std.mem.sliceAsBytes(grows[0..full]), stream.handle);
         if (dims.has_idx_wk) {
             try self.mm(p.idx_wk.?, self.lat.ptr, full, self.kraw.ptr, .bf16, stream);
-            try self.rmsnorm(self.kraw.ptr, p.idx_k_norm, self.k.ptr, full, c.idx_dim, stream);
+            try self.glue.rmsNormTorch(self.kraw.ptr, p.idx_k_norm, c.eps, full, c.idx_dim, self.k.ptr, stream);
             try self.ropeHeads(self.k.ptr, rope, self.gpos.ptr, full, 1, c.idx_dim, false, stream);
             try self.fp4Store(self.k.ptr, c.idx_dim, caches.idxk_codes.ptr, caches.idxk_scales.ptr, self.grows.ptr, full, 32, false, stream);
         }
@@ -888,10 +905,10 @@ pub const Prompt = struct {
             self.cand_rows = n;
         } else if (after_cand and self.cand_rows != n) return error.NoCandidateSource;
         const host = fwd.glue.hostSelect();
-        // (switch "prompt_keys") layers before the candidate source with a power-of-two k: the fork's score kernel
-        // writes topk_indices' int64 keys (and tile maxima) instead of scores; the selection is the same set either
-        // way, so the device selection always takes the scores
-        const keyed = host and !is_cand_source and !after_cand and (kk & (kk - 1)) == 0;
+        // (switch "prompt_keys") layers before the candidate source with a power-of-two k: the score kernel writes
+        // topk_indices' int64 keys (and tile maxima) instead of scores, and the selection reads them. It must be
+        // that variant: the KEYS and the score variants are compiled apart and need not sum the heads in one order
+        const keyed = !is_cand_source and !after_cand and (kk & (kk - 1)) == 0;
         const cb = @max(1, c.cand_block);
         const ccols = (n_comp_end + cb - 1) / cb;
         var r0: usize = 0;
@@ -927,7 +944,11 @@ pub const Prompt = struct {
                 const mask = self.cand.ptr + r0 * ccols;
                 if (is_cand_source) try tg.candidates(self.score.ptr, n_comp_end, rows, n_comp_end, vr, c.cand_blocks, cb, self.smax.ptr, mask, ccols, stream);
                 if (after_cand) try tg.apply(self.score.ptr, n_comp_end, rows, n_comp_end, mask, ccols, cb, stream);
-                try tg.topk(self.score.ptr, n_comp_end, rows, n_comp_end, kk, vr, self.cidx.ptr + r0 * kk * 8, kk, stream);
+                if (keyed) {
+                    try tg.topkKeys(self.score.ptr, n_comp_end, rows, n_comp_end, kk, vr, self.cidx.ptr + r0 * kk * 8, kk, stream);
+                } else {
+                    try tg.topk(self.score.ptr, n_comp_end, rows, n_comp_end, kk, vr, self.cidx.ptr + r0 * kk * 8, kk, stream);
+                }
                 continue;
             }
             try stream.synchronize();

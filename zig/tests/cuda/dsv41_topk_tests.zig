@@ -85,6 +85,23 @@ pub fn topk(gpu: Gpu, aot_dir: ?[]const u8) !void {
         if (check.sameBytes(try std.fmt.bufPrint(&what, "topk glue rows {d} n {d} k {d}", .{ cs.rows, cs.n, cs.kk }), std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want))) |_| {
             check.pass("dsv41-topk glue: {d} rows of {d} scores, k {d}: the host oracle's picks", .{ cs.rows, cs.n, cs.kk });
         } else |_| failures += 1;
+        {
+            // the same picks from the score kernels' int64 keys (KEYS)
+            const hk = try gpa.alloc(i64, cs.rows * cs.n);
+            defer gpa.free(hk);
+            for (0..cs.rows) |r| for (0..cs.n) |t| {
+                hk[r * cs.n + t] = A.key(sc[r * cs.n + t], t);
+            };
+            var d_k = try upload(gpu.d, std.mem.sliceAsBytes(hk));
+            defer d_k.free();
+            try d_out.fill8(0xAB, null);
+            try tg.topkKeys(d_k.ptr, cs.n, cs.rows, cs.n, cs.kk, d_vis.ptr, d_out.ptr, cs.kk, stream);
+            try stream.synchronize();
+            try d_out.download(0, std.mem.sliceAsBytes(got));
+            if (check.sameBytes(try std.fmt.bufPrint(&what, "topk keys rows {d} n {d} k {d}", .{ cs.rows, cs.n, cs.kk }), std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want))) |_| {
+                check.pass("dsv41-topk glue from keys: {d} rows of {d} keys, k {d}: the host oracle's picks", .{ cs.rows, cs.n, cs.kk });
+            } else |_| failures += 1;
+        }
         if (set) |*s| {
             var d_keys = try cuda.DeviceBuffer.alloc(gpu.d, cs.rows * cs.n * 8);
             defer d_keys.free();
@@ -181,4 +198,47 @@ pub fn topk(gpu: Gpu, aot_dir: ?[]const u8) !void {
         } else failures += 1;
     }
     try check.expect(failures == 0, "{d} selection case(s) differ from the host oracle", .{failures});
+}
+
+/// `dsv41-rmsnorm-torch <dir>`: cuda_prompt.zig's torch-order rms_norm (prompt_glue.cu) against the fork's
+/// ops.rms_norm on tools/zig/dsv41/dump_rmsnorm.py's rows (128 and 512 columns), byte for byte.
+pub fn rmsnormTorch(gpu: Gpu, dir: []const u8) !void {
+    const gpa = gpu.gpa;
+    const fixture = @import("fixture.zig");
+    var glue = try dsv41.prompt.Glue.load(gpu.d);
+    defer glue.deinit();
+    var stream = try cuda.Stream.init(gpu.d, true);
+    defer stream.deinit();
+    var failures: usize = 0;
+    for ([_]usize{ 128, 512 }) |d| {
+        var nb: [32]u8 = undefined;
+        const path = try std.fs.path.join(gpa, &.{ dir, try std.fmt.bufPrint(&nb, "rms_{d}", .{d}) });
+        defer gpa.free(path);
+        var fx = try fixture.Fixture.open(gpa, gpu.io, path);
+        defer fx.deinit();
+        const rows: usize = @intCast(try fx.int("rows"));
+        const eps: f32 = @floatCast(try fx.float("eps"));
+        const xb = try fx.bytes("x");
+        defer gpa.free(xb);
+        const wb = try fx.bytes("w");
+        defer gpa.free(wb);
+        const want = try fx.bytes("expected_y");
+        defer gpa.free(want);
+        var dx = try upload(gpu.d, xb);
+        defer dx.free();
+        var dw = try upload(gpu.d, wb);
+        defer dw.free();
+        var dy = try cuda.DeviceBuffer.alloc(gpu.d, want.len);
+        defer dy.free();
+        try glue.rmsNormTorch(dx.ptr, dw.ptr, eps, rows, d, dy.ptr, stream);
+        try stream.synchronize();
+        const got = try gpa.alloc(u8, want.len);
+        defer gpa.free(got);
+        try dy.download(0, got);
+        var what: [64]u8 = undefined;
+        if (check.sameBytes(try std.fmt.bufPrint(&what, "rms_norm torch order d {d}", .{d}), got, want)) |_| {
+            check.pass("BITEXACT dsv41 rms_norm (torch order): {d} rows of {d} equal to ops.rms_norm's", .{ rows, d });
+        } else |_| failures += 1;
+    }
+    try check.expect(failures == 0, "{d} rms_norm case(s) differ", .{failures});
 }

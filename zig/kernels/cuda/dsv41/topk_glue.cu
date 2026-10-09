@@ -25,6 +25,11 @@ __device__ __forceinline__ uint32_t ordered(float v) {
     return (uint32_t)s ^ 0x80000000u;
 }
 
+// The same word from a key the score kernels wrote (KEYS: the ordered bits above the inverted index).
+__device__ __forceinline__ uint32_t ordered(long long key) {
+    return (uint32_t)((unsigned long long)key >> 32) ^ 0x80000000u;
+}
+
 // Exclusive block-wide prefix sum of `v` over the block's threads; `total` gets the sum. Uses `scratch` [kWarps + 1].
 __device__ __forceinline__ uint32_t block_exclusive(uint32_t v, uint32_t* scratch, uint32_t& total) {
     const int lane = threadIdx.x & 31;
@@ -57,7 +62,8 @@ __device__ __forceinline__ uint32_t block_exclusive(uint32_t v, uint32_t* scratc
 
 // The k-th largest ordered key of row[0..n) (k >= 1, k <= n) and how many entries equal to it are taken (the rest
 // lie above it).
-__device__ void radix_threshold(const float* row, int n, int k, uint32_t& thr, uint32_t& need) {
+template <typename T>
+__device__ void radix_threshold(const T* row, int n, int k, uint32_t& thr, uint32_t& need) {
     __shared__ uint32_t hist[256];
     __shared__ uint32_t s_prefix, s_remaining;
     if (threadIdx.x == 0) {
@@ -91,22 +97,12 @@ __device__ void radix_threshold(const float* row, int n, int k, uint32_t& thr, u
     need = s_remaining;
 }
 
-}  // namespace
-
-extern "C" {
-
-// Rows of fp32 scores [rows, n] (row stride ld) -> each row's k picks (k <= n) into out [rows, k] (row stride
-// out_ld): the indices of its k highest scores ascending, -1 at or past vis[r] (vis null: no mask). One block a row
-// (kThreads threads).
-__global__ void __launch_bounds__(kThreads) tf_dsv41_topk_rows(const float* __restrict__ score, long long ld, int n,
-                                                               int k, const long long* __restrict__ vis,
-                                                               long long* __restrict__ out, long long out_ld) {
+// One row's k picks (k <= n): its k largest keys' indices ascending, -1 at or past v.
+template <typename T>
+__device__ void topk_row(const T* row, int n, int k, long long v, long long* out) {
     __shared__ uint32_t scan[kWarps + 1];
-    const int r = blockIdx.x;
-    const float* row = score + (size_t)r * ld;
     uint32_t thr, need;
     radix_threshold(row, n, k, thr, need);
-    const long long v = vis ? vis[r] : (long long)n;
     uint32_t eq_seen = 0u, taken = 0u;
     for (int base = 0; base < n; base += blockDim.x) {
         const int j = base + threadIdx.x;
@@ -118,10 +114,33 @@ __global__ void __launch_bounds__(kThreads) tf_dsv41_topk_rows(const float* __re
         const uint32_t sel = (j < n && (u > thr || (eq && eq_seen + eq_before < need))) ? 1u : 0u;
         uint32_t sel_total;
         const uint32_t at = block_exclusive(sel, scan, sel_total);
-        if (sel) out[(size_t)r * out_ld + taken + at] = (long long)j < v ? (long long)j : -1LL;
+        if (sel) out[taken + at] = (long long)j < v ? (long long)j : -1LL;
         eq_seen += eq_total;
         taken += sel_total;
     }
+}
+
+}  // namespace
+
+extern "C" {
+
+// Rows of fp32 scores [rows, n] (row stride ld) -> each row's k picks (k <= n) into out [rows, k] (row stride
+// out_ld): the indices of its k highest scores ascending, -1 at or past vis[r] (vis null: no mask). One block a row
+// (kThreads threads).
+__global__ void __launch_bounds__(kThreads) tf_dsv41_topk_rows(const float* __restrict__ score, long long ld, int n,
+                                                               int k, const long long* __restrict__ vis,
+                                                               long long* __restrict__ out, long long out_ld) {
+    const int r = blockIdx.x;
+    topk_row(score + (size_t)r * ld, n, k, vis ? vis[r] : (long long)n, out + (size_t)r * out_ld);
+}
+
+// tf_dsv41_topk_rows on the int64 keys the score kernels write with KEYS (kernels.topk_select's input): the same
+// order, so the same picks as from the scores those kernels computed.
+__global__ void __launch_bounds__(kThreads) tf_dsv41_topk_keys(const long long* __restrict__ keys, long long ld, int n,
+                                                               int k, const long long* __restrict__ vis,
+                                                               long long* __restrict__ out, long long out_ld) {
+    const int r = blockIdx.x;
+    topk_row(keys + (size_t)r * ld, n, k, vis ? vis[r] : (long long)n, out + (size_t)r * out_ld);
 }
 
 // model.py _candidates' block maxima: s[r, b] = max of score[r, b * bsize .. (b + 1) * bsize) (-inf past n, NaN

@@ -144,6 +144,7 @@ pub const Select = enum {
 pub const TopkGlue = struct {
     module: cuda.Module,
     topk_rows: cuda.Function,
+    topk_keys: cuda.Function,
     cand_blockmax: cuda.Function,
     cand_mask: cuda.Function,
     apply_cand: cuda.Function,
@@ -157,6 +158,7 @@ pub const TopkGlue = struct {
         return .{
             .module = module,
             .topk_rows = try module.function("tf_dsv41_topk_rows"),
+            .topk_keys = try module.function("tf_dsv41_topk_keys"),
             .cand_blockmax = try module.function("tf_dsv41_cand_blockmax"),
             .cand_mask = try module.function("tf_dsv41_cand_mask"),
             .apply_cand = try module.function("tf_dsv41_apply_cand"),
@@ -171,17 +173,28 @@ pub const TopkGlue = struct {
     /// floats): out [rows, kk] int64 (row stride `out_ld`), each row's kk highest scores' indices ascending (ties to
     /// the lower index), -1 at or past vis[r] (`vis` 0: no mask). kk <= n.
     pub fn topk(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
+        return self.select(self.topk_rows, score, ld, rows, n, kk, vis, out, out_ld, stream);
+    }
+
+    /// `topk` from the int64 keys a score kernel wrote with KEYS (kernels.topk_select's input; row stride `ld`
+    /// keys): the picks of the scores that kernel computed.
+    pub fn topkKeys(self: *const TopkGlue, keys: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
+        return self.select(self.topk_keys, keys, ld, rows, n, kk, vis, out, out_ld, stream);
+    }
+
+    fn select(self: *const TopkGlue, f: cuda.Function, src: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
+        _ = self;
         if (kk == 0 or rows == 0) return;
         if (kk > n) return error.BadShape;
         var a: cuda.Args = .{};
-        a.add(score);
+        a.add(src);
         a.add(@as(c_longlong, @intCast(ld)));
         a.add(@as(c_int, @intCast(n)));
         a.add(@as(c_int, @intCast(kk)));
         a.add(vis);
         a.add(out);
         a.add(@as(c_longlong, @intCast(out_ld)));
-        try cuda.launch.launch(self.topk_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
     }
 
     /// model.py _candidates on rows of fp32 scores [rows, n] (row stride `ld`): mask [rows, ceil(n / bsize)] u8 (row
