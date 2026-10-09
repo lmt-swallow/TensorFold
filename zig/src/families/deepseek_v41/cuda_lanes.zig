@@ -320,10 +320,16 @@ pub const Sequence = struct {
         for (self.hist[0..ids.len], ids) |*hv, id| hv.* = @intCast(id);
         if (self.engram) |g| g.history = self.hist[0..ids.len];
         if (self.dc) |*c| c.absorbed = 0;
+        if (self.engram) |g| {
+            try g.resetAhead();
+            try g.prefetch(self.hist[0..ids.len], 0, @min(ids.len, chunk));
+        }
         var s: usize = 0;
         while (s < ids.len) {
             const e = @min(ids.len, s + chunk);
             const last = e == ids.len;
+            // the next chunk's Engram rows read while this one runs
+            if (self.engram) |g| if (!last) try g.prefetch(self.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
             // A chunk of max_rows or fewer is a decode window (it runs the head): Prompt.chunk sends it through
             // `Forward.rows` only when it asks for logits; with taps it goes there through `rowsTapped`.
             const out = if (self.spark != null and e - s <= max_rows)
@@ -986,10 +992,17 @@ pub const Streams = struct {
         self.point(slot, base, size);
         self.logits = 0;
         var dc: ?dspark.Cache = if (self.spark != null) self.slotCache(slot) else null;
+        const t0 = nowNs();
+        if (self.engram) |g| {
+            try g.resetAhead();
+            try g.prefetch(lane.hist[0..ids.len], 0, @min(ids.len, chunk));
+        }
         var s: usize = 0;
         while (s < ids.len) {
             const e = @min(ids.len, s + chunk);
             const last = e == ids.len;
+            // the next chunk's Engram rows read while this one runs (engine.py prefill_steps' `ahead`)
+            if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
             const out = if (self.spark != null and e - s <= max_rows)
                 try self.rowsTapped(gather, ids[s..e], s)
             else
@@ -1003,6 +1016,11 @@ pub const Streams = struct {
         }
         lane.pos = ids.len;
         lane.absorbed = if (dc) |c| c.absorbed else 0;
+        if (ids.len > max_rows) {
+            try self.stream.synchronize();
+            const ms = msSince(t0);
+            std.log.info("deepseek_v41 rank {d}: a prompt of {d} rows in {d} chunks: {d:.0} ms, {d:.0} tok/s", .{ self.base.w.rank, ids.len, (ids.len + chunk - 1) / chunk, ms, @as(f64, @floatFromInt(ids.len)) * 1000 / ms });
+        }
     }
 
     /// The view's decode loop with the window's taps written into `taps` (dspark's tap layers' inputs).
@@ -1296,18 +1314,18 @@ pub const Engine = struct {
         if (s.chunk < 1 or s.chunk > prompt.max_chunk) return error.BadChunk;
         e.chunk = @min(s.chunk, s.context);
         e.broken = false;
+        var clock = Clock.start(s.rank);
         e.cfg = try Config.read(gpa, io, dir);
-        // the communicator first: rank 1 waits here for rank 0's store, as the Python ranks do
-        e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
-        errdefer e.comm.deinit();
         e.set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, s.kernels_dir);
         errdefer e.set.deinit();
+        clock.mark("the Triton set", .{});
         e.glue = try attention.Glue.load(ctx.d);
         errdefer e.glue.deinit();
         e.kernels = try exl3.Kernels.load(ctx.d);
         errdefer e.kernels.deinit();
         e.ek = try experts.Kernels.load(ctx.d);
         errdefer e.ek.deinit();
+        clock.mark("the CUDA modules", .{});
         const rc_path = (try RankCache.locate(gpa, io, s.cache_dir, s.rank, s.world)) orelse return error.NoRankCache;
         defer gpa.free(rc_path);
         var rc = try RankCache.open(gpa, rc_path);
@@ -1315,6 +1333,7 @@ pub const Engine = struct {
         std.log.info("deepseek_v41 rank {d} of {d}: weights from {s}", .{ s.rank, s.world, rc_path });
         e.w = try weights.load(gpa, ctx.d, &e.cfg, &rc, &e.kernels, s.rank, s.world, .mul1, null);
         errdefer e.w.deinit();
+        clock.mark("the weights", .{});
         e.stream = try cuda.Stream.init(ctx.d, true);
         errdefer e.stream.deinit();
         const rows = ropeRows(s.context);
@@ -1322,8 +1341,10 @@ pub const Engine = struct {
         errdefer freeRope(&e.rope_c);
         e.rope_w = try loadRope(gpa, io, ctx.d, s.rope_dir, "rope_w", rows);
         errdefer freeRope(&e.rope_w);
+        clock.mark("the RoPE tables ({d} rows)", .{rows});
         e.fwd = try forward.Forward.init(gpa, ctx.d, &e.cfg, &e.w, &e.set, &e.glue, &e.ek, s.world, max_rows, base_cap, s.bucket, e.rope_c, e.rope_w, e.stream);
         errdefer e.fwd.deinit();
+        clock.mark("the decode loop", .{});
         e.engram = null;
         if (getenv("TF_DS_ENGRAM")) |engram_dir| {
             const tm = if (getenv("TF_DS_TOKEN_MAP")) |p| try gpa.dupe(u8, p) else try std.fs.path.join(gpa, &.{ s.kernels_dir, "token_map.json" });
@@ -1331,6 +1352,7 @@ pub const Engine = struct {
             const threads: usize = if (getenv("TF_DS_ENGRAM_THREADS")) |t| std.fmt.parseInt(usize, t, 10) catch 32 else 32;
             e.engram = try engram_apply.Engram.init(gpa, io, ctx.d, &e.cfg, &e.w, &e.set, engram_dir, tm, @max(max_rows, e.chunk), threads);
             std.log.info("deepseek_v41 rank {d}: Engram tables {s}, token map {s}, {d} reader threads", .{ s.rank, engram_dir, tm, threads });
+            clock.mark("Engram", .{});
         } else if (s.rank == 0) {
             std.log.warn("deepseek_v41: no Engram tables (TF_DS_ENGRAM): output will be degraded", .{});
         }
@@ -1353,11 +1375,19 @@ pub const Engine = struct {
             e.drafter = try dspark.Drafter.init(gpa, ctx.d, dspark.dimsOf(&e.cfg, s.rank, s.world), &e.set, &e.glue, &e.ek, e.stages, dspark.headOf(&e.ds.?, &e.w.head), &e.comm);
             try e.drafter.?.enableWide(&e.kernels);
             std.log.info("deepseek_v41 rank {d}: DSpark drafter ({d} stages, taps of layers {any})", .{ s.rank, e.stages.len, e.cfg.dspark_taps.slice() });
+            clock.mark("the DSpark drafter", .{});
         }
         const before = cuda.usage(false).device;
         try e.streams.init(gpa, ctx.d, &e.fwd, &e.kernels, e.engram, e.chunk, e.stream, e.drafter, s.slots, s.context + extra);
         errdefer e.streams.deinit();
         if (s.rank == 0) std.log.info("deepseek_v41: {d} stream slots over a window of {d} positions ({d:.2} GiB), prompts in chunks of {d} rows", .{ s.slots, e.streams.extents.total, @as(f64, @floatFromInt(cuda.usage(false).device - before)) / (1 << 30), e.chunk });
+        clock.mark("the stream pool", .{});
+        if (getenv("TF_DS_PROFILE") != null) try e.streams.pr.enableProfile();
+        // the communicator after the loads: each rank loads on its own, then they meet (rank 1 retries its
+        // connection for up to 30 minutes while rank 0 still loads, so the ranks may start in either order)
+        e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
+        errdefer e.comm.deinit();
+        clock.mark("the ranks' rendezvous", .{});
         e.agree_send = try cuda.DeviceBuffer.alloc(ctx.d, 16);
         errdefer e.agree_send.free();
         e.agree_recv = try cuda.DeviceBuffer.alloc(ctx.d, 16 * s.world);
@@ -1609,6 +1639,26 @@ fn nowNs() i128 {
 fn msSince(t0: i128) f64 {
     return @as(f64, @floatFromInt(nowNs() - t0)) / 1e6;
 }
+
+/// `info:` lines of a load's phases: each mark logs the time since the previous one and since the start.
+pub const Clock = struct {
+    rank: u32,
+    t0: i128,
+    last: i128,
+
+    pub fn start(rank: u32) Clock {
+        const t = nowNs();
+        return .{ .rank = rank, .t0 = t, .last = t };
+    }
+
+    pub fn mark(self: *Clock, comptime what: []const u8, args: anytype) void {
+        const t = nowNs();
+        var buf: [160]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, what, args) catch what;
+        std.log.info("deepseek_v41 rank {d}: {s} in {d:.0} ms ({d:.1} s since the load began)", .{ self.rank, name, @as(f64, @floatFromInt(t - self.last)) / 1e6, @as(f64, @floatFromInt(t - self.t0)) / 1e9 });
+        self.last = t;
+    }
+};
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
     const v = std.mem.span(std.c.getenv(name) orelse return null);

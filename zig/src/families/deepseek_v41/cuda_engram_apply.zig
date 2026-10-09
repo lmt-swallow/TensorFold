@@ -7,6 +7,11 @@
 //! Every rank runs the same steps on the same host ids (the hashes are deterministic), so the gather pairs. The hook
 //! (`hook()`) plugs into `Forward.engram`; `history` must hold the sequence's ids from position 0 through the rows
 //! being run (negative ids mark an image span: no n-gram reaches into one).
+//!
+//! A prompt's chunks read their rows ahead (engine.py prefill_steps' `ahead`): `prefetch` hashes a chunk's rows and
+//! a background thread reads every Engram layer's rows into pinned buffers of their own while the chunk before runs;
+//! the chunk's layers then upload those rows instead of reading. A prefetched batch serves a call only when its
+//! positions and row ids equal the call's, so the bits are the ones a direct read gives.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -54,6 +59,18 @@ pub const Engram = struct {
     /// The sequence's ids from position 0 (set by the caller before each run; covers every row it runs).
     history: []const i32 = &.{},
     probe: ?forward.Probe = null,
+    /// Read-ahead batches (`prefetch`): two buffer sets, the pending batches in order in `fifo` (at most two), the
+    /// background reader's queue (`queue[i % 2]` is the set of the i-th posted batch) and counters.
+    sets: [2]Batch,
+    fifo: [2]u8 = .{ 0, 0 },
+    fifo_len: usize = 0,
+    queue: [2]u8 = .{ 0, 0 },
+    posted: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    finished: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    /// The Engram layers this rank's weights hold (their slots in cfg.engram_layers).
+    present: []usize,
 
     /// `dir`: the Engram shards (`layers.L.engram.embed.{weight,scale}`); `token_map_path`: the Python engine's
     /// compressed token map JSON. `max_rows`: the most rows a call runs. `threads`: the reader pool's workers.
@@ -134,10 +151,32 @@ pub const Engram = struct {
         self.gathered = try cuda.DeviceBuffer.alloc(d, w.world * max_rows * kvw * 4);
         errdefer self.gathered.free();
         self.kv = try cuda.DeviceBuffer.alloc(d, max_rows * kvw * 2);
+        errdefer self.kv.free();
+        var present: std.ArrayList(usize) = .empty;
+        defer present.deinit(gpa);
+        for (cfg.engram_layers.slice(), 0..) |li, slot| if (li < @as(i64, @intCast(w.layers.len))) try present.append(gpa, slot);
+        self.present = try present.toOwnedSlice(gpa);
+        errdefer gpa.free(self.present);
+        self.fifo = .{ 0, 0 };
+        self.fifo_len = 0;
+        self.queue = .{ 0, 0 };
+        self.posted = std.atomic.Value(u32).init(0);
+        self.finished = std.atomic.Value(u32).init(0);
+        self.stop = std.atomic.Value(bool).init(false);
+        self.thread = null;
+        self.sets[0] = try Batch.init(gpa, d, nl, max_rows * per);
+        errdefer self.sets[0].deinit(gpa);
+        self.sets[1] = try Batch.init(gpa, d, nl, max_rows * per);
         return self;
     }
 
     pub fn deinit(self: *Engram) void {
+        if (self.thread) |t| {
+            self.stop.store(true, .release);
+            t.join();
+        }
+        for (&self.sets) |*b| b.deinit(self.gpa);
+        self.gpa.free(self.present);
         for (self.uploaded, self.pending) |ev, p| if (p) ev.synchronize() catch {};
         inline for (.{ "e", "xh", "z", "partial", "gathered", "kv" }) |f| @field(self, f).free();
         for (self.staging) |*s| s.deinit();
@@ -212,14 +251,19 @@ pub const Engram = struct {
         for (0..n) |p| for (0..per) |c| {
             self.idx_h[p * per + c] = self.hashes_h[(p * nl + slot) * cols + lo + c];
         };
-        // the rows into this layer's pinned staging (its previous copy to the device has run), then to the device
-        const st = &self.staging[slot];
-        if (self.pending[slot]) try self.uploaded[slot].synchronize();
-        self.pending[slot] = false;
-        try self.reader.gather(table, self.idx_h[0 .. n * per], st.codes(n * per), st.scales(n * per));
-        try st.upload(n * per, stream);
-        try self.uploaded[slot].record(stream);
-        self.pending[slot] = true;
+        // the rows: a prefetched batch's (read ahead into its own pinned buffers), else read now into this layer's
+        // pinned staging (its previous copy to the device has run); then to the device
+        const st = if (try self.takeAhead(slot, spans, n, per, stream)) |ahead| ahead else blk: {
+            try self.idleAhead();
+            const st = &self.staging[slot];
+            if (self.pending[slot]) try self.uploaded[slot].synchronize();
+            self.pending[slot] = false;
+            try self.reader.gather(table, self.idx_h[0 .. n * per], st.codes(n * per), st.scales(n * per));
+            try st.upload(n * per, stream);
+            try self.uploaded[slot].record(stream);
+            self.pending[slot] = true;
+            break :blk st;
+        };
         try self.kernels.decode(stream, st.dev_w.ptr, st.dev_s.ptr, self.e.ptr, n * per);
         // this rank's partial, every rank's in rank order, their sum to bf16, the gate
         if (mm) |f| {
@@ -235,4 +279,182 @@ pub const Engram = struct {
         try self.kernels.sumToBf16(stream, self.gathered.ptr, @intCast(self.w.world), n * kvw, self.kv.ptr);
         try self.hc.engramGate(stream, h, self.kv.ptr, qk.ptr(), h, @intCast(n));
     }
+
+    // -- read-ahead ------------------------------------------------------------------------------------------------
+
+    /// Starts reading the rows of positions start .. start + n - 1 of `ids` (the sequence's ids from position 0) for
+    /// every Engram layer, on the background reader; the chunk's calls at those positions take them (`applySpans`).
+    /// Does nothing when two batches are already pending or n exceeds `max_rows`.
+    pub fn prefetch(self: *Engram, ids: []const i32, start: usize, n: usize) !void {
+        if (n < 1 or n > self.max_rows or self.fifo_len == 2 or self.present.len == 0) return;
+        if (ids.len < start + n) return error.HistoryShort;
+        const k: u8 = if (self.fifo_len == 1) 1 - self.fifo[0] else 0;
+        const b = &self.sets[k];
+        // the set's last uploads have run (its host rows are about to be overwritten)
+        for (b.pending, b.uploaded) |*p, ev| if (p.*) {
+            try ev.synchronize();
+            p.* = false;
+        };
+        const nl = self.hasher.n_layers;
+        const cols = self.hasher.cols;
+        const lo = self.cols[0];
+        const per = self.cols[1] - lo;
+        try self.hasher.hashes(ids, start, n, self.hashes_h[0 .. n * nl * cols]);
+        for (self.present) |slot| {
+            const idx = b.idx[slot * b.rows ..][0 .. n * per];
+            for (0..n) |p| for (0..per) |c| {
+                idx[p * per + c] = self.hashes_h[(p * nl + slot) * cols + lo + c];
+            };
+        }
+        b.start = start;
+        b.n = n;
+        @memset(b.consumed, true);
+        for (self.present) |slot| {
+            b.consumed[slot] = false;
+            b.ready[slot].store(0, .release);
+        }
+        self.fifo[self.fifo_len] = k;
+        self.fifo_len += 1;
+        const at = self.posted.load(.acquire);
+        self.queue[at % 2] = k;
+        self.posted.store(at + 1, .release);
+        if (self.thread == null) self.thread = try std.Thread.spawn(.{}, aheadLoop, .{self});
+    }
+
+    /// The oldest pending batch's rows of layer `slot`, uploaded on `stream`, when that batch is for this call (one
+    /// span at its positions with its row ids `idx_h`); pending batches that are not are dropped. Null: read now.
+    fn takeAhead(self: *Engram, slot: usize, spans: []const rounds.EngramSpan, n: usize, per: usize, stream: cuda.Stream) !?*rows_mod.Staging {
+        if (self.fifo_len == 0) return null;
+        const b = &self.sets[self.fifo[0]];
+        const fits = spans.len == 1 and spans[0].start == b.start and n == b.n and !b.consumed[slot];
+        if (fits) {
+            var spins: u32 = 0;
+            while (b.ready[slot].load(.acquire) == 0) {
+                spins += 1;
+                if (spins < 1000) std.atomic.spinLoopHint() else sleepUs(20);
+            }
+            if (b.ready[slot].load(.acquire) == 2) return error.ReadFailed;
+        }
+        if (!fits or !std.mem.eql(i64, b.idx[slot * b.rows ..][0 .. n * per], self.idx_h[0 .. n * per])) {
+            try self.idleAhead();
+            self.fifo_len = 0;
+            return null;
+        }
+        const st = &b.staging[slot];
+        try st.upload(n * per, stream);
+        try b.uploaded[slot].record(stream);
+        b.pending[slot] = true;
+        b.consumed[slot] = true;
+        if (std.mem.indexOfScalar(bool, b.consumed, false) == null) {
+            self.fifo[0] = self.fifo[1];
+            self.fifo_len -= 1;
+        }
+        return st;
+    }
+
+    /// Drops every pending batch (a prompt's admission starts from none: an earlier one may have stopped part way).
+    pub fn resetAhead(self: *Engram) !void {
+        try self.idleAhead();
+        self.fifo_len = 0;
+    }
+
+    /// Waits until the background reader has finished every posted batch (the reader pool is then this thread's).
+    fn idleAhead(self: *Engram) !void {
+        var spins: u32 = 0;
+        while (self.finished.load(.acquire) != self.posted.load(.acquire)) {
+            spins += 1;
+            if (spins < 1000) std.atomic.spinLoopHint() else sleepUs(20);
+        }
+    }
+
+    fn aheadLoop(self: *Engram) void {
+        var done: u32 = 0;
+        while (true) {
+            var spins: u32 = 0;
+            while (self.posted.load(.acquire) == done) {
+                if (self.stop.load(.acquire)) return;
+                spins += 1;
+                if (spins < 1000) std.atomic.spinLoopHint() else sleepUs(50);
+            }
+            const b = &self.sets[self.queue[done % 2]];
+            const per = self.cols[1] - self.cols[0];
+            for (self.present) |slot| {
+                const table = self.tables.get(self.cfg.engram_layers.slice()[slot]).?;
+                const st = &b.staging[slot];
+                const ok = if (self.reader.gather(table, b.idx[slot * b.rows ..][0 .. b.n * per], st.codes(b.n * per), st.scales(b.n * per))) |_| true else |_| false;
+                b.ready[slot].store(if (ok) 1 else 2, .release);
+            }
+            done += 1;
+            self.finished.store(done, .release);
+        }
+    }
+
 };
+
+/// A read-ahead batch's buffers: a pinned staging pair and its upload's event a layer, the row ids of every layer
+/// (`rows` a layer), and the batch's positions.
+const Batch = struct {
+    rows: usize,
+    start: usize = 0,
+    n: usize = 0,
+    idx: []i64,
+    staging: []rows_mod.Staging,
+    uploaded: []cuda.Event,
+    pending: []bool, // an upload from the layer's pinned rows is queued
+    ready: []std.atomic.Value(u8), // the layer's rows: 0 reading, 1 read, 2 the read failed
+    consumed: []bool,
+
+    fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, layers: usize, rows: usize) !Batch {
+        var b: Batch = .{ .rows = rows, .idx = &.{}, .staging = &.{}, .uploaded = &.{}, .pending = &.{}, .ready = &.{}, .consumed = &.{} };
+        errdefer b.deinit(gpa);
+        b.idx = try gpa.alloc(i64, layers * rows);
+        b.pending = try gpa.alloc(bool, layers);
+        @memset(b.pending, false);
+        b.consumed = try gpa.alloc(bool, layers);
+        @memset(b.consumed, true);
+        b.ready = try gpa.alloc(std.atomic.Value(u8), layers);
+        for (b.ready) |*r| r.* = std.atomic.Value(u8).init(0);
+        const staging = try gpa.alloc(rows_mod.Staging, layers);
+        const events = gpa.alloc(cuda.Event, layers) catch |err| {
+            gpa.free(staging);
+            return err;
+        };
+        var made: usize = 0;
+        errdefer {
+            for (staging[0..made], events[0..made]) |*st, *ev| {
+                st.deinit();
+                ev.deinit();
+            }
+            gpa.free(staging);
+            gpa.free(events);
+        }
+        while (made < layers) : (made += 1) {
+            staging[made] = try rows_mod.Staging.init(d, rows);
+            events[made] = cuda.Event.init(d, false) catch |err| {
+                staging[made].deinit();
+                return err;
+            };
+        }
+        b.staging = staging;
+        b.uploaded = events;
+        return b;
+    }
+
+    fn deinit(self: *Batch, gpa: std.mem.Allocator) void {
+        for (self.uploaded, self.pending) |ev, p| if (p) ev.synchronize() catch {};
+        for (self.staging) |*st| st.deinit();
+        for (self.uploaded) |*ev| ev.deinit();
+        if (self.staging.len > 0) gpa.free(self.staging);
+        if (self.uploaded.len > 0) gpa.free(self.uploaded);
+        if (self.idx.len > 0) gpa.free(self.idx);
+        if (self.pending.len > 0) gpa.free(self.pending);
+        if (self.consumed.len > 0) gpa.free(self.consumed);
+        if (self.ready.len > 0) gpa.free(self.ready);
+        self.* = .{ .rows = 0, .idx = &.{}, .staging = &.{}, .uploaded = &.{}, .pending = &.{}, .ready = &.{}, .consumed = &.{} };
+    }
+};
+
+fn sleepUs(us: u32) void {
+    var req: std.c.timespec = .{ .sec = 0, .nsec = @intCast(us * 1000) };
+    _ = std.c.nanosleep(&req, null);
+}

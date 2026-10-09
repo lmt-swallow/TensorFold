@@ -260,10 +260,45 @@ pub const Options = struct {
     logits: bool = true,
 };
 
+/// A chunk's timing (`Prompt.enableProfile`, TF_DS_PROFILE=1 in the served engine): CUDA events between every
+/// layer's sublayer groups, read back after the chunk (a host sync a chunk, so chunks no longer overlap), and the
+/// host's time inside the chunk call. `chunk` logs one `info:` line a profiled chunk.
+pub const Profile = struct {
+    pub const groups = [_][]const u8{ "engram", "attention", "attention gather", "moe", "moe gather" };
+    /// [1 + layers * groups.len + 1]: before the embedding, after each layer's groups, after the head.
+    marks: []cuda.Event,
+    gpa: std.mem.Allocator,
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, layers: usize) !Profile {
+        const marks = try gpa.alloc(cuda.Event, 2 + layers * groups.len);
+        errdefer gpa.free(marks);
+        var made: usize = 0;
+        errdefer for (marks[0..made]) |*e| e.deinit();
+        for (marks) |*e| {
+            e.* = try cuda.Event.init(d, true);
+            made += 1;
+        }
+        return .{ .marks = marks, .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Profile) void {
+        for (self.marks) |*e| e.deinit();
+        self.gpa.free(self.marks);
+    }
+};
+
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
+
 pub const Prompt = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
     fwd: *Forward,
+    /// Per-chunk timing when set (`enableProfile`).
+    profile: ?Profile = null,
     kernels: *const exl3.Kernels,
     glue: Glue,
     pk: ExpertKernels,
@@ -360,6 +395,7 @@ pub const Prompt = struct {
         self.gpa = gpa;
         self.d = d;
         self.fwd = fwd;
+        self.profile = null;
         self.kernels = kernels;
         self.rows = rows;
         self.glue = try Glue.load(d);
@@ -481,7 +517,13 @@ pub const Prompt = struct {
         return self;
     }
 
+    /// Times every chunk from now on (see `Profile`).
+    pub fn enableProfile(self: *Prompt) !void {
+        if (self.profile == null) self.profile = try Profile.init(self.gpa, self.d, self.fwd.w.layers.len);
+    }
+
     pub fn deinit(self: *Prompt) void {
+        if (self.profile) |*p| p.deinit();
         for (self.gate_w32) |*b| b.free();
         self.gpa.free(self.gate_w32);
         inline for (.{ "had", "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "xh", "wq", "z", "pos", "vis", "vis_blk", "gpos", "grows", "src_idx", "dst_idx", "wlo", "qa", "qr", "q", "ykv", "wsrc", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "x32", "wl", "wts", "score", "tmax", "cidx", "cand", "smax", "o", "og", "ug", "u", "out", "logits", "pick", "wts_moe", "moe", "xc", "local", "glog", "head_logits" }) |f| @field(self, f).free();
@@ -506,6 +548,40 @@ pub const Prompt = struct {
         const n = ids.len;
         if (n < 1 or n > self.rows) return error.TooManyRows;
         if (n <= decode_rows and o.replay == null and o.taps == null and o.logits) return try self.fwd.rows(gather, ids, start, n, false, stream);
+        const t0 = nowNs();
+        var engram_ns: i128 = 0;
+        try self.mark(0, stream);
+        const out = try self.layers(gather, ids, start, o, stream, &engram_ns);
+        try self.mark(1 + self.fwd.w.layers.len * Profile.groups.len, stream);
+        if (self.profile != null and o.replay == null) try self.report(start, n, nowNs() - t0, engram_ns, stream);
+        return out;
+    }
+
+    fn mark(self: *const Prompt, i: usize, stream: cuda.Stream) !void {
+        if (self.profile) |p| try p.marks[i].record(stream);
+    }
+
+    /// The profiled chunk's line: the GPU's ms by sublayer group (summed over the layers), the head's, and the host's
+    /// ms in the call (and in the Engram hook: hashing, row reads, uploads).
+    fn report(self: *const Prompt, start: usize, n: usize, host_ns: i128, engram_ns: i128, stream: cuda.Stream) !void {
+        const p = self.profile.?;
+        const L = self.fwd.w.layers.len;
+        const ng = Profile.groups.len;
+        const t_sync = nowNs();
+        try stream.synchronize();
+        const wait_ms = @as(f64, @floatFromInt(nowNs() - t_sync)) / 1e6;
+        var sum: [Profile.groups.len]f64 = @splat(0);
+        for (0..L * ng) |i| sum[i % ng] += try cuda.Event.elapsedMs(p.marks[i], p.marks[i + 1]);
+        const head = try cuda.Event.elapsedMs(p.marks[L * ng], p.marks[L * ng + 1]);
+        const total = try cuda.Event.elapsedMs(p.marks[0], p.marks[L * ng + 1]);
+        std.log.info("deepseek_v41 rank {d}: chunk at {d} ({d} rows): GPU {d:.0} ms (engram {d:.0}, attention {d:.0}, attention gather {d:.0}, moe {d:.0}, moe gather {d:.0}, head {d:.1}); host {d:.0} ms in the call ({d:.0} in Engram), then {d:.0} ms waiting for the GPU", .{
+            self.fwd.w.rank, start, n, total, sum[0], sum[1], sum[2], sum[3], sum[4], head,
+            @as(f64, @floatFromInt(host_ns)) / 1e6, @as(f64, @floatFromInt(engram_ns)) / 1e6, wait_ms,
+        });
+    }
+
+    fn layers(self: *Prompt, gather: Gather, ids: []const i64, start: usize, o: Options, stream: cuda.Stream, engram_ns: *i128) !?Ptr {
+        const n = ids.len;
         const c = self.fwd.cfg;
         const dm = c.dim;
         const w = self.fwd.w;
@@ -541,27 +617,35 @@ pub const Prompt = struct {
                 floor = replay;
                 kv_done = true;
             };
+            const m0 = 1 + li * Profile.groups.len;
             if (l.engram_wkv != null) if (fwd.engram) |e| {
+                const te = nowNs();
                 try e.call(e.ctx, li, h, at, rows, .{ .ctx = self, .call = mmF32 }, gather, stream);
+                engram_ns.* += nowNs() - te;
                 try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
             };
             if (o.taps) |t| if (c.dspark_taps.indexOf(@intCast(li))) |ti| {
                 try fwd.hc.tap(stream, h, t.buf + ti * dm * 2, @intCast(t.stride), @intCast(rows));
             };
+            try self.mark(m0, stream);
             try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, rows * dm * 2, stream);
             const pa = try self.attend(li, self.x.ptr, rows, at, floor, kv_done and li == c.n_layers / 2, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, rows * dm * 4, stream);
+            try self.mark(m0 + 1, stream);
             try gather.run(pa, rows * dm, self.gathered.ptr, stream);
             try fwd.hc.post(stream, self.gathered.ptr, fwd.world, h, self.post.ptr, self.comb.ptr, h, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_attn", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
+            try self.mark(m0 + 2, stream);
             try fwd.hc.pre(stream, h, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), self.x.ptr, pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_ffn", .{li}), self.x.ptr, rows * dm * 2, stream);
             const pm = try self.moeRows(li, self.x.ptr, rows, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r0", .{li}), pm, rows * dm * 4, stream);
+            try self.mark(m0 + 3, stream);
             try gather.run(pm, rows * dm, self.gathered.ptr, stream);
             try fwd.hc.post(stream, self.gathered.ptr, fwd.world, h, self.post.ptr, self.comb.ptr, h, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
+            try self.mark(m0 + 4, stream);
             const t = pre;
             pre = pre_f;
             pre_f = t;

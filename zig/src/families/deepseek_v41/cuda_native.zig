@@ -6,7 +6,9 @@
 //! rounds (16 rows a round at most), their caches in one pool of the context's positions (cuda_lanes.zig `Streams`);
 //! TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks) sets the pool's slots. With drafts (the default;
 //! `--no-drafts` turns them off on both ranks) the rank cache's DSpark blocks load and every stream verifies drafted
-//! windows of up to 6 rows, the rounds' and drafts' costs timed on both ranks at load.
+//! windows of up to 6 rows, the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
+//! time (`info:` lines); each rank loads on its own and the ranks meet after their loads, so both may start at once.
+//! TF_DS_PROFILE=1 logs every prompt chunk's GPU time by sublayer group and its host time (a host sync a chunk).
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -91,6 +93,7 @@ pub fn weightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     var s = try settings(gpa, kernels, o.context);
     s.drafts = o.drafts;
+    if (processAge()) |age| std.log.info("deepseek_v41 rank {d}: the engine's load begins {d:.1} s after the process started", .{ s.rank, age });
     if (s.world != 2) {
         std.log.err("deepseek_v41 serves on two ranks: start rank 0 and rank 1 with --tp 2 (TF_TP_WORLD=2)", .{});
         return error.WorldNotTwo;
@@ -101,7 +104,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .lanes = Lanes.init(gpa, e) };
     // rank 0 times the rounds and drafts with rank 1 (its follow loop runs the same step)
-    if (s.rank == 0) try own.lanes.measure(2);
+    if (s.rank == 0) {
+        var clock = lanesmod.Clock.start(s.rank);
+        try own.lanes.measure(2);
+        clock.mark("the measure step", .{});
+    }
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
@@ -122,6 +129,33 @@ pub fn follow(p: *anyopaque) !void {
 /// Whether this process is a follower (rank > 0), from the same environment `open` reads.
 pub fn isFollower() bool {
     return (envInt("TF_TP_RANK", 0) catch 0) != 0;
+}
+
+/// Seconds since this process started (Linux: /proc/self/stat's start time against /proc/uptime), null elsewhere.
+fn processAge() ?f64 {
+    var stat_buf: [1024]u8 = undefined;
+    var up_buf: [128]u8 = undefined;
+    const stat = readSmall("/proc/self/stat", &stat_buf) orelse return null;
+    const up = readSmall("/proc/uptime", &up_buf) orelse return null;
+    // the fields after the command's closing parenthesis start at field 3; the start time (clock ticks after boot,
+    // USER_HZ = 100 on Linux) is field 22
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, stat[close + 1 ..], ' ');
+    var field: usize = 3;
+    const ticks = while (it.next()) |f| : (field += 1) {
+        if (field == 22) break std.fmt.parseInt(u64, f, 10) catch return null;
+    } else return null;
+    var ut = std.mem.tokenizeAny(u8, up, " \n");
+    const uptime = std.fmt.parseFloat(f64, ut.next() orelse return null) catch return null;
+    return uptime - @as(f64, @floatFromInt(ticks)) / 100.0;
+}
+
+fn readSmall(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const fd = std.c.open(path, .{});
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, buf.ptr, buf.len);
+    return if (n > 0) buf[0..@intCast(n)] else null;
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {

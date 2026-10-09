@@ -3,8 +3,8 @@
 # (the follower) on $R1, each in nvcr.io/nvidia/pytorch:26.07-py3 as containers tfz0 / tfz1. Run it from any machine
 # that reaches both nodes over ssh (the Mac, or rank 0 itself).
 #
-#   bash serve_smoke.sh [run]   copy the binary, start rank 0, wait for its master port, start rank 1, wait for
-#                               "serving", send one fixed greedy chat request, print the reply's token ids and tok/s,
+#   bash serve_smoke.sh [run]   copy the binary, start rank 0 and rank 1 together (each loads on its own, then
+#                               rank 1 connects to rank 0's master port), wait for "serving", send one fixed greedy chat request, print the reply's token ids and tok/s,
 #                               then remove both containers (KEEP=1 leaves them serving)
 #   bash serve_smoke.sh stop    remove both containers
 #
@@ -31,7 +31,6 @@ KERNELS=${KERNELS:-dsv41-all}   # the captured Triton set under ~/aot (aot.json,
 DRAFTS=${DRAFTS:-1}            # 0: --no-drafts
 PARALLEL=${PARALLEL:-1}        # streams decoded together (--parallel)
 RESERVE=${RESERVE:-4}          # TENSORFOLD_MEMORY_RESERVE_GIB
-PORT_TIMEOUT=${PORT_TIMEOUT:-600}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -143,15 +142,8 @@ start() { # host name rank
 running() { [ -n "$(on "$1" "docker ps -q --filter name=^$2\$")" ]; }
 tail_log() { say "last lines of $1:"; tail -n 30 "$LOG_DIR/$1.log" >&2 || true; }
 
-say "starting rank 0 (tfz0) on $R0"
+say "starting rank 0 (tfz0) on $R0 and rank 1 (tfz1) on $R1"
 start "$R0" tfz0 0
-waited=0
-until on "$R0" "ss -ltn 'sport = :$MASTER_PORT' | grep -q LISTEN"; do
-  running "$R0" tfz0 || { tail_log tfz0; die "rank 0 exited before listening on $MASTER_PORT"; }
-  [ $waited -lt "$PORT_TIMEOUT" ] || { tail_log tfz0; die "rank 0 did not listen on $MASTER_PORT within ${PORT_TIMEOUT}s"; }
-  sleep 2; waited=$((waited + 2))
-done
-say "rank 0 listens on $MASTER:$MASTER_PORT after ${waited}s; starting rank 1 (tfz1) on $R1"
 start "$R1" tfz1 1
 
 waited=0
