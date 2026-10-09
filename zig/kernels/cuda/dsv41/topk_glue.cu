@@ -120,6 +120,63 @@ __device__ void topk_row(const T* row, int n, int k, long long v, long long* out
     }
 }
 
+// hist[bin] += 1 for every lane of the warp with `live`, one shared atomic a distinct bin (the keys of a row share
+// their top digits: per-lane atomics on one bin would serialize the whole row). Every lane of the warp calls it (the
+// callers' loops are uniform over the block).
+__device__ __forceinline__ void hist_add(uint32_t* hist, uint32_t bin, bool live) {
+    const unsigned same = __match_any_sync(0xFFFFFFFFu, live ? bin : 0xFFFFFFFFu);
+    if (live && (threadIdx.x & 31) == __ffs(same) - 1) atomicAdd(&hist[bin], (uint32_t)__popc(same));
+}
+
+// Loads a sweep issues together a thread (the sweeps are latency-bound: one row a block).
+constexpr int kUnroll = 8;
+
+// The k-th largest ordered key of row[0..n) as radix_threshold, with hist_add's warp-aggregated counts.
+template <typename T>
+__device__ void radix_threshold_agg(const T* row, int n, int k, uint32_t& thr, uint32_t& need) {
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t s_prefix, s_remaining;
+    if (threadIdx.x == 0) {
+        s_prefix = 0u;
+        s_remaining = (uint32_t)k;
+    }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        const uint32_t prefix = s_prefix;
+        const uint32_t high = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+        for (int base = 0; base < n; base += kUnroll * blockDim.x) {
+            T v[kUnroll];
+#pragma unroll
+            for (int t = 0; t < kUnroll; ++t) {
+                const int j = base + t * blockDim.x + threadIdx.x;
+                v[t] = j < n ? row[j] : T(0);
+            }
+#pragma unroll
+            for (int t = 0; t < kUnroll; ++t) {
+                const int j = base + t * blockDim.x + threadIdx.x;
+                const uint32_t u = ordered(v[t]);
+                hist_add(hist, (u >> shift) & 255u, j < n && (u & high) == (prefix & high));
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t rem = s_remaining;
+            uint32_t above = 0u;
+            int d = 255;
+            for (; d > 0; --d) {
+                if (above + hist[d] >= rem) break;
+                above += hist[d];
+            }
+            s_remaining = rem - above;
+            s_prefix = prefix | ((uint32_t)d << shift);
+        }
+        __syncthreads();
+    }
+    thr = s_prefix;
+    need = s_remaining;
+}
+
 // kernels.topk_select's picks a row at most (tf_dsv41_topk_keyset's shared sort).
 constexpr int kMaxPicks = 1024;
 
@@ -228,9 +285,18 @@ __global__ void __launch_bounds__(kThreads) tf_dsv41_topk_keyset(const long long
         __syncthreads();
         const unsigned long long prefix = s_prefix;
         const unsigned long long high = shift == 56 ? 0ull : (~0ull << (shift + 8));
-        for (int j = threadIdx.x; j < n; j += blockDim.x) {
-            const unsigned long long u = key_order(row[j]);
-            if ((u & high) == (prefix & high)) atomicAdd(&hist[(u >> shift) & 255u], 1u);
+        for (int base = 0; base < n; base += kUnroll * blockDim.x) {
+            unsigned long long v[kUnroll];
+#pragma unroll
+            for (int t = 0; t < kUnroll; ++t) {
+                const int j = base + t * blockDim.x + threadIdx.x;
+                v[t] = j < n ? key_order(row[j]) : 0ull;
+            }
+#pragma unroll
+            for (int t = 0; t < kUnroll; ++t) {
+                const int j = base + t * blockDim.x + threadIdx.x;
+                hist_add(hist, (uint32_t)(v[t] >> shift) & 255u, j < n && (v[t] & high) == (prefix & high));
+            }
         }
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -248,12 +314,21 @@ __global__ void __launch_bounds__(kThreads) tf_dsv41_topk_keyset(const long long
     }
     const unsigned long long thr = s_prefix;
     const int need = (int)s_remaining;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const long long key = row[j];
-        const unsigned long long u = key_order(key);
-        bool take = u > thr;
-        if (!take && u == thr) take = atomicAdd(&s_eq, 1) < need;
-        if (take) picks[atomicAdd(&s_taken, 1)] = 0xFFFFFFFFll - (key & 0xFFFFFFFFll);
+    for (int base = 0; base < n; base += kUnroll * blockDim.x) {
+        long long v[kUnroll];
+#pragma unroll
+        for (int t = 0; t < kUnroll; ++t) {
+            const int j = base + t * blockDim.x + threadIdx.x;
+            v[t] = j < n ? row[j] : (long long)0x8000000000000000ull;
+        }
+#pragma unroll
+        for (int t = 0; t < kUnroll; ++t) {
+            const int j = base + t * blockDim.x + threadIdx.x;
+            const unsigned long long u = key_order(v[t]);
+            bool take = j < n && u > thr;
+            if (!take && j < n && u == thr) take = atomicAdd(&s_eq, 1) < need;
+            if (take) picks[atomicAdd(&s_taken, 1)] = 0xFFFFFFFFll - (v[t] & 0xFFFFFFFFll);
+        }
     }
     int p2 = 1;
     while (p2 < k) p2 <<= 1;
@@ -289,26 +364,64 @@ __global__ void __launch_bounds__(kThreads) tf_dsv41_topk_keyset(const long long
 // tf_dsv41_cand_mask marks, as the block ids index_keys_cand reads. One block a row (kThreads).
 __global__ void __launch_bounds__(kThreads) tf_dsv41_cand_blocks(const float* __restrict__ s, long long ld, int nblk,
                                                                  int k, int* __restrict__ cblk, long long cblk_ld) {
-    __shared__ uint32_t scan[kWarps + 1];
+    __shared__ uint32_t w_eq[kWarps], w_sel[kWarps];
     const int r = blockIdx.x;
     const float* row = s + (size_t)r * ld;
     uint32_t thr, need;
-    radix_threshold(row, nblk, k, thr, need);
-    uint32_t eq_seen = 0u, taken = 0u;
-    for (int base = 0; base < nblk; base += blockDim.x) {
-        const int j = base + threadIdx.x;
-        uint32_t u = 0u;
-        if (j < nblk) u = ordered(row[j]);
-        const uint32_t eq = (j < nblk && u == thr) ? 1u : 0u;
-        uint32_t eq_total;
-        const uint32_t eq_before = block_exclusive(eq, scan, eq_total);
-        const uint32_t sel = (j < nblk && (u > thr || (eq && eq_seen + eq_before < need))) ? 1u : 0u;
-        uint32_t sel_total;
-        const uint32_t at = block_exclusive(sel, scan, sel_total);
-        // `where(s.gather(-1, idx) > -inf, idx, -1)`: NaN maxima compare false as well
-        if (sel) cblk[(size_t)r * cblk_ld + taken + at] = row[j] > -__int_as_float(0x7F800000) ? j : -1;
-        eq_seen += eq_total;
-        taken += sel_total;
+    radix_threshold_agg(row, nblk, k, thr, need);
+    // each warp a contiguous segment (lanes coalesced), so the warps' counts in warp order order the picks by block
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned below = (1u << lane) - 1u;
+    const int seg = (nblk + kWarps * 32 - 1) / (kWarps * 32) * 32;
+    const int lo = min(nblk, warp * seg), hi = min(nblk, lo + seg);
+    uint32_t eq = 0u;
+    for (int base = lo; base < hi; base += 32 * kUnroll) {
+        float v[kUnroll];
+#pragma unroll
+        for (int t = 0; t < kUnroll; ++t) {
+            const int j = base + t * 32 + lane;
+            v[t] = j < hi ? row[j] : 0.0f;
+        }
+#pragma unroll
+        for (int t = 0; t < kUnroll; ++t) eq += (base + t * 32 + lane < hi && ordered(v[t]) == thr) ? 1u : 0u;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) eq += __shfl_xor_sync(0xFFFFFFFFu, eq, o);
+    if (lane == 0) w_eq[warp] = eq;
+    __syncthreads();
+    uint32_t eq_before = 0u;
+    for (int w = 0; w < warp; ++w) eq_before += w_eq[w];
+    // two sweeps of the segment: the warp's picks counted, then written at the picks of the warps before
+    uint32_t at = 0u;
+    for (int sweep = 0; sweep < 2; ++sweep) {
+        uint32_t seen = eq_before, taken = 0u;
+        for (int base0 = lo; base0 < hi; base0 += 32 * kUnroll) {
+            float v[kUnroll];
+#pragma unroll
+            for (int t = 0; t < kUnroll; ++t) {
+                const int j = base0 + t * 32 + lane;
+                v[t] = j < hi ? row[j] : 0.0f;
+            }
+#pragma unroll
+            for (int t = 0; t < kUnroll; ++t) {
+                const int j = base0 + t * 32 + lane;
+                const float x = v[t];
+                const uint32_t u = j < hi ? ordered(x) : 0u;
+                const bool e = j < hi && u == thr;
+                const unsigned eqm = __ballot_sync(0xFFFFFFFFu, e);
+                const bool take = j < hi && (u > thr || (e && seen + __popc(eqm & below) < need));
+                const unsigned selm = __ballot_sync(0xFFFFFFFFu, take);
+                // `where(s.gather(-1, idx) > -inf, idx, -1)`: NaN maxima compare false as well
+                if (sweep == 1 && take) cblk[(size_t)r * cblk_ld + at + taken + __popc(selm & below)] = x > -__int_as_float(0x7F800000) ? j : -1;
+                seen += __popc(eqm);
+                taken += __popc(selm);
+            }
+        }
+        if (sweep == 0) {
+            if (lane == 0) w_sel[warp] = taken;
+            __syncthreads();
+            for (int w = 0; w < warp; ++w) at += w_sel[w];
+        }
     }
 }
 
