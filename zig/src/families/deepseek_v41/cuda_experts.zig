@@ -120,6 +120,16 @@ pub const Experts = struct {
     aligned16: bool,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, experts: []const ExpertMats, cb: Codebook) !Experts {
+        return build(gpa, d, experts, cb, null);
+    }
+
+    /// `init` with each trellis copied straight from its own bytes on `stream` (no host staging; asynchronous when
+    /// they are pinned), waiting for the copies before it returns. The device bytes are `init`'s.
+    pub fn initOn(gpa: std.mem.Allocator, d: *const cuda.Driver, experts: []const ExpertMats, cb: Codebook, stream: cuda.Stream) !Experts {
+        return build(gpa, d, experts, cb, stream);
+    }
+
+    fn build(gpa: std.mem.Allocator, d: *const cuda.Driver, experts: []const ExpertMats, cb: Codebook, stream: ?cuda.Stream) !Experts {
         const E = experts.len;
         if (E == 0) return error.BadShape;
         const D = experts[0].gate.kt * 16;
@@ -132,14 +142,15 @@ pub const Experts = struct {
                 total += m.trellis.len;
             }
         }
-        const staging = try gpa.alloc(u8, total);
-        defer gpa.free(staging);
+        const staging: []u8 = if (stream == null) try gpa.alloc(u8, total) else &.{};
+        defer if (stream == null) gpa.free(staging);
         var ptrs = try gpa.alloc(i64, 3 * E);
         defer gpa.free(ptrs);
         var k2s = try gpa.alloc(i32, 3 * E);
         defer gpa.free(k2s);
         var trellises = try cuda.DeviceBuffer.alloc(d, total);
         errdefer trellises.free();
+        errdefer if (stream) |st| st.synchronize() catch {};
         var off: usize = 0;
         var aligned = true;
         var k2_gu: [2]u32 = .{ 1 << 30, 0 };
@@ -150,7 +161,9 @@ pub const Experts = struct {
                 1 => ex.up,
                 else => ex.down,
             };
-            @memcpy(staging[off..][0..m.trellis.len], m.trellis);
+            if (stream) |st| {
+                try trellises.uploadAsync(off, m.trellis, st.handle);
+            } else @memcpy(staging[off..][0..m.trellis.len], m.trellis);
             ptrs[j * E + e] = @intCast(trellises.ptr + off);
             if ((trellises.ptr + off) % 16 != 0) aligned = false;
             const k2 = try exl3.k2Of(m.w16);
@@ -160,7 +173,7 @@ pub const Experts = struct {
             range[1] = @max(range[1], k2);
             off += m.trellis.len;
         };
-        try trellises.upload(0, staging);
+        if (stream) |st| try st.synchronize() else try trellises.upload(0, staging);
         var self: Experts = .{
             .trellises = trellises,
             .gate_ptr = undefined,
