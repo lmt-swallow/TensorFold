@@ -12,6 +12,12 @@
 //! per-row bases), the candidate pool at the candidate source and its mask after it, and the top-k on the device
 //! (cuda_attention.zig's selection: the same set as the fork's `topk_indices`, a total order). Engram runs on its
 //! layers when a hook is set (`engram`), each row's n-grams from its own stream's ids (`Window.host`).
+//!
+//! A round scans a context bucket sized by its windows, not the pool (graph.py `bucket_for`): the smallest power of
+//! two, `bucket_min` (BUCKET_MIN) at least, holding the deepest row's position + 1, so its cost follows the live
+//! streams' lengths. Every row's bits are the same at any bucket holding it (the scans mask past a row's visible
+//! count); the fork's round runs at this bucket, so its launches do too. The bucket depends only on the windows,
+//! so ranks running the same windows run the same shapes.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -30,6 +36,16 @@ pub const Error = error{ TooManyRows, BadShape, Unsupported, OutOfMemory } || cu
 
 pub const max_rows = 16;
 pub const raw_rows = 64; // compressor inputs kept by position a slot (model.py RAW)
+/// The smallest context bucket (graph.py BUCKET_MIN).
+pub const bucket_min = 1024;
+
+/// graph.py `bucket_for(deepest, cap)`: the smallest power of two >= `deepest`, `least` at least, then at most
+/// max(cap, least). Monotone in `deepest`; >= `deepest` whenever `deepest` <= max(cap, least).
+pub fn bucketFor(deepest: usize, cap: usize, least: usize) usize {
+    var b = least;
+    while (b < deepest) b *= 2;
+    return @min(b, @max(cap, least));
+}
 
 /// One stream's verify window in a round (multi.py `_round`'s tuple): its slot, its extent, the first row's
 /// position (relative to the extent) and the rows' ids (the pending token, then the drafts). `host`: the stream's
@@ -204,7 +220,12 @@ pub const RoundRunner = struct {
     hc: hcmod.Hc,
     route: routemod.Route,
     world: u32,
+    /// The widest bucket a round may scan (the per-round buffers' size): the context's.
     bucket: usize,
+    /// The least bucket a round scans (graph.py BUCKET_MIN; the pool's widest makes every round scan it whole).
+    least: usize = bucket_min,
+    /// The last round's bucket (`bucketOf` its windows).
+    round_bucket: usize = 0,
     rope_c: attention.Rope,
     rope_w: attention.Rope,
     pool: *Pool,
@@ -298,6 +319,8 @@ pub const RoundRunner = struct {
         self.ek = ek;
         self.world = world;
         self.bucket = bucket;
+        self.least = bucket_min;
+        self.round_bucket = 0;
         self.rope_c = rope_c;
         self.rope_w = rope_w;
         self.pool = pool;
@@ -340,7 +363,8 @@ pub const RoundRunner = struct {
         // the widest scan is the ratio-1 layers' (bucket entries); the smallest is the fused selection's candidate
         const scored = bucket > cfg.idx_topk;
         self.score = try cuda.DeviceBuffer.alloc(d, if (scored) R * bucket * 4 else 16);
-        self.keys = try cuda.DeviceBuffer.alloc(d, if (scored and bucket / 2 <= 4096) R * @as(usize, @min(bucket, 4096)) * 8 else 16);
+        // the fused selection's keys: scans of up to 4096 entries (fusedTopk's widest), at any round's bucket
+        self.keys = try cuda.DeviceBuffer.alloc(d, if (scored) R * @as(usize, @min(bucket, 4096)) * 8 else 16);
         const ccols = (bucket + @max(1, cfg.cand_block) - 1) / @max(1, cfg.cand_block);
         self.smax = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols * 4 else 16);
         self.cand_mask = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols else 16);
@@ -427,6 +451,16 @@ pub const RoundRunner = struct {
         if (self.probe) |p| try p.call(p.ctx, name, ptr, bytes, stream);
     }
 
+    /// The bucket a round of `windows` scans: `bucketFor` its deepest row (position + 1) over the pool, the
+    /// runner's `least` at least; error.BadShape past the runner's widest (its buffers).
+    pub fn bucketOf(self: *const RoundRunner, windows: []const Window) error{BadShape}!usize {
+        var deepest: usize = 1;
+        for (windows) |wd| deepest = @max(deepest, wd.position + wd.ids.len);
+        const b = bucketFor(deepest, self.pool.cap, @min(self.least, self.bucket));
+        if (b < deepest or b > self.bucket) return error.BadShape;
+        return b;
+    }
+
     /// Every window's rows in one forward: logits [R, V] f32 (`self.logits`, row order = the windows'), the taps
     /// in `self.taps` [R, ntap x d]; the pool holds the rows' keys after.
     pub fn forward(self: *RoundRunner, windows: []const Window, gather: fwd.Gather, stream: cuda.Stream) !Ptr {
@@ -448,6 +482,7 @@ pub const RoundRunner = struct {
             if (wd.position + wd.ids.len > wd.size or wd.position + wd.ids.len > rope_rows) return error.BadShape;
             if (self.engram != null and wd.host.len < wd.position + wd.ids.len) return error.BadShape;
         }
+        self.round_bucket = try self.bucketOf(windows);
         var r: usize = 0;
         for (windows) |wd| {
             for (wd.ids, 0..) |id, i| {
@@ -619,7 +654,7 @@ pub const RoundRunner = struct {
                 try self.fp4Store(self.lat2.ptr, hd, src.comp_codes.ptr, src.comp_scales.ptr, self.t_ctarget.ptr, R, 16, true, stream);
             }
             // -- the indexer: every visible compressed entry (short buckets: no scores) -------------------------
-            const nb_ = self.bucket / ratio;
+            const nb_ = self.round_bucket / ratio;
             kk = @min(c.idx_topk, nb_);
             if (c.isIndexSource(li)) {
                 if (nb_ > c.idx_topk) {
@@ -776,3 +811,34 @@ pub const RoundRunner = struct {
         try cuda.launch.launch(self.glue.copy_cols, .{ .grid = .{ .x = @intCast((cols + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
     }
 };
+
+test "a round's bucket is graph.py bucket_for: a power of two holding the deepest row, at least the least, at most the pool's" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 1024), bucketFor(1, 1 << 20, bucket_min));
+    try t.expectEqual(@as(usize, 1024), bucketFor(1024, 1 << 20, bucket_min));
+    try t.expectEqual(@as(usize, 2048), bucketFor(1025, 1 << 20, bucket_min));
+    try t.expectEqual(@as(usize, 1 << 20), bucketFor((1 << 19) + 1, 1 << 20, bucket_min));
+    // a pool narrower than the power of two: its capacity (the fork's min(b, max(cap, BUCKET_MIN)))
+    try t.expectEqual(@as(usize, 4120), bucketFor(4100, 4120, bucket_min));
+    try t.expectEqual(@as(usize, 1024), bucketFor(100, 600, bucket_min));
+    // the least bucket the pool's widest: every round scans the whole pool
+    try t.expectEqual(@as(usize, 1 << 20), bucketFor(7, 1 << 20, 1 << 20));
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    for (0..2000) |_| {
+        const cap = rnd.intRangeAtMost(usize, 1, 1 << 21);
+        const deep = rnd.intRangeAtMost(usize, 1, cap);
+        const b = bucketFor(deep, cap, bucket_min);
+        try t.expect(b >= deep and b >= bucket_min and b <= @max(cap, bucket_min));
+        try t.expect(std.math.isPowerOfTwo(b) or b == cap);
+        // the smallest such: half of it does not hold the row
+        if (b > bucket_min) try t.expect(b / 2 < deep);
+    }
+    // monotone in the deepest row over one pool
+    var last: usize = 0;
+    for (1..70000) |deep| {
+        const b = bucketFor(deep, 65536 + 24, bucket_min);
+        try t.expect(b >= last);
+        last = b;
+    }
+}

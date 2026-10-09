@@ -224,7 +224,10 @@ const Supply = struct {
 /// stream's prompt and then its rows. TF_DS_ROUNDS_CAP sizes the pool for that many positions instead of the
 /// fixture's cap (the windows stay where the fixture put them), with the RoPE tables of `ropeRows(cap)` rows from
 /// TF_DS_ROPE_DIR (`rope_{c,w}_<rows>.bin`, dump_rope.py) in place of the fixture's; their first rows are compared
-/// with the fixture's tables.
+/// with the fixture's tables, and the runner may scan up to the cap's bucket: the round must pick the fixture's
+/// bucket from its windows (cuda_rounds.zig `bucketOf`). TF_DS_ROUNDS_TIME=<reps> then times rounds of 1 and 16
+/// noise rows on slot 0 (no Engram, the gathers local) at position 0 and at the cap's bucket, each also with every
+/// round scanning the cap's bucket whole.
 pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, aot_override: ?[]const u8, rank_arg: ?[]const u8) !void {
     const rank: usize = if (rank_arg) |r| try std.fmt.parseInt(usize, r, 10) else 0;
     const other: usize = 1 - rank;
@@ -245,7 +248,8 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     try check.expect(world == 2, "the fixture's world is {d}; this test supplies one other rank", .{world});
     const slots: usize = @intCast(try fx.int("slots"));
     const cap: usize = if (getenv("TF_DS_ROUNDS_CAP")) |v| try std.fmt.parseInt(usize, v, 10) else @intCast(try fx.int("cap"));
-    const bucket: usize = @intCast(try fx.int("bucket"));
+    const fx_bucket: usize = @intCast(try fx.int("bucket"));
+    const bucket: usize = if (getenv("TF_DS_ROUNDS_CAP") != null) @max(Rounds.bucket_min, try std.math.ceilPowerOfTwo(usize, cap)) else fx_bucket;
     var kernels = try exl3.Kernels.load(gpu.d);
     defer kernels.deinit();
     var ek = try dsv41.experts.Kernels.load(gpu.d);
@@ -353,6 +357,8 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     const gather: F.Gather = .{ .ctx = &supply, .call = Supply.gather };
     const logits = try runner.forward(windows[0..n_windows], gather, h.stream);
     try h.stream.synchronize();
+    try check.expect(runner.round_bucket == fx_bucket, "dsv41 rounds: the round scanned a bucket of {d} positions, the fork's {d}", .{ runner.round_bucket, fx_bucket });
+    check.pass("dsv41 rounds: the round scans the fork's bucket of {d} positions (the runner's widest {d})", .{ runner.round_bucket, runner.bucket });
     for (supply.names.items, supply.probes.items) |name, buf| try h.stage(name, buf.ptr);
     try h.stage("logits", logits);
     for (0..layers) |li| {
@@ -376,6 +382,55 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         }
     }
     try check.expect(h.failures == 0, "dsv41-rounds: {d} stage(s) differ from the Python fork", .{h.failures});
+    if (getenv("TF_DS_ROUNDS_TIME")) |v| try timeRounds(gpu, &runner, cap, try std.fmt.parseInt(usize, v, 10), h.stream);
+}
+
+/// A gather of one rank's partial into both ranks' places (timing only: the bits are not compared).
+const Echo = struct {
+    d: *const cuda.Driver,
+
+    fn gather(ctx: *anyopaque, partial: cuda.abi.DevicePtr, words: usize, out: cuda.abi.DevicePtr, stream: cuda.Stream) anyerror!void {
+        const self: *Echo = @ptrCast(@alignCast(ctx));
+        const dst: cuda.DeviceBuffer = .{ .d = self.d, .ptr = out, .len = 2 * words * 4 };
+        try dst.copyFrom(0, partial, words * 4, stream.handle);
+        try dst.copyFrom(words * 4, partial, words * 4, stream.handle);
+    }
+};
+
+/// Rounds of 1 and 16 noise rows on slot 0 over the whole pool, at position 0 and at the widest bucket's end, each
+/// with the least bucket graph.py's and the widest (every round scanning the pool whole): the best of `reps`
+/// after a warm-up, in ms.
+fn timeRounds(gpu: Gpu, runner: *Rounds.RoundRunner, cap: usize, reps: usize, stream: cuda.Stream) !void {
+    runner.probe = null;
+    runner.engram = null;
+    var echo: Echo = .{ .d = gpu.d };
+    const gather: F.Gather = .{ .ctx = &echo, .call = Echo.gather };
+    const ids: [Rounds.max_rows]i64 = @splat(1);
+    const rope_rows = @min(runner.rope_c.rows, runner.rope_w.rows);
+    const least = runner.least;
+    defer runner.least = least;
+    for ([_]usize{ least, runner.bucket }) |lb| {
+        runner.least = lb;
+        for ([_]usize{ 1, Rounds.max_rows }) |rows| {
+            const deep = @min(@min(cap, rope_rows), runner.bucket) - rows;
+            for ([_]usize{ 0, deep }) |p| {
+                const w = [1]Rounds.Window{.{ .slot = 0, .base = 0, .size = cap, .position = p, .ids = ids[0..rows] }};
+                var best: f64 = std.math.inf(f64);
+                for (0..reps + 1) |rep| {
+                    try stream.synchronize();
+                    var t0: std.c.timespec = undefined;
+                    _ = std.c.clock_gettime(.MONOTONIC, &t0);
+                    _ = try runner.forward(&w, gather, stream);
+                    try stream.synchronize();
+                    var t1: std.c.timespec = undefined;
+                    _ = std.c.clock_gettime(.MONOTONIC, &t1);
+                    const ms = @as(f64, @floatFromInt((t1.sec - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec))) / 1e6;
+                    if (rep > 0) best = @min(best, ms);
+                }
+                std.debug.print("dsv41-rounds time: cap {d}, least bucket {d}: {d} row(s) at position {d} scan bucket {d}: {d:.3} ms\n", .{ cap, lb, rows, p, runner.round_bucket, best });
+            }
+        }
+    }
 }
 
 fn getenv(name: [:0]const u8) ?[]const u8 {

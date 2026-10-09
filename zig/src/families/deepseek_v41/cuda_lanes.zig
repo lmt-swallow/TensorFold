@@ -1192,14 +1192,29 @@ pub const Streams = struct {
     }
 
     /// The timing step's round: `rows` noise ids at position 0 of slot 0 over the whole window (no stream's state
-    /// changes; every slot must be free: a later admission rewrites every row a later row reads).
+    /// changes; every slot must be free: a later admission rewrites every row a later row reads). It scans the
+    /// least bucket.
     pub fn probeRound(self: *Streams, gather: forward.Gather, rows: usize) !void {
-        var ids: [max_rows]i64 = @splat(@intCast(self.cfg.dspark_noise));
-        const w = [1]rounds.Window{.{ .slot = 0, .base = 0, .size = self.extents.total, .position = 0, .ids = ids[0..rows] }};
+        try self.probeRoundAt(gather, rows, 0);
+    }
+
+    /// The deepest position a probe round of `rows` rows can take whose bucket is the runner's widest (or the
+    /// window's end, for a window narrower than it).
+    pub fn probeDeep(self: *const Streams, rows: usize) usize {
+        const rope_rows = @min(self.runner.rope_c.rows, self.runner.rope_w.rows);
+        return @min(@min(self.extents.total, rope_rows), self.runner.bucket) -| rows;
+    }
+
+    /// `probeRound` with its rows at `position` .. `position + rows - 1`: the round scans their bucket.
+    pub fn probeRoundAt(self: *Streams, gather: forward.Gather, rows: usize, position: usize) !void {
+        const noise: i32 = @intCast(self.cfg.dspark_noise);
+        var ids: [max_rows]i64 = @splat(noise);
+        const w = [1]rounds.Window{.{ .slot = 0, .base = 0, .size = self.extents.total, .position = position, .ids = ids[0..rows] }};
         if (self.engram != null) {
-            for (self.lanes[0].hist[0..rows]) |*h| h.* = @intCast(self.cfg.dspark_noise);
+            // the rows' n-grams reach before them: noise there too (the history is otherwise unset)
+            @memset(self.lanes[0].hist[position -| 64 .. position + rows], noise);
             var hw = w;
-            hw[0].host = self.lanes[0].hist[0..rows];
+            hw[0].host = self.lanes[0].hist[0 .. position + rows];
             self.logits = try self.runner.forward(&hw, gather, self.stream);
         } else self.logits = try self.runner.forward(&w, gather, self.stream);
     }
@@ -1249,9 +1264,11 @@ pub const Engine = struct {
     ds: ?weights.DSpark,
     stages: []dspark.Stage,
     drafter: ?*dspark.Drafter,
-    /// A round's ms by rows (index rows - 1) and a batched draft's by streams (index streams - 1), timed at load by
-    /// the `measure` step (rank 0's clock).
+    /// A round's ms by rows (index rows - 1) at the least bucket and a batched draft's by streams (index streams -
+    /// 1), timed at load by the `measure` step (rank 0's clock).
     round_ms: [max_rows]f64,
+    /// A round's ms of 1 and `max_rows` rows at the widest bucket (the context's), the same step's.
+    round_deep_ms: [2]f64,
     draft_ms: [max_slots]f64,
     streams: Streams,
     /// Prompt rows a chunk (the settings' chunk, at most the context).
@@ -1322,6 +1339,7 @@ pub const Engine = struct {
         e.stages = &.{};
         e.drafter = null;
         e.round_ms = @splat(0);
+        e.round_deep_ms = @splat(0);
         e.draft_ms = @splat(0);
         errdefer e.freeDrafter();
         if (s.drafts) {
@@ -1471,22 +1489,15 @@ pub const Engine = struct {
         }
     }
 
-    /// The measure step (every rank): rounds of 1 .. max_rows rows at position 0 of slot 0, then batched drafts
-    /// of 1 .. draftBatch streams, each timed after a warm-up run. Rank 0 keeps the times.
+    /// The measure step (every rank): rounds of 1 .. max_rows rows at position 0 of slot 0 (the least bucket), of
+    /// 1 and max_rows rows at the widest bucket (`probeDeep`), then batched drafts of 1 .. draftBatch streams, each
+    /// timed after a warm-up run. Rank 0 keeps the times. The positions follow from the record's window alone, so
+    /// every rank runs the same buckets.
     fn runMeasure(e: *Engine, m: Measure) !void {
         const reps: usize = @max(m.reps, 1);
         const st = &e.streams;
-        for (1..max_rows + 1) |n| {
-            var best: f64 = std.math.inf(f64);
-            for (0..reps + 1) |rep| {
-                try e.stream.synchronize();
-                const t0 = nowNs();
-                try st.probeRound(e.gather(), n);
-                try e.stream.synchronize();
-                if (rep > 0) best = @min(best, msSince(t0));
-            }
-            e.round_ms[n - 1] = best;
-        }
+        for (1..max_rows + 1) |n| e.round_ms[n - 1] = try e.timeRound(reps, n, 0);
+        for ([_]usize{ 1, max_rows }, &e.round_deep_ms) |n, *ms| ms.* = try e.timeRound(reps, n, st.probeDeep(n));
         if (st.spark) |sp| {
             const most = @min(draftBatch(sp.dims.block), st.lanes.len);
             for (1..most + 1) |n| {
@@ -1501,6 +1512,19 @@ pub const Engine = struct {
                 e.draft_ms[n - 1] = best;
             }
         }
+    }
+
+    /// The best of `reps` probe rounds of `rows` rows at `position` (after a warm-up one), in ms.
+    fn timeRound(e: *Engine, reps: usize, rows: usize, position: usize) !f64 {
+        var best: f64 = std.math.inf(f64);
+        for (0..reps + 1) |rep| {
+            try e.stream.synchronize();
+            const t0 = nowNs();
+            try e.streams.probeRoundAt(e.gather(), rows, position);
+            try e.stream.synchronize();
+            if (rep > 0) best = @min(best, msSince(t0));
+        }
+        return best;
     }
 
     /// Whether this rank can run `op` as recorded (the checks each step's run makes before its first collective).
@@ -1689,7 +1713,7 @@ pub const Lanes = struct {
             c.* = .{ .width = @intCast(rows), .ms = ms };
         }
         for (&self.window_costs, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
-        std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms, batched drafts of 1..{d} streams {any} ms", .{ max_rows, e.round_ms, max_slots, e.draft_ms });
+        std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket ({d} and {d} rows {any} ms at the {d}-position bucket), batched drafts of 1..{d} streams {any} ms", .{ max_rows, e.round_ms, rounds.bucket_min, 1, max_rows, e.round_deep_ms, e.streams.runner.bucket, max_slots, e.draft_ms });
     }
 
     pub fn facts(self: *const Lanes) lanes.Model {
