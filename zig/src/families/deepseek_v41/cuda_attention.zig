@@ -316,7 +316,7 @@ pub const Attention = struct {
     /// the caches updated as the fork's; `self.cidx` holds the picks. Synchronous at the top-k (a host read).
     /// `picks`: the index layer's picks a layer without an indexer reads (required when the layer is compressed and
     /// not an index source); an index source makes its own (`self.picks()`).
-    pub fn forward(self: *Attention, p: Params, c: *const Caches, rope: Rope, x: Ptr, n: usize, start: usize, picks: ?Picks, stream: cuda.Stream) !Ptr {
+    pub fn forward(self: *Attention, p: Params, c: *const Caches, rope: Rope, x: Ptr, n: usize, start: usize, given: ?Picks, stream: cuda.Stream) !Ptr {
         const dm = self.dims;
         if (n < 1 or n > dm.max_rows) return error.TooManyRows;
         const ratio = dm.ratio;
@@ -439,10 +439,10 @@ pub const Attention = struct {
         {
             const groups_h = dm.heads / 16;
             const has = ratio > 0; // no compressed source: the wrapper passes the window source (bf16) for COMP and CSC
-            const pk: Picks = if (dm.index_source) .{ .cidx = self.cidx.ptr, .kk = dm.kk() } else if (has) (picks orelse return error.BadShape) else .{ .cidx = self.pos.ptr, .kk = 0 };
+            const pk: Picks = if (dm.index_source) .{ .cidx = self.cidx.ptr, .kk = dm.kk() } else if (has) (given orelse return error.BadShape) else .{ .cidx = self.pos.ptr, .kk = 0 };
             const kk = pk.kk;
-            const picks: usize = if (has) (kk + 31) / 32 else 0;
-            const nblk: usize = dm.window / 32 + picks;
+            const pick_blocks: usize = if (has) (kk + 31) / 32 else 0;
+            const nblk: usize = dm.window / 32 + pick_blocks;
             const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dm.hd))));
             try self.set.run(stream, "_sparse_attn_part", .{ @intCast(n), @intCast(groups_h), 8 }, &.{
                 aot.ptr("Q", "*bf16", self.q.ptr),       aot.ptr("WSRC", "*bf16", c.ring.ptr),
