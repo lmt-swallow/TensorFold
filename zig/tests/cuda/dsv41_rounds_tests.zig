@@ -189,9 +189,12 @@ const Supply = struct {
         const other = self.rank1.items[self.next];
         self.next += 1;
         if (other.len != words * 4) return error.GatherShape;
+        // rank order: this rank's partial sits at its own index of the gathered [world, words]
         const dst: cuda.DeviceBuffer = .{ .d = self.gpu.d, .ptr = out, .len = 2 * words * 4 };
-        try dst.copyFrom(0, partial, words * 4, stream.handle);
-        try dst.copyFrom(words * 4, other.ptr, words * 4, stream.handle);
+        const mine: usize = self.rank * words * 4;
+        const theirs: usize = (1 - self.rank) * words * 4;
+        try dst.copyFrom(mine, partial, words * 4, stream.handle);
+        try dst.copyFrom(theirs, other.ptr, words * 4, stream.handle);
     }
 
     fn probe(ctx: *anyopaque, name: []const u8, ptr: cuda.abi.DevicePtr, bytes: usize, stream: cuda.Stream) anyerror!void {
