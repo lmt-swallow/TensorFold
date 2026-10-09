@@ -159,7 +159,30 @@ def capture_kv_norm_rope(K, rec, out: Path, cache: Path, g: torch.Generator) -> 
     return {"hash": jit["hash"], "divisible16": jit["divisible16"], "metadata": jit["metadata"]}
 
 
-CAPTURES = {"rmsnorm": capture_rmsnorm, "kv_norm_rope": capture_kv_norm_rope}
+
+def capture_index_score_sweep(K, rec, out: Path, cache: Path, g: torch.Generator) -> dict:
+    """Every integer specialization of the prompt indexer's kernels (`_index_score_rows`, and `_index_score` at
+    decode rows): rows, n and nt each divisible by 16 or not, keyed and plain, so a served prompt of any length finds
+    its variant (Triton specializes ints on 16-divisibility and == 1)."""
+    ih, idim = 32, 128
+    done = 0
+    for rows in (1, 5, 16, 17, 32, 299, 683, 1365, 2048):
+        for n in (1, 16, 1024, 1039, 12288, 13312, 56044, 63715, 131072):
+            q = torch.randn(rows, ih, idim, generator=g, device=DEV).to(torch.bfloat16)
+            codes = torch.randint(0, 256, (max(n, 64), idim // 2), generator=g, device=DEV, dtype=torch.uint8)
+            scales = torch.randint(100, 140, (max(n, 64), idim // 32), generator=g, device=DEV, dtype=torch.uint8)
+            w = torch.randn(rows, ih, generator=g, device=DEV).to(torch.bfloat16)
+            vis = torch.full((rows,), n, dtype=torch.int64, device=DEV)
+            for keys in (False, True):
+                with rec.scope(f"index_score_rows_{rows}_{n}_{int(keys)}"):
+                    K.index_score(q, (codes, scales), w, vis, n, keys=keys, tmax=keys)
+                done += 1
+            torch.cuda.synchronize()
+            del q, codes, scales, w, vis
+    return {"launches": done}
+
+
+CAPTURES = {"rmsnorm": capture_rmsnorm, "kv_norm_rope": capture_kv_norm_rope, "index_score_sweep": capture_index_score_sweep}
 
 
 def main() -> int:
