@@ -7,8 +7,9 @@
 //!   fewer keep the row-invariant linear kernel (`mm` in model.py).
 //! - Attention (model.py `attention_k` with `ring_mode` off): the window keys assembled from the ring and the
 //!   chunk's rows (`wsrc`), the kv-source update over whole groups (`_compress`, `kv_source_update`), the indexer
-//!   in row blocks with the fp32 scores' top-k on the host (`topk_indices`, the candidate pool at the candidate
-//!   source and its mask after it), one attention launch a row (no key splits), the ring written last.
+//!   in row blocks of at most 64 MB of fp32 scores (model.py `rb`) with the top-k on the device (`topk_indices`,
+//!   the candidate pool at the candidate source and its mask after it: cuda_attention.zig's selection; the host
+//!   oracle under TF_DS_TOPK=host), one attention launch a row (no key splits), the ring written last.
 //! - The MoE gate's logits and the indexer's weights through cuBLAS fp32 GEMMs (torch's `x.float() @ w.t()`), the
 //!   route kernel on them, and the experts' prompt path (experts.py `routed` for 64 rows or more: member lists on the
 //!   device, the gate/up `grouped_mma` with its splits folded, the down `grouped_rows`, the epilogue and the combine).
@@ -296,6 +297,8 @@ pub const Prompt = struct {
     score: cuda.DeviceBuffer, // fp32 scores or int64 keys [rb, n_comp]
     tmax: cuda.DeviceBuffer, // int64 [rb, nt]: the keyed path's tile maxima (unread)
     cidx: cuda.DeviceBuffer, // int64 [rows, idx_topk]
+    cand: cuda.DeviceBuffer, // u8 [rows, cand cols]: the candidate pool of the chunk's rows (device selection)
+    smax: cuda.DeviceBuffer, // fp32 [rb, cand cols]: a row block's block maxima
     o: cuda.DeviceBuffer,
     og: cuda.DeviceBuffer,
     ug: cuda.DeviceBuffer,
@@ -417,6 +420,10 @@ pub const Prompt = struct {
         self.score = try cuda.DeviceBuffer.alloc(d, score_words * 8);
         self.tmax = try cuda.DeviceBuffer.alloc(d, @max(16, r * ((nb_max + 63) / 64) * 8));
         self.cidx = try cuda.DeviceBuffer.alloc(d, @max(16, r * (c.idx_topk + 16) * 8));
+        const cb = @max(1, c.cand_block);
+        const cand_cols_max = (nb_max + cb - 1) / cb;
+        self.cand = try cuda.DeviceBuffer.alloc(d, @max(16, r * cand_cols_max));
+        self.smax = try cuda.DeviceBuffer.alloc(d, @max(16, (score_words / cb + r) * 4));
         self.o = try cuda.DeviceBuffer.alloc(d, r * heads * c.head_dim * 2);
         const groups = c.o_groups / fwd.world;
         self.og = try cuda.DeviceBuffer.alloc(d, r * (heads * c.head_dim / groups) * 2);
@@ -459,7 +466,7 @@ pub const Prompt = struct {
     pub fn deinit(self: *Prompt) void {
         for (self.gate_w32) |*b| b.free();
         self.gpa.free(self.gate_w32);
-        inline for (.{ "had", "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "xh", "wq", "z", "pos", "vis", "gpos", "grows", "src_idx", "dst_idx", "wlo", "qa", "qr", "q", "ykv", "wsrc", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "x32", "wl", "wts", "score", "tmax", "cidx", "o", "og", "ug", "u", "out", "logits", "pick", "wts_moe", "moe", "xc", "local", "glog", "head_logits" }) |f| @field(self, f).free();
+        inline for (.{ "had", "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "xh", "wq", "z", "pos", "vis", "gpos", "grows", "src_idx", "dst_idx", "wlo", "qa", "qr", "q", "ykv", "wsrc", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "x32", "wl", "wts", "score", "tmax", "cidx", "cand", "smax", "o", "og", "ug", "u", "out", "logits", "pick", "wts_moe", "moe", "xc", "local", "glog", "head_logits" }) |f| @field(self, f).free();
         self.scratch.deinit();
         self.gemm.deinit();
         self.pk.deinit();
@@ -816,6 +823,9 @@ pub const Prompt = struct {
             .eps = c.eps,
             .bucket = self.fwd.bucket,
             .max_rows = self.fwd.max_rows,
+            .cand = attention.CandRole.of(c.cand_source, li, c.isIndexSource(li) and c.ratio(li) > 0),
+            .cand_blocks = c.cand_blocks,
+            .cand_block = @max(1, c.cand_block),
         };
     }
 
@@ -867,7 +877,7 @@ pub const Prompt = struct {
             a.add(@as(c_int, @intCast(n * c.idx_heads)));
             try cuda.launch.launch(fwd.glue.bf16_scale, .{ .grid = .{ .x = @intCast((n * c.idx_heads + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
         }
-        // scores in row blocks (the [rb, n_comp] matrix bounded), the top-k of each on the host
+        // scores in row blocks (the [rb, n_comp] matrix bounded), the top-k of each on the device (or the host)
         const rb = @max(16, @min(n, score_bytes_limit / (4 * @max(n_comp_end, 1))));
         const nt: usize = (n_comp_end + 63) / 64;
         const vis = self.tab[self.rows + 1 .. self.rows + 1 + n];
@@ -877,103 +887,81 @@ pub const Prompt = struct {
             self.cand_cols = (n_comp_end + c.cand_block - 1) / c.cand_block;
             self.cand_rows = n;
         } else if (after_cand and self.cand_rows != n) return error.NoCandidateSource;
-        // (switch "prompt_keys") layers before the candidate source with a power-of-two k: the score kernel writes
-        // topk_indices' int64 keys (and tile maxima) instead of scores; the selection is the same set either way
-        const keyed = !is_cand_source and !after_cand and (kk & (kk - 1)) == 0;
+        const host = fwd.glue.hostSelect();
+        // (switch "prompt_keys") layers before the candidate source with a power-of-two k: the fork's score kernel
+        // writes topk_indices' int64 keys (and tile maxima) instead of scores; the selection is the same set either
+        // way, so the device selection always takes the scores
+        const keyed = host and !is_cand_source and !after_cand and (kk & (kk - 1)) == 0;
+        const cb = @max(1, c.cand_block);
+        const ccols = (n_comp_end + cb - 1) / cb;
         var r0: usize = 0;
         while (r0 < n) : (r0 += rb) {
             const r1 = @min(n, r0 + rb);
             const rows = r1 - r0;
-            try fwd.set.run(stream, "_index_score_rows", .{ @intCast((rows + 7) / 8), @intCast(nt), 1 }, &.{
-                aot.ptr("Q", "*bf16", self.iqq.ptr + r0 * c.idx_heads * c.idx_dim * 2), aot.ptr("K", "*u8", caches.idxk_codes.ptr),
-                aot.ptr("KS", "*u8", caches.idxk_scales.ptr),                              aot.ptr("Wt", "*bf16", self.wts.ptr + r0 * c.idx_heads * 2),
-                aot.ptr("VIS", "*i64", self.vis.ptr + r0 * 8),                             aot.ptr("OUT", if (keyed) "*i64" else "*fp32", self.score.ptr),
-                aot.int("n", @intCast(n_comp_end)),                                        aot.int("rows", @intCast(rows)),
-                aot.ptr("TMAX", if (keyed) "*i64" else "*fp32", if (keyed) self.tmax.ptr else self.score.ptr), aot.int("nt", @intCast(nt)),
-            }, &.{ aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64), aot.ci("RB", 8), aot.ci("PACKED", 1), aot.ci("KEYS", @intFromBool(keyed)), aot.ci("HAS_TMAX", @intFromBool(keyed)) });
+            const q = self.iqq.ptr + r0 * c.idx_heads * c.idx_dim * 2;
+            const wt = self.wts.ptr + r0 * c.idx_heads * 2;
+            const vr = self.vis.ptr + r0 * 8;
+            if (rows <= decode_rows) {
+                // kernels.index_score: a block of decode rows takes one row a program (the same kernel as a window)
+                try fwd.set.run(stream, "_index_score", .{ @intCast(rows), @intCast(nt), 1 }, &.{
+                    aot.ptr("Q", "*bf16", q),                     aot.ptr("K", "*u8", caches.idxk_codes.ptr),  aot.ptr("KS", "*u8", caches.idxk_scales.ptr),
+                    aot.ptr("Wt", "*bf16", wt),                   aot.ptr("VIS", "*i64", vr),                  aot.ptr("OUT", if (keyed) "*i64" else "*fp32", self.score.ptr),
+                    aot.int("n", @intCast(n_comp_end)),           aot.ptr("KB", "*i64", vr),                   aot.ptr("CAND", "*i64", vr),
+                    aot.int("cs", 0),                             aot.ptr("TMAX", if (keyed) "*i64" else "*fp32", if (keyed) self.tmax.ptr else self.score.ptr), aot.int("nt", @intCast(nt)),
+                }, &.{
+                    aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64),      aot.ci("PACKED", 1),
+                    aot.ci("HAS_BASE", 0),                aot.ci("PDL", 1),                  aot.ci("HAS_CAND", 0), aot.ci("CB", 8),
+                    aot.ci("KEYS", @intFromBool(keyed)),  aot.ci("HAS_TMAX", @intFromBool(keyed)), aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
+                });
+            } else {
+                try fwd.set.run(stream, "_index_score_rows", .{ @intCast((rows + 7) / 8), @intCast(nt), 1 }, &.{
+                    aot.ptr("Q", "*bf16", q),                     aot.ptr("K", "*u8", caches.idxk_codes.ptr),
+                    aot.ptr("KS", "*u8", caches.idxk_scales.ptr), aot.ptr("Wt", "*bf16", wt),
+                    aot.ptr("VIS", "*i64", vr),                   aot.ptr("OUT", if (keyed) "*i64" else "*fp32", self.score.ptr),
+                    aot.int("n", @intCast(n_comp_end)),           aot.int("rows", @intCast(rows)),
+                    aot.ptr("TMAX", if (keyed) "*i64" else "*fp32", if (keyed) self.tmax.ptr else self.score.ptr), aot.int("nt", @intCast(nt)),
+                }, &.{ aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64), aot.ci("RB", 8), aot.ci("PACKED", 1), aot.ci("KEYS", @intFromBool(keyed)), aot.ci("HAS_TMAX", @intFromBool(keyed)) });
+            }
+            if (!host) {
+                const tg = &fwd.glue.topk.?;
+                const mask = self.cand.ptr + r0 * ccols;
+                if (is_cand_source) try tg.candidates(self.score.ptr, n_comp_end, rows, n_comp_end, vr, c.cand_blocks, cb, self.smax.ptr, mask, ccols, stream);
+                if (after_cand) try tg.apply(self.score.ptr, n_comp_end, rows, n_comp_end, mask, ccols, cb, stream);
+                try tg.topk(self.score.ptr, n_comp_end, rows, n_comp_end, kk, vr, self.cidx.ptr + r0 * kk * 8, kk, stream);
+                continue;
+            }
             try stream.synchronize();
             if (keyed) {
                 const keys = std.mem.bytesAsSlice(i64, @as([]align(8) u8, @alignCast(std.mem.sliceAsBytes(self.score_h[0 .. rows * n_comp_end * 2]))));
                 try self.score.download(0, std.mem.sliceAsBytes(keys));
                 for (0..rows) |i| {
                     const r = r0 + i;
-                    self.topkKeys(keys[i * n_comp_end .. (i + 1) * n_comp_end], kk, vis[r], self.cidx_h[r * kk .. (r + 1) * kk]);
+                    attention.hostTopkKeys(keys[i * n_comp_end .. (i + 1) * n_comp_end], kk, vis[r], self.cidx_h[r * kk .. (r + 1) * kk]);
                 }
             } else {
                 try self.score.download(0, std.mem.sliceAsBytes(self.score_h[0 .. rows * n_comp_end]));
                 for (0..rows) |i| {
                     const r = r0 + i;
                     const row = self.score_h[i * n_comp_end .. (i + 1) * n_comp_end];
-                    if (is_cand_source) self.candidates(r, row, n_comp_end, c.cand_blocks, c.cand_block);
-                    if (after_cand) self.applyCandidates(r, row, n_comp_end, c.cand_block);
-                    self.topkRow(row, kk, vis[r], self.cidx_h[r * kk .. (r + 1) * kk]);
+                    const mask = self.cand_h[r * self.cand_cols .. (r + 1) * self.cand_cols];
+                    if (is_cand_source) attention.hostCandidates(row, vis[r], c.cand_blocks, cb, self.keys_h, mask);
+                    if (after_cand) attention.hostApplyCandidates(row, mask, cb);
+                    attention.hostTopk(row, kk, vis[r], self.keys_h, self.cidx_h[r * kk .. (r + 1) * kk]);
                 }
             }
         }
-        try self.cidx.uploadAsync(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]), stream.handle);
+        if (host) try self.cidx.uploadAsync(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]), stream.handle);
         self.cidx_cols = kk;
         self.cidx_stride = kk;
-    }
-
-    /// kernels.topk_indices on one row: the kk highest scores' indices ascending (ties to the lower index, torch's
-    /// total-order key), -1 at or past the row's visible count.
-    fn topkRow(self: *Prompt, row: []const f32, kk: usize, vis: i64, out: []i64) void {
-        const n = row.len;
-        for (row, 0..) |s, j| self.keys_h[j] = attention.key(s, j);
-        std.sort.pdq(i64, self.keys_h[0..n], {}, std.sort.desc(i64));
-        for (self.keys_h[0..kk], 0..) |kv, i| out[i] = 0xFFFFFFFF - (kv & 0xFFFFFFFF);
-        std.sort.pdq(i64, out, {}, std.sort.asc(i64));
-        for (out) |*v| if (v.* >= vis) {
-            v.* = -1;
-        };
-    }
-
-    /// kernels.topk_select on one row of the score kernel's int64 keys (the same keys topkRow builds): the kk
-    /// largest keys' indices ascending, -1 at or past the row's visible count.
-    fn topkKeys(self: *Prompt, keys: []const i64, kk: usize, vis: i64, out: []i64) void {
-        @memcpy(self.keys_h[0..keys.len], keys);
-        std.sort.pdq(i64, self.keys_h[0..keys.len], {}, std.sort.desc(i64));
-        for (self.keys_h[0..kk], 0..) |kv, i| out[i] = 0xFFFFFFFF - (kv & 0xFFFFFFFF);
-        std.sort.pdq(i64, out, {}, std.sort.asc(i64));
-        for (out) |*v| if (v.* >= vis) {
-            v.* = -1;
-        };
-    }
-
-    /// model.py _candidates on one row: the block mask of the `nblocks` blocks of `bsize` entries with the largest
-    /// maxima (the newest, partly filled block pinned in; blocks of -inf alone excluded).
-    fn candidates(self: *Prompt, r: usize, row: []const f32, n: usize, nblocks: usize, bsize: usize) void {
-        const nb = (n + bsize - 1) / bsize;
-        const last: usize = @intCast(@divFloor(@max(self.tab[self.rows + 1 + r] - 1, 0), @as(i64, @intCast(bsize))));
-        const mask = self.cand_h[r * self.cand_cols .. (r + 1) * self.cand_cols];
-        @memset(mask, 0);
-        for (0..nb) |b| {
-            var m: f32 = -std.math.inf(f32);
-            for (row[b * bsize .. @min(n, (b + 1) * bsize)]) |v| m = @max(m, v);
-            if (b == last) m = std.math.inf(f32);
-            self.keys_h[b] = attention.key(m, b);
-        }
-        std.sort.pdq(i64, self.keys_h[0..nb], {}, std.sort.desc(i64));
-        const neg_inf_hi = attention.key(-std.math.inf(f32), 0) >> 32;
-        for (self.keys_h[0..@min(nblocks, nb)]) |kv| {
-            const b: usize = @intCast(0xFFFFFFFF - (kv & 0xFFFFFFFF));
-            if ((kv >> 32) != neg_inf_hi) mask[b] = 1;
-        }
-    }
-
-    /// model.py apply_candidates on one row: -inf outside the pool's blocks.
-    fn applyCandidates(self: *Prompt, r: usize, row: []f32, n: usize, bsize: usize) void {
-        const mask = self.cand_h[r * self.cand_cols .. (r + 1) * self.cand_cols];
-        for (row, 0..) |*v, t| if (mask[t / bsize] == 0) {
-            v.* = -std.math.inf(f32);
-        };
-        _ = n;
+        var nbuf: [32]u8 = undefined;
+        try self.probeOut(try std.fmt.bufPrint(&nbuf, "L{d}.cidx", .{li}), self.cidx.ptr, n * kk * 8, stream);
     }
 
     /// cidx [n, n_idx] -> [n, n_pad] with -1 past n_idx (torch.nn.functional.pad): rows moved from the back, in place
     /// on the host copy too, so once a chunk (the layers after the index layer read the padded list as it is).
     fn padCidx(self: *Prompt, n: usize, n_idx: usize, n_pad: usize, stream: cuda.Stream) !void {
         try stream.synchronize();
+        if (!self.fwd.glue.hostSelect() and self.cidx_stride == n_idx) try self.cidx.download(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * n_idx]));
         var r: usize = n;
         while (r > 0) {
             r -= 1;

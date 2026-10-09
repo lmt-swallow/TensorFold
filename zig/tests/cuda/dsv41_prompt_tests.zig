@@ -4,7 +4,9 @@
 //! every gather; for each chunk size the fixture holds (2048: one chunk, 512: a chunk and a tail), every chunk's
 //! mixes' inputs, both sublayers' streams, this rank's partials and the cache planes after it, then the last row's
 //! logits, byte-equal to the fork's. A fixture dumped with `--engram` runs Engram on its layers as dsv41-forward does
-//! (TF_DS_ENGRAM, TF_DS_TOKEN_MAP), the host ids the whole prompt's.
+//! (TF_DS_ENGRAM, TF_DS_TOKEN_MAP), the host ids the whole prompt's. A lean fixture (`dump_prompt.py --lean`, long
+//! prompts) holds every chunk's other-rank partials and index picks but the rest only for the last chunk: what it
+//! does not hold is not compared (a rank-0 run).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -30,6 +32,8 @@ const Supply = struct {
     next: usize = 0,
     probes: std.StringArrayHashMapUnmanaged(cuda.DeviceBuffer),
     prefix: []const u8 = "",
+    fx: ?*const Fixture = null, // drop the debug probes this fixture does not hold (in a lean one, any such probe)
+    lean: bool = false,
 
     fn gather(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
         const self: *Supply = @ptrCast(@alignCast(ctx));
@@ -46,6 +50,10 @@ const Supply = struct {
         const self: *Supply = @ptrCast(@alignCast(ctx));
         const key = try std.fmt.allocPrint(self.gpu.gpa, "{s}{s}", .{ if (std.mem.startsWith(u8, name, "head.")) "" else self.prefix, name });
         if (self.rank == 1 and std.mem.endsWith(u8, key, ".r0")) key[key.len - 1] = '1';
+        if (self.fx) |fx| if ((self.lean or std.mem.indexOf(u8, key, ".dbg.") != null) and !holds(fx.*, key)) {
+            self.gpu.gpa.free(key);
+            return;
+        };
         var buf = try cuda.DeviceBuffer.alloc(self.gpu.d, bytes);
         try buf.copyFrom(0, ptr, bytes, stream.handle);
         try self.probes.put(self.gpu.gpa, key, buf);
@@ -83,12 +91,13 @@ fn same(gpu: Gpu, fx: Fixture, got: cuda.DeviceBuffer, name: []const u8, label: 
     return true;
 }
 
-/// Whether the fixture holds `expected_<name>` (the debug probes exist only where the fixture recorded them).
-fn has(gpu: Gpu, fx: Fixture, name: []const u8) bool {
-    var nb: [128]u8 = undefined;
-    const b = fx.bytes(std.fmt.bufPrint(&nb, "expected_{s}", .{name}) catch return false) catch return false;
-    gpu.gpa.free(b);
-    return true;
+/// Whether the fixture holds `expected_<name>` (the debug probes exist only where the fixture recorded them; a lean
+/// fixture holds the chunks before the last only in part).
+fn holds(fx: Fixture, name: []const u8) bool {
+    var nb: [160]u8 = undefined;
+    const key = std.fmt.bufPrint(&nb, "expected_{s}", .{name}) catch return false;
+    const arrays = (fx.parsed.value.object.get("arrays") orelse return false).object;
+    return arrays.contains(key);
 }
 
 fn resetCaches(fwd: *dsv41.forward.Forward) !void {
@@ -200,7 +209,10 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
             try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_moe.r{d}", .{ ci, li, other })));
         };
         if (whole) try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_head.local.r{d}", .{other})));
+        supply.fx = &fx;
+        supply.lean = (fx.int("lean") catch 0) != 0;
         var ok = true;
+        var picks: usize = 0;
         var logits: ?Ptr = null;
         var prefix_buf: [16]u8 = undefined;
         var s: usize = 0;
@@ -212,6 +224,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
             try stream.synchronize();
             // the caches after this chunk: every row but the compressed planes' scratch row
             for (0..layers) |li| {
+                if (!holds(fx, try std.fmt.bufPrint(&nb, "C{d}.L{d}.ring", .{ ci, li }))) continue;
                 ok = same(gpu, fx, fwd.rings[li], try std.fmt.bufPrint(&nb, "C{d}.L{d}.ring", .{ ci, li }), label, 0) and ok;
                 if (fwd.planes[li]) |*p| {
                     const kept = p.rows - 1;
@@ -235,8 +248,8 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         var pit = supply.probes.iterator();
         while (pit.next()) |pe| {
             if (!whole and std.mem.startsWith(u8, pe.key_ptr.*, "head.")) continue;
-            if (std.mem.indexOf(u8, pe.key_ptr.*, ".dbg.") != null and !has(gpu, fx, pe.key_ptr.*)) continue;
             ok = same(gpu, fx, pe.value_ptr.*, pe.key_ptr.*, label, 0) and ok;
+            if (std.mem.endsWith(u8, pe.key_ptr.*, ".cidx")) picks += 1;
         }
         if (whole) {
             if (logits) |lg| {
@@ -247,7 +260,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
                 ok = false;
             }
         }
-        if (ok) check.pass("BITEXACT {s}: {d} chunk(s) over {d} tokens through {d} of {d} layers: the mixes, partials, streams and caches{s} equal to the Python fork's", .{ label, n_chunks, prompt_len, layers, fixture_layers, if (whole) " and the last row's logits" else "" });
+        if (ok) check.pass("BITEXACT {s}: {d} chunk(s) over {d} tokens through {d} of {d} layers: the mixes, partials, streams, {d} index layers' picks and caches{s} equal to the Python fork's", .{ label, n_chunks, prompt_len, layers, fixture_layers, picks, if (whole) " and the last row's logits" else "" });
         if (!ok) failures += 1;
     }
     try check.expect(failures == 0, "{d} prompt case(s) differ from the fork", .{failures});

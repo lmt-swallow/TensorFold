@@ -19,6 +19,7 @@ const dsv41_dspark_tests = @import("dsv41_dspark_tests.zig");
 const dsv41_rounds_tests = @import("dsv41_rounds_tests.zig");
 const dsv41_lanes_tests = @import("dsv41_lanes_tests.zig");
 const dsv41_parallel_tests = @import("dsv41_parallel_tests.zig");
+const dsv41_topk_tests = @import("dsv41_topk_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -36,6 +37,7 @@ const usage =
     \\  dsv41-attn <dir>          DSV4.1 attention sublayer (decode rows) against the fork's fixture (dsv41/dump_attention.py)
     \\  dsv41-forward <dir> <rank-cache-dir> <model-dir> [rank] [layers|all] [aot-dir]  DSV4.1 layer loop against the fork's fixture (dsv41/dump_forward.py)
     \\  dsv41-prompt <dir> <rank-cache-dir> <model-dir> [rank] [layers]  DSV4.1 prompt path (chunks of 2048 and 512) against the fork's fixture (dsv41/dump_prompt.py)
+    \\  dsv41-topk [aot-dir]      DSV4.1 indexer selection on the device (top-k, candidate pool, its mask) against the host oracle
     \\  dsv41-lanes-prefill <dir> <rank-cache-dir> <model-dir> <rank> [aot-dir]  DSV4.1 served engine's prefill step and a round against the fork's fixture (dsv41/dump_prompt.py --decode)
     \\  dsv41-lanes-spec <dir> <rank-cache-dir> <model-dir> <rank> [aot-dir]  DSV4.1 served engine's drafted rounds (DSpark draft, verify, keep) against the fork's fixture (dsv41/dump_spec.py)
     \\  dsv41-lanes-parallel <dir> <rank-cache-dir> <model-dir> <rank> [aot-dir]  DSV4.1 served engine's concurrent streams (admissions, batched drafts, one shared round, keeps) against the fork's fixture (dsv41/dump_lanes_parallel.py)
@@ -102,6 +104,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "dsv41-dspark")) return dsv41_dspark_tests.dspark(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "dsv41-draft-pool")) return dsv41_rounds_tests.draftPool(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "dsv41-rounds")) return dsv41_rounds_tests.rounds(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), if (rest.len > 3) rest[3] else null, if (rest.len > 4) rest[4] else null);
+    if (std.mem.eql(u8, cmd, "dsv41-topk")) return dsv41_topk_tests.topk(gpu, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "dsv41-lanes-prefill")) return dsv41_lanes_tests.prefill(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);
     if (std.mem.eql(u8, cmd, "dsv41-lanes-spec")) return dsv41_lanes_tests.spec(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);
     if (std.mem.eql(u8, cmd, "dsv41-lanes-parallel")) return dsv41_parallel_tests.parallel(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);

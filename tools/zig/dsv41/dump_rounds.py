@@ -11,6 +11,9 @@ over the round's rows; each rank's partial `L<i>.p_engram.r<r>` and the gated st
 
   python3 -B /w/tools/zig/dsv41/dump_rounds.py --tools /w/tools/zig --model /model --out /out [--layers 4] \
       [--engram /models/DeepSeek-V4.1-Flash-Engram --token-map /aot/token_map.json]
+
+`--streams slot:base:size:prompt,...` places the streams elsewhere (a long stream: a scored indexer, and past the
+candidate pool's width its mask), `--cap` sizes the pool to hold them; the round's bucket is bucket_for(deepest row).
 """
 
 from __future__ import annotations
@@ -46,6 +49,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20261009)
     ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
     ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
+    ap.add_argument("--streams", default="0:0:2048:40,2:2048:2048:200",
+                    help="the streams as slot:base:size:prompt-length, comma separated")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     fwd = load_module("dump_forward", HERE / "dump_forward.py")
@@ -128,7 +133,8 @@ def main() -> int:
 
     g = torch.Generator(device="cpu")
     g.manual_seed(a.seed)
-    streams = [(0, 0, 2048, 40), (2, 2048, 2048, 200)]       # (slot, base, size, prompt length)
+    streams = [tuple(int(v) for v in st.split(":")) for st in a.streams.split(",")]   # (slot, base, size, prompt length)
+    assert all(b + sz <= cap and sl < slots for sl, b, sz, _ in streams), "a stream outside the pool"
     views, prompts = [], []
     for slot, base, size, n_prompt in streams:
         sc = m.pool_view(pool, slot, base, size)

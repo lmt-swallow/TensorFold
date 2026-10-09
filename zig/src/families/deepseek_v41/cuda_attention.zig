@@ -3,8 +3,12 @@
 //! cuda_exl3.zig's (each `mm`), the Triton kernels come from the captured AOT set (cuda.aot: `_rmsnorm`,
 //! `_rope_heads`, `_kv_norm_rope`, `_fp4qd_p2`, `_fp4_store`, `_rowmm`, `_index_score`, `_sparse_attn_part`,
 //! `_sparse_attn_merge`) and the torch glue (the compressor's softmax pool, the indexer weights' scaling, column
-//! block copies) from attn_glue.cu. The indexer's top-k selection (torch's total-order keys) runs on the host for
-//! now. Every row's bits are its own, as in the fork: the output partial [n, d] fp32 is what rank 0 would gather.
+//! block copies) from attn_glue.cu. The indexer's selection (kernels.topk_indices: torch's total-order keys, so one
+//! set whatever the algorithm) runs on the device: the captured `_score_keys` + `_topk_sel` where the fork's fused
+//! selection has a variant for the shape, else topk_glue.cu's row select; the candidate pool of the candidate source
+//! (model.py `_candidates`) and its mask on the index layers after it (`apply_candidates`) as topk_glue.cu kernels.
+//! TF_DS_TOPK=host keeps the host selection (the oracle). Every row's bits are its own, as in the fork: the output
+//! partial [n, d] fp32 is what rank 0 would gather.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -87,6 +91,9 @@ pub const Dims = struct {
     eps: f32,
     bucket: usize, // the context bucket: the indexer scans bucket / ratio compressed entries
     max_rows: usize = 16,
+    cand: CandRole = .none, // the candidate pool: made here (the candidate source), applied here (an index layer after it)
+    cand_blocks: usize = 0, // the pool's blocks (candidate_topk_blocks)
+    cand_block: usize = 8, // entries a block (candidate_block_size)
 
     pub fn nb(self: Dims) usize {
         return if (self.ratio == 0) 0 else self.bucket / self.ratio;
@@ -95,7 +102,262 @@ pub const Dims = struct {
     pub fn kk(self: Dims) usize {
         return @min(self.idx_topk, self.nb());
     }
+
+    /// The pool's mask columns over the scanned entries (ceil(nb / cand_block)).
+    pub fn candCols(self: Dims) usize {
+        return (self.nb() + self.cand_block - 1) / @max(1, self.cand_block);
+    }
 };
+
+/// An index layer's part in the candidate pool (config candidate_source_layer_id).
+pub const CandRole = enum {
+    none,
+    source, // the candidate source: its scores make the pool
+    after, // an index layer after the source: its scores masked to the pool
+
+    /// Layer `li`'s role given the config's candidate source (-1: none) and whether `li` is an index layer.
+    pub fn of(cand_source: i64, li: usize, index_layer: bool) CandRole {
+        if (!index_layer or cand_source < 0) return .none;
+        const src: usize = @intCast(cand_source);
+        if (li == src) return .source;
+        return if (li > src) .after else .none;
+    }
+};
+
+/// How the indexer selects its picks: `auto` the device (the captured fused selection where it has the shape's
+/// variant, else topk_glue.cu), `glue` topk_glue.cu always, `host` the host oracle (a stream sync a layer). From
+/// TF_DS_TOPK (auto, glue, host); auto when unset.
+pub const Select = enum {
+    auto,
+    glue,
+    host,
+
+    pub fn fromEnv() Select {
+        const v = std.mem.span(std.c.getenv("TF_DS_TOPK") orelse return .auto);
+        if (std.mem.eql(u8, v, "host")) return .host;
+        if (std.mem.eql(u8, v, "glue")) return .glue;
+        return .auto;
+    }
+};
+
+/// topk_glue.cu, the indexer's selection kernels.
+pub const TopkGlue = struct {
+    module: cuda.Module,
+    topk_rows: cuda.Function,
+    cand_blockmax: cuda.Function,
+    cand_mask: cuda.Function,
+    apply_cand: cuda.Function,
+
+    pub const threads: u32 = 512; // topk_glue.cu kThreads
+
+    pub fn load(d: *const cuda.Driver) !TopkGlue {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_topk_glue);
+        errdefer module.unload();
+        return .{
+            .module = module,
+            .topk_rows = try module.function("tf_dsv41_topk_rows"),
+            .cand_blockmax = try module.function("tf_dsv41_cand_blockmax"),
+            .cand_mask = try module.function("tf_dsv41_cand_mask"),
+            .apply_cand = try module.function("tf_dsv41_apply_cand"),
+        };
+    }
+
+    pub fn deinit(self: *TopkGlue) void {
+        self.module.unload();
+    }
+
+    /// kernels.topk_indices then `where(top < vis, top, -1)` on rows of fp32 scores [rows, n] (row stride `ld`
+    /// floats): out [rows, kk] int64 (row stride `out_ld`), each row's kk highest scores' indices ascending (ties to
+    /// the lower index), -1 at or past vis[r] (`vis` 0: no mask). kk <= n.
+    pub fn topk(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, kk: usize, vis: Ptr, out: Ptr, out_ld: usize, stream: cuda.Stream) !void {
+        if (kk == 0 or rows == 0) return;
+        if (kk > n) return error.BadShape;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(kk)));
+        a.add(vis);
+        a.add(out);
+        a.add(@as(c_longlong, @intCast(out_ld)));
+        try cuda.launch.launch(self.topk_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
+    }
+
+    /// model.py _candidates on rows of fp32 scores [rows, n] (row stride `ld`): mask [rows, ceil(n / bsize)] u8 (row
+    /// stride `mask_ld`), 1 on the `nblocks` blocks with the largest maxima (the block of entry vis[r] - 1 pinned in)
+    /// whose maximum is above -inf. `smax`: fp32 scratch [rows, ceil(n / bsize)].
+    pub fn candidates(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, vis: Ptr, nblocks: usize, bsize: usize, smax: Ptr, mask: Ptr, mask_ld: usize, stream: cuda.Stream) !void {
+        if (rows == 0 or n == 0) return;
+        const nblk = (n + bsize - 1) / bsize;
+        {
+            var a: cuda.Args = .{};
+            a.add(score);
+            a.add(@as(c_longlong, @intCast(ld)));
+            a.add(@as(c_int, @intCast(n)));
+            a.add(vis);
+            a.add(@as(c_int, @intCast(bsize)));
+            a.add(smax);
+            a.add(@as(c_longlong, @intCast(nblk)));
+            a.add(@as(c_int, @intCast(nblk)));
+            try cuda.launch.launch(self.cand_blockmax, .{ .grid = .{ .x = @intCast((nblk + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
+        }
+        var a: cuda.Args = .{};
+        a.add(smax);
+        a.add(@as(c_longlong, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(@min(nblocks, nblk))));
+        a.add(mask);
+        a.add(@as(c_longlong, @intCast(mask_ld)));
+        try cuda.launch.launch(self.cand_mask, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
+    }
+
+    /// model.py apply_candidates in place: score[r, t] = -inf where mask[r, t / bsize] is 0 (t < n).
+    pub fn apply(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, mask: Ptr, mask_ld: usize, bsize: usize, stream: cuda.Stream) !void {
+        if (rows == 0 or n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(mask);
+        a.add(@as(c_longlong, @intCast(mask_ld)));
+        a.add(@as(c_int, @intCast(bsize)));
+        try cuda.launch.launch(self.apply_cand, .{ .grid = .{ .x = @intCast((n + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
+    }
+};
+
+/// The fork's fused selection (kernels.topk_select: `_score_keys` then `_topk_sel`, one launch a row) where the
+/// captured set has its shape: n and kk powers of two, kk <= n <= TOPK_FUSED_MAX (4096), contiguous rows. Returns
+/// false (nothing launched) where it does not apply; the picks are the same set either way (the keys' total order).
+/// `keys`: int64 scratch [rows, n].
+pub fn fusedTopk(set: *const aot.Set, score: Ptr, rows: usize, n: usize, kk: usize, vis: Ptr, keys: Ptr, out: Ptr, stream: cuda.Stream) !bool {
+    const pow2 = struct {
+        fn f(v: usize) bool {
+            return v > 0 and (v & (v - 1)) == 0;
+        }
+    }.f;
+    if (!pow2(n) or !pow2(kk) or kk > n or n > 4096 or keys == 0) return false;
+    const key_args = [_]aot.Arg{
+        aot.ptr("S", "*fp32", score), aot.ptr("OUT", "*i64", keys), aot.int("n", @intCast(n)),
+        aot.ptr("TMAX", "*i64", keys), aot.int("nt", @intCast((n + 63) / 64)),
+    };
+    const key_consts = [_]aot.Const{ aot.ci("BN", 1024), aot.ci("PDL", 1), aot.ci("HAS_TMAX", 0), aot.ci("TB", 64) };
+    const sel_args = [_]aot.Arg{ aot.ptr("KEYS", "*i64", keys), aot.ptr("VIS", "*i64", vis), aot.ptr("OUT", "*i64", out) };
+    const sel_consts = [_]aot.Const{ aot.ci("N", @intCast(n)), aot.ci("KK", @intCast(kk)), aot.ci("PDL", 1) };
+    if (!captured(set, "_score_keys", &key_args, &key_consts) or !captured(set, "_topk_sel", &sel_args, &sel_consts)) return false;
+    try set.run(stream, "_score_keys", .{ @intCast(rows), @intCast((n + 1023) / 1024), 1 }, &key_args, &key_consts);
+    try set.run(stream, "_topk_sel", .{ @intCast(rows), 1, 1 }, &sel_args, &sel_consts);
+    return true;
+}
+
+/// Whether `set` holds a variant `Set.run` would launch for these arguments (aot.zig's matching, strict or with a
+/// less specialized capture), without its missing-variant report: an optional fast path probes with it.
+fn captured(set: *const aot.Set, function: []const u8, args: []const aot.Arg, consts: []const aot.Const) bool {
+    for ([_]bool{ false, true }) |loose| for (set.variants) |v| {
+        if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+        if (variantMatches(v.spec, args, consts, loose)) return true;
+    };
+    return false;
+}
+
+fn variantMatches(k: anytype, args: []const aot.Arg, consts: []const aot.Const, loose: bool) bool {
+    for (consts) |c| {
+        const got = k.consts.map.get(c.name) orelse return false;
+        if (c.int) |x| if (got.int == null or got.int.? != x) return false;
+    }
+    var runtime: usize = 0;
+    for (args) |a| {
+        const param = for (k.params) |p| {
+            if (std.mem.eql(u8, p.name, a.name)) break p;
+        } else null;
+        switch (a.value) {
+            .i32 => |x| {
+                if (param == null) {
+                    const got = k.consts.map.get(a.name) orelse return false;
+                    if (x != 1 or got.int == null or got.int.? != 1) return false;
+                    continue;
+                }
+                const p = param.?;
+                if (!std.mem.eql(u8, p.type, "i32")) return false;
+                if (!p.nospec and x == 1 and !loose) return false;
+                const div = !p.nospec and @mod(x, 16) == 0;
+                if (p.div16 != div and !(loose and !p.div16)) return false;
+            },
+            .ptr => |x| {
+                const p = param orelse return false;
+                if (!std.mem.eql(u8, p.type, x.ty)) return false;
+                const div = x.addr % 16 == 0;
+                if (p.div16 != div and !(loose and !p.div16)) return false;
+            },
+            .f32 => {
+                const p = param orelse return false;
+                if (!std.mem.eql(u8, p.type, "fp32")) return false;
+            },
+            .u64 => |x| {
+                const p = param orelse return false;
+                if (!std.mem.eql(u8, p.type, "u64")) return false;
+                const div = x % 16 == 0;
+                if (p.div16 != div and !(loose and !p.div16)) return false;
+            },
+        }
+        runtime += 1;
+    }
+    return runtime == k.params.len;
+}
+
+/// kernels.topk_indices on one row on the host: the kk highest scores' indices ascending (ties to the lower index),
+/// -1 at or past `vis`. `keys`: scratch of row.len.
+pub fn hostTopk(row: []const f32, kk: usize, vis: i64, keys: []i64, out: []i64) void {
+    for (row, 0..) |v, j| keys[j] = key(v, j);
+    hostTopkKeys(keys[0..row.len], kk, vis, out);
+}
+
+/// kernels.topk_select on one row of int64 keys on the host (sorts `keys` in place).
+pub fn hostTopkKeys(keys: []i64, kk: usize, vis: i64, out: []i64) void {
+    std.sort.pdq(i64, keys, {}, std.sort.desc(i64));
+    for (keys[0..kk], 0..) |kv, i| out[i] = 0xFFFFFFFF - (kv & 0xFFFFFFFF);
+    std.sort.pdq(i64, out[0..kk], {}, std.sort.asc(i64));
+    for (out[0..kk]) |*p| if (p.* >= vis) {
+        p.* = -1;
+    };
+}
+
+/// model.py _candidates on one row on the host: mask[b] = 1 on the `nblocks` blocks of `bsize` entries with the
+/// largest maxima (the block of entry vis - 1 pinned in) whose maximum is above -inf. `keys`: scratch of the blocks.
+pub fn hostCandidates(row: []const f32, vis: i64, nblocks: usize, bsize: usize, keys: []i64, mask: []u8) void {
+    const n = row.len;
+    const nb = (n + bsize - 1) / bsize;
+    const last: i64 = if (vis - 1 >= 0) @divFloor(vis - 1, @as(i64, @intCast(bsize))) else -1;
+    @memset(mask[0..nb], 0);
+    for (0..nb) |b| {
+        var m: f32 = -std.math.inf(f32);
+        var nan = false;
+        for (row[b * bsize .. @min(n, (b + 1) * bsize)]) |v| {
+            if (std.math.isNan(v)) nan = true else if (v > m) m = v;
+        }
+        if (nan) m = std.math.nan(f32);
+        if (@as(i64, @intCast(b)) == last) m = std.math.inf(f32);
+        keys[b] = key(m, b);
+    }
+    const ks = keys[0..nb];
+    std.sort.pdq(i64, ks, {}, std.sort.desc(i64));
+    // `s.gather(idx) > -inf`: true exactly for the keys strictly above -inf's and at most +inf's (NaN maxima order
+    // outside that range)
+    const neg_inf_hi = key(-std.math.inf(f32), 0) >> 32;
+    const inf_hi = key(std.math.inf(f32), 0) >> 32;
+    for (ks[0..@min(nblocks, nb)]) |kv| {
+        const b: usize = @intCast(0xFFFFFFFF - (kv & 0xFFFFFFFF));
+        const hi = kv >> 32;
+        if (hi > neg_inf_hi and hi <= inf_hi) mask[b] = 1;
+    }
+}
+
+/// model.py apply_candidates on one row on the host: -inf outside the pool's blocks.
+pub fn hostApplyCandidates(row: []f32, mask: []const u8, bsize: usize) void {
+    for (row, 0..) |*v, t| if (mask[t / bsize] == 0) {
+        v.* = -std.math.inf(f32);
+    };
+}
 
 /// attn_glue.cu, loaded from a cubin (built by tools/zig/dsv41/attn_capture.sh with the fork image's nvcc).
 pub const Glue = struct {
@@ -104,6 +366,8 @@ pub const Glue = struct {
     bf16_scale: cuda.Function,
     copy_cols: cuda.Function,
     f32_to_f16: cuda.Function,
+    topk: ?TopkGlue = null, // the selection kernels (built-in fatbin; null in host-only builds: the host selection)
+    select: Select = .auto,
 
     /// The fatbin built into the binary (zig/build/cuda.zig: dsv41_attn_glue).
     pub fn load(d: *const cuda.Driver) !Glue {
@@ -115,17 +379,26 @@ pub const Glue = struct {
     pub fn loadBytes(d: *const cuda.Driver, cubin: []const u8) !Glue {
         var module = try cuda.Module.load(d, cubin);
         errdefer module.unload();
+        const sel = Select.fromEnv();
         return .{
             .module = module,
             .comp_pool2 = try module.function("comp_pool2"),
             .bf16_scale = try module.function("bf16_scale"),
             .copy_cols = try module.function("copy_cols"),
             .f32_to_f16 = try module.function("f32_to_f16"),
+            .topk = if (cuda.kernels.available) try TopkGlue.load(d) else null,
+            .select = if (cuda.kernels.available) sel else .host,
         };
     }
 
     pub fn deinit(self: *Glue) void {
+        if (self.topk) |*t| t.deinit();
         self.module.unload();
+    }
+
+    /// Whether the indexer selects on the host (TF_DS_TOPK=host, or no selection kernels).
+    pub fn hostSelect(self: *const Glue) bool {
+        return self.select == .host or self.topk == null;
     }
 };
 
@@ -246,8 +519,19 @@ pub const Caches = struct {
 pub const Rope = struct { cos: cuda.DeviceBuffer, sin: cuda.DeviceBuffer, rows: usize };
 
 /// The picks a compressed layer attends through: its own (an index source) or the latest index layer's before it
-/// (the fork's shared["topk"]): cidx [n, kk] int64 (-1: none).
-pub const Picks = struct { cidx: Ptr, kk: usize };
+/// (the fork's shared["topk"]): cidx [n, kk] int64 (-1: none). Past the candidate source they also carry its pool
+/// (shared["cand"]): the block mask [n, cand_ld] u8 on the device, or on the host under the host selection.
+pub const Picks = struct {
+    cidx: Ptr,
+    kk: usize,
+    cand: Ptr = 0,
+    cand_ld: usize = 0,
+    cand_h: []const u8 = &.{},
+
+    fn hasCand(self: Picks) bool {
+        return self.cand != 0 or self.cand_h.len > 0;
+    }
+};
 
 /// The sublayer's launcher and its scratch for up to `dims.max_rows` rows.
 pub const Attention = struct {
@@ -284,6 +568,9 @@ pub const Attention = struct {
     wts: cuda.DeviceBuffer,
     score: cuda.DeviceBuffer,
     cidx: cuda.DeviceBuffer,
+    keys: cuda.DeviceBuffer, // int64 [rows, nb]: the fused selection's keys (where it applies)
+    smax: cuda.DeviceBuffer, // fp32 [rows, cand cols]: the candidate source's block maxima
+    cand_mask: cuda.DeviceBuffer, // u8 [rows, cand cols]: the candidate source's pool
     pm: cuda.DeviceBuffer,
     pl: cuda.DeviceBuffer,
     po: cuda.DeviceBuffer,
@@ -298,6 +585,8 @@ pub const Attention = struct {
     score_h: []f32,
     keys_h: []i64,
     cidx_h: []i64,
+    cand_h: []u8, // the pool on the host (the candidate source under the host selection)
+    cand_from: Picks, // the pool this layer's scores were masked to (an index layer after the source)
 
     /// `z_words`: fp32 words of split-K scratch the widest EXL3 layer of this kind needs at `dims.max_rows` rows
     /// (`Params.scratchWords`).
@@ -340,6 +629,11 @@ pub const Attention = struct {
         self.wts = try cuda.DeviceBuffer.alloc(d, r * dims.idx_heads * 2);
         self.score = try cuda.DeviceBuffer.alloc(d, @max(16, r * nb * 4));
         self.cidx = try cuda.DeviceBuffer.alloc(d, @max(16, r * kk * 8));
+        const fused = dims.index_source and nb > 0 and nb <= 4096 and (nb & (nb - 1)) == 0;
+        self.keys = try cuda.DeviceBuffer.alloc(d, if (fused) r * nb * 8 else 16);
+        const ccols = if (dims.cand == .source) dims.candCols() else 0;
+        self.smax = try cuda.DeviceBuffer.alloc(d, @max(16, r * ccols * 4));
+        self.cand_mask = try cuda.DeviceBuffer.alloc(d, @max(16, r * ccols));
         self.pm = try cuda.DeviceBuffer.alloc(d, r * groups_h * 8 * 16 * 4);
         self.pl = try cuda.DeviceBuffer.alloc(d, r * groups_h * 8 * 16 * 4);
         self.po = try cuda.DeviceBuffer.alloc(d, r * groups_h * 8 * 16 * dims.hd * 4);
@@ -352,13 +646,16 @@ pub const Attention = struct {
         self.score_h = try gpa.alloc(f32, @max(1, r * nb));
         self.keys_h = try gpa.alloc(i64, @max(1, nb));
         self.cidx_h = try gpa.alloc(i64, @max(1, r * kk));
+        self.cand_h = try gpa.alloc(u8, r * ccols);
+        self.cand_from = .{ .cidx = 0, .kk = 0 };
         self.uploads = try Uploads.init(d, Uploads.room(5, r * 8) + Uploads.room(1, r * kk * 8));
         return self;
     }
 
     pub fn deinit(self: *Attention) void {
-        inline for (.{ "pos", "slots", "vis", "first", "target", "zero", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "wl", "wts", "score", "cidx", "pm", "pl", "po", "o", "og", "ug", "u", "out" }) |f| @field(self, f).free();
+        inline for (.{ "pos", "slots", "vis", "first", "target", "zero", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "wl", "wts", "score", "cidx", "keys", "smax", "cand_mask", "pm", "pl", "po", "o", "og", "ug", "u", "out" }) |f| @field(self, f).free();
         self.gpa.free(self.tab);
+        self.gpa.free(self.cand_h);
         self.gpa.free(self.score_h);
         self.gpa.free(self.keys_h);
         self.gpa.free(self.cidx_h);
@@ -366,9 +663,10 @@ pub const Attention = struct {
     }
 
     /// Rows x bf16 [n, d] at positions start .. start + n - 1 -> this rank's fp32 partial [n, d] (`self.out`),
-    /// the caches updated as the fork's; `self.cidx` holds the picks. Synchronous at the top-k (a host read).
-    /// `picks`: the index layer's picks a layer without an indexer reads (required when the layer is compressed and
-    /// not an index source); an index source makes its own (`self.picks()`).
+    /// the caches updated as the fork's; `self.cidx` holds the picks (synchronous only under the host selection).
+    /// `given`: the latest index layer's picks, which a layer without an indexer attends through (required when
+    /// the layer is compressed and not an index source) and whose candidate pool an index layer after the candidate
+    /// source masks its scores to (required there); an index source makes its own picks (`self.picks()`).
     pub fn forward(self: *Attention, p: Params, c: *const Caches, rope: Rope, x: Ptr, n: usize, start: usize, given: ?Picks, stream: cuda.Stream) !Ptr {
         const dm = self.dims;
         if (n < 1 or n > dm.max_rows) return error.TooManyRows;
@@ -486,7 +784,7 @@ pub const Attention = struct {
                     aot.ci("HAS_BASE", 0),                aot.ci("PDL", 1),                    aot.ci("HAS_CAND", 0), aot.ci("CB", 8),
                     aot.ci("KEYS", 0),                    aot.ci("HAS_TMAX", 0),               aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
                 });
-                try self.topk(n, nb, kk, vis[0..n], stream);
+                try self.select(n, nb, kk, vis[0..n], given, stream);
             }
         }
         // -- sparse attention over the window ring and the picks, 8 key splits a head group, then the merge --------
@@ -532,9 +830,47 @@ pub const Attention = struct {
         return self.out.ptr;
     }
 
-    /// The picks this index layer made in its last forward, for the layers after it.
+    /// The picks this index layer made in its last forward, for the layers after it, with the candidate pool it
+    /// made (the source) or masked to (after the source).
     pub fn picks(self: *const Attention) Picks {
-        return .{ .cidx = self.cidx.ptr, .kk = self.dims.kk() };
+        var p: Picks = .{ .cidx = self.cidx.ptr, .kk = self.dims.kk() };
+        switch (self.dims.cand) {
+            .source => {
+                p.cand_ld = self.dims.candCols();
+                if (self.glue.hostSelect()) p.cand_h = self.cand_h else p.cand = self.cand_mask.ptr;
+            },
+            .after => {
+                p.cand = self.cand_from.cand;
+                p.cand_ld = self.cand_from.cand_ld;
+                p.cand_h = self.cand_from.cand_h;
+            },
+            .none => {},
+        }
+        return p;
+    }
+
+    /// The indexer's picks from `self.score` [n, nb]: the candidate pool made or applied first, then each row's kk
+    /// highest scores' indices ascending, -1 at or past its visible count, into `self.cidx` [n, kk].
+    fn select(self: *Attention, n: usize, nb: usize, kk: usize, vis: []const i64, given: ?Picks, stream: cuda.Stream) !void {
+        const dm = self.dims;
+        self.cand_from = .{ .cidx = 0, .kk = 0 };
+        if (dm.cand == .after) {
+            const pk = given orelse return error.NoCandidateSource;
+            if (!pk.hasCand()) return error.NoCandidateSource;
+            self.cand_from = pk;
+        }
+        if (self.glue.hostSelect()) return self.topk(n, nb, kk, vis, stream);
+        const tg = &self.glue.topk.?;
+        switch (dm.cand) {
+            .source => try tg.candidates(self.score.ptr, nb, n, nb, self.vis.ptr, dm.cand_blocks, dm.cand_block, self.smax.ptr, self.cand_mask.ptr, dm.candCols(), stream),
+            .after => {
+                if (self.cand_from.cand == 0) return error.NoCandidateSource;
+                try tg.apply(self.score.ptr, nb, n, nb, self.cand_from.cand, self.cand_from.cand_ld, dm.cand_block, stream);
+            },
+            .none => {},
+        }
+        if (self.glue.select == .auto and try fusedTopk(self.set, self.score.ptr, n, nb, kk, self.vis.ptr, self.keys.ptr, self.cidx.ptr, stream)) return;
+        try tg.topk(self.score.ptr, nb, n, nb, kk, self.vis.ptr, self.cidx.ptr, kk, stream);
     }
 
     fn rmsnorm(self: *Attention, x: Ptr, w: Ptr, out: Ptr, n: usize, d: usize, stream: cuda.Stream) !void {
@@ -571,22 +907,27 @@ pub const Attention = struct {
         try cuda.launch.launch(self.glue.copy_cols, .{ .grid = .{ .x = @intCast((cols + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
     }
 
-    /// kernels.topk_indices on the host: each row's kk highest scores' indices ascending (ties to the lower index,
-    /// one int64 key a score: its ordered bits above, the inverted index below), -1 at or past the row's visible
-    /// count (`torch.where(top < vis, top, -1)`). Reads the scores back: a stream sync.
+    /// The host selection (the oracle): kernels.topk_indices on each row (ties to the lower index, one int64 key a
+    /// score: its ordered bits above, the inverted index below), -1 at or past the row's visible count
+    /// (`torch.where(top < vis, top, -1)`), the candidate pool made or applied first. Reads the scores back: a
+    /// stream sync.
     fn topk(self: *Attention, n: usize, nb: usize, kk: usize, vis: []const i64, stream: cuda.Stream) !void {
+        const dm = self.dims;
         try stream.synchronize();
         try self.score.download(0, std.mem.sliceAsBytes(self.score_h[0 .. n * nb]));
+        const ccols = dm.candCols();
         for (0..n) |r| {
             const row = self.score_h[r * nb .. (r + 1) * nb];
-            for (row, 0..) |s, j| self.keys_h[j] = key(s, j);
-            std.sort.pdq(i64, self.keys_h[0..nb], {}, std.sort.desc(i64));
-            const picked = self.cidx_h[r * kk .. (r + 1) * kk];
-            for (self.keys_h[0..kk], 0..) |kv, i| picked[i] = 0xFFFFFFFF - (kv & 0xFFFFFFFF);
-            std.sort.pdq(i64, picked, {}, std.sort.asc(i64));
-            for (picked) |*p| if (p.* >= vis[r]) {
-                p.* = -1;
-            };
+            switch (dm.cand) {
+                .source => hostCandidates(row, vis[r], dm.cand_blocks, dm.cand_block, self.keys_h, self.cand_h[r * ccols .. (r + 1) * ccols]),
+                .after => {
+                    const ld = self.cand_from.cand_ld;
+                    if (self.cand_from.cand_h.len < (r + 1) * ld) return error.NoCandidateSource;
+                    hostApplyCandidates(row, self.cand_from.cand_h[r * ld .. (r + 1) * ld], dm.cand_block);
+                },
+                .none => {},
+            }
+            hostTopk(row, kk, vis[r], self.keys_h, self.cidx_h[r * kk .. (r + 1) * kk]);
         }
         try self.uploads.put(self.cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]), stream);
     }

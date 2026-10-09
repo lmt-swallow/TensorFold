@@ -34,6 +34,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_engram", .src = "dsv41/engram", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: model.py Engram._decode and Comm.sum as kernels
     .{ .name = "dsv41_exl3_experts_prompt", .src = "dsv41/experts_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // the experts extension's prompt-chunk kernels (grouped_mma, grouped_rows)
     .{ .name = "dsv41_prompt_glue", .src = "dsv41/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue (row copies, the compressor's pair pool, fp32 casts)
+    .{ .name = "dsv41_topk_glue", .src = "dsv41/topk_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the indexer's selection (topk_indices, the candidate pool and its mask) on the device
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

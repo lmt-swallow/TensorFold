@@ -9,7 +9,9 @@ fixture's layers hold none); Engram runs on its layers when `--engram <dir>` nam
 each rank's partial `L<i>.p_engram.r<r>` and the gated streams `L<i>.h_engram` recorded), as without tables it is
 skipped. With `--decode`, each chunk size's fixture also holds one decode row after the prompt (graph.py
 `StaticDecoder._body` at R = 1, as dump_forward.py runs it) on the prompt's greedy token (the argmax of the last row's
-logits): its partials, streams, head, logits (`D.<name>`) and the cache planes after it.
+logits): its partials, streams, head, logits (`D.<name>`) and the cache planes after it. With `--lean` (long
+prompts), a chunk before the last keeps only what a rank-0 run needs and the picks: the other rank's partials
+(`.r1`) and each index layer's `cidx`; the last chunk keeps everything, the cache planes only after it.
 
 Written: fixtures/prompt_common (dims, the prompt ids, rope tables), fixtures/prompt_c<chunk> per chunk size,
 launches.json / jit.json for tools/zig/dsv41/prompt_capture.sh.
@@ -60,6 +62,8 @@ def main() -> int:
     ap.add_argument("--engram", default=None, help="the Engram shards' dir: run Engram on its layers")
     ap.add_argument("--token-map", default=None, help="the compressed token map JSON (default: built from tokenizer.json)")
     ap.add_argument("--decode", action="store_true", help="one greedy decode row after the prompt (D.<name>)")
+    ap.add_argument("--lean", action="store_true",
+                    help="chunks before the last: only the .r1 partials and the picks (long prompts, rank-0 runs)")
     a = ap.parse_args()
     ck = load_module("capture_kernel", HERE / "capture_kernel.py")
     df = load_module("dump_forward", HERE / "dump_forward.py")
@@ -243,14 +247,17 @@ def main() -> int:
         with rec.scope(f"prompt_c{chunk}", detail=True):
             for ci, s in enumerate(starts):
                 e = min(a.prompt, s + chunk)
+                whole = not a.lean or ci == len(starts) - 1
 
-                def record(name: str, t: torch.Tensor, ci=ci, recorded=recorded) -> None:
-                    recorded[f"C{ci}.{name}"] = t.detach().clone()
+                def record(name: str, t: torch.Tensor, ci=ci, recorded=recorded, whole=whole) -> None:
+                    if whole or (".dbg." not in name and (name.endswith(".r1") or name.endswith(".cidx"))):
+                        recorded[f"C{ci}.{name}"] = t.detach().to("cpu", copy=True)
 
                 h, pre = chunk_forward(sc, prompt_ids[s:e], s, shared, record)
                 torch.cuda.synchronize()
-                for k, v in df.planes(sc, L).items():
-                    recorded[f"C{ci}.{k}"] = v.detach().clone()
+                if whole:
+                    for k, v in df.planes(sc, L).items():
+                        recorded[f"C{ci}.{k}"] = v.detach().clone()
                 last = (h, pre)
             h, pre = last
             xc = K.collapse_norm(h[-1:].contiguous(), pre[-1:].contiguous(), w.norm, c.eps)
@@ -262,7 +269,7 @@ def main() -> int:
         torch.cuda.synchronize()
         arrays = {"prompt_ids": prompt_ids, "expected_logits": logits.clone()}
         params = {"chunk": chunk, "n_chunks": len(starts), "prompt": a.prompt, "layers": L, "bucket": a.bucket, "cap": a.cap,
-                  "comp_rows": int(sc.comp[2][0].shape[0]) if 2 in sc.comp else 0}
+                  "comp_rows": int(sc.comp[2][0].shape[0]) if 2 in sc.comp else 0, "lean": int(a.lean)}
         if a.decode:
             token = int(torch.argmax(logits[0]).item())   # torch's first index of the maximum
 

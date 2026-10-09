@@ -7,9 +7,11 @@
 //!
 //! The unfused path (TF_DS_HC_FUSED=0, TF_DS_ROT_*=0): plain hc_pre / hc_post, the attention's q path in three
 //! launches, the merge apart from wo_a; the fork documents the fused launches as the same bits. The indexer's
-//! selection is the short-context one (`alltop`: every compressed entry below the row's visible count, bucket /
-//! ratio <= idx_topk); longer buckets' scored top-k is not here yet. Engram runs on its layers when a hook is set
-//! (`engram`), each row's n-grams from its own stream's ids (`Window.host`).
+//! selection: at short buckets (bucket / ratio <= idx_topk) every compressed entry below the row's visible count
+//! (`alltop`, no scores); past them the scores of every row against its own stream's extent (`_index_score` with
+//! per-row bases), the candidate pool at the candidate source and its mask after it, and the top-k on the device
+//! (cuda_attention.zig's selection: the same set as the fork's `topk_indices`, a total order). Engram runs on its
+//! layers when a hook is set (`engram`), each row's n-grams from its own stream's ids (`Window.host`).
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -222,6 +224,20 @@ pub const RoundRunner = struct {
     t_gpos: cuda.DeviceBuffer,
     t_cidx: cuda.DeviceBuffer,
     t_zero: cuda.DeviceBuffer,
+    t_vis: cuda.DeviceBuffer,
+    // the scored indexer (buckets past idx_topk compressed entries)
+    iq: cuda.DeviceBuffer, // bf16 [R, idx_heads, idx_dim]
+    iqq: cuda.DeviceBuffer,
+    wl: cuda.DeviceBuffer, // fp32 [R, idx_heads]
+    wts_i: cuda.DeviceBuffer, // bf16 [R, idx_heads]
+    score: cuda.DeviceBuffer, // fp32 [R, bucket]
+    keys: cuda.DeviceBuffer, // int64 [R, bucket / ratio] for the fused selection (where it applies)
+    smax: cuda.DeviceBuffer, // fp32 [R, cand cols]
+    cand_mask: cuda.DeviceBuffer, // u8 [R, cand cols]: the candidate source's pool this round
+    cand_made: bool, // the pool exists this round
+    score_h: []f32, // the host selection's
+    keys_h: []i64,
+    cand_h: []u8,
     // activations
     h: cuda.DeviceBuffer,
     pre: cuda.DeviceBuffer,
@@ -305,7 +321,7 @@ pub const RoundRunner = struct {
         self.tab = try gpa.alloc(i64, 12 * R);
         const kk = @min(cfg.idx_topk, bucket); // the widest selection (ratio 1)
         self.cidx_h = try gpa.alloc(i64, R * kk);
-        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(4 + 3 * w.layers.len, R * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
+        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(4 + 4 * w.layers.len, R * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
         self.t_ids = try cuda.DeviceBuffer.alloc(d, R * 8);
         self.t_pos = try cuda.DeviceBuffer.alloc(d, R * 8);
         self.t_wslot = try cuda.DeviceBuffer.alloc(d, R * 8);
@@ -316,6 +332,22 @@ pub const RoundRunner = struct {
         self.t_cidx = try cuda.DeviceBuffer.alloc(d, R * kk * 8);
         self.t_zero = try cuda.DeviceBuffer.alloc(d, R * 8);
         try self.t_zero.fill8(0, null);
+        self.t_vis = try cuda.DeviceBuffer.alloc(d, R * 8);
+        self.iq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
+        self.iqq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
+        self.wl = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 4);
+        self.wts_i = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 2);
+        // the widest scan is the ratio-1 layers' (bucket entries); the smallest is the fused selection's candidate
+        const scored = bucket > cfg.idx_topk;
+        self.score = try cuda.DeviceBuffer.alloc(d, if (scored) R * bucket * 4 else 16);
+        self.keys = try cuda.DeviceBuffer.alloc(d, if (scored and bucket / 2 <= 4096) R * @as(usize, @min(bucket, 4096)) * 8 else 16);
+        const ccols = (bucket + @max(1, cfg.cand_block) - 1) / @max(1, cfg.cand_block);
+        self.smax = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols * 4 else 16);
+        self.cand_mask = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols else 16);
+        self.cand_made = false;
+        self.score_h = try gpa.alloc(f32, if (scored) R * bucket else 1);
+        self.keys_h = try gpa.alloc(i64, if (scored) bucket else 1);
+        self.cand_h = try gpa.alloc(u8, if (scored) R * ccols else 1);
         self.h = try cuda.DeviceBuffer.alloc(d, R * 4 * D * 2);
         self.pre = try cuda.DeviceBuffer.alloc(d, R * 16);
         self.pre_a = try cuda.DeviceBuffer.alloc(d, R * 16);
@@ -383,8 +415,11 @@ pub const RoundRunner = struct {
         self.gpa.free(self.idx_proj_h);
         self.gpa.free(self.tab);
         self.gpa.free(self.cidx_h);
+        self.gpa.free(self.score_h);
+        self.gpa.free(self.keys_h);
+        self.gpa.free(self.cand_h);
         self.uploads.deinit();
-        inline for (.{ "t_ids", "t_pos", "t_wslot", "t_wbase", "t_cbase", "t_ctarget", "t_gpos", "t_cidx", "t_zero", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
+        inline for (.{ "t_ids", "t_pos", "t_wslot", "t_wbase", "t_cbase", "t_ctarget", "t_gpos", "t_cidx", "t_zero", "t_vis", "iq", "iqq", "wl", "wts_i", "score", "keys", "smax", "cand_mask", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
         self.scratch.deinit();
     }
 
@@ -436,6 +471,7 @@ pub const RoundRunner = struct {
         try self.uploads.put(self.t_pos, 0, std.mem.sliceAsBytes(pos[0..R]), stream);
         try self.uploads.put(self.t_wslot, 0, std.mem.sliceAsBytes(wslot[0..R]), stream);
         try self.uploads.put(self.t_wbase, 0, std.mem.sliceAsBytes(wbase[0..R]), stream);
+        self.cand_made = false;
         // -- the layers ------------------------------------------------------------------------------------------
         const w = self.w;
         try self.hc.embedInit(stream, w.embed.ptr(), self.t_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(R));
@@ -586,11 +622,15 @@ pub const RoundRunner = struct {
             const nb_ = self.bucket / ratio;
             kk = @min(c.idx_topk, nb_);
             if (c.isIndexSource(li)) {
-                if (nb_ > c.idx_topk) return error.Unsupported; // the scored top-k with bases: not here yet
-                for (0..R) |i| for (0..kk) |j| {
-                    self.cidx_h[i * kk + j] = if (@as(i64, @intCast(j)) < vis[i]) @intCast(j) else -1;
-                };
-                try self.uploads.put(self.t_cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. R * kk]), stream);
+                if (nb_ > c.idx_topk) {
+                    try self.roundIndex(li, R, nb_, kk, vis[0..R], stream);
+                } else {
+                    // every scanned entry is picked: the top-k of the scores is every index below vis
+                    for (0..R) |i| for (0..kk) |j| {
+                        self.cidx_h[i * kk + j] = if (@as(i64, @intCast(j)) < vis[i]) @intCast(j) else -1;
+                    };
+                    try self.uploads.put(self.t_cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. R * kk]), stream);
+                }
             }
             comp_codes = src.comp_codes.ptr;
             comp_scales = src.comp_scales.ptr;
@@ -633,6 +673,75 @@ pub const RoundRunner = struct {
         }
         try l.wo_b.run(self.u.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.attn_out.ptr, .f32, stream);
         return self.attn_out.ptr;
+    }
+
+    /// rounds.py `_attention`'s scored indexer on layer `li` (an index layer, nb > idx_topk): the rows' index
+    /// queries and weights, `_index_score` against each row's stream's extent (KB = the extent's first compressed
+    /// row), the candidate pool made (the candidate source) or applied (after it), then the picks into `t_cidx`.
+    fn roundIndex(self: *RoundRunner, li: usize, R: usize, nb: usize, kk: usize, vis: []const i64, stream: cuda.Stream) !void {
+        const c = self.cfg;
+        const l = &self.w.layers[li];
+        const src = &self.pool.planes[self.pool.source[li]].?;
+        const role = attention.CandRole.of(c.cand_source, li, true);
+        const bsize = @max(1, c.cand_block);
+        const ccols = (nb + bsize - 1) / bsize;
+        try self.uploads.put(self.t_vis, 0, std.mem.sliceAsBytes(vis), stream);
+        try l.idx_wq_b.?.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
+        try self.ropeHeads(self.iq.ptr, self.rope_c, self.t_pos.ptr, R, c.idx_heads, c.idx_dim, false, stream);
+        const nblk: usize = R * c.idx_heads * c.idx_dim / 32;
+        try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
+            aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
+        }, &.{ aot.ci("BLKS", 32), aot.ci("PDL", 1) });
+        try self.set.run(stream, "_rowmm", .{ @intCast(R), @intCast((c.idx_heads + 7) / 8), 1 }, &.{
+            aot.ptr("X", "*bf16", self.x.ptr), aot.int("xs", @intCast(c.dim)), aot.ptr("W", "*fp16", self.idx_proj_h[li].ptr), aot.ptr("OUT", "*fp32", self.wl.ptr),
+        }, &.{ aot.ci("K", @intCast(c.dim)), aot.ci("N", @intCast(c.idx_heads)), aot.ci("BN", 8), aot.ci("BK", 256), aot.ci("PDL", 1) });
+        {
+            const scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.idx_dim))) * @sqrt(@as(f64, @floatFromInt(c.idx_heads)))));
+            var a: cuda.Args = .{};
+            a.add(self.wl.ptr);
+            a.add(self.wts_i.ptr);
+            a.add(scale);
+            a.add(@as(c_int, @intCast(R * c.idx_heads)));
+            try cuda.launch.launch(self.glue.bf16_scale, .{ .grid = .{ .x = @intCast((R * c.idx_heads + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+        }
+        const nt: usize = (nb + 63) / 64;
+        try self.set.run(stream, "_index_score", .{ @intCast(R), @intCast(nt), 1 }, &.{
+            aot.ptr("Q", "*bf16", self.iqq.ptr),     aot.ptr("K", "*u8", src.idxk_codes.ptr),  aot.ptr("KS", "*u8", src.idxk_scales.ptr),
+            aot.ptr("Wt", "*bf16", self.wts_i.ptr),  aot.ptr("VIS", "*i64", self.t_vis.ptr),  aot.ptr("OUT", "*fp32", self.score.ptr),
+            aot.int("n", @intCast(nb)),              aot.ptr("KB", "*i64", self.t_cbase.ptr), aot.ptr("CAND", "*i64", self.t_vis.ptr),
+            aot.int("cs", 0),                        aot.ptr("TMAX", "*fp32", self.score.ptr), aot.int("nt", @intCast(nt)),
+        }, &.{
+            aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64),      aot.ci("PACKED", 1),
+            aot.ci("HAS_BASE", 1),                aot.ci("PDL", 1),                  aot.ci("HAS_CAND", 0), aot.ci("CB", 8),
+            aot.ci("KEYS", 0),                    aot.ci("HAS_TMAX", 0),             aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
+        });
+        if (role == .after and !self.cand_made) return error.Unsupported; // no candidate source before this layer
+        if (self.glue.hostSelect()) {
+            try stream.synchronize();
+            try self.score.download(0, std.mem.sliceAsBytes(self.score_h[0 .. R * nb]));
+            for (0..R) |r| {
+                const row = self.score_h[r * nb .. (r + 1) * nb];
+                const mrow = self.cand_h[r * ccols .. (r + 1) * ccols];
+                switch (role) {
+                    .source => attention.hostCandidates(row, vis[r], c.cand_blocks, bsize, self.keys_h, mrow),
+                    .after => attention.hostApplyCandidates(row, mrow, bsize),
+                    .none => {},
+                }
+                attention.hostTopk(row, kk, vis[r], self.keys_h, self.cidx_h[r * kk .. (r + 1) * kk]);
+            }
+            try self.uploads.put(self.t_cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. R * kk]), stream);
+        } else {
+            const tg = &self.glue.topk.?;
+            switch (role) {
+                .source => try tg.candidates(self.score.ptr, nb, R, nb, self.t_vis.ptr, c.cand_blocks, bsize, self.smax.ptr, self.cand_mask.ptr, ccols, stream),
+                .after => try tg.apply(self.score.ptr, nb, R, nb, self.cand_mask.ptr, ccols, bsize, stream),
+                .none => {},
+            }
+            const fused = self.glue.select == .auto and self.keys.len >= R * nb * 8 and
+                try attention.fusedTopk(self.set, self.score.ptr, R, nb, kk, self.t_vis.ptr, self.keys.ptr, self.t_cidx.ptr, stream);
+            if (!fused) try tg.topk(self.score.ptr, nb, R, nb, kk, self.t_vis.ptr, self.t_cidx.ptr, kk, stream);
+        }
+        if (role == .source) self.cand_made = true;
     }
 
     fn rmsnorm(self: *RoundRunner, x: Ptr, w: Ptr, out: Ptr, n: usize, d: usize, stream: cuda.Stream) !void {

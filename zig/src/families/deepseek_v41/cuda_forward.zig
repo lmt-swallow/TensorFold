@@ -260,6 +260,9 @@ pub const Forward = struct {
             .eps = c.eps,
             .bucket = self.bucket,
             .max_rows = self.max_rows,
+            .cand = attention.CandRole.of(c.cand_source, li, c.isIndexSource(li) and c.ratio(li) > 0),
+            .cand_blocks = c.cand_blocks,
+            .cand_block = @max(1, c.cand_block),
         };
     }
 
