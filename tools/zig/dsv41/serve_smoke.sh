@@ -31,6 +31,7 @@ KERNELS=${KERNELS:-dsv41-all}   # the captured Triton set under ~/aot (aot.json,
 DRAFTS=${DRAFTS:-1}            # 0: --no-drafts
 PARALLEL=${PARALLEL:-1}        # streams decoded together (--parallel)
 RESERVE=${RESERVE:-4}          # TENSORFOLD_MEMORY_RESERVE_GIB
+REPLAY=${REPLAY:-1}            # TF_DS_REPLAY: bounded replay for prompts (0: every row through every layer)
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -125,7 +126,7 @@ say "binary $sum0 on both nodes; context $CONTEXT, RoPE rows $ROWS"
 # -- the ranks ----------------------------------------------------------------------------------------------------
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
 DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/aot/$KERNELS:/k:ro -v \$HOME/bin:/b:ro"
-ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE"
+ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE -e TF_DS_REPLAY=$REPLAY"
 ENVS="$ENVS -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
