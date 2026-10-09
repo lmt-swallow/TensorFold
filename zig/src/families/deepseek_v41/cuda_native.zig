@@ -2,9 +2,11 @@
 //! core, rank 1 follows its steps. The ranks' settings come from the environment (`--tp/--rank/--master/
 //! --master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT), the weights from the Python
 //! family's rank cache (TF_DS_RANK_CACHE), the RoPE tables from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
-//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048). With drafts (the default; `--no-drafts` turns
-//! them off on both ranks) the rank cache's DSpark blocks load and the rounds verify drafted windows of up to 6 rows,
-//! their costs timed on both ranks at load.
+//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048). Up to four streams decode together in shared
+//! rounds (16 rows a round at most), their caches in one pool of the context's positions (cuda_lanes.zig `Streams`);
+//! TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks) sets the pool's slots. With drafts (the default;
+//! `--no-drafts` turns them off on both ranks) the rank cache's DSpark blocks load and every stream verifies drafted
+//! windows of up to 6 rows, the rounds' and drafts' costs timed on both ranks at load.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -64,7 +66,12 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
         std.log.err("TF_DS_PREFILL_CHUNK is {d}: it takes 1 to {d} rows", .{ chunk, lanesmod.default_chunk });
         return error.BadEnvironment;
     }
-    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk };
+    const slots = try envInt("TF_DS_SLOTS", @intCast(lanesmod.max_slots));
+    if (slots < 1 or slots > lanesmod.max_slots) {
+        std.log.err("TF_DS_SLOTS is {d}: it takes 1 to {d} streams", .{ slots, lanesmod.max_slots });
+        return error.BadEnvironment;
+    }
+    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots };
 }
 
 /// This rank's device bytes: every entry of the rank cache (the backbone, and the DSpark blocks drafts load).
@@ -93,13 +100,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .lanes = Lanes.init(gpa, e) };
-    // rank 0 times the windows and a draft with rank 1 (its follow loop runs the same step)
+    // rank 0 times the rounds and drafts with rank 1 (its follow loop runs the same step)
     if (s.rank == 0) try own.lanes.measure(2);
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = own.lanes.windowRows(),
-        .stream_bytes = (o.context + lanesmod.extra) * 1024,
+        .stream_bytes = e.streamBytes(),
         .ctx = own,
         .deinit = release,
         .lone = null,
@@ -121,8 +128,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.SamplingNotSupported => "this engine decodes greedily for now: send temperature 0",
-        error.WindowTooWide, error.NoDraftHead, error.TreesNotBuilt => "this engine serves one stream at a time: drafted windows of up to 6 rows, no trees, no concurrent rounds",
-        error.OutOfStep => "the two ranks planned different steps (or one cannot run a step: check both ranks' TF_DS_PREFILL_CHUNK, TF_DS_ENGRAM and --no-drafts); restart both ranks",
+        error.WindowTooWide, error.NoDraftHead, error.TreesNotBuilt => "this engine verifies drafted windows of up to 6 rows, 16 rows a round, no trees",
+        error.NoRoom => "every stream slot is busy, or the context window shared by the running requests has no room for this one: retry when one finishes, or lower max_tokens",
+        error.OutOfStep => "the two ranks planned different steps (or one cannot run a step: check both ranks' TF_DS_PREFILL_CHUNK, TF_DS_SLOTS, TF_DS_ENGRAM and --no-drafts); restart both ranks",
         else => null,
     };
 }
@@ -190,7 +198,7 @@ test "a drafted stream drafts after its first token and verifies the held drafts
     var costs: [lanesmod.draft_width]lanes.config.Cost = undefined;
     for (&costs, ms, 1..) |*c, v, w| c.* = .{ .width = @intCast(w), .ms = v };
     const rows = lanesmod.rowsOf(true);
-    var cfg = try lanes.Config.init(gpa, lanesmod.factsOf(true, &costs), rows, rows - 1);
+    var cfg = try lanes.Config.init(gpa, lanesmod.factsOf(true, 1, &costs, &.{}), rows, rows - 1);
     defer cfg.deinit(gpa);
     try std.testing.expect(cfg.family_mtp);
     try std.testing.expectEqual(@as(u32, lanesmod.draft_width - 1), cfg.most_drafts);
@@ -211,7 +219,7 @@ test "a drafted stream drafts after its first token and verifies the held drafts
     for (mock.verify_held.items) |h| try std.testing.expect(h >= 1);
 
     // the old rows (one) turned drafting off whatever the facts said
-    var one = try lanes.Config.init(gpa, lanesmod.factsOf(true, &costs), 1, 0);
+    var one = try lanes.Config.init(gpa, lanesmod.factsOf(true, 1, &costs, &.{}), 1, 0);
     defer one.deinit(gpa);
     try std.testing.expect(!one.family_mtp and one.most_drafts == 0);
 }

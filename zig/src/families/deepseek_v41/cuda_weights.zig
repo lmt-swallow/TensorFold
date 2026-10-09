@@ -264,15 +264,31 @@ pub fn loadDSpark(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Con
     errdefer conf.buf.free();
     var nb: [96]u8 = undefined;
     var kb: [160]u8 = undefined;
-    const me = try gpa.dupe(u8, try src.get(plainKey(&kb, std.fmt.bufPrint(&nb, "{s}.markov_head.embed.weight", .{last}) catch unreachable, null)));
+    const me = try hostWords(gpa, try src.get(plainKey(&kb, std.fmt.bufPrint(&nb, "{s}.markov_head.embed.weight", .{last}) catch unreachable, null)));
     errdefer gpa.free(me);
-    const cf = try gpa.dupe(u8, try src.get(plainKey(&kb, std.fmt.bufPrint(&nb, "{s}.confidence_head.proj.weight", .{last}) catch unreachable, null)));
+    const cf = try hostWords(gpa, try src.get(plainKey(&kb, std.fmt.bufPrint(&nb, "{s}.confidence_head.proj.weight", .{last}) catch unreachable, null)));
     errdefer gpa.free(cf);
     return .{
         .blocks = blocks, .main_proj = main_proj, .main_norm = main_norm, .norm = norm, .markov_embed = markov_embed,
-        .markov_head = markov_head, .conf = conf,
-        .markov_embed_host = @alignCast(std.mem.bytesAsSlice(u16, me)), .conf_host = @alignCast(std.mem.bytesAsSlice(u16, cf)),
+        .markov_head = markov_head, .conf = conf, .markov_embed_host = me, .conf_host = cf,
     };
+}
+
+/// A 16-bit tensor's bytes copied into a u16 allocation (so `DSpark.deinit` frees it as what it was allocated as).
+fn hostWords(gpa: std.mem.Allocator, bytes: []const u8) Error![]u16 {
+    if (bytes.len % 2 != 0) return error.BadShape;
+    const out = try gpa.alloc(u16, bytes.len / 2);
+    @memcpy(std.mem.sliceAsBytes(out), bytes);
+    return out;
+}
+
+test "16-bit host tensors are u16 allocations whose bytes are the tensor's" {
+    const gpa = std.testing.allocator; // reports a free with the wrong size or alignment
+    const bytes = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const words = try hostWords(gpa, &bytes);
+    defer gpa.free(words);
+    try std.testing.expectEqualSlices(u8, &bytes, std.mem.sliceAsBytes(words));
+    try std.testing.expectError(error.BadShape, hostWords(gpa, bytes[0..5]));
 }
 
 // -- the rank cache's keys ----------------------------------------------------------------------------------------
