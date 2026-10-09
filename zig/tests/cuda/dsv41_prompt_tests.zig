@@ -1,4 +1,4 @@
-//! `dsv41-prompt <dir> <rank-cache-dir> <model-dir> [rank]`: the DeepSeek-V4.1 prompt path (cuda_prompt.zig) on
+//! `dsv41-prompt <dir> <rank-cache-dir> <model-dir> [rank] [layers]`: the DeepSeek-V4.1 prompt path (cuda_prompt.zig) on
 //! tools/zig/dsv41/prompt_capture.sh's work dir: this rank's weights of the fixture's layers from the Python rank
 //! cache, the fork's Triton kernels from the captured AOT set, the other rank's partials supplied from the fixture at
 //! every gather; for each chunk size the fixture holds (2048: one chunk, 512: a chunk and a tail), every chunk's
@@ -102,7 +102,7 @@ fn resetCaches(fwd: *dsv41.forward.Forward) !void {
     };
 }
 
-pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, rank: usize) !void {
+pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []const u8, rank: usize, layers_cut: ?usize) !void {
     const gpa = gpu.gpa;
     const io = gpu.io;
     const F = dsv41.forward;
@@ -121,7 +121,9 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     defer gpa.free(cdir);
     var cf = try Fixture.open(gpa, io, cdir);
     defer cf.deinit();
-    const layers: usize = @intCast(try cf.int("layers"));
+    const fixture_layers: usize = @intCast(try cf.int("layers"));
+    const layers = @min(layers_cut orelse fixture_layers, fixture_layers);
+    const whole = layers == fixture_layers;
     const prompt_len: usize = @intCast(try cf.int("prompt"));
     const bucket: usize = @intCast(try cf.int("bucket"));
     const cap: usize = @intCast(try cf.int("cap"));
@@ -147,7 +149,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     defer stream.deinit();
     var fwd = try F.Forward.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, 16, cap, bucket, rope_c, rope_w, stream);
     defer fwd.deinit();
-    var pr = try dsv41.prompt.Prompt.init(gpa, gpu.d, &fwd, &kernels, dsv41.prompt.max_chunk);
+    var pr = try dsv41.prompt.Prompt.init(gpa, gpu.d, &fwd, &kernels, @min(dsv41.prompt.max_chunk, prompt_len));
     defer pr.deinit();
     var supply: Supply = .{ .gpu = gpu, .rank = rank, .rank1 = .empty, .probes = .empty };
     defer {
@@ -184,7 +186,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
             try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_attn.r{d}", .{ ci, li, other })));
             try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_C{d}.L{d}.p_moe.r{d}", .{ ci, li, other })));
         };
-        try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_head.local.r{d}", .{other})));
+        if (whole) try supply.rank1.append(gpa, try upload(gpu, fx, try std.fmt.bufPrint(&nb, "expected_head.local.r{d}", .{other})));
         var ok = true;
         var logits: ?Ptr = null;
         var prefix_buf: [16]u8 = undefined;
@@ -193,7 +195,7 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         while (s < prompt_len) : (ci += 1) {
             const e = @min(prompt_len, s + chunk);
             supply.prefix = try std.fmt.bufPrint(&prefix_buf, "C{d}.", .{ci});
-            logits = try pr.chunk(gather, prompt_ids[s..e], s, .{}, stream);
+            logits = try pr.chunk(gather, prompt_ids[s..e], s, .{ .logits = whole and e == prompt_len }, stream);
             try stream.synchronize();
             // the caches after this chunk: every row but the compressed planes' scratch row
             for (0..layers) |li| {
@@ -219,17 +221,20 @@ pub fn prompt(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
         // every probed buffer (the mixes' inputs, both ranks' partials, the streams, the head's)
         var pit = supply.probes.iterator();
         while (pit.next()) |pe| {
+            if (!whole and std.mem.startsWith(u8, pe.key_ptr.*, "head.")) continue;
             if (std.mem.indexOf(u8, pe.key_ptr.*, ".dbg.") != null and !has(gpu, fx, pe.key_ptr.*)) continue;
             ok = same(gpu, fx, pe.value_ptr.*, pe.key_ptr.*, label, 0) and ok;
         }
-        if (logits) |lg| {
-            const view: cuda.DeviceBuffer = .{ .d = gpu.d, .ptr = lg, .len = cfg.vocab * 4 };
-            ok = same(gpu, fx, view, "logits", label, 0) and ok;
-        } else {
-            std.debug.print("FAIL {s}: no logits\n", .{label});
-            ok = false;
+        if (whole) {
+            if (logits) |lg| {
+                const view: cuda.DeviceBuffer = .{ .d = gpu.d, .ptr = lg, .len = cfg.vocab * 4 };
+                ok = same(gpu, fx, view, "logits", label, 0) and ok;
+            } else {
+                std.debug.print("FAIL {s}: no logits\n", .{label});
+                ok = false;
+            }
         }
-        if (ok) check.pass("BITEXACT {s}: {d} chunk(s) over {d} tokens through {d} layers: the mixes, partials, streams, caches and the last row's logits equal to the Python fork's", .{ label, n_chunks, prompt_len, layers });
+        if (ok) check.pass("BITEXACT {s}: {d} chunk(s) over {d} tokens through {d} of {d} layers: the mixes, partials, streams and caches{s} equal to the Python fork's", .{ label, n_chunks, prompt_len, layers, fixture_layers, if (whole) " and the last row's logits" else "" });
         if (!ok) failures += 1;
     }
     try check.expect(failures == 0, "{d} prompt case(s) differ from the fork", .{failures});

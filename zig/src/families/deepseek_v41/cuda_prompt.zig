@@ -239,6 +239,8 @@ pub const Options = struct {
     /// positions >= replay (max(0, prompt length - window)); null: every row through every layer.
     replay: ?usize = null,
     taps: ?Taps = null,
+    /// The head on the chunk's last row (the fork runs it every chunk; only the prompt's last chunk's is read).
+    logits: bool = true,
 };
 
 pub const Prompt = struct {
@@ -320,7 +322,10 @@ pub const Prompt = struct {
     cand_h: []u8, // the candidate pool's block mask [rows, cand_blocks_of(n_comp)] from the candidate source
     cand_cols: usize,
     cand_rows: usize,
-    cidx_valid: usize, // rows of cidx the last index layer wrote (the shared pick list)
+    // the shared pick list (model.py shared["topk"]): its columns as the last index layer made them, and the row
+    // stride `cidx` holds them at now (the columns, or padded to a multiple of 16 for sparse_attn)
+    cidx_cols: usize,
+    cidx_stride: usize,
     kv_layer: usize, // shared["kv_layer"]
 
     /// Buffers for chunks of up to `rows` rows (at most max_chunk), sharing `fwd`'s weights and caches.
@@ -437,7 +442,8 @@ pub const Prompt = struct {
         self.cand_cols = (nb_max + c.cand_block - 1) / @max(1, c.cand_block);
         self.cand_h = try gpa.alloc(u8, @max(1, r * self.cand_cols));
         self.cand_rows = 0;
-        self.cidx_valid = 0;
+        self.cidx_cols = 0;
+        self.cidx_stride = 0;
         self.kv_layer = 0;
         // the gate weights as fp32 (torch's gate_w.float(), once)
         var stream = try cuda.Stream.init(d, true);
@@ -474,13 +480,16 @@ pub const Prompt = struct {
     pub fn chunk(self: *Prompt, gather: Gather, ids: []const i64, start: usize, o: Options, stream: cuda.Stream) !?Ptr {
         const n = ids.len;
         if (n < 1 or n > self.rows) return error.TooManyRows;
-        if (n <= decode_rows and o.replay == null and o.taps == null) return try self.fwd.rows(gather, ids, start, n, false, stream);
+        if (n <= decode_rows and o.replay == null and o.taps == null and o.logits) return try self.fwd.rows(gather, ids, start, n, false, stream);
         const c = self.fwd.cfg;
         const dm = c.dim;
         const w = self.fwd.w;
         const fwd = self.fwd;
         @memcpy(self.ids_h[0..n], ids);
-        try self.ids.upload(0, std.mem.sliceAsBytes(self.ids_h[0..n]));
+        // every host table goes up in stream order: a layer rewrites the tables (positions, gather and scatter rows,
+        // picks) that launches still queued from the layer before read, and a plain upload (the legacy stream) is not
+        // ordered after a non-blocking stream's work
+        try self.ids.uploadAsync(0, std.mem.sliceAsBytes(self.ids_h[0..n]), stream.handle);
         try fwd.hc.embedInit(stream, w.embed.ptr(), self.ids.ptr, self.h.ptr, self.pre.ptr, @intCast(n));
         var h = self.h.ptr;
         var pre = self.pre.ptr;
@@ -490,7 +499,8 @@ pub const Prompt = struct {
         var floor: usize = 0;
         var kv_done = false;
         var nb: [32]u8 = undefined;
-        self.cidx_valid = 0;
+        self.cidx_cols = 0;
+        self.cidx_stride = 0;
         self.cand_rows = 0;
         for (w.layers, 0..) |*l, li| {
             if (o.replay) |replay| if (li == c.n_layers / 2) {
@@ -532,6 +542,7 @@ pub const Prompt = struct {
             pre_f = t;
         }
         // the head on the last row
+        if (!o.logits) return null;
         const h0 = h + (rows - 1) * hcmod.hc_streams * dm * 2;
         const pre0 = pre + (rows - 1) * hcmod.hc_streams * 4;
         try fwd.hc.collapseNorm(stream, h0, pre0, w.norm.ptr(), self.xc.ptr, 1);
@@ -609,23 +620,23 @@ pub const Prompt = struct {
             pos[i] = @intCast(start + i);
             vis[i] = if (ratio > 0) @divFloor(pos[i] + 1, @as(i64, @intCast(ratio))) else 0;
         }
-        try self.pos.upload(0, std.mem.sliceAsBytes(pos));
-        if (ratio > 0) try self.vis.upload(0, std.mem.sliceAsBytes(vis));
+        try self.pos.uploadAsync(0, std.mem.sliceAsBytes(pos), stream.handle);
+        if (ratio > 0) try self.vis.uploadAsync(0, std.mem.sliceAsBytes(vis), stream.handle);
         // attn_in: wq_a, wkv (the compressor's in kvSourceUpdate)
         try self.mm(p.wq_a, x, n, self.qa.ptr, .bf16, stream);
         try self.mm(p.wkv, x, n, self.ykv.ptr, .bf16, stream);
-        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.qa", .{li}), self.qa.ptr, n * c.q_rank * 2, stream);
+        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.qa.r0", .{li}), self.qa.ptr, n * c.q_rank * 2, stream);
         try self.rmsnorm(self.qa.ptr, p.q_norm, self.qr.ptr, n, c.q_rank, stream);
         try self.mm(p.wq_b, self.qr.ptr, n, self.q.ptr, .bf16, stream);
         try self.ropeHeads(self.q.ptr, rope, self.pos.ptr, n, heads, hd, false, stream);
-        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.q", .{li}), self.q.ptr, n * heads * hd * 2, stream);
+        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.q.r0", .{li}), self.q.ptr, n * heads * hd * 2, stream);
         // the window keys: the ring's rows before start (from lo), then the chunk's normed, roped, quantized rows
         const lo: usize = @max(floor, if (start + 1 > c.window) start + 1 - c.window else 0);
         const before = start - lo;
         if (before > 0) {
             const idx = self.tab[2 * (self.rows + 1) .. 2 * (self.rows + 1) + before];
             for (0..before) |i| idx[i] = @intCast((lo + i) % R);
-            try self.src_idx.upload(0, std.mem.sliceAsBytes(idx));
+            try self.src_idx.uploadAsync(0, std.mem.sliceAsBytes(idx), stream.handle);
             try self.copyRows(caches.ring.ptr, self.src_idx.ptr, self.wsrc.ptr, 0, before, hd * 2 / 4, stream);
         }
         const kv = self.wsrc.ptr + before * hd * 2;
@@ -643,21 +654,19 @@ pub const Prompt = struct {
             const n_comp_end = (start + n) / ratio;
             if (p.idx_wq_b != null) {
                 if (n_comp_end == 0) {
-                    self.cidx_valid = n;
-                    n_idx = 0;
+                    self.cidx_cols = 0;
+                    self.cidx_stride = 0;
                 } else {
                     try self.index(li, x, n, n_comp_end, stream);
-                    n_idx = @min(c.idx_topk, n_comp_end);
                 }
-            } else {
-                n_idx = @min(c.idx_topk, n_comp_end);
             }
+            n_idx = self.cidx_cols;
             has = n_idx > 0;
         }
         // the picks padded with -1 to a multiple of 16 entries (sparse_attn at prompt rows)
         var n_pad = n_idx;
         if (has and n_idx % 16 != 0) n_pad = n_idx + 16 - n_idx % 16;
-        if (has and n_pad != n_idx) try self.padCidx(n, n_idx, n_pad, stream);
+        if (has and self.cidx_stride != n_pad) try self.padCidx(n, n_idx, n_pad, stream);
         var picks: usize = 0;
         if (has) {
             picks = (n_pad + 31) / 32;
@@ -666,7 +675,7 @@ pub const Prompt = struct {
         const nblk: usize = c.window / 32 + picks;
         const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))));
         const wlo_v: [1]i64 = .{@intCast(lo)};
-        try self.wlo.upload(0, std.mem.sliceAsBytes(&wlo_v));
+        try self.wlo.uploadAsync(0, std.mem.sliceAsBytes(&wlo_v), stream.handle);
         const srcp = if (ratio > 0) fwd.planes[fwd.source[li]] else null;
         try fwd.set.run(stream, "_sparse_attn_part", .{ @intCast(n), @intCast(heads / 16), 1 }, &.{
             aot.ptr("Q", "*bf16", self.q.ptr),       aot.ptr("WSRC", "*bf16", self.wsrc.ptr),
@@ -684,16 +693,16 @@ pub const Prompt = struct {
             aot.ci("SPLITS", 1), aot.ci("NBLK", @intCast(nblk)), aot.ci("FINAL", 1), aot.ci("HAS_BASE", 0),
             aot.ci("PDL", 1), aot.ci("WPF", 0),
         });
-        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.wsrc", .{li}), self.wsrc.ptr, (before + n) * hd * 2, stream);
-        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o_raw", .{li}), self.o.ptr, n * heads * hd * 2, stream);
+        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.wsrc.r0", .{li}), self.wsrc.ptr, (before + n) * hd * 2, stream);
+        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o_raw.r0", .{li}), self.o.ptr, n * heads * hd * 2, stream);
         try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, n, heads, hd, true, stream);
-        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o", .{li}), self.o.ptr, n * heads * hd * 2, stream);
+        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o.r0", .{li}), self.o.ptr, n * heads * hd * 2, stream);
         // the ring gets the chunk's last rows (positions start + n - keep ..)
         {
             const keep = @min(n, R);
             const idx = self.tab[3 * (self.rows + 1) .. 3 * (self.rows + 1) + keep];
             for (0..keep) |i| idx[i] = @intCast((start + n - keep + i) % R);
-            try self.dst_idx.upload(0, std.mem.sliceAsBytes(idx));
+            try self.dst_idx.uploadAsync(0, std.mem.sliceAsBytes(idx), stream.handle);
             try self.copyRows(kv + (n - keep) * hd * 2, 0, caches.ring.ptr, self.dst_idx.ptr, keep, hd * 2 / 4, stream);
         }
         // wo_a's slices on o's column blocks, then wo_b
@@ -704,7 +713,7 @@ pub const Prompt = struct {
             try self.mm(p.wo_a[g], self.og.ptr, n, self.ug.ptr, .bf16, stream);
             try self.copyCols(self.ug.ptr, c.o_rank, self.u.ptr + g * c.o_rank * 2, dims.groups * c.o_rank, n, c.o_rank, stream);
         }
-        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.u", .{li}), self.u.ptr, n * dims.groups * c.o_rank * 2, stream);
+        try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.u.r0", .{li}), self.u.ptr, n * dims.groups * c.o_rank * 2, stream);
         try self.mm(p.wo_b, self.u.ptr, n, self.out.ptr, .f32, stream);
         return self.out.ptr;
     }
@@ -735,7 +744,7 @@ pub const Prompt = struct {
             try self.mm(p.comp_wgate.?, x, n, self.cgate.ptr + pend * hd * 4, .f32, stream);
             if (pend > 0) {
                 const prev: [1]i64 = .{@intCast((start - 1) % dims.raw)};
-                try self.src_idx.upload(0, std.mem.sliceAsBytes(&prev));
+                try self.src_idx.uploadAsync(0, std.mem.sliceAsBytes(&prev), stream.handle);
                 try self.copyRows(caches.raw_kv.ptr, self.src_idx.ptr, self.ckv.ptr, 0, 1, hd, stream);
                 try self.copyRows(caches.raw_score.ptr, self.src_idx.ptr, self.cgate.ptr, 0, 1, hd, stream);
             }
@@ -743,7 +752,7 @@ pub const Prompt = struct {
             const keep = @min(n, dims.raw);
             const idx = self.tab[3 * (self.rows + 1) .. 3 * (self.rows + 1) + keep];
             for (0..keep) |i| idx[i] = @intCast((start + n - keep + i) % dims.raw);
-            try self.dst_idx.upload(0, std.mem.sliceAsBytes(idx));
+            try self.dst_idx.uploadAsync(0, std.mem.sliceAsBytes(idx), stream.handle);
             try self.copyRows(self.ckv.ptr + (pend + n - keep) * hd * 4, 0, caches.raw_kv.ptr, self.dst_idx.ptr, keep, hd, stream);
             try self.copyRows(self.cgate.ptr + (pend + n - keep) * hd * 4, 0, caches.raw_score.ptr, self.dst_idx.ptr, keep, hd, stream);
             full = (pend + n) / ratio;
@@ -765,8 +774,8 @@ pub const Prompt = struct {
             gpos[g] = @intCast((first_group + g) * ratio);
             grows[g] = @intCast(first_group + g);
         }
-        try self.gpos.upload(0, std.mem.sliceAsBytes(gpos[0..full]));
-        try self.grows.upload(0, std.mem.sliceAsBytes(grows[0..full]));
+        try self.gpos.uploadAsync(0, std.mem.sliceAsBytes(gpos[0..full]), stream.handle);
+        try self.grows.uploadAsync(0, std.mem.sliceAsBytes(grows[0..full]), stream.handle);
         if (dims.has_idx_wk) {
             try self.mm(p.idx_wk.?, self.lat.ptr, full, self.kraw.ptr, .bf16, stream);
             try self.rmsnorm(self.kraw.ptr, p.idx_k_norm, self.k.ptr, full, c.idx_dim, stream);
@@ -895,8 +904,9 @@ pub const Prompt = struct {
                 }
             }
         }
-        try self.cidx.upload(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]));
-        self.cidx_valid = n;
+        try self.cidx.uploadAsync(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]), stream.handle);
+        self.cidx_cols = kk;
+        self.cidx_stride = kk;
     }
 
     /// kernels.topk_indices on one row: the kk highest scores' indices ascending (ties to the lower index, torch's
@@ -954,7 +964,8 @@ pub const Prompt = struct {
         _ = n;
     }
 
-    /// cidx [n, n_idx] -> [n, n_pad] with -1 past n_idx (torch.nn.functional.pad): rows moved from the back.
+    /// cidx [n, n_idx] -> [n, n_pad] with -1 past n_idx (torch.nn.functional.pad): rows moved from the back, in place
+    /// on the host copy too, so once a chunk (the layers after the index layer read the padded list as it is).
     fn padCidx(self: *Prompt, n: usize, n_idx: usize, n_pad: usize, stream: cuda.Stream) !void {
         try stream.synchronize();
         var r: usize = n;
@@ -965,7 +976,8 @@ pub const Prompt = struct {
             std.mem.copyBackwards(i64, dst[0..n_idx], src);
             @memset(dst[n_idx..], -1);
         }
-        try self.cidx.upload(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * n_pad]));
+        try self.cidx.uploadAsync(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * n_pad]), stream.handle);
+        self.cidx_stride = n_pad;
     }
 
     // -- the MoE at chunk rows -------------------------------------------------------------------------------------

@@ -25,6 +25,9 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("TF_DS_L2_PREFETCH", "0")
+# the fork's fp32 GEMMs (the prompt chunks' router logits and indexer weights) stay fp32, as cuda_engine sets before
+# torch reads it: NVIDIA's PyTorch containers default TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 (TF32)
+os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
 
 import torch  # noqa: E402
 
@@ -57,6 +60,7 @@ def main() -> int:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    from tensorfold.families.deepseek_v41 import fp32_gemms
     from tensorfold.families.deepseek_v41.config import Cfg
     from tensorfold.families.deepseek_v41.cuda import kernels as K
     from tensorfold.families.deepseek_v41.cuda.model import KV_QUANT, RAW, Comm, Model, mm
@@ -64,6 +68,7 @@ def main() -> int:
 
     assert KV_QUANT
     torch.cuda.set_device(0)
+    fp32_gemms()
     world = 2
     L = a.layers
     c = Cfg.read(a.model)
@@ -134,7 +139,15 @@ def main() -> int:
                     record(f"L{li}.dbg.o.r{r}", o)
                     from tensorfold.families.deepseek_v41.cuda.model import wo_a_out
                     record(f"L{li}.dbg.u.r{r}", wo_a_out(lay_r, o))
-            parts = [m.attention_k(blocks.get(r, li), x, sc, start, shared[r], pos) for r in range(world)]
+            # each rank's attention from the caches before the chunk (two ranks keep their own caches): the ring's
+            # and the compressor store's rows a rank writes at the end are rows the next rank's window reads
+            mutable = [sc.ring[li], *sc.comp_raw.get(li, ())]
+            before = [t.clone() for t in mutable]
+            parts = []
+            for r in range(world):
+                for t, b in zip(mutable, before):
+                    t.copy_(b)
+                parts.append(m.attention_k(blocks.get(r, li), x, sc, start, shared[r], pos))
             for r in range(world):
                 record(f"L{li}.p_attn.r{r}", parts[r])
             if "topk" in shared[0] and c.compress_ratios[li] > 0:
