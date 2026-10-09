@@ -142,6 +142,7 @@ pub const Forward = struct {
     glog: cuda.DeviceBuffer,
     logits: cuda.DeviceBuffer,
     ids_h: []i64,
+    uploads: attention.Uploads,
 
     /// `stream`: where the one-time setup launches go (the index layers' fp16 weights); synchronized before returning.
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, w: *const weights.Weights, set: *const aot.Set, glue: *const attention.Glue, ek: *const experts.Kernels, world: u32, max_rows: usize, cap: usize, bucket: usize, rope_c: attention.Rope, rope_w: attention.Rope, stream: cuda.Stream) !Forward {
@@ -216,6 +217,7 @@ pub const Forward = struct {
         self.glog = try cuda.DeviceBuffer.alloc(d, world * r * vh * 4);
         self.logits = try cuda.DeviceBuffer.alloc(d, r * cfg.vocab * 4);
         self.ids_h = try gpa.alloc(i64, r);
+        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(1, r * 8));
         return self;
     }
 
@@ -232,6 +234,7 @@ pub const Forward = struct {
         inline for (.{ "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "parts", "pick", "wts", "moe", "xc", "xh", "z", "local", "glog", "logits" }) |f| @field(self, f).free();
         self.scratch.deinit();
         self.gpa.free(self.ids_h);
+        self.uploads.deinit();
     }
 
     fn dimsOf(self: *const Forward, li: usize) attention.Dims {
@@ -309,7 +312,8 @@ pub const Forward = struct {
         const dm = c.dim;
         const w = self.w;
         @memcpy(self.ids_h[0..n], ids);
-        try self.ids.upload(0, std.mem.sliceAsBytes(self.ids_h[0..n]));
+        try self.uploads.begin();
+        try self.uploads.put(self.ids, 0, std.mem.sliceAsBytes(self.ids_h[0..n]), stream);
         try self.hc.embedInit(stream, w.embed.ptr(), self.ids.ptr, self.h.ptr, self.pre.ptr, @intCast(n));
         var pre = self.pre.ptr;
         var pre_f = self.pre_f.ptr;

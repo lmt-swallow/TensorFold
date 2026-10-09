@@ -15,6 +15,56 @@ const Ptr = cuda.abi.DevicePtr;
 
 pub const Error = error{ BadShape, NoCandidateSource, OutOfMemory, TooManyRows } || cuda.Error || exl3.Error;
 
+/// Small host tables copied to the device in a stream's order: each `put` copies its bytes into the next free part
+/// of a page-locked buffer and from there asynchronously on the caller's stream (a plain upload runs on the legacy
+/// stream, outside the order of the non-blocking streams the kernels run on). A put's host bytes stay untouched until
+/// its copy has run: `begin` (once a forward, before its first put) waits for the previous forward's copies.
+pub const Uploads = struct {
+    host: cuda.HostBuffer,
+    used: usize,
+    done: cuda.Event,
+    pending: bool,
+
+    pub const alignment: usize = 16;
+
+    /// Room for puts of `bytes` in total a forward, each rounded up to `alignment`.
+    pub fn init(d: *const cuda.Driver, bytes: usize) !Uploads {
+        var host = try cuda.HostBuffer.alloc(d, @max(alignment, bytes));
+        errdefer host.free();
+        return .{ .host = host, .used = 0, .done = try cuda.Event.init(d, false), .pending = false };
+    }
+
+    /// The room `puts` copies of up to `bytes` each need.
+    pub fn room(puts: usize, bytes: usize) usize {
+        return puts * std.mem.alignForward(usize, bytes, alignment);
+    }
+
+    pub fn deinit(self: *Uploads) void {
+        if (self.pending) self.done.synchronize() catch {};
+        self.done.deinit();
+        self.host.free();
+    }
+
+    /// Starts a forward's puts: the previous forward's copies have run once this returns, and their room is free.
+    pub fn begin(self: *Uploads) !void {
+        if (self.pending) try self.done.synchronize();
+        self.pending = false;
+        self.used = 0;
+    }
+
+    /// dst[offset ..] <- bytes, on `stream` after the work already queued there.
+    pub fn put(self: *Uploads, dst: cuda.DeviceBuffer, offset: usize, bytes: []const u8, stream: cuda.Stream) !void {
+        const need = std.mem.alignForward(usize, bytes.len, alignment);
+        if (self.used + need > self.host.bytes.len) return error.OutOfMemory;
+        const staged = self.host.bytes[self.used .. self.used + bytes.len];
+        @memcpy(staged, bytes);
+        self.used += need;
+        try dst.uploadAsync(offset, staged, stream.handle);
+        try self.done.record(stream);
+        self.pending = true;
+    }
+};
+
 /// The sizes the launches read: the pack's (defaults), and the layer's ratio, sources and context bucket.
 pub const Dims = struct {
     d: usize = 5120,
@@ -244,6 +294,7 @@ pub const Attention = struct {
     out: cuda.DeviceBuffer,
     // host side
     tab: []i64, // 5 x max_rows
+    uploads: Uploads, // the row tables' and the picks' copies
     score_h: []f32,
     keys_h: []i64,
     cidx_h: []i64,
@@ -301,6 +352,7 @@ pub const Attention = struct {
         self.score_h = try gpa.alloc(f32, @max(1, r * nb));
         self.keys_h = try gpa.alloc(i64, @max(1, nb));
         self.cidx_h = try gpa.alloc(i64, @max(1, r * kk));
+        self.uploads = try Uploads.init(d, Uploads.room(5, r * 8) + Uploads.room(1, r * kk * 8));
         return self;
     }
 
@@ -310,6 +362,7 @@ pub const Attention = struct {
         self.gpa.free(self.score_h);
         self.gpa.free(self.keys_h);
         self.gpa.free(self.cidx_h);
+        self.uploads.deinit();
     }
 
     /// Rows x bf16 [n, d] at positions start .. start + n - 1 -> this rank's fp32 partial [n, d] (`self.out`),
@@ -340,12 +393,13 @@ pub const Attention = struct {
                 target[i] = if (@mod(pv + 1, rt) == 0) g else scratch_row;
             }
         }
-        try self.pos.upload(0, std.mem.sliceAsBytes(pos[0..n]));
-        try self.slots.upload(0, std.mem.sliceAsBytes(slots[0..n]));
+        try self.uploads.begin();
+        try self.uploads.put(self.pos, 0, std.mem.sliceAsBytes(pos[0..n]), stream);
+        try self.uploads.put(self.slots, 0, std.mem.sliceAsBytes(slots[0..n]), stream);
         if (ratio > 0) {
-            try self.vis.upload(0, std.mem.sliceAsBytes(vis[0..n]));
-            try self.first.upload(0, std.mem.sliceAsBytes(first[0..n]));
-            try self.target.upload(0, std.mem.sliceAsBytes(target[0..n]));
+            try self.uploads.put(self.vis, 0, std.mem.sliceAsBytes(vis[0..n]), stream);
+            try self.uploads.put(self.first, 0, std.mem.sliceAsBytes(first[0..n]), stream);
+            try self.uploads.put(self.target, 0, std.mem.sliceAsBytes(target[0..n]), stream);
         }
         // -- attn_in: wq_a, wkv (and the compressor's) on x ------------------------------------------------------
         try p.wq_a.run(x, .bf16, n, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
@@ -534,7 +588,7 @@ pub const Attention = struct {
                 p.* = -1;
             };
         }
-        try self.cidx.upload(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]));
+        try self.uploads.put(self.cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]), stream);
     }
 };
 

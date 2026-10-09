@@ -212,6 +212,7 @@ pub const RoundRunner = struct {
     // the round's tables (int64 [R]), host and device
     tab: []i64, // 12 x max_rows: ids pos slot base end wslot cbase ctarget gpos vis rslot first
     cidx_h: []i64,
+    uploads: attention.Uploads, // the tables' copies: 4 a round, then 3 and the picks a compressed layer
     t_ids: cuda.DeviceBuffer,
     t_pos: cuda.DeviceBuffer,
     t_wslot: cuda.DeviceBuffer,
@@ -304,6 +305,7 @@ pub const RoundRunner = struct {
         self.tab = try gpa.alloc(i64, 12 * R);
         const kk = @min(cfg.idx_topk, bucket); // the widest selection (ratio 1)
         self.cidx_h = try gpa.alloc(i64, R * kk);
+        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(4 + 3 * w.layers.len, R * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
         self.t_ids = try cuda.DeviceBuffer.alloc(d, R * 8);
         self.t_pos = try cuda.DeviceBuffer.alloc(d, R * 8);
         self.t_wslot = try cuda.DeviceBuffer.alloc(d, R * 8);
@@ -381,6 +383,7 @@ pub const RoundRunner = struct {
         self.gpa.free(self.idx_proj_h);
         self.gpa.free(self.tab);
         self.gpa.free(self.cidx_h);
+        self.uploads.deinit();
         inline for (.{ "t_ids", "t_pos", "t_wslot", "t_wbase", "t_cbase", "t_ctarget", "t_gpos", "t_cidx", "t_zero", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
         self.scratch.deinit();
     }
@@ -428,10 +431,11 @@ pub const RoundRunner = struct {
             wbase[i] = slot[i] * RS;
             wslot[i] = wbase[i] + @mod(pos[i], RS);
         }
-        try self.t_ids.upload(0, std.mem.sliceAsBytes(ids[0..R]));
-        try self.t_pos.upload(0, std.mem.sliceAsBytes(pos[0..R]));
-        try self.t_wslot.upload(0, std.mem.sliceAsBytes(wslot[0..R]));
-        try self.t_wbase.upload(0, std.mem.sliceAsBytes(wbase[0..R]));
+        try self.uploads.begin();
+        try self.uploads.put(self.t_ids, 0, std.mem.sliceAsBytes(ids[0..R]), stream);
+        try self.uploads.put(self.t_pos, 0, std.mem.sliceAsBytes(pos[0..R]), stream);
+        try self.uploads.put(self.t_wslot, 0, std.mem.sliceAsBytes(wslot[0..R]), stream);
+        try self.uploads.put(self.t_wbase, 0, std.mem.sliceAsBytes(wbase[0..R]), stream);
         // -- the layers ------------------------------------------------------------------------------------------
         const w = self.w;
         try self.hc.embedInit(stream, w.embed.ptr(), self.t_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(R));
@@ -536,9 +540,9 @@ pub const RoundRunner = struct {
                 gpos[i] = (if (ratio == 1) pos[i] else groups_i) * rt;
                 vis[i] = @divFloor(pos[i] + 1, rt);
             }
-            try self.t_cbase.upload(0, std.mem.sliceAsBytes(cbase[0..R]));
-            try self.t_ctarget.upload(0, std.mem.sliceAsBytes(ctarget[0..R]));
-            try self.t_gpos.upload(0, std.mem.sliceAsBytes(gpos[0..R]));
+            try self.uploads.put(self.t_cbase, 0, std.mem.sliceAsBytes(cbase[0..R]), stream);
+            try self.uploads.put(self.t_ctarget, 0, std.mem.sliceAsBytes(ctarget[0..R]), stream);
+            try self.uploads.put(self.t_gpos, 0, std.mem.sliceAsBytes(gpos[0..R]), stream);
             const src = &self.pool.planes[self.pool.source[li]].?;
             if (kv_source) {
                 // -- the kv source: compressed latents (and index keys) of the rows' groups ----------------------
@@ -586,7 +590,7 @@ pub const RoundRunner = struct {
                 for (0..R) |i| for (0..kk) |j| {
                     self.cidx_h[i * kk + j] = if (@as(i64, @intCast(j)) < vis[i]) @intCast(j) else -1;
                 };
-                try self.t_cidx.upload(0, std.mem.sliceAsBytes(self.cidx_h[0 .. R * kk]));
+                try self.uploads.put(self.t_cidx, 0, std.mem.sliceAsBytes(self.cidx_h[0 .. R * kk]), stream);
             }
             comp_codes = src.comp_codes.ptr;
             comp_scales = src.comp_scales.ptr;
