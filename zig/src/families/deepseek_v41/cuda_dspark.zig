@@ -15,7 +15,12 @@
 //! A batched draft over the DraftPool replays a CUDA graph per stream count (dspark.py `BatchDraftGraph`,
 //! TF_DS_GRAPHS=0 keeps it eager): its row tables, embedding rows and the Markov loop's first tokens go to fixed
 //! device buffers before the launch, so the pass's launches (the stages, the head, the Markov steps and their
-//! gathers) depend on the host only through the stream count, the pool's rings and the RoPE tables.
+//! gathers) depend on the host only through the stream count, the pool's rings and the RoPE tables. Its stages take
+//! the fork's fused kernels (dspark.py `_stages_fused`, TF_DS_DRAFT_FUSED; here TF_DS_FUSED, default on): each
+//! sublayer's hc_post fused into the next sublayer's mixes (`_hc_mix_part` posted, `_hc_finish_s`), wq_a and wkv as
+//! one grouped EXL3 launch, q's RMSNorm writing wq_b's rotated rows (`_rmsnorm_rot`) and q's RoPE in wq_b's epilogue,
+//! wo_a's epilogue writing wo_b's rotated rows, and the paced L2 prefetch forks; the same bits. Absorbs run every
+//! stage's wkv as one grouped launch (dspark.py `stage_kv`).
 const std = @import("std");
 const cuda = @import("cuda");
 const exl3 = @import("cuda_exl3.zig");
@@ -273,6 +278,31 @@ pub const BatchGraph = struct {
     pub const Key = struct { rings: [max_rings]Ptr = @splat(0), cos: Ptr = 0, sin: Ptr = 0 };
 };
 
+/// A draft stage's grouped EXL3 launches (dspark.py's fused stage: attn_in's group, q_proj's, wo_ab's).
+pub const StageGroups = struct {
+    in: exl3.Group, // wq_a, wkv
+    q: exl3.Group, // wq_b
+    wo_a: exl3.Group,
+    wo_b: exl3.Group,
+
+    pub fn init(gk: *const exl3.GroupKernels, s: Stage, d: *const cuda.Driver) !StageGroups {
+        _ = d;
+        var wo: [exl3.gmax]*const exl3.Linear = undefined;
+        if (s.wo_a.len > exl3.gmax) return error.BadShape;
+        for (s.wo_a, 0..) |*x, i| wo[i] = x;
+        return .{
+            .in = try exl3.Group.init(gk, &.{ s.wq_a, s.wkv }),
+            .q = try exl3.Group.init(gk, &.{s.wq_b}),
+            .wo_a = try exl3.Group.init(gk, wo[0..s.wo_a.len]),
+            .wo_b = try exl3.Group.init(gk, &.{s.wo_b}),
+        };
+    }
+
+    pub fn deinit(self: *StageGroups) void {
+        _ = self;
+    }
+};
+
 pub const Drafter = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -356,6 +386,19 @@ pub const Drafter = struct {
     host_out: []i64,
     host_xc: []u16,
     emb_pair: []u16,
+    // the fused stages (batched passes) and the grouped absorb
+    fused: bool,
+    gk: exl3.GroupKernels,
+    sg: []StageGroups,
+    kv_group: exl3.Group, // every stage's wkv (absorbs)
+    kvg: cuda.DeviceBuffer, // bf16 [stages, 128, hd]: the grouped absorb's outputs
+    h2: cuda.DeviceBuffer,
+    xh_in: cuda.DeviceBuffer,
+    xh_q: cuda.DeviceBuffer,
+    xh_woa: cuda.DeviceBuffer,
+    xh_wob: cuda.DeviceBuffer,
+    zg: cuda.DeviceBuffer,
+    l2: rounds.L2,
 
     pub const max_absorb = 2048;
     /// Rows a draft pass holds at most (kernels.DECODE_ROWS): N streams x the block.
@@ -465,6 +508,63 @@ pub const Drafter = struct {
         self.host_out = try gpa.alloc(i64, Markov.np * (dims.block + 1));
         self.host_xc = try gpa.alloc(u16, nd);
         self.emb_pair = try gpa.alloc(u16, 2 * D);
+        self.fused = rounds.fusedFromEnv();
+        self.gk = try exl3.GroupKernels.load(d);
+        self.sg = try gpa.alloc(StageGroups, stages.len);
+        var in_b: usize = 16;
+        var q_b: usize = 16;
+        var woa_b: usize = 16;
+        var wob_b: usize = 16;
+        var zgw: usize = 4;
+        var kv_l: [exl3.gmax]*const exl3.Linear = undefined;
+        if (stages.len > exl3.gmax) return error.BadShape;
+        for (self.sg, stages, 0..) |*g, st, j| {
+            g.* = try StageGroups.init(&self.gk, st, d);
+            in_b = @max(in_b, g.in.bufferBytes(n));
+            q_b = @max(q_b, g.q.bufferBytes(n));
+            woa_b = @max(woa_b, g.wo_a.bufferBytes(n));
+            wob_b = @max(wob_b, g.wo_b.bufferBytes(n));
+            inline for (.{ "in", "q", "wo_a", "wo_b" }) |f| zgw = @max(zgw, @field(g, f).scratchWords(n));
+            kv_l[j] = st.wkv;
+        }
+        self.kv_group = try exl3.Group.init(&self.gk, kv_l[0..stages.len]);
+        zgw = @max(zgw, self.kv_group.scratchWords(128));
+        self.kvg = try cuda.DeviceBuffer.alloc(d, stages.len * 128 * dims.hd * 2);
+        self.h2 = try cuda.DeviceBuffer.alloc(d, nd * hc_mod.hc_streams * 2);
+        self.xh_in = try cuda.DeviceBuffer.alloc(d, @max(in_b, self.kv_group.bufferBytes(128)));
+        self.xh_q = try cuda.DeviceBuffer.alloc(d, q_b);
+        self.xh_woa = try cuda.DeviceBuffer.alloc(d, woa_b);
+        self.xh_wob = try cuda.DeviceBuffer.alloc(d, wob_b);
+        self.zg = try cuda.DeviceBuffer.alloc(d, zgw * 4);
+        self.l2 = try rounds.L2.create(gpa, d, stages.len);
+        {
+            // dspark.py's forks: wo_a, wo_b after wq_b; the FFN's mix, gate and shared expert after wo_b; the next
+            // stage's mix, input projections and wq_b (the head after the last) after the experts
+            const fn_bytes = 24 * 4 * D * 4;
+            var bufs: [16]cuda.DeviceBuffer = undefined;
+            for (stages, 0..) |st, j| {
+                var k: usize = 0;
+                for (st.wo_a) |x| {
+                    bufs[k] = x.words;
+                    k += 1;
+                }
+                bufs[k] = st.wo_b.words;
+                self.l2.setAttn(j, bufs[0 .. k + 1]);
+                bufs[0] = .{ .d = d, .ptr = st.hc_ffn_fn, .len = fn_bytes };
+                bufs[1] = .{ .d = d, .ptr = st.gate_w, .len = dims.n_routed * D * 2 };
+                const shared = try rounds.L2.sharedTrellises(st.experts);
+                @memcpy(bufs[2..5], &shared);
+                self.l2.setMoe(j, bufs[0..5]);
+                if (j + 1 < stages.len) {
+                    const x = stages[j + 1];
+                    bufs[0] = .{ .d = d, .ptr = x.hc_attn_fn, .len = fn_bytes };
+                    bufs[1] = x.wq_a.words;
+                    bufs[2] = x.wkv.words;
+                    bufs[3] = x.wq_b.words;
+                    self.l2.setNext(j, false, false, bufs[0..4]);
+                } else self.l2.setNext(j, false, false, &.{head.head.words});
+            }
+        }
         return self;
     }
 
@@ -478,6 +578,11 @@ pub const Drafter = struct {
         self.gpa.free(self.host_out);
         self.gpa.free(self.host_xc);
         self.gpa.free(self.emb_pair);
+        for (self.sg) |*g| g.deinit();
+        self.gpa.free(self.sg);
+        inline for (.{ "kvg", "h2", "xh_in", "xh_q", "xh_woa", "xh_wob", "zg" }) |f| @field(self, f).free();
+        self.gk.deinit();
+        self.l2.deinit();
         self.gpa.destroy(self);
     }
 
@@ -653,7 +758,12 @@ pub const Drafter = struct {
         var pre = self.pre.ptr;
         var pre_f = self.pre_f.ptr;
         var nb: [32]u8 = undefined;
-        for (self.stages, rings, 0..) |s, ring, j| {
+        var h = self.h.ptr;
+        if (batched and self.fused) {
+            const st = try self.fusedStages(R, rings, rope, stream, ctx, hook);
+            h = st.h;
+            pre = st.pre;
+        } else for (self.stages, rings, 0..) |s, ring, j| {
             try self.hc.pre(stream, self.h.ptr, s.hc_attn_fn, s.hc_attn_scale, s.hc_attn_base, pre, s.attn_norm, self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x1", .{j}), self.x.ptr);
             const pa = try self.stageAttention(s, ring.ptr, R, batched, rope, stream);
@@ -674,7 +784,7 @@ pub const Drafter = struct {
         }
         // xc = collapse(h, pre); local = head(rmsnorm(xc, norm))
         try self.set.run(stream, "_collapse", .{ @intCast(R), @intCast(D / 1024), 1 }, &.{
-            aot.ptr("X", "*bf16", self.h.ptr), aot.ptr("PRE", "*fp32", pre), aot.ptr("OUT", "*bf16", self.xc.ptr),
+            aot.ptr("X", "*bf16", h), aot.ptr("PRE", "*fp32", pre), aot.ptr("OUT", "*bf16", self.xc.ptr),
         }, &.{ aot.ci("D", @intCast(D)), aot.ci("BLOCK", 1024) });
         try self.rmsnorm(self.xc.ptr, self.head.norm, self.xn.ptr, R, D, stream);
         try self.head.head.run(self.xn.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.local.ptr, .f32, stream);
@@ -685,6 +795,137 @@ pub const Drafter = struct {
             break :blk self.lg.ptr;
         };
         try self.markov.loop(lg, self.head, N, n, n, self, stream);
+    }
+
+    /// dspark.py `BatchDraftGraph._stages_fused`: every stage with each sublayer's post fused into the next
+    /// sublayer's mixes (kernels.hc_pre2 without a side stream: `_hc_mix_part` posted, then `_hc_finish_s` with both
+    /// halves), the last post alone, the L2 forks joined at the end. Returns the streams' buffer and the last pre-mix.
+    fn fusedStages(self: *Drafter, R: usize, rings: []const cuda.DeviceBuffer, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook) !struct { h: Ptr, pre: Ptr } {
+        const dm = self.dims;
+        const D = dm.d;
+        const rows: u32 = @intCast(R);
+        var h = self.h.ptr;
+        var spare = self.h2.ptr;
+        var pre = self.pre.ptr;
+        var pre_f = self.pre_f.ptr;
+        var pending: ?Ptr = null; // the last sublayer's gathered partials, not yet posted
+        var nb: [32]u8 = undefined;
+        for (self.stages, rings, self.sg, 0..) |s, ring, *g, j| {
+            inline for (0..2) |sub| {
+                const fn_ = if (sub == 0) s.hc_attn_fn else s.hc_ffn_fn;
+                const scale = if (sub == 0) s.hc_attn_scale else s.hc_ffn_scale;
+                const base = if (sub == 0) s.hc_attn_base else s.hc_ffn_base;
+                const norm = if (sub == 0) s.attn_norm else s.ffn_norm;
+                const pre_in = if (sub == 0) pre else self.pre_a.ptr;
+                const pre_out = if (sub == 0) self.pre_a.ptr else pre_f;
+                if (pending) |ga| {
+                    try self.hc.mixPart(stream, h, spare, ga, @intCast(dm.world), self.post.ptr, self.comb.ptr, fn_, self.part.ptr, rows, true, true);
+                    const t = h;
+                    h = spare;
+                    spare = t;
+                    pending = null;
+                    if (hook) |f| try f(ctx.?, if (sub == 0) try std.fmt.bufPrint(&nb, "s{d}_h2", .{j - 1}) else try std.fmt.bufPrint(&nb, "s{d}_h1", .{j}), h);
+                } else try self.hc.mixPart(stream, h, h, null, 1, self.post.ptr, self.comb.ptr, fn_, self.part.ptr, rows, true, false);
+                try self.hc.finishS(stream, h, self.part.ptr, base, scale, pre_in, norm, self.x.ptr, pre_out, self.post.ptr, self.comb.ptr, rows, true);
+                if (sub == 0) {
+                    if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x1", .{j}), self.x.ptr);
+                    const pa = try self.fusedAttention(s, g, ring.ptr, R, rope, stream, j);
+                    if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_attn", .{j}), pa);
+                    pending = try self.gather(pa, R * D, stream);
+                } else {
+                    if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x2", .{j}), self.x.ptr);
+                    const pmo = try self.stageMoe(s, R, stream);
+                    try self.l2.next(j, self.stages.len, stream);
+                    if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_moe", .{j}), pmo);
+                    pending = try self.gather(pmo, R * D, stream);
+                }
+            }
+            const t = pre;
+            pre = pre_f;
+            pre_f = t;
+        }
+        if (pending) |gm| {
+            try self.hc.post(stream, gm, @intCast(dm.world), h, self.post.ptr, self.comb.ptr, h, rows);
+            if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_h2", .{self.stages.len - 1}), h);
+        }
+        try self.l2.join(stream);
+        return .{ .h = h, .pre = pre };
+    }
+
+    /// dspark.py `BatchDraftGraph._attention(fused=True)`: wq_a and wkv in one grouped launch, q's RMSNorm writing
+    /// wq_b's rotated rows (`_rmsnorm_rot`) and q's RoPE in wq_b's epilogue, the block's keys and the attention as
+    /// the plain stage, wo_a's inputs rotated from o's column blocks in place and wo_a's epilogue writing wo_b's
+    /// rotated rows (model.py `wo_ab`). This rank's fp32 partial.
+    fn fusedAttention(self: *Drafter, s: Stage, g: *const StageGroups, ring: Ptr, R: usize, rope: Rope, stream: cuda.Stream, j: usize) !Ptr {
+        const dm = self.dims;
+        const n = dm.block;
+        {
+            const xr: exl3.Rows = .{ .ptr = self.x.ptr, .dtype = .bf16, .ld = dm.d };
+            const outs = [_]exl3.Rows{ .{ .ptr = self.qa.ptr, .dtype = .bf16, .ld = dm.q_rank }, .{ .ptr = self.ykv.ptr, .dtype = .bf16, .ld = dm.hd } };
+            try g.in.rotate(&.{ xr, xr }, R, self.xh_in.ptr, stream);
+            try g.in.rotated(R, self.xh_in.ptr, &outs, self.zg.ptr, null, null, stream);
+        }
+        {
+            const block = std.math.ceilPowerOfTwo(usize, dm.q_rank) catch return error.BadShape;
+            try self.set.run(stream, "_rmsnorm_rot", .{ @intCast(R), 1, 1 }, &.{
+                aot.ptr("X", "*bf16", self.qa.ptr),     aot.int("xs", @intCast(dm.q_rank)), aot.ptr("W", "*bf16", s.q_norm),
+                aot.ptr("OUT", "*bf16", self.qr.ptr),   aot.int("os_", @intCast(dm.q_rank)), aot.float("eps", dm.eps),
+                aot.ptr("S0", "*fp16", s.wq_b.suh.ptr), aot.ptr("H0", "*fp16", self.xh_q.ptr),
+                aot.ptr("S1", "*bf16", self.qr.ptr),    aot.ptr("H1", "*bf16", self.qr.ptr),
+            }, &.{ aot.ci("D", @intCast(dm.q_rank)), aot.ci("BLOCK", @intCast(block)), aot.ci("NROT", 1), aot.ci("PDL", 1) });
+            var flags: [exl3.gmax]bool = @splat(false);
+            flags[0] = true;
+            const outs = [_]exl3.Rows{.{ .ptr = self.q.ptr, .dtype = .bf16, .ld = dm.heads * dm.hd }};
+            try g.q.rotated(R, self.xh_q.ptr, &outs, self.zg.ptr, null, .{ .cos = rope.cos.ptr, .sin = rope.sin.ptr, .pos = self.pos.ptr, .hd = dm.hd, .rd = dm.rd, .layers = flags }, stream);
+        }
+        try self.l2.attn(j, stream);
+        try self.kvNormRope(self.ykv.ptr, s.kv_norm, rope, self.pos.ptr, self.neg.ptr, ring, self.kvb.ptr, R, stream);
+        const groups_h = dm.heads / 16;
+        const picks: usize = (n + 31) / 32;
+        const nblk: usize = dm.window / 32 + picks;
+        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dm.hd))));
+        try self.set.run(stream, "_sparse_attn_part", .{ @intCast(R), @intCast(groups_h), 8 }, &.{
+            aot.ptr("Q", "*bf16", self.q.ptr),      aot.ptr("WSRC", "*bf16", ring),
+            aot.ptr("WLO", "*i64", self.zero.ptr),  aot.ptr("COMP", "*bf16", self.kvb.ptr),
+            aot.ptr("CSC", "*bf16", ring),          aot.ptr("IDX", "*i64", self.bidx.ptr),
+            aot.ptr("POS", "*i64", self.wpos.ptr),  aot.ptr("PM", "*fp32", self.pm.ptr),
+            aot.ptr("PL", "*fp32", self.pl.ptr),    aot.ptr("PO", "*fp32", self.po.ptr),
+            aot.ptr("SINK", "*fp32", s.sink),       aot.ptr("OUT", "*bf16", self.o.ptr),
+            aot.float("scale", scale),              aot.int("ring_size", @intCast(dm.ring)),
+            aot.int("n_idx", @intCast(n)),          aot.ptr("RBASE", "*i64", self.rbase.ptr),
+            aot.ptr("CBASE", "*i64", self.zero.ptr),
+        }, &.{
+            aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16),      aot.ci("WIN", @intCast(dm.window)),
+            aot.ci("BN", 32),                aot.ci("RING", 1),               aot.ci("HAS_COMP", 1), aot.ci("PACKED", 0),
+            aot.ci("SPLITS", 8),             aot.ci("NBLK", @intCast(nblk)),  aot.ci("FINAL", 0),    aot.ci("HAS_BASE", 1),
+            aot.ci("PDL", 1),                aot.ci("WPF", 1),
+        });
+        try self.set.run(stream, "_sparse_attn_merge", .{ @intCast(R), @intCast(groups_h), 1 }, &.{
+            aot.ptr("PM", "*fp32", self.pm.ptr), aot.ptr("PL", "*fp32", self.pl.ptr), aot.ptr("PO", "*fp32", self.po.ptr),
+            aot.ptr("SINK", "*fp32", s.sink),   aot.ptr("OUT", "*bf16", self.o.ptr),
+        }, &.{ aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
+        try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, R, dm.heads, dm.hd, true, stream);
+        {
+            const groups = g.wo_a.n;
+            const o_cols = dm.heads * dm.hd;
+            const g_cols = o_cols / groups;
+            var xs: [exl3.gmax]exl3.Rows = undefined;
+            var outs: [exl3.gmax]exl3.Rows = undefined;
+            var rot: [exl3.gmax]?exl3.RotOut = @splat(null);
+            var col: usize = 0;
+            for (0..groups) |q| {
+                xs[q] = .{ .ptr = self.o.ptr + q * g_cols * 2, .dtype = .bf16, .ld = o_cols };
+                outs[q] = .{ .ptr = self.u.ptr + col * 2, .dtype = .bf16, .ld = groups * dm.o_rank };
+                rot[q] = .{ .suh = s.wo_b.suh.ptr, .xh = self.xh_wob.ptr, .ld = s.wo_b.k, .off = col };
+                col += s.wo_a[q].n;
+            }
+            try g.wo_a.rotate(xs[0..groups], R, self.xh_woa.ptr, stream);
+            try g.wo_a.rotated(R, self.xh_woa.ptr, outs[0..groups], self.zg.ptr, rot[0..groups], null, stream);
+            const ob = [_]exl3.Rows{.{ .ptr = self.attn_out.ptr, .dtype = .f32, .ld = dm.d }};
+            try g.wo_b.rotated(R, self.xh_wob.ptr, &ob, self.zg.ptr, null, null, stream);
+        }
+        try self.l2.moe(j, stream);
+        return self.attn_out.ptr;
     }
 
     /// The graph of a batched pass of N streams over `rings` with `rope`, recorded (nothing runs) when missing or
@@ -882,10 +1123,33 @@ pub const Drafter = struct {
         try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         try self.head.main_proj.run(taps, .bf16, n, self.xh.ptr, self.z.ptr, self.main_y.ptr, .bf16, stream);
         try self.rmsnorm(self.main_y.ptr, self.head.main_norm, self.main_x.ptr, n, dm.d, stream);
+        if (self.fused) {
+            try self.stageKv(self.main_x.ptr, n, stream);
+            for (self.stages, pool.rings, 0..) |s, ring, j| {
+                const y = self.kvg.ptr + j * 128 * dm.hd * 2;
+                try self.kvNormRope(y, s.kv_norm, rope, self.abs_pos.ptr, self.abs_slots.ptr, ring.ptr, y, n, stream);
+            }
+            return;
+        }
         for (self.stages, pool.rings) |s, ring| {
             try s.wkv.run(self.main_x.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.abs_kv.ptr, .bf16, stream);
             try self.kvNormRope(self.abs_kv.ptr, s.kv_norm, rope, self.abs_pos.ptr, self.abs_slots.ptr, ring.ptr, self.abs_kv.ptr, n, stream);
         }
+    }
+
+    /// dspark.py `stage_kv`: every stage's wkv of main_x [m, d] (m <= 128) in one grouped launch, stage j's rows at
+    /// `kvg` + j x 128 rows; each the bits of the stage's own launch.
+    fn stageKv(self: *Drafter, main_x: Ptr, m: usize, stream: cuda.Stream) !void {
+        const dm = self.dims;
+        var xs: [exl3.gmax]exl3.Rows = undefined;
+        var outs: [exl3.gmax]exl3.Rows = undefined;
+        for (0..self.stages.len) |j| {
+            xs[j] = .{ .ptr = main_x, .dtype = .bf16, .ld = dm.d };
+            outs[j] = .{ .ptr = self.kvg.ptr + j * 128 * dm.hd * 2, .dtype = .bf16, .ld = dm.hd };
+        }
+        const k = self.stages.len;
+        try self.kv_group.rotate(xs[0..k], m, self.xh_in.ptr, stream);
+        try self.kv_group.rotated(m, self.xh_in.ptr, outs[0..k], self.zg.ptr, null, null, stream);
     }
 
     /// dspark.py `absorb_many` for one slot: the taps of positions start .. start + n - 1 into slot `slot`'s rows of
@@ -914,7 +1178,17 @@ pub const Drafter = struct {
                 try self.head.main_proj.run(tap_ptr + at * 3 * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.main_y.ptr + at * dm.d * 2, .bf16, stream);
                 try self.rmsnorm(self.main_y.ptr + at * dm.d * 2, self.head.main_norm, self.main_x.ptr + at * dm.d * 2, m, dm.d, stream);
             }
-            for (self.stages, pool.rings) |s, ring| {
+            if (self.fused) {
+                at = 0;
+                while (at < n) : (at += 128) {
+                    const m = @min(128, n - at);
+                    try self.stageKv(self.main_x.ptr + at * dm.d * 2, m, stream);
+                    for (self.stages, pool.rings, 0..) |s, ring, j| {
+                        const y = self.kvg.ptr + j * 128 * dm.hd * 2;
+                        try self.kvNormRope(y, s.kv_norm, rope, self.abs_pos.ptr + at * 8, self.abs_slots.ptr + at * 8, ring.ptr, y, m, stream);
+                    }
+                }
+            } else for (self.stages, pool.rings) |s, ring| {
                 at = 0;
                 while (at < n) : (at += 128) {
                     const m = @min(128, n - at);

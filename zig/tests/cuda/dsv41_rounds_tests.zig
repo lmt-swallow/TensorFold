@@ -128,11 +128,14 @@ pub fn draftPool(gpu: Gpu, dir: []const u8, aot_override: ?[]const u8) !void {
             q0[s_] = len;
             var taps = try h.upload(try std.fmt.bufPrint(&nb, "c{d}_taps{d}", .{ ci, s_ }));
             defer taps.free();
+            try gpu.ctx.synchronize(); // (the upload's DMA landed before the stream reads it)
             try drafter.absorbSlot(&pool, slots[s_], taps.ptr, 0, len, rope, h.stream);
         }
         for (0..stages_n) |j| try h.stage(try std.fmt.bufPrint(&nb, "c{d}_ring{d}_absorbed", .{ ci, j }), pool.rings[j].ptr);
         var emb = try h.upload(try std.fmt.bufPrint(&nb, "c{d}_emb", .{ci}));
         defer emb.free();
+        // a pageable upload may return before its DMA lands, and the pass reads the table on a non-blocking stream
+        try gpu.ctx.synchronize();
         var pbuf: [16]u8 = undefined;
         var pref: Prefixed = .{ .h = &h, .prefix = try std.fmt.bufPrint(&pbuf, "c{d}", .{ci}) };
         var out: [16]dsp.Drafts = undefined;
@@ -188,6 +191,46 @@ pub fn draftPool(gpu: Gpu, dir: []const u8, aot_override: ?[]const u8) !void {
         }
     }
     try check.expect(h.failures == 0, "dsv41-draft-pool: {d} stage(s) differ from the Python fork", .{h.failures});
+    if (getenv("TF_DS_DRAFT_TIME")) |v| try timeDrafts(gpa, gpu, drafter, stages_n, slots_n, dims, rope, h.stream, try std.fmt.parseInt(usize, v, 10));
+}
+
+/// Batched draft passes of 2 and 3 streams (the fixture's cases: its AOT set holds their variants) (slots 0 .., each absorbed to 40 positions of noise taps), eager and
+/// replayed as graphs: the best of `reps` after a warm-up, in ms (TF_DS_DRAFT_TIME=<reps>).
+fn timeDrafts(gpa: std.mem.Allocator, gpu: Gpu, drafter: *dsp.Drafter, stages_n: usize, slots_n: usize, dims: dsp.Dims, rope: dsp.Rope, stream: cuda.Stream, reps: usize) !void {
+    var pool = try dsp.DraftPool.init(gpa, gpu.d, stages_n, slots_n, dims);
+    defer pool.deinit(gpa);
+    const len = 40;
+    var taps = try cuda.DeviceBuffer.alloc(gpu.d, len * 3 * dims.d * 2);
+    defer taps.free();
+    try taps.fill8(0x3c, null);
+    for (0..@min(3, slots_n)) |s_| try drafter.absorbSlot(&pool, s_, taps.ptr, 0, len, rope, stream);
+    var table = try cuda.DeviceBuffer.alloc(gpu.d, 4 * dims.d * 2);
+    defer table.free();
+    try table.fill8(0x3c, null);
+    const graphs = drafter.graphs;
+    defer drafter.graphs = graphs;
+    for ([_]bool{ false, true }) |g| {
+        drafter.graphs = g;
+        for (2..4) |N| {
+            if (N > slots_n or N * dims.block > dsp.Drafter.max_rows) break;
+            const tokens = [_]u32{ 11, 22, 33 };
+            const q0 = [_]usize{ len, len, len };
+            const slots = [_]usize{ 0, 1, 2 };
+            var out: [16]dsp.Drafts = undefined;
+            var best: f64 = std.math.inf(f64);
+            for (0..reps + 1) |rep| {
+                try stream.synchronize();
+                var t0: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &t0);
+                try drafter.batchDraftWithTable(&pool, tokens[0..N], q0[0..N], slots[0..N], table.ptr, rope, stream, null, null, out[0..N]);
+                var t1: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &t1);
+                const ms = @as(f64, @floatFromInt((t1.sec - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec))) / 1e6;
+                if (rep > 0) best = @min(best, ms);
+            }
+            std.debug.print("dsv41-draft-pool time: {d} stream(s) x {d} rows, {d} stages, {s}: {d:.3} ms\n", .{ N, dims.block, stages_n, if (g) "graph" else "eager", best });
+        }
+    }
 }
 
 // -- the backbone round ----------------------------------------------------------------------------------------

@@ -366,13 +366,14 @@ pub const L2 = struct {
         return !std.mem.eql(u8, v, "0");
     }
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, w: *const weights.Weights) !L2 {
-        _ = cfg;
-        const n = w.layers.len;
+    /// Forks for `n` layers, every range empty until set (`setAttn`, `setMoe`, `setNext`).
+    pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, n: usize) !L2 {
+        var pf = try exl3.Prefetch.load(d);
+        errdefer pf.deinit();
         var self: L2 = .{
             .gpa = gpa,
             .on = fromEnv(),
-            .pf = try exl3.Prefetch.load(d),
+            .pf = pf,
             .side = undefined,
             .ev = undefined,
             .ev_join = undefined,
@@ -380,10 +381,38 @@ pub const L2 = struct {
             .moe_r = try gpa.alloc(exl3.PArgs, n),
             .next_r = try gpa.alloc([4]exl3.PArgs, n),
         };
+        for (self.attn_r, self.moe_r, self.next_r) |*a, *m, *x| {
+            a.* = .{};
+            m.* = .{};
+            x.* = @splat(.{});
+        }
         self.side = try cuda.Stream.init(d, true);
         self.ev = try cuda.Event.init(d, false);
         self.ev_join = try cuda.Event.init(d, false);
-        const chunk = self.pf.chunk;
+        return self;
+    }
+
+    pub fn setAttn(self: *L2, li: usize, bufs: []const cuda.DeviceBuffer) void {
+        exl3.Prefetch.ranges(bufs, attn_mb << 20, &self.attn_r[li], self.pf.chunk);
+    }
+
+    pub fn setMoe(self: *L2, li: usize, bufs: []const cuda.DeviceBuffer) void {
+        exl3.Prefetch.ranges(bufs, moe_mb << 20, &self.moe_r[li], self.pf.chunk);
+    }
+
+    /// The "next" fork after layer li: `with_engram` (the Engram projections included), `stretch_end` (the 4 MiB
+    /// budget of a fork that ends a stretch before an Engram layer).
+    pub fn setNext(self: *L2, li: usize, with_engram: bool, stretch_end: bool, bufs: []const cuda.DeviceBuffer) void {
+        const mb: usize = if (stretch_end) stretch_end_mb else next_mb;
+        exl3.Prefetch.ranges(bufs, mb << 20, &self.next_r[li][@as(usize, @intFromBool(with_engram)) * 2 + @intFromBool(stretch_end)], self.pf.chunk);
+    }
+
+    /// The backbone's forks (model.py `_l2_tensors` over the layers and the head).
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, w: *const weights.Weights) !L2 {
+        _ = cfg;
+        const n = w.layers.len;
+        var self = try create(gpa, d, n);
+        errdefer self.deinit();
         var bufs: [16]cuda.DeviceBuffer = undefined;
         for (w.layers, 0..) |*l, li| {
             var k: usize = 0;
@@ -393,22 +422,15 @@ pub const L2 = struct {
             }
             bufs[k] = l.wo_b.words;
             k += 1;
-            exl3.Prefetch.ranges(bufs[0..k], attn_mb << 20, &self.attn_r[li], chunk);
+            self.setAttn(li, bufs[0..k]);
             // the FFN's mix and gate, then the shared expert's trellises (the last expert's gate, up, down)
-            k = 0;
-            bufs[k] = l.hc_ffn_fn.buf;
-            bufs[k + 1] = l.gate_w.buf;
-            k += 2;
+            bufs[0] = l.hc_ffn_fn.buf;
+            bufs[1] = l.gate_w.buf;
             const shared = try sharedTrellises(&l.experts);
-            for (shared) |b| {
-                bufs[k] = b;
-                k += 1;
-            }
-            exl3.Prefetch.ranges(bufs[0..k], moe_mb << 20, &self.moe_r[li], chunk);
+            @memcpy(bufs[2..5], &shared);
+            self.setMoe(li, bufs[0..5]);
             for (0..4) |v| {
                 const with_engram = v / 2 == 1;
-                const mb: usize = if (v % 2 == 1) stretch_end_mb else next_mb;
-                const budget = mb << 20;
                 k = 0;
                 if (li + 1 < n) {
                     const x = &w.layers[li + 1];
@@ -436,14 +458,14 @@ pub const L2 = struct {
                     bufs[k] = w.head.words;
                     k += 1;
                 }
-                exl3.Prefetch.ranges(bufs[0..k], budget, &self.next_r[li][v], chunk);
+                self.setNext(li, with_engram, v % 2 == 1, bufs[0..k]);
             }
         }
         return self;
     }
 
     /// The shared expert's (the last expert's) gate, up and down trellises, as views of the layer's trellis buffer.
-    fn sharedTrellises(ex: *const experts.Experts) ![3]cuda.DeviceBuffer {
+    pub fn sharedTrellises(ex: *const experts.Experts) ![3]cuda.DeviceBuffer {
         const E = ex.count;
         var out: [3]cuda.DeviceBuffer = undefined;
         const tables = [3]cuda.DeviceBuffer{ ex.gate_ptr, ex.up_ptr, ex.down_ptr };
