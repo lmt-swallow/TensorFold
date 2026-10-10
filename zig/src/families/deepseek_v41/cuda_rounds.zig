@@ -294,6 +294,15 @@ pub fn fusedFromEnv() bool {
     return !std.mem.eql(u8, v, "0");
 }
 
+/// Whether a round's tail takes the device: the logits' rank columns copied in 16-byte words, each greedy row's token
+/// drawn on the device (R tokens read back instead of R x V logits), and the drafts' landing chances reported to
+/// the round loop: TF_DS_TAIL unset or anything but "0". Off: the byte copies and the host argmax, no chances (the
+/// same tokens either way; the chances only change which draft rows a round verifies).
+pub fn tailFromEnv() bool {
+    const v = std.mem.span(std.c.getenv("TF_DS_TAIL") orelse return true);
+    return !std.mem.eql(u8, v, "0");
+}
+
 /// A layer's grouped EXL3 launches (model.py `_attn_in_group`, `q_proj`'s groups, `wo_ab`'s): the projections of
 /// one input, each with its own plan, so the bits of each layer's own launches.
 pub const LayerGroups = struct {
@@ -686,6 +695,8 @@ pub const RoundRunner = struct {
     // the fused decode path (TF_DS_FUSED, default on): rounds.py `_layers_fused` + `_attention2` at the fork's default
     // switches
     fused: bool,
+    // the round's tail on the device (TF_DS_TAIL, default on): the logits' rank columns in 16-byte words
+    tail: bool,
     gk: exl3.GroupKernels,
     lg: []LayerGroups,
     h2: cuda.DeviceBuffer, // the posted streams' other buffer
@@ -768,6 +779,7 @@ pub const RoundRunner = struct {
         self.rows_glue = try cuda.Module.load(d, cuda.kernels.dsv41_prompt_glue);
         self.copy_rows = try self.rows_glue.function("tf_dsv41_copy_rows");
         self.graphs = graphsFromEnv();
+        self.tail = tailFromEnv();
         self.execs = .empty;
         self.captures = 0;
         self.launch_hook = null;
@@ -1204,7 +1216,9 @@ pub const RoundRunner = struct {
         try self.probeOut("head.local.r0", self.local.ptr, R * vl * 4, stream);
         try gather.run(self.local.ptr, R * vl, self.glog.ptr, stream);
         for (0..self.world) |rk| {
-            // [world, R, vl] -> [R, world x vl]: rank rk's columns of every row (f32 moved as pairs of 16-bit words)
+            // [world, R, vl] -> [R, world x vl]: rank rk's columns of every row (16-byte words with the tail on, else
+            // f32 moved as pairs of 16-bit words: the same bytes)
+            if (self.tail and try self.glue.copyRows16(self.glog.ptr + rk * R * vl * 4, vl * 4, self.logits.ptr + rk * vl * 4, c.vocab * 4, R, vl * 4, stream)) continue;
             try self.copyCols(self.glog.ptr + rk * R * vl * 4, vl * 2, self.logits.ptr + rk * vl * 4, c.vocab * 2, R, vl * 2, stream);
         }
     }

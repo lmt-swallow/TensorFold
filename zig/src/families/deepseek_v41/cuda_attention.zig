@@ -449,6 +449,9 @@ pub const Glue = struct {
     bf16_scale: cuda.Function,
     copy_cols: cuda.Function,
     f32_to_f16: cuda.Function,
+    // the round's tail (null in a cubin built before them: the callers keep copy_cols and the host argmax)
+    copy_rows16: ?cuda.Function = null,
+    argmax_rows: ?cuda.Function = null,
     topk: ?TopkGlue = null, // the selection kernels (built-in fatbin; null in host-only builds: the host selection)
     select: Select = .auto,
     rope: ?RopeGen = null, // rope.cu (built-in fatbin; null in host-only builds: the table path only)
@@ -470,6 +473,8 @@ pub const Glue = struct {
             .bf16_scale = try module.function("bf16_scale"),
             .copy_cols = try module.function("copy_cols"),
             .f32_to_f16 = try module.function("f32_to_f16"),
+            .copy_rows16 = module.function("copy_rows16") catch null,
+            .argmax_rows = module.function("argmax_rows") catch null,
             .topk = if (cuda.kernels.available) try TopkGlue.load(d) else null,
             .select = if (cuda.kernels.available) sel else .host,
             .rope = if (cuda.kernels.available) try RopeGen.load(d) else null,
@@ -485,6 +490,37 @@ pub const Glue = struct {
     /// Whether the indexer selects on the host (TF_DS_TOPK=host, or no selection kernels).
     pub fn hostSelect(self: *const Glue) bool {
         return self.select == .host or self.topk == null;
+    }
+
+    /// dst[r * dld + c] = src[r * sld + c] for c < bytes, r < rows, in 16-byte words; false (nothing launched) when
+    /// the kernel is missing or a pointer, stride or length is not a multiple of 16 bytes: copy_cols's bytes then.
+    pub fn copyRows16(self: *const Glue, src: Ptr, sld: usize, dst: Ptr, dld: usize, rows: usize, bytes: usize, stream: cuda.Stream) !bool {
+        const f = self.copy_rows16 orelse return false;
+        if ((src | dst | sld | dld | bytes) % 16 != 0 or rows == 0 or rows > 65535) return false;
+        const n16 = bytes / 16;
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(u64, sld / 16));
+        a.add(dst);
+        a.add(@as(u64, dld / 16));
+        a.add(@as(u64, n16));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((n16 + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
+        return true;
+    }
+
+    /// out[r] = row r's greedy token for r < rows (logits fp32, row stride `ld` floats, `n` of them a row): the first
+    /// index of the largest value, a NaN never larger, 0 when the row's first value is NaN (the host loop's
+    /// `x > row[best]` rule). False (nothing launched) without the kernel.
+    pub fn argmaxRows(self: *const Glue, logits: Ptr, ld: usize, n: usize, rows: usize, out: Ptr, stream: cuda.Stream) !bool {
+        const f = self.argmax_rows orelse return false;
+        if (rows == 0) return true;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(u64, ld));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(out);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &a);
+        return true;
     }
 };
 

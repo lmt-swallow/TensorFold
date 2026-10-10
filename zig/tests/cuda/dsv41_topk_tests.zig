@@ -4,7 +4,8 @@
 //! model.py `_candidates` / `apply_candidates` / rounds.py `_candidate_blocks` on the host), on seeded scores built
 //! to stress the total order: many ties, -0 beside +0, -inf past each row's visible count, visible counts of 0 and
 //! of the whole row, PAD keys, and candidate pools smaller than the visible blocks (the binding case of long
-//! contexts).
+//! contexts). Also the round's tail kernels (attn_glue.cu argmax_rows, copy_rows16) against the host's greedy draw and
+//! the source's bytes.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -343,7 +344,97 @@ pub fn topk(gpu: Gpu, aot_dir: ?[]const u8) !void {
             check.pass("dsv41-topk candidate blocks: {d} rows of {d} scores, a pool of {d} blocks: rounds.py _candidate_blocks' ids", .{ cs.rows, cs.n, cs.nblocks });
         } else |_| failures += 1;
     }
+    failures += try tail(gpu, &glue, rnd, stream);
     try check.expect(failures == 0, "{d} selection case(s) differ from the host oracle", .{failures});
+}
+
+/// The host's greedy draw (Streams.argmaxRows without the tail): best = 0, best = i where row[i] > row[best].
+fn hostArgmax(row: []const f32) u32 {
+    var best: usize = 0;
+    for (row, 0..) |x, i| if (x > row[best]) {
+        best = i;
+    };
+    return @intCast(best);
+}
+
+/// The round's tail on the device (Glue.argmaxRows, Glue.copyRows16) against the host: each row's greedy token on
+/// seeded rows built to stress the rule (ties, signed zeros, every value -inf, NaN first, NaN elsewhere, the maximum
+/// last) at the vocabulary's width and at widths that leave a block's threads idle; the 16-byte row copy against
+/// the source's bytes. The failures.
+fn tail(gpu: Gpu, glue: *const A.Glue, rnd: std.Random, stream: cuda.Stream) !usize {
+    const gpa = gpu.gpa;
+    if (glue.argmax_rows == null or glue.copy_rows16 == null) {
+        check.pass("dsv41-topk tail: no tail kernels in this glue (the host argmax and copy_cols stay)", .{});
+        return 0;
+    }
+    var failures: usize = 0;
+    const qnan = std.math.nan(f32);
+    for ([_]usize{ 129280, 1, 31, 1025, 4099 }) |n| {
+        const rows: usize = 16;
+        const ld = n + 4 * @as(usize, @intFromBool(n > 1));
+        const host = try gpa.alloc(f32, rows * ld);
+        defer gpa.free(host);
+        for (0..rows) |r| {
+            const row = host[r * ld ..][0..n];
+            const distinct = 1 + rnd.uintLessThan(usize, 6);
+            for (row) |*v| v.* = switch (rnd.uintLessThan(u8, 8)) {
+                0 => 0.0,
+                1 => -0.0,
+                else => @as(f32, @floatFromInt(@as(i64, @intCast(rnd.uintLessThan(usize, distinct))) - 3)) * 1.5,
+            };
+            switch (r) {
+                0 => @memset(row, -std.math.inf(f32)),
+                1 => row[0] = qnan,
+                2 => for (row, 0..) |*v, i| if (i % 3 == 1) {
+                    v.* = qnan;
+                },
+                3 => row[n - 1] = 1e30,
+                4 => @memset(row, qnan),
+                5 => @memset(row, 2.0),
+                else => {},
+            }
+            for (host[r * ld + n .. (r + 1) * ld]) |*v| v.* = 1e38; // past the row: never read
+        }
+        var dl = try upload(gpu.d, std.mem.sliceAsBytes(host));
+        defer dl.free();
+        var dout = try cuda.DeviceBuffer.alloc(gpu.d, rows * 4);
+        defer dout.free();
+        try check.expect(try glue.argmaxRows(dl.ptr, ld, n, rows, dout.ptr, stream), "the argmax kernel did not launch", .{});
+        try stream.synchronize();
+        var got: [16]u32 = undefined;
+        try dout.download(0, std.mem.sliceAsBytes(&got));
+        var want: [16]u32 = undefined;
+        for (&want, 0..) |*w, r| w.* = hostArgmax(host[r * ld ..][0..n]);
+        var what: [64]u8 = undefined;
+        if (check.sameBytes(try std.fmt.bufPrint(&what, "argmax rows of {d}", .{n}), std.mem.sliceAsBytes(&got), std.mem.sliceAsBytes(&want))) |_| {
+            check.pass("BITEXACT dsv41-topk tail: {d} rows of {d} (ties, signed zeros, -inf, NaN): the device argmax is the host's", .{ rows, n });
+        } else |_| failures += 1;
+    }
+    {
+        // two ranks' columns into rank order, as the round's head: [world, R, vl] -> [R, world x vl]
+        const R: usize = 16;
+        const vl: usize = 64640;
+        const src = try gpa.alloc(u32, 2 * R * vl);
+        defer gpa.free(src);
+        for (src) |*x| x.* = rnd.int(u32);
+        var dsrc = try upload(gpu.d, std.mem.sliceAsBytes(src));
+        defer dsrc.free();
+        var ddst = try cuda.DeviceBuffer.alloc(gpu.d, R * 2 * vl * 4);
+        defer ddst.free();
+        for (0..2) |rk| try check.expect(try glue.copyRows16(dsrc.ptr + rk * R * vl * 4, vl * 4, ddst.ptr + rk * vl * 4, 2 * vl * 4, R, vl * 4, stream), "copy_rows16 refused aligned rows", .{});
+        try check.expect(!try glue.copyRows16(dsrc.ptr + 4, vl * 4, ddst.ptr, 2 * vl * 4, R, vl * 4, stream), "copy_rows16 took an unaligned source", .{});
+        try stream.synchronize();
+        const got = try gpa.alloc(u32, R * 2 * vl);
+        defer gpa.free(got);
+        try ddst.download(0, std.mem.sliceAsBytes(got));
+        const want = try gpa.alloc(u32, R * 2 * vl);
+        defer gpa.free(want);
+        for (0..2) |rk| for (0..R) |r| @memcpy(want[r * 2 * vl + rk * vl ..][0..vl], src[(rk * R + r) * vl ..][0..vl]);
+        if (check.sameBytes("copy_rows16 rank columns", std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want))) |_| {
+            check.pass("BITEXACT dsv41-topk tail: {d} rows of two ranks' {d} columns in 16-byte words: copy_cols's bytes", .{ R, vl });
+        } else |_| failures += 1;
+    }
+    return failures;
 }
 
 /// `dsv41-rmsnorm-torch <dir>`: cuda_prompt.zig's torch-order rms_norm (prompt_glue.cu) against the fork's

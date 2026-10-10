@@ -840,6 +840,8 @@ pub const Streams = struct {
     logits_h: []f32,
     /// The last admission's last row's logits [1, V], or the last round's [R, V] (window order).
     logits: Ptr = 0,
+    /// u32 [max_rows]: the device argmax's tokens (`argmaxRows` with the runner's tail on).
+    amax: cuda.DeviceBuffer,
     stream: cuda.Stream,
     /// Kept prompts (cuda_keep.zig): the book of them, what its operations let go (`settle` frees it), and the ring
     /// snapshots (`snap_count` of `snap_bytes` each: the window rings of the first `snap_layers` layers, then every
@@ -870,7 +872,7 @@ pub const Streams = struct {
         self.* = .{
             .gpa = gpa, .d = d, .cfg = cfg, .base = base, .view = base.*, .view_rings = &.{}, .view_planes = &.{}, .pool = undefined,
             .runner = undefined, .pr = undefined, .extents = Extents.init(cap), .engram = engram, .spark = spark, .dpool = null,
-            .dc_rings = &.{}, .taps = .{ .d = d, .ptr = 0, .len = 0 }, .kept_taps = .{ .d = d, .ptr = 0, .len = 0 }, .lanes = &.{}, .logits_h = &.{}, .stream = stream,
+            .dc_rings = &.{}, .taps = .{ .d = d, .ptr = 0, .len = 0 }, .kept_taps = .{ .d = d, .ptr = 0, .len = 0 }, .lanes = &.{}, .logits_h = &.{}, .amax = .{ .d = d, .ptr = 0, .len = 0 }, .stream = stream,
             .book = .{ .set = .{ .on = false }, .chunk = rows, .window = cfg.window }, .snaps = .{ .d = d, .ptr = 0, .len = 0 },
         };
         self.book.released = &self.released;
@@ -907,6 +909,8 @@ pub const Streams = struct {
         }
         self.logits_h = try gpa.alloc(f32, max_rows * cfg.vocab);
         errdefer gpa.free(self.logits_h);
+        self.amax = try cuda.DeviceBuffer.alloc(d, max_rows * 4);
+        errdefer self.amax.free();
         if (spark) |sp| {
             self.taps = try cuda.DeviceBuffer.alloc(d, @max(rows, max_rows) * self.tapCols() * 2);
             errdefer self.taps.free();
@@ -929,6 +933,7 @@ pub const Streams = struct {
         if (self.taps.len > 0) self.taps.free();
         if (self.kept_taps.len > 0) self.kept_taps.free();
         gpa.free(self.logits_h);
+        self.amax.free();
         for (self.lanes) |l| gpa.free(l.hist);
         gpa.free(self.lanes);
         self.runner.deinit();
@@ -1511,10 +1516,17 @@ pub const Streams = struct {
     }
 
     /// The first `out.len` rows of `logits` (from row `row0`): each row's argmax (torch's rule: the first index of
-    /// the maximum).
+    /// the maximum; a NaN never larger, 0 when a row's first value is NaN). With the runner's tail on (TF_DS_TAIL) the
+    /// device draws them and only the tokens come back; else the rows' logits come back and the host draws them.
     pub fn argmaxRows(self: *Streams, row0: usize, out: []u32) !void {
         const v = self.cfg.vocab;
         if (out.len > max_rows) return error.WindowTooWide;
+        if (out.len == 0) return;
+        if (self.runner.tail and try self.runner.glue.argmaxRows(self.logits + row0 * v * 4, v, v, out.len, self.amax.ptr, self.stream)) {
+            try self.stream.synchronize();
+            try self.amax.download(0, std.mem.sliceAsBytes(out));
+            return;
+        }
         try self.stream.synchronize();
         const view: cuda.DeviceBuffer = .{ .d = self.d, .ptr = self.logits + row0 * v * 4, .len = out.len * v * 4 };
         try view.download(0, std.mem.sliceAsBytes(self.logits_h[0 .. out.len * v]));
@@ -2305,9 +2317,12 @@ pub const Lanes = struct {
             r += rows;
         }
         try e.both(Round.encode(e.op_buf, rws[0..windows.len]));
+        // every window's rows in one draw (one read back), then each window's share
+        var sampled: [max_rows]u32 = undefined;
+        try st.argmaxRows(0, sampled[0..r]);
         r = 0;
         for (windows, out) |w, o| {
-            try st.argmaxRows(r, o.sampled[0..w.rows()]);
+            @memcpy(o.sampled[0..w.rows()], sampled[r..][0..w.rows()]);
             r += w.rows();
         }
     }
