@@ -9,7 +9,7 @@
 #   bash serve_smoke.sh stop    remove both containers
 #
 # Environment: R0/R1 (ssh names, default spark-616b/spark-9e43), MASTER (rank 0's address on the NCCL link, 10.0.1.1),
-# BUILD_HOST and BUILD_BIN (where the built binary is: spark-9e43, ~/src/TensorFold/zig-out/native/bin/tensorfold-native),
+# ROPE (device: the RoPE frequencies ~/aot/$KERNELS/rope/rope_{c,w}_freqs.bin; table: the whole tables), BUILD_HOST and BUILD_BIN (where the built binary is: spark-9e43, ~/src/TensorFold/zig-out/native/bin/tensorfold-native),
 # CONTEXT (16384), MAX_TOKENS (64), ENGRAM (the Engram tables under ~/models, DeepSeek-V4.1-Flash-Engram; empty: run
 # without them, degraded; the token map is ~/aot/$KERNELS/token_map.json on both nodes), LOG_DIR (where both ranks' logs are kept), FORCE=1 (start even when the GPU
 # already has compute processes), NO_COPY=1 (use the ~/bin/tensorfold-native already on each node).
@@ -32,6 +32,7 @@ DRAFTS=${DRAFTS:-1}            # 0: --no-drafts
 PARALLEL=${PARALLEL:-1}        # streams decoded together (--parallel)
 RESERVE=${RESERVE:-4}          # TENSORFOLD_MEMORY_RESERVE_GIB
 REPLAY=${REPLAY:-1}            # TF_DS_REPLAY: bounded replay for prompts (0: every row through every layer)
+ROPE=${ROPE:-device}           # TF_DS_ROPE: device (rows computed from rope/rope_*_freqs.bin) or table (rope/rope_*_<rows>.bin)
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -94,13 +95,19 @@ for h in "$R0" "$R1"; do
   on "$h" "test -f \$HOME/aot/$KERNELS/aot.json" || die "$h has no ~/aot/$KERNELS/aot.json (the captured Triton set)"
   rank=$((rank + 1))
 done
-# the RoPE tables for this context: copy them from the node that has them to the one that lacks them
-for name in rope_c rope_w; do
-  f="aot/$KERNELS/rope/${name}_${ROWS}.bin"
+# the RoPE inputs (the frequencies, or the tables for this context): copy them from the node that has them to the one
+# that lacks them
+case "$ROPE" in
+  device) rope_files="rope_c_freqs rope_w_freqs"; rope_dump="--freqs-only" ;;
+  table) rope_files="rope_c_${ROWS} rope_w_${ROWS}"; rope_dump="--rows $ROWS" ;;
+  *) die "ROPE is $ROPE: device or table" ;;
+esac
+for name in $rope_files; do
+  f="aot/$KERNELS/rope/${name}.bin"
   has0=$(on "$R0" "test -f \$HOME/$f && echo y || true")
   has1=$(on "$R1" "test -f \$HOME/$f && echo y || true")
   if [ -z "$has0" ] && [ -z "$has1" ]; then
-    die "no ~/$f on either node: run dump_rope.py --rows $ROWS (tools/zig/dsv41/dump_rope.py)"
+    die "no ~/$f on either node: run dump_rope.py $rope_dump (tools/zig/dsv41/dump_rope.py)"
   elif [ -z "$has0" ]; then
     say "copying ~/$f from $R1 to $R0"
     on "$R1" "cat \$HOME/$f" | on "$R0" "mkdir -p \$HOME/aot/$KERNELS/rope && cat > \$HOME/$f.part && mv \$HOME/$f.part \$HOME/$f"
@@ -121,12 +128,12 @@ fi
 sum0=$(on "$R0" "sha256sum \$HOME/bin/tensorfold-native | cut -c1-16")
 sum1=$(on "$R1" "sha256sum \$HOME/bin/tensorfold-native | cut -c1-16")
 [ "$sum0" = "$sum1" ] || die "the binaries differ between the nodes ($sum0 vs $sum1)"
-say "binary $sum0 on both nodes; context $CONTEXT, RoPE rows $ROWS"
+say "binary $sum0 on both nodes; context $CONTEXT, RoPE $ROPE ($ROWS positions)"
 
 # -- the ranks ----------------------------------------------------------------------------------------------------
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
 DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/aot/$KERNELS:/k:ro -v \$HOME/bin:/b:ro"
-ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE -e TF_DS_REPLAY=$REPLAY"
+ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE -e TF_DS_REPLAY=$REPLAY -e TF_DS_ROPE=$ROPE"
 ENVS="$ENVS -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"

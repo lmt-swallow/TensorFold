@@ -6,8 +6,10 @@ containers).
 Rank 0 (spark-616b, 10.0.1.1) serves HTTP; rank 1 (spark-9e43, 10.0.1.2) follows its steps. Both need: the pack
 (`~/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw`), their own Python rank cache (`~/tfcache/rank/rank{r}of2-*.bin`,
 written by a `tensorfold serve` of the Python fork with `TF_DS_RANK_CACHE`), the captured Triton set with the RoPE
-tables beside it (`~/aot/dsv41-all/{aot.json,cubins,rope}`; `tools/zig/dsv41/dump_rope.py --rows 20480` for a
-16384-token context: rows = cuda_lanes.ropeRows(context)), and `zig-out/native/bin/tensorfold-native` built on a
+frequencies beside it (`~/aot/dsv41-all/{aot.json,cubins,rope}`; `tools/zig/dsv41/dump_rope.py --freqs-only` writes
+`rope/rope_{c,w}_freqs.bin`, from which every pass computes its RoPE rows on the device; with `TF_DS_ROPE=table`
+(`ROPE=table`) the whole tables instead, `dump_rope.py --rows 20480` for a 16384-token context: rows =
+cuda_lanes.ropeRows(context)), and `zig-out/native/bin/tensorfold-native` built on a
 GB10 (`zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=safe native`), run inside
 `nvcr.io/nvidia/pytorch:26.07-py3` (the host has no libnccl).
 
