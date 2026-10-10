@@ -150,6 +150,8 @@ pub const TopkGlue = struct {
     apply_cand: cuda.Function,
     topk_keyset: cuda.Function,
     cand_blocks: cuda.Function,
+    cand_bits: cuda.Function,
+    apply_cand_bits: cuda.Function,
 
     pub const threads: u32 = 512; // topk_glue.cu kThreads
     pub const max_picks: usize = 1024; // topk_glue.cu kMaxPicks
@@ -167,6 +169,8 @@ pub const TopkGlue = struct {
             .apply_cand = try module.function("tf_dsv41_apply_cand"),
             .topk_keyset = try module.function("tf_dsv41_topk_keyset"),
             .cand_blocks = try module.function("tf_dsv41_cand_blocks"),
+            .cand_bits = try module.function("tf_dsv41_cand_bits"),
+            .apply_cand_bits = try module.function("tf_dsv41_apply_cand_bits"),
         };
     }
 
@@ -255,6 +259,40 @@ pub const TopkGlue = struct {
         a.add(mask);
         a.add(@as(c_longlong, @intCast(mask_ld)));
         try cuda.launch.launch(self.cand_mask, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
+    }
+
+    /// `candidates` with the pool as bits: block b of row r is bit b % 32 of word b / 32 of bits [rows,
+    /// bitWords(ceil(n / bsize))] uint32 (row stride `bits_ld` words), 1 exactly where `candidates`' mask is 1.
+    pub fn candidatesBits(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, vis: Ptr, nblocks: usize, bsize: usize, smax: Ptr, bits: Ptr, bits_ld: usize, stream: cuda.Stream) !void {
+        if (rows == 0 or n == 0) return;
+        const nblk = (n + bsize - 1) / bsize;
+        try self.blockMax(score, ld, rows, n, vis, bsize, smax, nblk, stream);
+        var a: cuda.Args = .{};
+        a.add(smax);
+        a.add(@as(c_longlong, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(nblk)));
+        a.add(@as(c_int, @intCast(@min(nblocks, nblk))));
+        a.add(bits);
+        a.add(@as(c_longlong, @intCast(bits_ld)));
+        try cuda.launch.launch(self.cand_bits, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads } }, stream, &a);
+    }
+
+    /// The uint32 words a row of the pool as bits takes for `blocks` blocks.
+    pub fn bitWords(blocks: usize) usize {
+        return (blocks + 31) / 32;
+    }
+
+    /// `apply` with the pool as bits (`candidatesBits`): score[r, t] = -inf where block t / bsize's bit is 0 (t < n).
+    pub fn applyBits(self: *const TopkGlue, score: Ptr, ld: usize, rows: usize, n: usize, bits: Ptr, bits_ld: usize, bsize: usize, stream: cuda.Stream) !void {
+        if (rows == 0 or n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ld)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(bits);
+        a.add(@as(c_longlong, @intCast(bits_ld)));
+        a.add(@as(c_int, @intCast(bsize)));
+        try cuda.launch.launch(self.apply_cand_bits, .{ .grid = .{ .x = @intCast((n + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
     }
 
     /// model.py apply_candidates in place: score[r, t] = -inf where mask[r, t / bsize] is 0 (t < n).

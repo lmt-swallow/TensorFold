@@ -198,6 +198,43 @@ pub fn topk(gpu: Gpu, aot_dir: ?[]const u8) !void {
         if (ok) {
             check.pass("dsv41-topk candidates: {d} rows of {d} scores, a pool of {d} blocks of {d} ({d} rows with more visible blocks than the pool): mask, masked scores and picks equal the host oracle's", .{ cs.rows, cs.n, cs.nblocks, cs.bsize, bound });
         } else failures += 1;
+        // the same pool as bits (the prompt path's): set exactly at the mask's 1s, the same masked scores
+        {
+            const words = A.TopkGlue.bitWords(nblk);
+            var b_sc = try upload(gpu.d, std.mem.sliceAsBytes(sc));
+            defer b_sc.free();
+            var d_bits = try cuda.DeviceBuffer.alloc(gpu.d, cs.rows * words * 4);
+            defer d_bits.free();
+            try d_bits.fill8(0xEE, null);
+            try tg.candidatesBits(b_sc.ptr, cs.n, cs.rows, cs.n, d_vis.ptr, cs.nblocks, cs.bsize, d_smax.ptr, d_bits.ptr, words, stream);
+            try tg.applyBits(b_sc.ptr, cs.n, cs.rows, cs.n, d_bits.ptr, words, cs.bsize, stream);
+            try stream.synchronize();
+            const bits = try gpa.alloc(u32, cs.rows * words);
+            defer gpa.free(bits);
+            try d_bits.download(0, std.mem.sliceAsBytes(bits));
+            const unpacked = try gpa.alloc(u8, cs.rows * nblk);
+            defer gpa.free(unpacked);
+            var past_zero = true; // the last word's bits past nblk
+            for (0..cs.rows) |r| {
+                for (0..nblk) |b| unpacked[r * nblk + b] = @intCast((bits[r * words + b / 32] >> @intCast(b % 32)) & 1);
+                for (nblk..words * 32) |b| if ((bits[r * words + b / 32] >> @intCast(b % 32)) & 1 != 0) {
+                    past_zero = false;
+                };
+            }
+            const masked_bits = try gpa.alloc(f32, cs.rows * cs.n);
+            defer gpa.free(masked_bits);
+            try b_sc.download(0, std.mem.sliceAsBytes(masked_bits));
+            var bok = past_zero;
+            check.sameBytes(try std.fmt.bufPrint(&what, "candidate bits n {d} pool {d}", .{ cs.n, cs.nblocks }), unpacked, mask_want) catch {
+                bok = false;
+            };
+            check.sameBytes(try std.fmt.bufPrint(&what, "apply_candidates bits n {d} pool {d}", .{ cs.n, cs.nblocks }), std.mem.sliceAsBytes(masked_bits), std.mem.sliceAsBytes(masked)) catch {
+                bok = false;
+            };
+            if (bok) {
+                check.pass("dsv41-topk candidate bits: {d} rows of {d} scores, a pool of {d} blocks of {d}: the bits are the oracle's mask (0 past the blocks), the masked scores its", .{ cs.rows, cs.n, cs.nblocks, cs.bsize });
+            } else failures += 1;
+        }
     }
 
     // -- topk_select on keys in any order (the pruned selection's gathered tiles, the pool's keys): the key-set

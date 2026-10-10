@@ -356,7 +356,7 @@ pub const Prompt = struct {
     score: cuda.DeviceBuffer, // fp32 scores or int64 keys [rb, n_comp]
     tmax: cuda.DeviceBuffer, // int64 [rb, nt]: the keyed path's tile maxima of a row block (unread)
     cidx: cuda.DeviceBuffer, // int64 [rows, idx_topk]
-    cand: cuda.DeviceBuffer, // u8 [rows, cand cols]: the candidate pool of the chunk's rows (device selection)
+    cand: cuda.DeviceBuffer, // uint32 [rows, bitWords(cand cols)]: the chunk's rows' candidate pool as bits (device selection)
     smax: cuda.DeviceBuffer, // fp32 [rb, cand cols]: a row block's block maxima
     o: cuda.DeviceBuffer,
     og: cuda.DeviceBuffer,
@@ -489,7 +489,7 @@ pub const Prompt = struct {
         self.cidx = try cuda.DeviceBuffer.alloc(d, @max(16, r * (c.idx_topk + 16) * 8));
         const cb = @max(1, c.cand_block);
         const cand_cols_max = (nb_max + cb - 1) / cb;
-        self.cand = try cuda.DeviceBuffer.alloc(d, @max(16, r * cand_cols_max));
+        self.cand = try cuda.DeviceBuffer.alloc(d, @max(16, r * attention.TopkGlue.bitWords(cand_cols_max) * 4));
         self.smax = try cuda.DeviceBuffer.alloc(d, @max(16, (score_words / cb + r) * 4));
         self.o = try cuda.DeviceBuffer.alloc(d, r * heads * c.head_dim * 2);
         const groups = c.o_groups / fwd.world;
@@ -1106,9 +1106,10 @@ pub const Prompt = struct {
             }
             if (!host) {
                 const tg = &fwd.glue.topk.?;
-                const mask = self.cand.ptr + r0 * ccols;
-                if (is_cand_source) try tg.candidates(self.score.ptr, n_comp_end, rows, n_comp_end, vr, c.cand_blocks, cb, self.smax.ptr, mask, ccols, stream);
-                if (after_cand) try tg.apply(self.score.ptr, n_comp_end, rows, n_comp_end, mask, ccols, cb, stream);
+                const words = attention.TopkGlue.bitWords(ccols);
+                const bits = self.cand.ptr + r0 * words * 4;
+                if (is_cand_source) try tg.candidatesBits(self.score.ptr, n_comp_end, rows, n_comp_end, vr, c.cand_blocks, cb, self.smax.ptr, bits, words, stream);
+                if (after_cand) try tg.applyBits(self.score.ptr, n_comp_end, rows, n_comp_end, bits, words, cb, stream);
                 if (keyed) {
                     try tg.topkKeys(self.score.ptr, n_comp_end, rows, n_comp_end, kk, vr, self.cidx.ptr + r0 * kk * 8, kk, stream);
                 } else {

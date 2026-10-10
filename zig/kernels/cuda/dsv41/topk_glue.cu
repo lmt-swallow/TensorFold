@@ -185,6 +185,41 @@ __device__ __forceinline__ unsigned long long key_order(long long k) {
     return (unsigned long long)k ^ 0x8000000000000000ull;
 }
 
+// The pool's mask from the block maxima s [rows, nblk] (row stride ld): block b of row r is in it when it is among
+// the k blocks with the largest keys (k <= nblk) and its maximum is above -inf. BITS false: mask u8 [rows, nblk],
+// mask[r, b] = 1 or 0 (row stride mask_ld bytes); BITS true: bit b % 32 of word b / 32 of row r, uint32
+// [rows, ceil(nblk / 32)] (row stride mask_ld words; the last word's bits past nblk 0). One block a row (kThreads).
+template <bool BITS>
+__device__ __forceinline__ void cand_mask_row(const float* __restrict__ s, long long ld, int nblk, int k,
+                                              void* __restrict__ mask, long long mask_ld) {
+    __shared__ uint32_t scan[kWarps + 1];
+    const int r = blockIdx.x;
+    const float* row = s + (size_t)r * ld;
+    uint32_t thr, need;
+    radix_threshold(row, nblk, k, thr, need);
+    uint32_t eq_seen = 0u;
+    for (int base = 0; base < nblk; base += blockDim.x) {
+        const int j = base + threadIdx.x;
+        uint32_t u = 0u;
+        if (j < nblk) u = ordered(row[j]);
+        const uint32_t eq = (j < nblk && u == thr) ? 1u : 0u;
+        uint32_t eq_total;
+        const uint32_t eq_before = block_exclusive(eq, scan, eq_total);
+        const bool sel = j < nblk && (u > thr || (eq && eq_seen + eq_before < need));
+        // `s.gather(-1, idx) > -inf`: NaN maxima compare false as well
+        const float x = j < nblk ? row[j] : 0.0f;
+        const bool in = sel && x > -__int_as_float(0x7F800000);
+        if (BITS) {
+            // a warp's 32 consecutive blocks are one word (base and the warp's first lane are multiples of 32)
+            const unsigned word = __ballot_sync(0xFFFFFFFFu, in);
+            if ((threadIdx.x & 31) == 0 && j < nblk) ((uint32_t*)mask)[(size_t)r * mask_ld + j / 32] = word;
+        } else if (j < nblk) {
+            ((unsigned char*)mask)[(size_t)r * mask_ld + j] = in ? 1 : 0;
+        }
+        eq_seen += eq_total;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -232,30 +267,16 @@ __global__ void tf_dsv41_cand_blockmax(const float* __restrict__ score, long lon
     out[(size_t)r * out_ld + b] = m;
 }
 
-// The pool's mask from the block maxima s [rows, nblk] (row stride ld): mask[r, b] = 1 for the k blocks with the
-// largest keys (k <= nblk) whose maximum is above -inf, else 0 (row stride mask_ld). One block a row (kThreads).
+// model.py _candidates' mask (cand_mask_row<false>) and the same pool as bits (cand_mask_row<true>).
 __global__ void __launch_bounds__(kThreads) tf_dsv41_cand_mask(const float* __restrict__ s, long long ld, int nblk,
                                                                int k, unsigned char* __restrict__ mask,
                                                                long long mask_ld) {
-    __shared__ uint32_t scan[kWarps + 1];
-    const int r = blockIdx.x;
-    const float* row = s + (size_t)r * ld;
-    uint32_t thr, need;
-    radix_threshold(row, nblk, k, thr, need);
-    uint32_t eq_seen = 0u;
-    for (int base = 0; base < nblk; base += blockDim.x) {
-        const int j = base + threadIdx.x;
-        uint32_t u = 0u;
-        if (j < nblk) u = ordered(row[j]);
-        const uint32_t eq = (j < nblk && u == thr) ? 1u : 0u;
-        uint32_t eq_total;
-        const uint32_t eq_before = block_exclusive(eq, scan, eq_total);
-        const bool sel = j < nblk && (u > thr || (eq && eq_seen + eq_before < need));
-        // `s.gather(-1, idx) > -inf`: NaN maxima compare false as well
-        const float x = j < nblk ? row[j] : 0.0f;
-        if (j < nblk) mask[(size_t)r * mask_ld + j] = (sel && x > -__int_as_float(0x7F800000)) ? 1 : 0;
-        eq_seen += eq_total;
-    }
+    cand_mask_row<false>(s, ld, nblk, k, mask, mask_ld);
+}
+
+__global__ void __launch_bounds__(kThreads) tf_dsv41_cand_bits(const float* __restrict__ s, long long ld, int nblk,
+                                                               int k, uint32_t* __restrict__ bits, long long bits_ld) {
+    cand_mask_row<true>(s, ld, nblk, k, bits, bits_ld);
 }
 
 // kernels.topk_select's tail where torch.topk runs (rows of more than TOPK_FUSED_MAX keys, or keys not in position
@@ -423,6 +444,16 @@ __global__ void __launch_bounds__(kThreads) tf_dsv41_cand_blocks(const float* __
             for (int w = 0; w < warp; ++w) at += w_sel[w];
         }
     }
+}
+
+// tf_dsv41_apply_cand on the pool as bits (tf_dsv41_cand_bits'): score[r, t] = -inf where block t / bsize's bit is 0.
+__global__ void tf_dsv41_apply_cand_bits(float* __restrict__ score, long long ld, int n,
+                                         const uint32_t* __restrict__ bits, long long bits_ld, int bsize) {
+    const int r = blockIdx.y;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const int b = t / bsize;
+    if (((bits[(size_t)r * bits_ld + b / 32] >> (b & 31)) & 1u) == 0u) score[(size_t)r * ld + t] = -__int_as_float(0x7F800000);
 }
 
 // model.py apply_candidates in place: score[r, t] = -inf where mask[r, t / bsize] is 0, t < n.
