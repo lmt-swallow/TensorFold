@@ -1,6 +1,6 @@
 //! Tensor-parallel ranks over NCCL. Rank 0 listens on the master port, every other rank connects, rank 0 sends the
 //! NCCL unique id over that socket, and the socket stays open as the ranks' control link (length-prefixed messages,
-//! rank 0 to one peer). The collectives run on the caller's stream, so a CUDA graph captures them like the Python
+//! rank 0 to one peer; TCP_NODELAY on both ends, a message one write, SO_BUSY_POLL by `busyPoll`). The collectives run on the caller's stream, so a CUDA graph captures them like the Python
 //! engine's (`cuda/comm.py`). All-gathers only: a rank-order sum after a gather keeps every rank's bits equal, where
 //! an all-reduce would not.
 
@@ -67,8 +67,19 @@ pub const Comm = struct {
         const fd = try self.linkTo(peer);
         var len: [4]u8 = undefined;
         std.mem.writeInt(u32, &len, @intCast(bytes.len), .little);
-        try writeAll(fd, &len);
-        try writeAll(fd, bytes);
+        // the prefix and the body in one segment (two writes would put the body behind the prefix's ACK where
+        // Nagle is on, and cost a second syscall where it is off)
+        var iov = [_]posix.iovec_const{ .{ .base = &len, .len = len.len }, .{ .base = bytes.ptr, .len = bytes.len } };
+        const rc = std.c.writev(fd, &iov, iov.len);
+        if (rc < 0) {
+            switch (std.c.errno(rc)) {
+                .INTR, .AGAIN => {},
+                else => return error.LinkFailed,
+            }
+        }
+        const sent: usize = if (rc < 0) 0 else @intCast(rc);
+        if (sent < len.len) try writeAll(fd, len[sent..]);
+        try writeAll(fd, bytes[@max(sent, len.len) - len.len ..]);
     }
 
     /// The next message from `peer` into `buf`; returns the bytes read (error.LinkFailed when `buf` is too small).
@@ -80,6 +91,53 @@ pub const Comm = struct {
         if (n > buf.len) return error.LinkFailed;
         try readAll(fd, buf[0..n]);
         return buf[0..n];
+    }
+
+    /// `recvFrom`, polling the socket without blocking for up to `spin_ns` first: a message that comes within it
+    /// is read without the thread's sleep and wake-up (a GB10 core's deepest idle state takes ~0.4 ms to leave);
+    /// after it the read blocks. The bytes are recvFrom's.
+    pub fn recvFromSpin(self: *const Comm, peer: u32, buf: []u8, spin_ns: u64) Error![]u8 {
+        const fd = try self.linkTo(peer);
+        var len: [4]u8 = undefined;
+        var got: usize = 0;
+        if (spin_ns > 0) {
+            const t0 = nowNs();
+            var polls: u32 = 0;
+            while (got < len.len) {
+                const n = std.c.recv(fd, @as([*]u8, &len) + got, len.len - got, std.c.MSG.DONTWAIT);
+                if (n > 0) {
+                    got += @intCast(n);
+                    continue;
+                }
+                if (n == 0) return error.LinkClosed;
+                switch (std.c.errno(n)) {
+                    .AGAIN => {},
+                    .INTR => continue,
+                    else => return error.LinkFailed,
+                }
+                polls +%= 1;
+                if (polls % 64 == 0 and nowNs() -% t0 > spin_ns) break;
+                std.atomic.spinLoopHint();
+            }
+        }
+        try readAll(fd, len[got..]);
+        const n = std.mem.readInt(u32, &len, .little);
+        if (n > buf.len) return error.LinkFailed;
+        try readAll(fd, buf[0..n]);
+        return buf[0..n];
+    }
+
+    /// SO_BUSY_POLL of `us` microseconds on every control link: a blocking read polls the NIC's receive queue
+    /// itself instead of sleeping until its interrupt (0 turns it off). Returns whether every link took it.
+    pub fn busyPoll(self: *const Comm, us: u32) bool {
+        const v: c_int = @intCast(us);
+        var ok = true;
+        for (self.links[0 .. self.world - 1]) |fd| if (fd >= 0) {
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.BUSY_POLL, std.mem.asBytes(&v)) catch {
+                ok = false;
+            };
+        };
+        return ok;
     }
 
     fn linkTo(self: *const Comm, peer: u32) Error!posix.socket_t {
@@ -117,6 +175,7 @@ pub const Comm = struct {
                 _ = posix.system.close(fd);
                 return error.BadPeer;
             }
+            noDelay(fd);
             self.links[peer - 1] = fd;
             got += 1;
             deadline = nowMs() + @as(i64, timeout_ms);
@@ -162,9 +221,13 @@ fn connectOnce(master: [4]u8, port: u16) ?posix.socket_t {
         _ = posix.system.close(fd);
         return null;
     }
+    noDelay(fd);
+    return fd;
+}
+
+fn noDelay(fd: posix.socket_t) void {
     const one: c_int = 1;
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
-    return fd;
 }
 
 fn writeAll(fd: posix.socket_t, bytes: []const u8) Error!void {
@@ -203,8 +266,49 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
+fn nowNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 fn sleepMs(ms: u32) void {
     var req: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
     var rem: linux.timespec = undefined;
     _ = linux.nanosleep(&req, &rem);
+}
+
+test "control-link messages cross in order, polled or blocking" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds));
+    var r0: Comm = .{ .lib = undefined, .comm = null, .rank = 0, .world = 2, .links = @splat(-1) };
+    var r1: Comm = .{ .lib = undefined, .comm = null, .rank = 1, .world = 2, .links = @splat(-1) };
+    r0.links[0] = fds[0];
+    r1.links[0] = fds[1];
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    var prng = std.Random.DefaultPrng.init(41);
+    var sent: [64][300]u8 = undefined;
+    var lens: [64]usize = undefined;
+    for (&sent, &lens) |*m, *n| {
+        n.* = prng.random().uintLessThan(usize, m.len + 1);
+        prng.random().bytes(m[0..n.*]);
+        try r0.sendTo(1, m[0..n.*]);
+    }
+    var buf: [300]u8 = undefined;
+    for (sent, lens, 0..) |m, n, i| {
+        const got = switch (i % 3) {
+            0 => try r1.recvFrom(0, &buf),
+            1 => try r1.recvFromSpin(0, &buf, 1_000_000),
+            else => try r1.recvFromSpin(0, &buf, 0),
+        };
+        try std.testing.expectEqualSlices(u8, m[0..n], got);
+    }
+    // a message longer than the buffer is refused; rank 1 sends only to rank 0
+    const eight: [8]u8 = @splat(0);
+    try r0.sendTo(1, &eight);
+    try std.testing.expectError(error.LinkFailed, r1.recvFromSpin(0, buf[0..4], 1_000_000));
+    try std.testing.expectError(error.BadPeer, r1.sendTo(1, "x"));
 }

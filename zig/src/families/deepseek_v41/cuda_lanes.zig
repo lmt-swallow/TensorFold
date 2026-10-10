@@ -1675,6 +1675,8 @@ pub const Engine = struct {
     ids_buf: []i64, // a received prompt's ids
     op_buf: []u8,
     stepped: u64 = 0,
+    /// How rank 1 waits for rank 0's records and the link's timings (`LinkWait`).
+    link: LinkWait = .{},
     /// A step failed on this rank past its agreement: the other rank may sit in a collective, so no further
     /// collective is issued (it would pair with the wrong one or hang); the ranks must be restarted.
     broken: bool = false,
@@ -1779,6 +1781,9 @@ pub const Engine = struct {
         // connection for up to 30 minutes while rank 0 still loads, so the ranks may start in either order)
         e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
         errdefer e.comm.deinit();
+        e.link = LinkWait.fromEnv();
+        if (!e.comm.busyPoll(e.link.busy_poll_us)) std.log.warn("deepseek_v41 rank {d}: SO_BUSY_POLL refused on the control link", .{s.rank});
+        std.log.info("deepseek_v41 rank {d}: control link busy poll {d} us, follower spin {d} us{s}", .{ s.rank, e.link.busy_poll_us, e.link.spin_ns / 1000, if (e.link.profile) ", profiled (TF_DS_LINK_PROFILE)" else "" });
         clock.mark("the ranks' rendezvous", .{});
         {
             // every rank records the same graphs in the same order here (the gathers are recorded, not issued)
@@ -1888,8 +1893,11 @@ pub const Engine = struct {
     fn announce(e: *Engine, op: []const u8) !void {
         if (e.broken) return error.OutOfStep;
         errdefer e.broken = true;
+        const t0 = nowNs();
         if (e.settings.rank == 0) for (1..e.settings.world) |peer| try e.comm.sendTo(@intCast(peer), op);
+        const t1 = nowNs();
         try e.agree(op, true);
+        if (e.link.profile) e.link.note(e.settings.rank, .{ t1 - t0, nowNs() - t1 });
     }
 
     /// Runs a step; a failure breaks the lane on this rank (the other rank fails the same step on its own).
@@ -2025,10 +2033,14 @@ pub const Engine = struct {
         if (e.settings.rank == 0) return;
         std.log.info("deepseek_v41 rank {d}: following rank 0", .{e.settings.rank});
         while (true) {
-            const op = e.comm.recvFrom(0, e.op_buf) catch |err| switch (err) {
+            const t0 = nowNs();
+            // the next record, polled before the read blocks (rank 0 sends it a fraction of a millisecond after this
+            // rank's GPU goes idle; a sleeping thread would add its core's wake-up to every record)
+            const op = e.comm.recvFromSpin(0, e.op_buf, e.link.spin_ns) catch |err| switch (err) {
                 error.LinkClosed => return,
                 else => return err,
             };
+            const t1 = nowNs();
             if (op.len == 0) return error.OutOfStep;
             const code = std.enums.fromInt(Op, op[0]) orelse return error.OutOfStep;
             // rank 0 sends stop without an agreement (it is tearing its communicator down)
@@ -2036,6 +2048,7 @@ pub const Engine = struct {
             const ok = e.runnable(op);
             if (!ok) std.log.err("rank {d}: step {d} ({s}, {d} bytes, first {x}) cannot run here", .{ e.settings.rank, e.stepped, @tagName(code), op.len, op[0..@min(op.len, 48)] });
             try e.agree(op, ok);
+            if (e.link.profile) e.link.note(e.settings.rank, .{ t1 - t0, nowNs() - t1 });
             try e.step(Engine.run, .{ e, op });
         }
     }
@@ -2054,6 +2067,62 @@ pub const Engine = struct {
         for (1..e.settings.world) |peer| e.comm.sendTo(@intCast(peer), &op) catch {};
     }
 };
+
+/// The control link's waits: SO_BUSY_POLL on its sockets, rank 1 polling for the next record before its read
+/// blocks, and (TF_DS_LINK_PROFILE=1) every step's link times, logged every `LinkWait.window` steps as p50 / p90 /
+/// max in microseconds. Rank 0's pair: the record's send, and from the send to the agreement's gather done on this
+/// rank (the record -> gather latency: rank 1's receipt, check and gather launch). Rank 1's pair: the wait for the
+/// record (idle time), and from its receipt to the agreement done. Switches: TF_DS_LINK_POLL=0 (neither busy poll nor
+/// spin: a blocking read), TF_DS_LINK_BUSY_POLL_US (50), TF_DS_LINK_SPIN_US (20000). None changes what a step
+/// computes.
+pub const LinkWait = struct {
+    busy_poll_us: u32 = 50,
+    spin_ns: u64 = 20 * std.time.ns_per_ms,
+    profile: bool = false,
+    n: usize = 0,
+    us: [2][window]f32 = undefined,
+
+    pub const window = 256;
+
+    pub fn fromEnv() LinkWait {
+        var w: LinkWait = .{};
+        if (getenv("TF_DS_LINK_BUSY_POLL_US")) |v| w.busy_poll_us = std.fmt.parseInt(u32, v, 10) catch w.busy_poll_us;
+        if (getenv("TF_DS_LINK_SPIN_US")) |v| w.spin_ns = (std.fmt.parseInt(u64, v, 10) catch w.spin_ns / 1000) * 1000;
+        if (getenv("TF_DS_LINK_POLL")) |v| if (std.mem.eql(u8, v, "0")) {
+            w.busy_poll_us = 0;
+            w.spin_ns = 0;
+        };
+        if (getenv("TF_DS_LINK_PROFILE")) |v| w.profile = !std.mem.eql(u8, v, "0");
+        return w;
+    }
+
+    /// One step's two times (ns); a full window logs its summary and starts the next.
+    pub fn note(w: *LinkWait, rank: u32, ns: [2]i128) void {
+        for (ns, 0..) |x, k| w.us[k][w.n] = @floatCast(@as(f64, @floatFromInt(x)) / 1e3);
+        w.n += 1;
+        if (w.n < window) return;
+        w.n = 0;
+        const names: [2][2][]const u8 = .{ .{ "send", "send->agreed" }, .{ "wait", "received->agreed" } };
+        var q: [2][3]f32 = undefined;
+        for (&w.us, &q) |*xs, *qq| qq.* = quantiles(xs);
+        const nm = names[@min(rank, 1)];
+        std.log.info("deepseek_v41 rank {d} link ({d} steps, us p50/p90/max): {s} {d:.0}/{d:.0}/{d:.0}, {s} {d:.0}/{d:.0}/{d:.0}", .{ rank, window, nm[0], q[0][0], q[0][1], q[0][2], nm[1], q[1][0], q[1][1], q[1][2] });
+    }
+
+    fn quantiles(xs: *[window]f32) [3]f32 {
+        std.mem.sort(f32, xs, {}, std.sort.asc(f32));
+        return .{ xs[window / 2], xs[window * 9 / 10], xs[window - 1] };
+    }
+};
+
+test "the link window's quantiles" {
+    var w: LinkWait = .{ .profile = true };
+    for (0..LinkWait.window) |i| w.note(0, .{ @intCast((LinkWait.window - i) * 1000), @intCast(i * 2000) });
+    // the window logged and restarted; its last values were sorted in place
+    try std.testing.expectEqual(@as(usize, 0), w.n);
+    try std.testing.expectEqual(@as(f32, 1), w.us[0][0]);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(LinkWait.window)), w.us[0][LinkWait.window - 1]);
+}
 
 /// `weights.DSpark.deinit` (kept for the tests that call it).
 pub fn freeDSpark(gpa: std.mem.Allocator, ds: *weights.DSpark) void {
