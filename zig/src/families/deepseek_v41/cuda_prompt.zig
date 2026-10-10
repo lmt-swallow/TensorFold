@@ -311,6 +311,7 @@ pub const Prompt = struct {
     pk: ExpertKernels,
     gemm: Gemm32,
     rows: usize, // the chunk rows this holds buffers for (at most max_chunk)
+    rr: attention.RopeRows, // a chunk's rope rows (the device path's: its positions, its groups', the indexer's)
     had: cuda.DeviceBuffer, // the 128 x 128 Hadamard bf16 (prefill.py Workspace.hadamard)
     // the chunk's streams and mixes
     ids: cuda.DeviceBuffer,
@@ -512,6 +513,7 @@ pub const Prompt = struct {
         self.head_logits = try cuda.DeviceBuffer.alloc(d, c.vocab * 4);
         self.ids_h = try gpa.alloc(i64, r);
         self.tab = try gpa.alloc(i64, 6 * (r + 1));
+        self.rr = try attention.RopeRows.init(gpa, d, fwd.glue, r + 1, 3, c.rope_dim / 2);
         const host = fwd.glue.hostSelect(); // the host selection's copies of the scores and the pool
         self.score_h = try gpa.alloc(f32, if (host) score_words * 2 else 0);
         self.keys_h = try gpa.alloc(i64, if (host) @max(1, nb_max) else 0);
@@ -558,6 +560,7 @@ pub const Prompt = struct {
         self.gemm.deinit();
         self.pk.deinit();
         self.glue.deinit();
+        self.rr.deinit();
         self.gpa.free(self.ids_h);
         self.gpa.free(self.tab);
         self.gpa.free(self.score_h);
@@ -799,13 +802,14 @@ pub const Prompt = struct {
         }
         try self.pos.uploadAsync(0, std.mem.sliceAsBytes(pos), stream.handle);
         if (ratio > 0) try self.vis.uploadAsync(0, std.mem.sliceAsBytes(vis), stream.handle);
+        const at_pos = try self.rr.at(rope, 0, self.pos.ptr, n, stream);
         // attn_in: wq_a, wkv (the compressor's in kvSourceUpdate)
         try self.mm(p.wq_a, x, n, self.qa.ptr, .bf16, stream);
         try self.mm(p.wkv, x, n, self.ykv.ptr, .bf16, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.qa.r0", .{li}), self.qa.ptr, n * c.q_rank * 2, stream);
         try self.rmsnorm(self.qa.ptr, p.q_norm, self.qr.ptr, n, c.q_rank, stream);
         try self.mm(p.wq_b, self.qr.ptr, n, self.q.ptr, .bf16, stream);
-        try self.ropeHeads(self.q.ptr, rope, self.pos.ptr, n, heads, hd, false, stream);
+        try self.ropeHeads(self.q.ptr, at_pos, n, heads, hd, false, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.q.r0", .{li}), self.q.ptr, n * heads * hd * 2, stream);
         // the window keys: the ring's rows before start (from lo), then the chunk's normed, roped, quantized rows
         const lo: usize = @max(floor, if (start + 1 > c.window) start + 1 - c.window else 0);
@@ -819,8 +823,8 @@ pub const Prompt = struct {
         const kv = self.wsrc.ptr + before * hd * 2;
         try self.fillI64(self.grows.ptr, -1, n, stream); // no ring slot: the chunk's keys land in wsrc, the ring last
         try fwd.set.run(stream, "_kv_norm_rope", .{ @intCast(n), 1, 1 }, &.{
-            aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", p.kv_norm), aot.ptr("COS", "*fp32", rope.cos.ptr),
-            aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", self.pos.ptr), aot.ptr("OUT", "*bf16", kv),
+            aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", p.kv_norm), aot.ptr("COS", "*fp32", at_pos.cos),
+            aot.ptr("SIN", "*fp32", at_pos.sin), aot.ptr("POS", "*i64", at_pos.pos), aot.ptr("OUT", "*bf16", kv),
             aot.ptr("RING", "*bf16", caches.ring.ptr), aot.ptr("SLOT_OF", "*i64", self.grows.ptr), aot.int("ring_size", @intCast(R)),
             aot.float("eps", c.eps),
         }, &.{ aot.ci("QUANT", 1), aot.ci("D", @intCast(hd)), aot.ci("RD", @intCast(rd)), aot.ci("PDL", 1) });
@@ -872,7 +876,7 @@ pub const Prompt = struct {
         });
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.wsrc.r0", .{li}), self.wsrc.ptr, (before + n) * hd * 2, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o_raw.r0", .{li}), self.o.ptr, n * heads * hd * 2, stream);
-        try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, n, heads, hd, true, stream);
+        try self.ropeHeads(self.o.ptr, at_pos, n, heads, hd, true, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o.r0", .{li}), self.o.ptr, n * heads * hd * 2, stream);
         // the ring gets the chunk's last rows (positions start + n - keep ..)
         {
@@ -907,7 +911,7 @@ pub const Prompt = struct {
         const source = a.dims.kv_source;
         if (kv_done) a.dims.kv_source = false;
         defer a.dims.kv_source = source;
-        const pa = try a.forward(self.paramsOf(li), &caches, rope, x, n, start, picks.*, stream);
+        const pa = try a.forward(self.paramsOf(li), &caches, rope, &fwd.rr, x, n, start, picks.*, stream);
         if (c.isIndexSource(li)) picks.* = a.picks();
         return pa;
     }
@@ -971,14 +975,15 @@ pub const Prompt = struct {
         }
         try self.gpos.uploadAsync(0, std.mem.sliceAsBytes(gpos[0..full]), stream.handle);
         try self.grows.uploadAsync(0, std.mem.sliceAsBytes(grows[0..full]), stream.handle);
+        const at_g = try self.rr.at(rope, 1, self.gpos.ptr, full, stream);
         if (dims.has_idx_wk) {
             try self.mm(p.idx_wk.?, self.lat.ptr, full, self.kraw.ptr, .bf16, stream);
             try self.glue.rmsNormTorch(self.kraw.ptr, p.idx_k_norm, c.eps, full, c.idx_dim, self.k.ptr, stream);
-            try self.ropeHeads(self.k.ptr, rope, self.gpos.ptr, full, 1, c.idx_dim, false, stream);
+            try self.ropeHeads(self.k.ptr, at_g, full, 1, c.idx_dim, false, stream);
             try self.fp4Store(self.k.ptr, c.idx_dim, caches.idxk_codes.ptr, caches.idxk_scales.ptr, self.grows.ptr, full, 32, false, stream);
         }
         try self.lat2.copyFrom(0, self.lat.ptr, full * hd * 2, stream.handle);
-        try self.ropeHeads(self.lat2.ptr, rope, self.gpos.ptr, full, 1, hd, false, stream);
+        try self.ropeHeads(self.lat2.ptr, at_g, full, 1, hd, false, stream);
         try self.fp4Store(self.lat2.ptr, hd, caches.comp_codes.ptr, caches.comp_scales.ptr, self.grows.ptr, full, 16, true, stream);
     }
 
@@ -1042,7 +1047,7 @@ pub const Prompt = struct {
         const rope = fwd.rope_c;
         const kk = @min(c.idx_topk, n_comp_end);
         try self.mm(p.idx_wq_b.?, self.qr.ptr, n, self.iq.ptr, .bf16, stream);
-        try self.ropeHeads(self.iq.ptr, rope, self.pos.ptr, n, c.idx_heads, c.idx_dim, false, stream);
+        try self.ropeHeads(self.iq.ptr, try self.rr.at(rope, 2, self.pos.ptr, n, stream), n, c.idx_heads, c.idx_dim, false, stream);
         const nblk: usize = n * c.idx_heads * c.idx_dim / 32;
         try fwd.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
             aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
@@ -1372,10 +1377,10 @@ pub const Prompt = struct {
         }, &.{ aot.ci("D", @intCast(d)), aot.ci("BLOCK", @intCast(block)), aot.ci("PDL", 1) });
     }
 
-    fn ropeHeads(self: *Prompt, x: Ptr, rope: attention.Rope, pos: Ptr, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
+    fn ropeHeads(self: *Prompt, x: Ptr, at: attention.RopeAt, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
         const hb = @min(h, 16);
         try self.fwd.set.run(stream, "_rope_heads", .{ @intCast(n), @intCast(h / hb), 1 }, &.{
-            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", rope.cos.ptr), aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", pos),
+            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", at.cos), aot.ptr("SIN", "*fp32", at.sin), aot.ptr("POS", "*i64", at.pos),
         }, &.{ aot.ci("H", @intCast(h)), aot.ci("HD", @intCast(hd)), aot.ci("RD", @intCast(self.fwd.cfg.rope_dim)), aot.ci("INV", @intFromBool(inverse)), aot.ci("HB", @intCast(hb)), aot.ci("PDL", 1) });
     }
 

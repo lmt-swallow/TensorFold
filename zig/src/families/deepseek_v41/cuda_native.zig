@@ -1,7 +1,8 @@
 //! DeepSeek-V4.1-Flash (EXL3, two DGX Sparks over NCCL) behind the native family interface: rank 0 serves the lane
 //! core, rank 1 follows its steps. The ranks' settings come from the environment (`--tp/--rank/--master/
 //! --master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT), the weights from the Python
-//! family's rank cache (TF_DS_RANK_CACHE), the RoPE tables from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
+//! family's rank cache (TF_DS_RANK_CACHE), the RoPE frequencies (TF_DS_ROPE=device, the default: each pass's rows
+//! computed on the device) or whole tables (TF_DS_ROPE=table) from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
 //! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048). Up to four streams decode together in shared
 //! rounds (16 rows a round at most), their caches in one pool of the context's positions (cuda_lanes.zig `Streams`);
 //! TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks) sets the pool's slots. With drafts (the default;

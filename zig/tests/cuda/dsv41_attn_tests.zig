@@ -90,6 +90,7 @@ pub fn attention(gpu: Gpu, dir: []const u8) !void {
             lay.idx_k_norm = try upload(gpu, wf, "idx_k_norm");
         }
     }
+    const table_rows: A.RopeRows = .{}; // the fixture's tables
     var rope: A.Rope = .{ .cos = try upload(gpu, wf, "cos"), .sin = try upload(gpu, wf, "sin"), .rows = @intCast(try wf.int("rope_rows")) };
     defer rope.cos.free();
     defer rope.sin.free();
@@ -148,7 +149,7 @@ pub fn attention(gpu: Gpu, dir: []const u8) !void {
         defer caches.deinit();
         var x = try upload(gpu, fx, "x");
         defer x.free();
-        const out = try attn.?.forward(lay.params(), &caches, rope, x.ptr, n, start, null, stream);
+        const out = try attn.?.forward(lay.params(), &caches, rope, &table_rows, x.ptr, n, start, null, stream);
         try stream.synchronize();
         var label_buf: [64]u8 = undefined;
         const label = try std.fmt.bufPrint(&label_buf, "dsv41-attn n={d}", .{n});

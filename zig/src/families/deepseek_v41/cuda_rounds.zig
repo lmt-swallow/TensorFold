@@ -585,6 +585,11 @@ pub const RoundRunner = struct {
     round_bucket: usize = 0,
     rope_c: attention.Rope,
     rope_w: attention.Rope,
+    // the round's rope rows (the device path's computed from the tables' positions at the round's start): the rows'
+    // under each kind (0 rope_c, 1 rope_w), each ratio slot's groups' (rope_c)
+    rr: attention.RopeRows,
+    ra_pos: [2]attention.RopeAt,
+    ra_gpos: [max_ratios]attention.RopeAt,
     pool: *Pool,
     probe: ?fwd.Probe = null,
     engram: ?Engram = null,
@@ -753,6 +758,9 @@ pub const RoundRunner = struct {
         self.uploads = try attention.Uploads.init(d, attention.Uploads.room(1, Tab.words(kk) * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
         self.t_all = try cuda.DeviceBuffer.alloc(d, Tab.words(kk) * 8);
         try self.t_all.fill8(0, null);
+        self.rr = try attention.RopeRows.init(gpa, d, glue, max_rows, 2 + max_ratios, cfg.rope_dim / 2);
+        self.ra_pos = .{ self.rr.view(rope_c, 0, self.tab(Tab.row(Tab.pos))), self.rr.view(rope_w, 1, self.tab(Tab.row(Tab.pos))) };
+        for (&self.ra_gpos, 0..) |*v, j| v.* = self.rr.view(rope_c, 2 + j, self.tab(Tab.ratio(j, Tab.gpos)));
         self.t_cidx = try cuda.DeviceBuffer.alloc(d, R * kk * 8);
         self.t_zero = try cuda.DeviceBuffer.alloc(d, R * 8);
         try self.t_zero.fill8(0, null);
@@ -901,6 +909,7 @@ pub const RoundRunner = struct {
         self.gpa.free(self.keys_h);
         self.gpa.free(self.cand_h);
         self.uploads.deinit();
+        self.rr.deinit();
         inline for (.{ "t_all", "t_cidx", "t_zero", "iq", "iqq", "wl", "wts_i", "score", "keys", "tmax", "tkeys", "tpos", "cblk", "t_every", "smax", "cand_mask", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kv", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe", "xc", "local", "glog", "logits", "taps" }) |f| @field(self, f).free();
         self.scratch.deinit();
         for (self.lg) |*g| g.deinit();
@@ -1153,6 +1162,10 @@ pub const RoundRunner = struct {
         const w = self.w;
         const sg = segs[k];
         if (k == 0) {
+            const t_pos = self.tab(Tab.row(Tab.pos));
+            try self.rr.fill(self.rope_c, 0, t_pos, R, stream);
+            try self.rr.fill(self.rope_w, 1, t_pos, R, stream);
+            for (0..self.n_ratios) |j| try self.rr.fill(self.rope_c, 2 + j, self.tab(Tab.ratio(j, Tab.gpos)), R, stream);
             try self.hc.embedInit(stream, w.embed.ptr(), self.tab(Tab.row(Tab.ids)), self.h.ptr, self.pre.ptr, @intCast(R));
             self.st = .{ .h = self.h.ptr, .spare = self.h2.ptr, .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .tap = 0, .cidx = self.t_cidx.ptr, .cand_made = false, .cblk_made = false };
         }
@@ -1204,7 +1217,7 @@ pub const RoundRunner = struct {
         const heads = c.n_heads / self.world;
         const groups = c.o_groups / self.world;
         const ratio = c.ratio(li);
-        const rope = if (ratio > 0) self.rope_c else self.rope_w;
+        const ra = self.ra_pos[if (ratio > 0) 0 else 1];
         const t_pos = self.tab(Tab.row(Tab.pos));
         const t_wbase = self.tab(Tab.row(Tab.wbase));
         const ring = self.pool.rings[li];
@@ -1219,11 +1232,11 @@ pub const RoundRunner = struct {
         // -- q: RMSNorm, wq_b, RoPE on this rank's heads ----------------------------------------------------------
         try self.rmsnorm(self.qa.ptr, l.q_norm.ptr(), self.qr.ptr, R, c.q_rank, stream);
         try l.wq_b.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
-        try self.ropeHeads(self.q.ptr, rope, t_pos, R, heads, hd, false, stream);
+        try self.ropeHeads(self.q.ptr, ra, R, heads, hd, false, stream);
         // -- the window KV into the slot's ring rows ------------------------------------------------------------
         try self.set.run(stream, "_kv_norm_rope", .{ @intCast(R), 1, 1 }, &.{
-            aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", l.kv_norm.ptr()), aot.ptr("COS", "*fp32", rope.cos.ptr),
-            aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", t_pos),            aot.ptr("OUT", "*bf16", self.kv.ptr),
+            aot.ptr("Y", "*bf16", self.ykv.ptr),  aot.ptr("W", "*bf16", l.kv_norm.ptr()), aot.ptr("COS", "*fp32", ra.cos),
+            aot.ptr("SIN", "*fp32", ra.sin), aot.ptr("POS", "*i64", ra.pos),            aot.ptr("OUT", "*bf16", self.kv.ptr),
             aot.ptr("RING", "*bf16", ring.ptr),   aot.ptr("SLOT_OF", "*i64", self.tab(Tab.row(Tab.wslot))), aot.int("ring_size", @intCast(self.pool.slots * self.pool.ring)),
             aot.float("eps", c.eps),
         }, &.{ aot.ci("QUANT", 1), aot.ci("D", @intCast(hd)), aot.ci("RD", @intCast(c.rope_dim)), aot.ci("PDL", 1) });
@@ -1235,9 +1248,8 @@ pub const RoundRunner = struct {
             const j = self.ratioSlot(ratio);
             t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
             const t_ctarget = self.tab(Tab.ratio(j, Tab.ctarget));
-            const t_gpos = self.tab(Tab.ratio(j, Tab.gpos));
             const src = &self.pool.planes[self.pool.source[li]].?;
-            if (kv_source) try self.compressor(li, R, j, src, rope, t_ctarget, t_gpos, stream);
+            if (kv_source) try self.compressor(li, R, j, src, t_ctarget, stream);
             // -- the indexer: every visible compressed entry (short buckets: no scores, the picks table) ---------
             const nb_ = self.round_bucket / ratio;
             kk = @min(c.idx_topk, nb_);
@@ -1278,7 +1290,7 @@ pub const RoundRunner = struct {
                 aot.ptr("SINK", "*fp32", l.sink.ptr()), aot.ptr("OUT", "*bf16", self.o.ptr),
             }, &.{ aot.ci("H", @intCast(heads)), aot.ci("HD", @intCast(hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
         }
-        try self.ropeHeads(self.o.ptr, rope, t_pos, R, heads, hd, true, stream);
+        try self.ropeHeads(self.o.ptr, ra, R, heads, hd, true, stream);
         const o_cols = heads * hd;
         const g_cols = o_cols / groups;
         for (0..groups) |g| {
@@ -1293,7 +1305,7 @@ pub const RoundRunner = struct {
     /// A kv-source layer's compressor for the round's rows (rounds.py `_kv_idx`): the compressed latents (ratio 1:
     /// RMSNorm of the compressor's kv; ratio 2: the rows' inputs into their raw rows, each group's softmax pool) and,
     /// on an index layer, the index keys, FP4 into the planes at each row's target row.
-    fn compressor(self: *RoundRunner, li: usize, R: usize, j: usize, src: *const PoolPlanes, rope: attention.Rope, t_ctarget: Ptr, t_gpos: Ptr, stream: cuda.Stream) !void {
+    fn compressor(self: *RoundRunner, li: usize, R: usize, j: usize, src: *const PoolPlanes, t_ctarget: Ptr, stream: cuda.Stream) !void {
         const c = self.cfg;
         const l = &self.w.layers[li];
         const hd = c.head_dim;
@@ -1322,13 +1334,13 @@ pub const RoundRunner = struct {
         if (l.idx_wk) |*wk| {
             try wk.run(self.lat.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.kraw.ptr, .bf16, stream);
             try self.rmsnorm(self.kraw.ptr, l.idx_k_norm.?.ptr(), self.k.ptr, R, c.idx_dim, stream);
-            try self.ropeHeads(self.k.ptr, rope, t_gpos, R, 1, c.idx_dim, false, stream);
+            try self.ropeHeads(self.k.ptr, self.ra_gpos[j], R, 1, c.idx_dim, false, stream);
             try self.fp4Store(self.k.ptr, c.idx_dim, src.idxk_codes.ptr, src.idxk_scales.ptr, t_ctarget, R, 32, false, stream);
         }
         // the fused path rotates the latents in place (rounds.py `_kv_idx` with "comp": nothing reads them after)
         const lat = if (self.fused) self.lat.ptr else self.lat2.ptr;
         if (!self.fused) try self.lat2.copyFrom(0, self.lat.ptr, R * hd * 2, stream.handle);
-        try self.ropeHeads(lat, rope, t_gpos, R, 1, hd, false, stream);
+        try self.ropeHeads(lat, self.ra_gpos[j], R, 1, hd, false, stream);
         try self.fp4Store(lat, hd, src.comp_codes.ptr, src.comp_scales.ptr, t_ctarget, R, 16, true, stream);
     }
 
@@ -1346,7 +1358,7 @@ pub const RoundRunner = struct {
         const t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
         const vis = self.tab_h[Tab.ratio(j, Tab.vis)..][0..R];
         if (!iq_ready) try l.idx_wq_b.?.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
-        try self.ropeHeads(self.iq.ptr, self.rope_c, self.tab(Tab.row(Tab.pos)), R, c.idx_heads, c.idx_dim, false, stream);
+        try self.ropeHeads(self.iq.ptr, self.ra_pos[0], R, c.idx_heads, c.idx_dim, false, stream);
         const nblk: usize = R * c.idx_heads * c.idx_dim / 32;
         try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
             aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
@@ -1499,7 +1511,7 @@ pub const RoundRunner = struct {
         const hd = c.head_dim;
         const heads = c.n_heads / self.world;
         const ratio = c.ratio(li);
-        const rope = if (ratio > 0) self.rope_c else self.rope_w;
+        const ra = self.ra_pos[if (ratio > 0) 0 else 1];
         const t_pos = self.tab(Tab.row(Tab.pos));
         const t_wbase = self.tab(Tab.row(Tab.wbase));
         const ring = self.pool.rings[li];
@@ -1535,8 +1547,8 @@ pub const RoundRunner = struct {
                 aot.ptr("S0", "*fp16", l.wq_b.suh.ptr),   aot.ptr("H0", "*fp16", h0),
                 if (nrot > 1) aot.ptr("S1", "*fp16", l.idx_wq_b.?.suh.ptr) else aot.ptr("S1", "*bf16", self.qr.ptr),
                 if (nrot > 1) aot.ptr("H1", "*fp16", h1) else aot.ptr("H1", "*bf16", self.qr.ptr),
-                aot.ptr("Y", "*bf16", self.ykv.ptr),      aot.ptr("WK", "*bf16", l.kv_norm.ptr()), aot.ptr("COS", "*fp32", rope.cos.ptr),
-                aot.ptr("SIN", "*fp32", rope.sin.ptr),    aot.ptr("POS", "*i64", t_pos),          aot.ptr("KOUT", "*bf16", self.kv.ptr),
+                aot.ptr("Y", "*bf16", self.ykv.ptr),      aot.ptr("WK", "*bf16", l.kv_norm.ptr()), aot.ptr("COS", "*fp32", ra.cos),
+                aot.ptr("SIN", "*fp32", ra.sin),          aot.ptr("POS", "*i64", ra.pos),         aot.ptr("KOUT", "*bf16", self.kv.ptr),
                 aot.ptr("RING", "*bf16", ring.ptr),       aot.ptr("SLOT_OF", "*i64", self.tab(Tab.row(Tab.wslot))),
                 aot.int("ring_size", @intCast(self.pool.slots * self.pool.ring)),
             }, &.{
@@ -1549,7 +1561,7 @@ pub const RoundRunner = struct {
                 .{ .ptr = self.q.ptr, .dtype = .bf16, .ld = heads * hd },
                 .{ .ptr = self.iq.ptr, .dtype = .bf16, .ld = c.idx_heads * c.idx_dim },
             };
-            try qg.rotated(R, self.xh_q.ptr, outs[0..nrot], self.zg.ptr, null, .{ .cos = rope.cos.ptr, .sin = rope.sin.ptr, .pos = t_pos, .hd = hd, .rd = c.rope_dim, .layers = flags }, stream);
+            try qg.rotated(R, self.xh_q.ptr, outs[0..nrot], self.zg.ptr, null, .{ .cos = ra.cos, .sin = ra.sin, .pos = ra.pos, .hd = hd, .rd = c.rope_dim, .layers = flags }, stream);
         }
         try self.l2.attn(li, stream);
         // -- the compressor's caches and the indexer (as the plain path; the window KV is in the ring already) ----
@@ -1561,9 +1573,8 @@ pub const RoundRunner = struct {
             const j = self.ratioSlot(ratio);
             t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
             const t_ctarget = self.tab(Tab.ratio(j, Tab.ctarget));
-            const t_gpos = self.tab(Tab.ratio(j, Tab.gpos));
             const src = &self.pool.planes[self.pool.source[li]].?;
-            if (c.isKvSource(li)) try self.compressor(li, R, j, src, rope, t_ctarget, t_gpos, stream);
+            if (c.isKvSource(li)) try self.compressor(li, R, j, src, t_ctarget, stream);
             kk = @min(c.idx_topk, nb_);
             if (c.isIndexSource(li)) {
                 if (nb_ > c.idx_topk) {
@@ -1603,8 +1614,8 @@ pub const RoundRunner = struct {
             const ghd = l.wo_a[0].k / hd; // heads a wo_a slice
             try self.set.run(stream, "_sparse_attn_merge_rot2", .{ @intCast(R), @intCast(heads), 1 }, &.{
                 aot.ptr("PM", "*fp32", self.pm.ptr),   aot.ptr("PL", "*fp32", self.pl.ptr),    aot.ptr("PO", "*fp32", self.po.ptr),
-                aot.ptr("SINK", "*fp32", l.sink.ptr()), aot.ptr("OUT", "*bf16", self.o.ptr),   aot.ptr("COS", "*fp32", rope.cos.ptr),
-                aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", t_pos),          aot.ptr("SUH", "*fp16", g.wo_a_suh.ptr),
+                aot.ptr("SINK", "*fp32", l.sink.ptr()), aot.ptr("OUT", "*bf16", self.o.ptr),   aot.ptr("COS", "*fp32", ra.cos),
+                aot.ptr("SIN", "*fp32", ra.sin),       aot.ptr("POS", "*i64", ra.pos),         aot.ptr("SUH", "*fp16", g.wo_a_suh.ptr),
                 aot.ptr("XH", "*fp16", self.xh_woa.ptr), aot.int("rows", @intCast(R)),
             }, &.{
                 aot.ci("H", @intCast(heads)), aot.ci("HD", @intCast(hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("RD", @intCast(c.rope_dim)),
@@ -1653,7 +1664,7 @@ pub const RoundRunner = struct {
         const t_cbase = self.tab(Tab.ratio(j, Tab.cbase));
         const tg = &self.glue.topk.?;
         if (!iq_ready) try l.idx_wq_b.?.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.iq.ptr, .bf16, stream);
-        try self.ropeHeads(self.iq.ptr, self.rope_c, self.tab(Tab.row(Tab.pos)), R, c.idx_heads, c.idx_dim, false, stream);
+        try self.ropeHeads(self.iq.ptr, self.ra_pos[0], R, c.idx_heads, c.idx_dim, false, stream);
         const nblk: usize = R * c.idx_heads * c.idx_dim / 32;
         try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
             aot.ptr("X", "*bf16", self.iq.ptr), aot.ptr("OUT", "*bf16", self.iqq.ptr), aot.int("nblk", @intCast(nblk)),
@@ -1765,10 +1776,10 @@ pub const RoundRunner = struct {
         }, &.{ aot.ci("D", @intCast(d)), aot.ci("BLOCK", @intCast(block)), aot.ci("PDL", 1) });
     }
 
-    fn ropeHeads(self: *RoundRunner, x: Ptr, rope: attention.Rope, pos: Ptr, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
+    fn ropeHeads(self: *RoundRunner, x: Ptr, at: attention.RopeAt, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
         const hb = @min(h, 16);
         try self.set.run(stream, "_rope_heads", .{ @intCast(n), @intCast(h / hb), 1 }, &.{
-            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", rope.cos.ptr), aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", pos),
+            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", at.cos), aot.ptr("SIN", "*fp32", at.sin), aot.ptr("POS", "*i64", at.pos),
         }, &.{ aot.ci("H", @intCast(h)), aot.ci("HD", @intCast(hd)), aot.ci("RD", @intCast(self.cfg.rope_dim)), aot.ci("INV", @intFromBool(inverse)), aot.ci("HB", @intCast(hb)), aot.ci("PDL", 1) });
     }
 

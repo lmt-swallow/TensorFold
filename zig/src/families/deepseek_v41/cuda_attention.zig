@@ -451,6 +451,7 @@ pub const Glue = struct {
     f32_to_f16: cuda.Function,
     topk: ?TopkGlue = null, // the selection kernels (built-in fatbin; null in host-only builds: the host selection)
     select: Select = .auto,
+    rope: ?RopeGen = null, // rope.cu (built-in fatbin; null in host-only builds: the table path only)
 
     /// The fatbin built into the binary (zig/build/cuda.zig: dsv41_attn_glue).
     pub fn load(d: *const cuda.Driver) !Glue {
@@ -471,10 +472,12 @@ pub const Glue = struct {
             .f32_to_f16 = try module.function("f32_to_f16"),
             .topk = if (cuda.kernels.available) try TopkGlue.load(d) else null,
             .select = if (cuda.kernels.available) sel else .host,
+            .rope = if (cuda.kernels.available) try RopeGen.load(d) else null,
         };
     }
 
     pub fn deinit(self: *Glue) void {
+        if (self.rope) |*r| r.deinit();
         if (self.topk) |*t| t.deinit();
         self.module.unload();
     }
@@ -598,8 +601,81 @@ pub const Caches = struct {
     }
 };
 
-/// (cos, sin) fp32 [rows, rd / 2] of this layer's rope kind (ops.py `rope_cs`; here loaded, not computed).
-pub const Rope = struct { cos: cuda.DeviceBuffer, sin: cuda.DeviceBuffer, rows: usize };
+/// A rope kind (ops.py `rope_cs`) for positions below `rows`: on the table path its (cos, sin) fp32 [rows, rd / 2]
+/// loaded from dump_rope.py's tables; on the device path (`freqs` set: fp32 [rd / 2]) no table at all (cos and sin
+/// empty, null pointers), the rows a pass reads computed from `freqs` by RopeRows.
+pub const Rope = struct {
+    cos: cuda.DeviceBuffer,
+    sin: cuda.DeviceBuffer,
+    rows: usize,
+    freqs: ?cuda.DeviceBuffer = null,
+};
+
+/// What the rope kernels take: COS, SIN fp32 [*, rd / 2] and POS int64 [n], row r rotated by row POS[r].
+pub const RopeAt = struct {
+    cos: Ptr,
+    sin: Ptr,
+    pos: Ptr,
+
+    /// The rows from row `r` on.
+    pub fn from(self: RopeAt, r: usize) RopeAt {
+        return .{ .cos = self.cos, .sin = self.sin, .pos = self.pos + r * 8 };
+    }
+};
+
+/// A pass's rope rows: `at` gives a kind's rows at a position array, on the table path the table itself indexed
+/// by the positions, on the device path rows computed into slot `slot` of this scratch (at most `cap` rows) and
+/// indexed by 0 .. n - 1. A slot holds one position array's rows until it is computed again.
+pub const RopeRows = struct {
+    gen: ?*const RopeGen = null,
+    iota: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 }, // int64 0 .. cap - 1
+    buf: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 }, // fp32 [slots][cos, sin][cap, half]
+    cap: usize = 0,
+    slots: usize = 0,
+    half: usize = 0,
+
+    /// Scratch for `slots` position arrays of up to `cap` rows (none without rope.cu: the table path only).
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, glue: *const Glue, cap: usize, slots: usize, half: usize) !RopeRows {
+        const gen = if (glue.rope) |*g| g else return .{};
+        const ids = try gpa.alloc(i64, cap);
+        defer gpa.free(ids);
+        for (ids, 0..) |*v, i| v.* = @intCast(i);
+        var iota = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(ids));
+        errdefer iota.free();
+        const buf = try cuda.DeviceBuffer.alloc(d, slots * 2 * cap * half * 4);
+        return .{ .gen = gen, .iota = iota, .buf = buf, .cap = cap, .slots = slots, .half = half };
+    }
+
+    pub fn deinit(self: *RopeRows) void {
+        if (self.gen == null) return;
+        self.buf.free();
+        self.iota.free();
+    }
+
+    /// `rope`'s rows at the positions pos[0 .. n] (int64, on the device, read in stream order: after their upload).
+    pub fn at(self: *const RopeRows, rope: Rope, slot: usize, pos: Ptr, n: usize, stream: cuda.Stream) !RopeAt {
+        try self.fill(rope, slot, pos, n, stream);
+        return self.view(rope, slot, pos);
+    }
+
+    /// The device path: slot `slot` gets `rope`'s rows at pos[0 .. n] (a launch on `stream`); the table path: nothing.
+    pub fn fill(self: *const RopeRows, rope: Rope, slot: usize, pos: Ptr, n: usize, stream: cuda.Stream) !void {
+        const fr = rope.freqs orelse return;
+        const gen = self.gen orelse return error.NoRopeRows;
+        if (slot >= self.slots or n > self.cap or fr.len != self.half * 4) return error.BadShape;
+        const v = self.view(rope, slot, pos);
+        try gen.rows(pos, 0, n, fr.ptr, self.half, v.cos, v.sin, stream);
+    }
+
+    /// What `at` returns, without computing anything: the table and `pos`, or slot `slot` and 0 .. cap - 1 (its
+    /// rows as the last `fill` of the slot left them).
+    pub fn view(self: *const RopeRows, rope: Rope, slot: usize, pos: Ptr) RopeAt {
+        if (rope.freqs == null) return .{ .cos = rope.cos.ptr, .sin = rope.sin.ptr, .pos = pos };
+        const plane = self.cap * self.half * 4;
+        const cos = self.buf.ptr + 2 * slot * plane;
+        return .{ .cos = cos, .sin = cos + plane, .pos = self.iota.ptr };
+    }
+};
 
 /// rope.cu: rows of a rope kind's (cos, sin) table computed on the device, the same bits as ops.py `rope_cs`'s.
 pub const RopeGen = struct {
@@ -843,7 +919,7 @@ pub const Attention = struct {
     /// `given`: the latest index layer's picks, which a layer without an indexer attends through (required when
     /// the layer is compressed and not an index source) and whose candidate pool an index layer after the candidate
     /// source masks its scores to (required there); an index source makes its own picks (`self.picks()`).
-    pub fn forward(self: *Attention, p: Params, c: *const Caches, rope: Rope, x: Ptr, n: usize, start: usize, given: ?Picks, stream: cuda.Stream) !Ptr {
+    pub fn forward(self: *Attention, p: Params, c: *const Caches, rope: Rope, rr: *const RopeRows, x: Ptr, n: usize, start: usize, given: ?Picks, stream: cuda.Stream) !Ptr {
         const dm = self.dims;
         if (n < 1 or n > dm.max_rows) return error.TooManyRows;
         const ratio = dm.ratio;
@@ -875,6 +951,8 @@ pub const Attention = struct {
             try self.uploads.put(self.first, 0, std.mem.sliceAsBytes(first[0..n]), stream);
             try self.uploads.put(self.target, 0, std.mem.sliceAsBytes(target[0..n]), stream);
         }
+        const at_pos = try rr.at(rope, 0, self.pos.ptr, n, stream);
+        const at_first: RopeAt = if (ratio > 0 and dm.kv_source) try rr.at(rope, 1, self.first.ptr, n, stream) else undefined;
         // -- attn_in: wq_a, wkv (and the compressor's) on x ------------------------------------------------------
         try p.wq_a.run(x, .bf16, n, self.s.xh.ptr, self.s.z.ptr, self.s.qa.ptr, .bf16, stream);
         try p.wkv.run(x, .bf16, n, self.s.xh.ptr, self.s.z.ptr, self.s.ykv.ptr, .bf16, stream);
@@ -885,11 +963,11 @@ pub const Attention = struct {
         // -- q: RMSNorm, wq_b, RoPE on this rank's heads ----------------------------------------------------------
         try self.rmsnorm(self.s.qa.ptr, p.q_norm, self.s.qr.ptr, n, dm.q_rank, stream);
         try p.wq_b.run(self.s.qr.ptr, .bf16, n, self.s.xh.ptr, self.s.z.ptr, self.s.q.ptr, .bf16, stream);
-        try self.ropeHeads(self.s.q.ptr, rope, self.pos.ptr, n, dm.heads, dm.hd, false, stream);
+        try self.ropeHeads(self.s.q.ptr, at_pos, n, dm.heads, dm.hd, false, stream);
         // -- the window KV into the ring ------------------------------------------------------------------------
         try self.set.run(stream, "_kv_norm_rope", .{ @intCast(n), 1, 1 }, &.{
-            aot.ptr("Y", "*bf16", self.s.ykv.ptr),  aot.ptr("W", "*bf16", p.kv_norm), aot.ptr("COS", "*fp32", rope.cos.ptr),
-            aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", self.pos.ptr),     aot.ptr("OUT", "*bf16", self.s.kv.ptr),
+            aot.ptr("Y", "*bf16", self.s.ykv.ptr),  aot.ptr("W", "*bf16", p.kv_norm), aot.ptr("COS", "*fp32", at_pos.cos),
+            aot.ptr("SIN", "*fp32", at_pos.sin), aot.ptr("POS", "*i64", at_pos.pos),     aot.ptr("OUT", "*bf16", self.s.kv.ptr),
             aot.ptr("RING", "*bf16", c.ring.ptr),  aot.ptr("SLOT_OF", "*i64", self.slots.ptr), aot.int("ring_size", @intCast(dm.ring)),
             aot.float("eps", dm.eps),
         }, &.{ aot.ci("QUANT", 1), aot.ci("D", @intCast(dm.hd)), aot.ci("RD", @intCast(dm.rd)), aot.ci("PDL", 1) });
@@ -919,11 +997,11 @@ pub const Attention = struct {
                 if (dm.has_idx_wk) {
                     try p.idx_wk.?.run(self.s.lat.ptr, .bf16, n, self.s.xh.ptr, self.s.z.ptr, self.s.kraw.ptr, .bf16, stream);
                     try self.rmsnorm(self.s.kraw.ptr, p.idx_k_norm, self.s.k.ptr, n, dm.idx_dim, stream);
-                    try self.ropeHeads(self.s.k.ptr, rope, self.first.ptr, n, 1, dm.idx_dim, false, stream);
+                    try self.ropeHeads(self.s.k.ptr, at_first, n, 1, dm.idx_dim, false, stream);
                     try self.fp4Store(self.s.k.ptr, dm.idx_dim, c.idxk_codes.ptr, c.idxk_scales.ptr, self.target.ptr, n, 32, false, stream);
                 }
                 try self.s.lat2.copyFrom(0, self.s.lat.ptr, n * dm.hd * 2, stream.handle);
-                try self.ropeHeads(self.s.lat2.ptr, rope, self.first.ptr, n, 1, dm.hd, false, stream);
+                try self.ropeHeads(self.s.lat2.ptr, at_first, n, 1, dm.hd, false, stream);
                 try self.fp4Store(self.s.lat2.ptr, dm.hd, c.comp_codes.ptr, c.comp_scales.ptr, self.target.ptr, n, 16, true, stream);
             }
             // -- the indexer: scores over the visible compressed entries, the top-k picks -------------------------
@@ -931,7 +1009,7 @@ pub const Attention = struct {
                 const nb = dm.nb();
                 const kk = dm.kk();
                 try p.idx_wq_b.?.run(self.s.qr.ptr, .bf16, n, self.s.xh.ptr, self.s.z.ptr, self.s.iq.ptr, .bf16, stream);
-                try self.ropeHeads(self.s.iq.ptr, rope, self.pos.ptr, n, dm.idx_heads, dm.idx_dim, false, stream);
+                try self.ropeHeads(self.s.iq.ptr, at_pos, n, dm.idx_heads, dm.idx_dim, false, stream);
                 const nblk: usize = n * dm.idx_heads * dm.idx_dim / 32;
                 try self.set.run(stream, "_fp4qd_p2", .{ @intCast((nblk + 31) / 32), 1, 1 }, &.{
                     aot.ptr("X", "*bf16", self.s.iq.ptr), aot.ptr("OUT", "*bf16", self.s.iqq.ptr), aot.int("nblk", @intCast(nblk)),
@@ -993,7 +1071,7 @@ pub const Attention = struct {
                 aot.ptr("SINK", "*fp32", p.sink), aot.ptr("OUT", "*bf16", self.s.o.ptr),
             }, &.{ aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
         }
-        try self.ropeHeads(self.s.o.ptr, rope, self.pos.ptr, n, dm.heads, dm.hd, true, stream);
+        try self.ropeHeads(self.s.o.ptr, at_pos, n, dm.heads, dm.hd, true, stream);
         // -- wo_a's slices on o's column blocks, then wo_b: this rank's fp32 partial ------------------------------
         const o_cols = dm.heads * dm.hd;
         const g_cols = o_cols / dm.groups;
@@ -1057,11 +1135,11 @@ pub const Attention = struct {
         }, &.{ aot.ci("D", @intCast(d)), aot.ci("BLOCK", @intCast(block)), aot.ci("PDL", 1) });
     }
 
-    /// RoPE on the last rd dims of every head of x [n, h, hd] bf16 in place, at the positions in `pos`.
-    fn ropeHeads(self: *Attention, x: Ptr, rope: Rope, pos: Ptr, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
+    /// RoPE on the last rd dims of every head of x [n, h, hd] bf16 in place, by the rows `at`.
+    fn ropeHeads(self: *Attention, x: Ptr, at: RopeAt, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
         const hb = @min(h, 16);
         try self.set.run(stream, "_rope_heads", .{ @intCast(n), @intCast(h / hb), 1 }, &.{
-            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", rope.cos.ptr), aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", pos),
+            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", at.cos), aot.ptr("SIN", "*fp32", at.sin), aot.ptr("POS", "*i64", at.pos),
         }, &.{ aot.ci("H", @intCast(h)), aot.ci("HD", @intCast(hd)), aot.ci("RD", @intCast(self.dims.rd)), aot.ci("INV", @intFromBool(inverse)), aot.ci("HB", @intCast(hb)), aot.ci("PDL", 1) });
     }
 

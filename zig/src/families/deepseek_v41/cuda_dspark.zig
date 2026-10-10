@@ -377,6 +377,7 @@ pub const Drafter = struct {
     lg: cuda.DeviceBuffer, // f32 [world, n, vocab_local] (the unsplit Markov loop's gather)
     // absorb
     abs_pos: cuda.DeviceBuffer,
+    rr: attention.RopeRows, // the rope rows of a pass's positions (slot 0) and of an absorb's (slot 1)
     abs_slots: cuda.DeviceBuffer,
     main_x: cuda.DeviceBuffer,
     main_y: cuda.DeviceBuffer,
@@ -500,6 +501,7 @@ pub const Drafter = struct {
         self.local = try cuda.DeviceBuffer.alloc(d, n * dims.vocab_local * 4);
         self.lg = try cuda.DeviceBuffer.alloc(d, dims.world * n * dims.vocab_local * 4);
         self.abs_pos = try cuda.DeviceBuffer.alloc(d, max_absorb * 8);
+        self.rr = try attention.RopeRows.init(gpa, d, glue, max_absorb, 2, dims.rd / 2);
         self.abs_slots = try cuda.DeviceBuffer.alloc(d, max_absorb * 8);
         self.main_x = try cuda.DeviceBuffer.alloc(d, max_absorb * D * 2);
         self.main_y = try cuda.DeviceBuffer.alloc(d, max_absorb * D * 2);
@@ -571,6 +573,7 @@ pub const Drafter = struct {
     pub fn deinit(self: *Drafter) void {
         inline for (.{ "ids", "pos", "wpos", "bidx", "rbase", "neg", "zero", "emb_ids", "emb2", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "xh", "z", "qa", "qr", "q", "ykv", "kvb", "pm", "pl", "po", "o", "og", "ug", "u", "attn_out", "gathered", "parts", "pick", "wts", "moe_out", "xc", "xn", "local", "lg", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(self, f).free();
         if (self.wide) |wd| wd.deinit(self.gpa);
+        self.rr.deinit();
         self.dropGraphs();
         self.uploads.deinit();
         self.ex_scratch.deinit();
@@ -629,6 +632,7 @@ pub const Drafter = struct {
         try self.uploads.put(self.abs_pos, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         for (0..n) |i| tab[i] = @intCast((first + i) % dm.ring);
         try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
+        const ra = try self.rr.at(rope, 1, self.abs_pos.ptr, n, stream);
         // main_x = rmsnorm(main_proj(taps), main_norm), then every stage's keys into its ring; the EXL3 row kernel
         // takes 128 rows a launch (the fork's prompt GEMM beyond that is a cuBLAS path: pieces here)
         // model.py `mm`: past 128 rows the prompt GEMM (`wide`), whose bits differ from the row kernel's
@@ -646,7 +650,7 @@ pub const Drafter = struct {
             while (at < n) : (at += 128) {
                 const m = @min(128, n - at);
                 if (wide == null) try s.wkv.run(self.main_x.ptr + at * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.abs_kv.ptr + at * dm.hd * 2, .bf16, stream);
-                try self.kvNormRope(self.abs_kv.ptr + at * dm.hd * 2, s.kv_norm, rope, self.abs_pos.ptr + at * 8, self.abs_slots.ptr + at * 8, ring.ptr, self.abs_kv.ptr + at * dm.hd * 2, m, stream);
+                try self.kvNormRope(self.abs_kv.ptr + at * dm.hd * 2, s.kv_norm, ra.from(at), self.abs_slots.ptr + at * 8, ring.ptr, self.abs_kv.ptr + at * dm.hd * 2, m, stream);
             }
         }
         cache.absorbed = start + n_in;
@@ -753,6 +757,7 @@ pub const Drafter = struct {
         const n = dm.block;
         const R = N * n;
         const D = dm.d;
+        const ra = try self.rr.at(rope, 0, self.pos.ptr, R, stream);
         try self.hc.embedInit(stream, self.emb2.ptr, self.emb_ids.ptr, self.h.ptr, self.pre.ptr, @intCast(R));
         if (hook) |f| try f(ctx.?, "h0", self.h.ptr);
         var pre = self.pre.ptr;
@@ -760,13 +765,13 @@ pub const Drafter = struct {
         var nb: [32]u8 = undefined;
         var h = self.h.ptr;
         if (batched and self.fused) {
-            const st = try self.fusedStages(R, rings, rope, stream, ctx, hook);
+            const st = try self.fusedStages(R, rings, ra, stream, ctx, hook);
             h = st.h;
             pre = st.pre;
         } else for (self.stages, rings, 0..) |s, ring, j| {
             try self.hc.pre(stream, self.h.ptr, s.hc_attn_fn, s.hc_attn_scale, s.hc_attn_base, pre, s.attn_norm, self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(R));
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x1", .{j}), self.x.ptr);
-            const pa = try self.stageAttention(s, ring.ptr, R, batched, rope, stream);
+            const pa = try self.stageAttention(s, ring.ptr, R, batched, ra, stream);
             if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_attn", .{j}), pa);
             const ga = try self.gather(pa, R * D, stream);
             try self.hc.post(stream, ga, @intCast(dm.world), self.h.ptr, self.post.ptr, self.comb.ptr, self.h.ptr, @intCast(R));
@@ -800,7 +805,7 @@ pub const Drafter = struct {
     /// dspark.py `BatchDraftGraph._stages_fused`: every stage with each sublayer's post fused into the next
     /// sublayer's mixes (kernels.hc_pre2 without a side stream: `_hc_mix_part` posted, then `_hc_finish_s` with both
     /// halves), the last post alone, the L2 forks joined at the end. Returns the streams' buffer and the last pre-mix.
-    fn fusedStages(self: *Drafter, R: usize, rings: []const cuda.DeviceBuffer, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook) !struct { h: Ptr, pre: Ptr } {
+    fn fusedStages(self: *Drafter, R: usize, rings: []const cuda.DeviceBuffer, ra: attention.RopeAt, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook) !struct { h: Ptr, pre: Ptr } {
         const dm = self.dims;
         const D = dm.d;
         const rows: u32 = @intCast(R);
@@ -829,7 +834,7 @@ pub const Drafter = struct {
                 try self.hc.finishS(stream, h, self.part.ptr, base, scale, pre_in, norm, self.x.ptr, pre_out, self.post.ptr, self.comb.ptr, rows, true);
                 if (sub == 0) {
                     if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_x1", .{j}), self.x.ptr);
-                    const pa = try self.fusedAttention(s, g, ring.ptr, R, rope, stream, j);
+                    const pa = try self.fusedAttention(s, g, ring.ptr, R, ra, stream, j);
                     if (hook) |f| try f(ctx.?, try std.fmt.bufPrint(&nb, "s{d}_attn", .{j}), pa);
                     pending = try self.gather(pa, R * D, stream);
                 } else {
@@ -856,7 +861,7 @@ pub const Drafter = struct {
     /// wq_b's rotated rows (`_rmsnorm_rot`) and q's RoPE in wq_b's epilogue, the block's keys and the attention as
     /// the plain stage, wo_a's inputs rotated from o's column blocks in place and wo_a's epilogue writing wo_b's
     /// rotated rows (model.py `wo_ab`). This rank's fp32 partial.
-    fn fusedAttention(self: *Drafter, s: Stage, g: *const StageGroups, ring: Ptr, R: usize, rope: Rope, stream: cuda.Stream, j: usize) !Ptr {
+    fn fusedAttention(self: *Drafter, s: Stage, g: *const StageGroups, ring: Ptr, R: usize, ra: attention.RopeAt, stream: cuda.Stream, j: usize) !Ptr {
         const dm = self.dims;
         const n = dm.block;
         {
@@ -876,10 +881,10 @@ pub const Drafter = struct {
             var flags: [exl3.gmax]bool = @splat(false);
             flags[0] = true;
             const outs = [_]exl3.Rows{.{ .ptr = self.q.ptr, .dtype = .bf16, .ld = dm.heads * dm.hd }};
-            try g.q.rotated(R, self.xh_q.ptr, &outs, self.zg.ptr, null, .{ .cos = rope.cos.ptr, .sin = rope.sin.ptr, .pos = self.pos.ptr, .hd = dm.hd, .rd = dm.rd, .layers = flags }, stream);
+            try g.q.rotated(R, self.xh_q.ptr, &outs, self.zg.ptr, null, .{ .cos = ra.cos, .sin = ra.sin, .pos = ra.pos, .hd = dm.hd, .rd = dm.rd, .layers = flags }, stream);
         }
         try self.l2.attn(j, stream);
-        try self.kvNormRope(self.ykv.ptr, s.kv_norm, rope, self.pos.ptr, self.neg.ptr, ring, self.kvb.ptr, R, stream);
+        try self.kvNormRope(self.ykv.ptr, s.kv_norm, ra, self.neg.ptr, ring, self.kvb.ptr, R, stream);
         const groups_h = dm.heads / 16;
         const picks: usize = (n + 31) / 32;
         const nblk: usize = dm.window / 32 + picks;
@@ -904,7 +909,7 @@ pub const Drafter = struct {
             aot.ptr("PM", "*fp32", self.pm.ptr), aot.ptr("PL", "*fp32", self.pl.ptr), aot.ptr("PO", "*fp32", self.po.ptr),
             aot.ptr("SINK", "*fp32", s.sink),   aot.ptr("OUT", "*bf16", self.o.ptr),
         }, &.{ aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
-        try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, R, dm.heads, dm.hd, true, stream);
+        try self.ropeHeads(self.o.ptr, ra, R, dm.heads, dm.hd, true, stream);
         {
             const groups = g.wo_a.n;
             const o_cols = dm.heads * dm.hd;
@@ -931,7 +936,7 @@ pub const Drafter = struct {
     /// The graph of a batched pass of N streams over `rings` with `rope`, recorded (nothing runs) when missing or
     /// recorded for other rings or tables.
     fn batchGraph(self: *Drafter, N: usize, rings: []const cuda.DeviceBuffer, rope: Rope, stream: cuda.Stream) !*BatchGraph {
-        var key: BatchGraph.Key = .{ .cos = rope.cos.ptr, .sin = rope.sin.ptr };
+        var key: BatchGraph.Key = .{ .cos = if (rope.freqs) |f| f.ptr else rope.cos.ptr, .sin = rope.sin.ptr };
         for (rings, key.rings[0..rings.len]) |r, *k| k.* = r.ptr;
         if (self.batch_graphs[N]) |*g| {
             if (std.meta.eql(g.key, key)) return g;
@@ -1011,16 +1016,16 @@ pub const Drafter = struct {
     /// dspark.py `Drafter._attention` / `BatchDraftGraph._attention` (unfused): the rows attend their stream's ring's
     /// newest 128 absorbed positions (ending at q0 - 1) and their block's rows (its keys as `comp`, no mask inside
     /// the block); this rank's fp32 partial. `batched`: per-row ring bases into the pool's plane (HAS_BASE).
-    fn stageAttention(self: *Drafter, s: Stage, ring: Ptr, R: usize, batched: bool, rope: Rope, stream: cuda.Stream) !Ptr {
+    fn stageAttention(self: *Drafter, s: Stage, ring: Ptr, R: usize, batched: bool, ra: attention.RopeAt, stream: cuda.Stream) !Ptr {
         const dm = self.dims;
         const n = dm.block;
         try s.wq_a.run(self.x.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.qa.ptr, .bf16, stream);
         try s.wkv.run(self.x.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.ykv.ptr, .bf16, stream);
         try self.rmsnorm(self.qa.ptr, s.q_norm, self.qr.ptr, R, dm.q_rank, stream);
         try s.wq_b.run(self.qr.ptr, .bf16, R, self.xh.ptr, self.z.ptr, self.q.ptr, .bf16, stream);
-        try self.ropeHeads(self.q.ptr, rope, self.pos.ptr, R, dm.heads, dm.hd, false, stream);
+        try self.ropeHeads(self.q.ptr, ra, R, dm.heads, dm.hd, false, stream);
         // the block's keys, normalized, roped and quantized like the ring's, not stored (slots -1)
-        try self.kvNormRope(self.ykv.ptr, s.kv_norm, rope, self.pos.ptr, self.neg.ptr, ring, self.kvb.ptr, R, stream);
+        try self.kvNormRope(self.ykv.ptr, s.kv_norm, ra, self.neg.ptr, ring, self.kvb.ptr, R, stream);
         if (R > max_rows) return error.TooManyRows;
         const groups_h = dm.heads / 16;
         const picks: usize = (n + 31) / 32;
@@ -1046,7 +1051,7 @@ pub const Drafter = struct {
             aot.ptr("PM", "*fp32", self.pm.ptr), aot.ptr("PL", "*fp32", self.pl.ptr), aot.ptr("PO", "*fp32", self.po.ptr),
             aot.ptr("SINK", "*fp32", s.sink),   aot.ptr("OUT", "*bf16", self.o.ptr),
         }, &.{ aot.ci("H", @intCast(dm.heads)), aot.ci("HD", @intCast(dm.hd)), aot.ci("HB", 16), aot.ci("SPLITS", 8), aot.ci("PDL", 1) });
-        try self.ropeHeads(self.o.ptr, rope, self.pos.ptr, R, dm.heads, dm.hd, true, stream);
+        try self.ropeHeads(self.o.ptr, ra, R, dm.heads, dm.hd, true, stream);
         const o_cols = dm.heads * dm.hd;
         const g_cols = o_cols / dm.groups;
         for (0..dm.groups) |g| {
@@ -1074,20 +1079,20 @@ pub const Drafter = struct {
         }, &.{ aot.ci("D", @intCast(d)), aot.ci("BLOCK", @intCast(block)), aot.ci("PDL", 1) });
     }
 
-    fn ropeHeads(self: *Drafter, x: Ptr, rope: Rope, pos: Ptr, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
+    fn ropeHeads(self: *Drafter, x: Ptr, at: attention.RopeAt, n: usize, h: usize, hd: usize, inverse: bool, stream: cuda.Stream) !void {
         const hb = @min(h, 16);
         try self.set.run(stream, "_rope_heads", .{ @intCast(n), @intCast(h / hb), 1 }, &.{
-            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", rope.cos.ptr), aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", pos),
+            aot.ptr("X", "*bf16", x), aot.ptr("COS", "*fp32", at.cos), aot.ptr("SIN", "*fp32", at.sin), aot.ptr("POS", "*i64", at.pos),
         }, &.{ aot.ci("H", @intCast(h)), aot.ci("HD", @intCast(hd)), aot.ci("RD", @intCast(self.dims.rd)), aot.ci("INV", @intFromBool(inverse)), aot.ci("HB", @intCast(hb)), aot.ci("PDL", 1) });
     }
 
     /// kernels.kv_norm_rope: y [n, hd] -> out (normalized, roped, FP8 quantize-dequantized), and into ring[slots]
     /// where a slot is >= 0 (`ring_rows`: the plane's rows, a pool's slots x ring).
-    fn kvNormRope(self: *Drafter, y: Ptr, w: Ptr, rope: Rope, pos: Ptr, slots: Ptr, ring: Ptr, out: Ptr, n: usize, stream: cuda.Stream) !void {
+    fn kvNormRope(self: *Drafter, y: Ptr, w: Ptr, at: attention.RopeAt, slots: Ptr, ring: Ptr, out: Ptr, n: usize, stream: cuda.Stream) !void {
         const dm = self.dims;
         try self.set.run(stream, "_kv_norm_rope", .{ @intCast(n), 1, 1 }, &.{
-            aot.ptr("Y", "*bf16", y),            aot.ptr("W", "*bf16", w),         aot.ptr("COS", "*fp32", rope.cos.ptr),
-            aot.ptr("SIN", "*fp32", rope.sin.ptr), aot.ptr("POS", "*i64", pos),    aot.ptr("OUT", "*bf16", out),
+            aot.ptr("Y", "*bf16", y),            aot.ptr("W", "*bf16", w),         aot.ptr("COS", "*fp32", at.cos),
+            aot.ptr("SIN", "*fp32", at.sin),     aot.ptr("POS", "*i64", at.pos),   aot.ptr("OUT", "*bf16", out),
             aot.ptr("RING", "*bf16", ring),      aot.ptr("SLOT_OF", "*i64", slots), aot.int("ring_size", @intCast(dm.ring)),
             aot.float("eps", dm.eps),
         }, &.{ aot.ci("QUANT", 1), aot.ci("D", @intCast(dm.hd)), aot.ci("RD", @intCast(dm.rd)), aot.ci("PDL", 1) });
@@ -1121,19 +1126,20 @@ pub const Drafter = struct {
         try self.uploads.put(self.abs_pos, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
         for (0..n) |i| tab[i] = @intCast(slots[i] * dm.ring + pos[i] % dm.ring);
         try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
+        const ra = try self.rr.at(rope, 1, self.abs_pos.ptr, n, stream);
         try self.head.main_proj.run(taps, .bf16, n, self.xh.ptr, self.z.ptr, self.main_y.ptr, .bf16, stream);
         try self.rmsnorm(self.main_y.ptr, self.head.main_norm, self.main_x.ptr, n, dm.d, stream);
         if (self.fused) {
             try self.stageKv(self.main_x.ptr, n, stream);
             for (self.stages, pool.rings, 0..) |s, ring, j| {
                 const y = self.kvg.ptr + j * 128 * dm.hd * 2;
-                try self.kvNormRope(y, s.kv_norm, rope, self.abs_pos.ptr, self.abs_slots.ptr, ring.ptr, y, n, stream);
+                try self.kvNormRope(y, s.kv_norm, ra, self.abs_slots.ptr, ring.ptr, y, n, stream);
             }
             return;
         }
         for (self.stages, pool.rings) |s, ring| {
             try s.wkv.run(self.main_x.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.abs_kv.ptr, .bf16, stream);
-            try self.kvNormRope(self.abs_kv.ptr, s.kv_norm, rope, self.abs_pos.ptr, self.abs_slots.ptr, ring.ptr, self.abs_kv.ptr, n, stream);
+            try self.kvNormRope(self.abs_kv.ptr, s.kv_norm, ra, self.abs_slots.ptr, ring.ptr, self.abs_kv.ptr, n, stream);
         }
     }
 
@@ -1172,6 +1178,7 @@ pub const Drafter = struct {
             try self.uploads.put(self.abs_pos, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
             for (0..n) |i| tab[i] = @intCast(slot * dm.ring + (first + i) % dm.ring);
             try self.uploads.put(self.abs_slots, 0, std.mem.sliceAsBytes(tab[0..n]), stream);
+            const ra = try self.rr.at(rope, 1, self.abs_pos.ptr, n, stream);
             var at: usize = 0;
             while (at < n) : (at += 128) {
                 const m = @min(128, n - at);
@@ -1185,7 +1192,7 @@ pub const Drafter = struct {
                     try self.stageKv(self.main_x.ptr + at * dm.d * 2, m, stream);
                     for (self.stages, pool.rings, 0..) |s, ring, j| {
                         const y = self.kvg.ptr + j * 128 * dm.hd * 2;
-                        try self.kvNormRope(y, s.kv_norm, rope, self.abs_pos.ptr + at * 8, self.abs_slots.ptr + at * 8, ring.ptr, y, m, stream);
+                        try self.kvNormRope(y, s.kv_norm, ra.from(at), self.abs_slots.ptr + at * 8, ring.ptr, y, m, stream);
                     }
                 }
             } else for (self.stages, pool.rings) |s, ring| {
@@ -1193,7 +1200,7 @@ pub const Drafter = struct {
                 while (at < n) : (at += 128) {
                     const m = @min(128, n - at);
                     try s.wkv.run(self.main_x.ptr + at * dm.d * 2, .bf16, m, self.xh.ptr, self.z.ptr, self.abs_kv.ptr + at * dm.hd * 2, .bf16, stream);
-                    try self.kvNormRope(self.abs_kv.ptr + at * dm.hd * 2, s.kv_norm, rope, self.abs_pos.ptr + at * 8, self.abs_slots.ptr + at * 8, ring.ptr, self.abs_kv.ptr + at * dm.hd * 2, m, stream);
+                    try self.kvNormRope(self.abs_kv.ptr + at * dm.hd * 2, s.kv_norm, ra.from(at), self.abs_slots.ptr + at * 8, ring.ptr, self.abs_kv.ptr + at * dm.hd * 2, m, stream);
                 }
             }
         }

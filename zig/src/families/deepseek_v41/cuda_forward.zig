@@ -112,6 +112,7 @@ pub const Forward = struct {
     bucket: usize,
     rope_c: attention.Rope, // the compressed layers' (YaRN)
     rope_w: attention.Rope, // the window layers'
+    rr: attention.RopeRows, // a window's rope rows (the device path's: its positions and its groups' first ones)
     probe: ?Probe = null,
     engram: ?Engram = null,
     // caches
@@ -168,6 +169,8 @@ pub const Forward = struct {
         self.bucket = bucket;
         self.rope_c = rope_c;
         self.rope_w = rope_w;
+        self.rr = try attention.RopeRows.init(gpa, d, glue, max_rows, 2, cfg.rope_dim / 2);
+        errdefer self.rr.deinit();
         self.probe = null;
         self.engram = null;
         self.rings = try gpa.alloc(cuda.DeviceBuffer, L);
@@ -252,6 +255,7 @@ pub const Forward = struct {
         self.scratch.deinit();
         self.gpa.free(self.ids_h);
         self.uploads.deinit();
+        self.rr.deinit();
     }
 
     fn dimsOf(self: *const Forward, li: usize) attention.Dims {
@@ -348,7 +352,7 @@ pub const Forward = struct {
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, n * dm * 2, stream);
             const caches = self.cachesOf(li);
             const rope = if (c.ratio(li) > 0) self.rope_c else self.rope_w;
-            const pa = try self.attn[li].forward(self.paramsOf(li), &caches, rope, self.x.ptr, n, start, picks, stream);
+            const pa = try self.attn[li].forward(self.paramsOf(li), &caches, rope, &self.rr, self.x.ptr, n, start, picks, stream);
             if (c.isIndexSource(li)) picks = self.attn[li].picks();
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, n * dm * 4, stream);
             try gather.run(pa, n * dm, self.gathered.ptr, stream);

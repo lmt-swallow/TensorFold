@@ -1680,11 +1680,12 @@ pub const Engine = struct {
         e.stream = try cuda.Stream.init(ctx.d, true);
         errdefer e.stream.deinit();
         const rows = ropeRows(s.context);
-        e.rope_c = try loadRope(gpa, io, ctx.d, s.rope_dir, "rope_c", rows);
+        const rope_mode = try ropeMode();
+        e.rope_c = try loadRope(gpa, io, ctx.d, s.rope_dir, "rope_c", rows, rope_mode);
         errdefer freeRope(&e.rope_c);
-        e.rope_w = try loadRope(gpa, io, ctx.d, s.rope_dir, "rope_w", rows);
+        e.rope_w = try loadRope(gpa, io, ctx.d, s.rope_dir, "rope_w", rows, rope_mode);
         errdefer freeRope(&e.rope_w);
-        clock.mark("the RoPE tables ({d} rows)", .{rows});
+        clock.mark("the RoPE {t} ({d} positions)", .{ rope_mode, rows });
         e.fwd = try forward.Forward.init(gpa, ctx.d, &e.cfg, &e.w, &e.set, &e.glue, &e.ek, s.world, max_rows, base_cap, s.bucket, e.rope_c, e.rope_w, e.stream);
         errdefer e.fwd.deinit();
         clock.mark("the decode loop", .{});
@@ -2063,10 +2064,40 @@ fn getenv(name: [:0]const u8) ?[]const u8 {
 fn freeRope(r: *attention.Rope) void {
     r.cos.free();
     r.sin.free();
+    if (r.freqs) |*f| f.free();
+}
+
+/// Where the rounds read RoPE rows from: TF_DS_ROPE=device (the default) computes each pass's rows on the device
+/// from the kinds' frequencies (`<dir>/<name>_freqs.bin`, rope.cu), the same bits as the tables, no table held;
+/// TF_DS_ROPE=table loads the whole tables (`<dir>/<name>_<rows>.bin`, 2 x 4 x 32 bytes a position a kind).
+pub const RopeMode = enum { device, table };
+
+pub fn ropeMode() !RopeMode {
+    const v = std.mem.span(std.c.getenv("TF_DS_ROPE") orelse return .device);
+    return std.meta.stringToEnum(RopeMode, v) orelse {
+        std.log.err("TF_DS_ROPE is {s}: it takes device or table", .{v});
+        return error.BadEnvironment;
+    };
+}
+
+/// A rope kind for positions below `rows` (`mode`: its frequencies, or its table).
+fn loadRope(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, name: []const u8, rows: usize, mode: RopeMode) !attention.Rope {
+    if (mode == .table) return loadRopeTable(gpa, io, d, dir, name, rows);
+    const half = 32;
+    const path = try std.fmt.allocPrint(gpa, "{s}/{s}_freqs.bin", .{ dir, name });
+    defer gpa.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 16)) catch {
+        std.log.err("no RoPE frequencies at {s}: run tools/zig/dsv41/dump_rope.py --freqs-only (or TF_DS_ROPE=table)", .{path});
+        return error.NoRopeTables;
+    };
+    defer gpa.free(bytes);
+    if (bytes.len != half * 4) return error.RopeRowsShort;
+    const none: cuda.DeviceBuffer = .{ .d = d, .ptr = 0, .len = 0 };
+    return .{ .cos = none, .sin = none, .rows = rows, .freqs = try cuda.DeviceBuffer.fromHost(d, bytes) };
 }
 
 /// `<dir>/<name>_<rows>.bin`: cos then sin, f32 [rows, rope_dim / 2] each (tools/zig/dsv41/dump_rope.py).
-fn loadRope(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, name: []const u8, rows: usize) !attention.Rope {
+fn loadRopeTable(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, name: []const u8, rows: usize) !attention.Rope {
     const half = 32;
     const path = try std.fmt.allocPrint(gpa, "{s}/{s}_{d}.bin", .{ dir, name, rows });
     defer gpa.free(path);
