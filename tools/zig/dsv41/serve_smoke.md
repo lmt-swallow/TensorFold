@@ -60,3 +60,9 @@ fail an allocation: it swaps the node until nothing answers (sshd included), and
 node with it. Run `tools/zig/dsv41/gpu_guard.sh` on the node before any `docker run --gpus` (the capture scripts do;
 test containers must too: `ssh node bash -s < tools/zig/dsv41/gpu_guard.sh && ssh node docker run ...`), and run
 `serve_smoke.sh stop` as soon as a measurement ends; `KEEP=1` is for serving, not for a pause between tests.
+
+## After the smoke: the workload
+
+With the server kept up (`KEEP=1`) at the goal configuration, `python3 tools/zig/dsv41/bench_watch.py --host
+spark-616b` runs the fixed workload of `bench_watch.md` (short decode, an agent session, needles at 64k and 256k, four
+streams at once) and `--compare results/bench/<baseline>.json` flags any reply whose token sha changed.
