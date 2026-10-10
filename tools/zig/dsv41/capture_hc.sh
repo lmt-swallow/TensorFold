@@ -5,6 +5,7 @@
 # tensorfold-dsv41:90b68e0-p1. Writes <work-dir>/out/fixture (manifest.json + arrays), <work-dir>/out/launches.json
 # and <work-dir>/aot/{aot.json,cubins/}; `tf-cuda-test dsv41-hc <work-dir>` and `dsv41-route <work-dir>` read them.
 set -euo pipefail
+"$(dirname "$0")/gpu_guard.sh" || exit $?   # never beside a serving rank: the node swaps into a hang
 WORK=$1; shift
 TF=${TF:-$HOME/src/TensorFold}
 MODEL=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw}

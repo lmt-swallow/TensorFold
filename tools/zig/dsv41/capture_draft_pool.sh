@@ -6,6 +6,7 @@
 # <work-dir>/out/fixture (several GB: the stages' experts), <work-dir>/out/launches.json and <work-dir>/aot/;
 # `tf-cuda-test dsv41-draft-pool <work-dir>` reads them. Needs ~9 GiB of GPU memory at 3 stages (~4.5 at 1).
 set -euo pipefail
+"$(dirname "$0")/gpu_guard.sh" || exit $?   # never beside a serving rank: the node swaps into a hang
 WORK=$1; shift
 TF=${TF:-$HOME/src/TensorFold}
 MODEL=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw}

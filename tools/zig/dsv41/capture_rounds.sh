@@ -5,6 +5,7 @@
 # tensorfold-dsv41:90b68e0-p1 (UNFUSED=1: the unfused switches); $MODELS is mounted at /models and $TOKEN_MAP_DIR at /tm for Engram.
 # `tf-cuda-test dsv41-rounds <work-dir> <rank-cache-dir> <model-dir>` reads <work-dir>/out/fixture and <work-dir>/aot.
 set -euo pipefail
+"$(dirname "$0")/gpu_guard.sh" || exit $?   # never beside a serving rank: the node swaps into a hang
 WORK=$1; shift
 TF=${TF:-$HOME/src/TensorFold}
 MODEL=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw}

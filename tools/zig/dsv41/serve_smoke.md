@@ -50,3 +50,11 @@ What the interim engine does not do yet: the fork's prompt kernels (prompts run 
 DSpark drafts, several streams, Engram's gate (no tables are read), prompt snapshots. The context bucket (the
 indexer's scan) is the power of two at or above `--context` (`TF_DS_BUCKET` overrides); the captured kernel set
 covers buckets the serving capture saw (prompts to 9,000 tokens).
+
+## One model per node
+
+Host and GPU share the Spark's unified memory, so a fixture test or a capture started beside a serving rank does not
+fail an allocation: it swaps the node until nothing answers (sshd included), and a two-rank server takes the other
+node with it. Run `tools/zig/dsv41/gpu_guard.sh` on the node before any `docker run --gpus` (the capture scripts do;
+test containers must too: `ssh node bash -s < tools/zig/dsv41/gpu_guard.sh && ssh node docker run ...`), and run
+`serve_smoke.sh stop` as soon as a measurement ends; `KEEP=1` is for serving, not for a pause between tests.

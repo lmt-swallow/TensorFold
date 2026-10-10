@@ -5,6 +5,7 @@
 # Writes <work-dir>/out/fixtures/attn_weights, attn_n<rows>/, <work-dir>/out/glue.cubin (attn_glue.cu by the
 # image's nvcc, the toolkit torch was built with) and <work-dir>/aot/{aot.json,cubins/}.
 set -euo pipefail
+"$(dirname "$0")/gpu_guard.sh" || exit $?   # never beside a serving rank: the node swaps into a hang
 WORK=$1; shift
 TF=${TF:-$HOME/src/TensorFold}
 MODELS=${MODELS:-$HOME/models}

@@ -7,6 +7,7 @@
 # tensorfold-dsv41:90b68e0-p1. Writes <work-dir>/out/fixtures/parallel and <work-dir>/aot/{aot.json,cubins/};
 # `tf-cuda-test dsv41-lanes-parallel` reads them.
 set -euo pipefail
+"$(dirname "$0")/gpu_guard.sh" || exit $?   # never beside a serving rank: the node swaps into a hang
 WORK=$1; shift
 TF=${TF:-$HOME/src/TensorFold}
 MODELS=${MODELS:-$HOME/models}
