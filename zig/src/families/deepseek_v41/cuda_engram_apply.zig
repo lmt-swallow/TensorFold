@@ -27,8 +27,9 @@ const Ptr = cuda.abi.DevicePtr;
 
 pub const Error = error{ NotEngramLayer, NoTable, TooManyRows, HistoryShort, BadTokenMap };
 
-/// Rows at most a call without an `mm` (the row-invariant decode linear's scratch is sized for these).
-pub const decode_rows: usize = 16;
+/// Rows at most a call without an `mm` (the row-invariant decode linear's scratch is sized for these): a round's
+/// most (cuda_rounds.max_rows).
+pub const decode_rows: usize = rounds.max_rows;
 
 pub const Engram = struct {
     gpa: std.mem.Allocator,

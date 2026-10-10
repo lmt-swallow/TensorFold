@@ -37,9 +37,9 @@
 //! upload stay eager between the stretches, as the fork's ENGRAM_SPLIT), and replayed; a replay runs the eager path's
 //! launches with the same arguments, so it writes the same bytes. The gathers are recorded with the rest (the
 //! communicator's all-gather runs on the round's stream). The host selection (TF_DS_TOPK=host) and a probe stay
-//! eager. Keys at buckets up to `graph_bucket_max` are kept once recorded; keys at wider buckets are recorded on first
-//! use and held under `graph_budget` bytes (TF_DS_GRAPH_MIB), the least recently replayed dropped first
-//! (TF_DS_GRAPH_ALL=0, or a budget of 0: wider buckets run eager). Every rank records the same keys in the same order:
+//! eager. Keys at buckets up to `graph_bucket_max` of up to `graph_rows_max` rows are kept once recorded; the others
+//! are recorded on first use and held under `graph_budget` bytes (TF_DS_GRAPH_MIB), the least recently replayed
+//! dropped first (TF_DS_GRAPH_ALL=0, or a budget of 0: they run eager). Every rank records the same keys in the same order:
 //! they follow from the windows alone. A capture issues no collective (the gathers are recorded, not run), so a rank
 //! that drops and records a key again where the other replays it still runs the same gathers in the same order.
 const std = @import("std");
@@ -267,7 +267,7 @@ pub fn graphsFromEnv() bool {
 }
 
 /// MiB the keys of buckets past the kept ones may hold unless TF_DS_GRAPH_MIB says otherwise.
-pub const graph_mib_default: usize = 1024;
+pub const graph_mib_default: usize = 512;
 
 /// `RoundRunner.graph_budget` from the environment: 0 when TF_DS_GRAPH_ALL is "0" (rounds past the kept buckets run
 /// eager), else TF_DS_GRAPH_MIB (default `graph_mib_default`) MiB; error.BadEnvironment when that is not a number.
@@ -593,6 +593,8 @@ const SegState = struct {
 const Graphs = struct {
     n: usize,
     bucket: usize,
+    /// Kept once recorded (`RoundRunner.keeps`); else held under the budget.
+    kept: bool,
     execs: [max_segments]?cuda.graph.Exec = @splat(null),
     gathers: [max_segments]usize = @splat(0),
     after: [max_segments]SegState = @splat(.{}),
@@ -602,12 +604,12 @@ const Graphs = struct {
     used: u64 = 0,
 };
 
-/// The key to drop for room (`RoundRunner.graph_budget`): among `keys`' wider-than-`kept` buckets other than
-/// `current`, the least recently used (`used`, then the smaller key: the same on every rank); null when none is.
-fn lruVictim(keys: []const u64, used: []const u64, buckets: []const usize, kept: usize, current: u64) ?usize {
+/// The key to drop for room (`RoundRunner.graph_budget`): among `keys` not `kept` other than `current`, the least
+/// recently used (`used`, then the smaller key: the same on every rank); null when none is.
+fn lruVictim(keys: []const u64, used: []const u64, kept: []const bool, current: u64) ?usize {
     var best: ?usize = null;
-    for (keys, used, buckets, 0..) |k, u, b, i| {
-        if (b <= kept or k == current) continue;
+    for (keys, used, kept, 0..) |k, u, kp, i| {
+        if (kp or k == current) continue;
         if (best) |j| {
             if (u > used[j] or (u == used[j] and k > keys[j])) continue;
         }
@@ -616,15 +618,15 @@ fn lruVictim(keys: []const u64, used: []const u64, buckets: []const usize, kept:
     return best;
 }
 
-test "lruVictim: the least recently used key past the kept buckets, never the current one" {
+test "lruVictim: the least recently used key not kept, never the current one" {
     const keys = [_]u64{ 10, 11, 12, 13 };
     const used = [_]u64{ 5, 2, 2, 1 };
-    const buckets = [_]usize{ 16384, 16384, 32768, 8192 };
-    // 13 is older but kept (bucket 8192); 11 and 12 tie: the smaller key
-    try std.testing.expectEqual(@as(?usize, 1), lruVictim(&keys, &used, &buckets, 8192, 99));
-    try std.testing.expectEqual(@as(?usize, 2), lruVictim(&keys, &used, &buckets, 8192, 11));
-    try std.testing.expectEqual(@as(?usize, null), lruVictim(keys[3..], used[3..], buckets[3..], 8192, 99));
-    try std.testing.expectEqual(@as(?usize, null), lruVictim(keys[0..1], used[0..1], buckets[0..1], 8192, 10));
+    const kept = [_]bool{ false, false, false, true };
+    // 13 is older but kept; 11 and 12 tie: the smaller key
+    try std.testing.expectEqual(@as(?usize, 1), lruVictim(&keys, &used, &kept, 99));
+    try std.testing.expectEqual(@as(?usize, 2), lruVictim(&keys, &used, &kept, 11));
+    try std.testing.expectEqual(@as(?usize, null), lruVictim(keys[3..], used[3..], kept[3..], 99));
+    try std.testing.expectEqual(@as(?usize, null), lruVictim(keys[0..1], used[0..1], kept[0..1], 10));
 }
 
 /// A gather that counts its calls (a capture's).
@@ -698,12 +700,14 @@ pub const RoundRunner = struct {
     /// graphs hold their recorded all-gathers' resources (about 40 MiB a key of 3 stretches at 43 layers), so the
     /// keys of wider buckets are held under `graph_budget`.
     graph_bucket_max: usize = std.math.maxInt(usize),
-    /// Bytes the keys past `graph_bucket_max` may hold (their `Graphs.bytes`); 0: rounds at those buckets run eager.
+    /// Keys of more rows are held under `graph_budget` too, as the wider buckets' are.
+    graph_rows_max: usize = std.math.maxInt(usize),
+    /// Bytes the keys not kept (`keeps`) may hold (their `Graphs.bytes`); 0: those rounds run eager.
     graph_budget: usize = 0,
-    /// The bytes the keys past `graph_bucket_max` hold now, and the most one of them took.
+    /// The bytes the keys not kept hold now, and the most one of them took.
     long_bytes: usize = 0,
     long_most: usize = 0,
-    /// Keys past `graph_bucket_max` recorded and dropped so far.
+    /// Keys not kept recorded and dropped so far.
     long_records: usize = 0,
     long_drops: usize = 0,
     /// The rounds run (each key's `used` is one of these).
@@ -864,6 +868,7 @@ pub const RoundRunner = struct {
         self.captures = 0;
         self.launch_hook = null;
         self.graph_bucket_max = std.math.maxInt(usize);
+        self.graph_rows_max = std.math.maxInt(usize);
         self.graph_budget = 0;
         self.long_bytes = 0;
         self.long_most = 0;
@@ -1063,7 +1068,7 @@ pub const RoundRunner = struct {
         self.rounds += 1;
         const entry: ?*Graphs = if (self.graphed()) try self.graphsFor(R, self.round_bucket, ns, stream) else null;
         if (entry) |g| g.used = self.rounds;
-        const fresh = if (entry) |g| g.execs[0] == null and g.bucket > self.graph_bucket_max else false;
+        const fresh = if (entry) |g| g.execs[0] == null and !g.kept else false;
         var nb: [48]u8 = undefined;
         for (segs[0..ns], 0..) |sg, k| {
             if (k > 0) {
@@ -1079,7 +1084,7 @@ pub const RoundRunner = struct {
                 self.st = g.after[k];
             } else try self.segment(segs[0..ns], k, R, gather, stream);
         }
-        if (fresh) std.log.info("deepseek_v41: round graphs of {d} rows at bucket {d} recorded ({d:.1} MiB); the buckets past {d} hold {d:.0} of {d} MiB ({d} keys recorded, {d} dropped)", .{ R, self.round_bucket, mib(entry.?.bytes), self.graph_bucket_max, mib(self.long_bytes), self.graph_budget >> 20, self.long_records, self.long_drops });
+        if (fresh) std.log.info("deepseek_v41: round graphs of {d} rows at bucket {d} recorded ({d:.1} MiB); the keys past bucket {d} or {d} rows hold {d:.0} of {d} MiB ({d} recorded, {d} dropped)", .{ R, self.round_bucket, mib(entry.?.bytes), self.graph_bucket_max, self.graph_rows_max, mib(self.long_bytes), self.graph_budget >> 20, self.long_records, self.long_drops });
         return self.logits.ptr;
     }
 
@@ -1100,6 +1105,7 @@ pub const RoundRunner = struct {
             if (b > self.bucket or b < @min(self.least, self.bucket) or b > self.graph_bucket_max) continue;
             for (rows) |R| {
                 if (R < 1 or R > self.rows) return error.TooManyRows;
+                if (R > self.graph_rows_max) continue;
                 self.round_bucket = b;
                 const g = (try self.graphsFor(R, b, ns, stream)) orelse continue;
                 for (0..ns) |k| {
@@ -1144,12 +1150,13 @@ pub const RoundRunner = struct {
     }
 
     /// The key (R, bucket, stretches)'s graphs, made (none recorded) when missing; null when the round runs eager:
-    /// a bucket past `graph_bucket_max` with no budget, or with no room for one more key after dropping every
-    /// other key past it.
+    /// a key not kept (`keeps`) with no budget, or with no room for one more after dropping every other key not
+    /// kept.
     fn graphsFor(self: *RoundRunner, R: usize, bucket: usize, ns: usize, stream: cuda.Stream) !?*Graphs {
         const key: u64 = @as(u64, R) | @as(u64, ns) << 6 | @as(u64, bucket) << 10;
         if (self.execs.get(key)) |g| return g;
-        if (bucket > self.graph_bucket_max) {
+        const kept = self.keeps(R, bucket);
+        if (!kept) {
             if (self.graph_budget == 0) return null;
             // room for one more key of the size the widest so far took (the first: assumed to fit)
             while (self.long_bytes + self.long_most > self.graph_budget) {
@@ -1161,26 +1168,31 @@ pub const RoundRunner = struct {
             _ = self.execs.remove(key);
             return err;
         };
-        got.value_ptr.*.* = .{ .n = ns, .bucket = bucket };
+        got.value_ptr.*.* = .{ .n = ns, .bucket = bucket, .kept = kept };
         return got.value_ptr.*;
     }
 
-    /// Drops the least recently replayed key past `graph_bucket_max` other than `keep` (`lruVictim`), after the
+    /// Whether the key of `R` rows at `bucket` stays once recorded (else it is held under `graph_budget`).
+    fn keeps(self: *const RoundRunner, R: usize, bucket: usize) bool {
+        return bucket <= self.graph_bucket_max and R <= self.graph_rows_max;
+    }
+
+    /// Drops the least recently replayed key not kept other than `keep` (`lruVictim`), after the
     /// launches queued on `stream` (which may replay it) finish. False when there is none.
     fn dropOne(self: *RoundRunner, keep: u64, stream: cuda.Stream) !bool {
         var keys: std.ArrayList(u64) = .empty;
         defer keys.deinit(self.gpa);
         var used: std.ArrayList(u64) = .empty;
         defer used.deinit(self.gpa);
-        var buckets: std.ArrayList(usize) = .empty;
-        defer buckets.deinit(self.gpa);
+        var kept: std.ArrayList(bool) = .empty;
+        defer kept.deinit(self.gpa);
         var it = self.execs.iterator();
         while (it.next()) |e| {
             try keys.append(self.gpa, e.key_ptr.*);
             try used.append(self.gpa, e.value_ptr.*.used);
-            try buckets.append(self.gpa, e.value_ptr.*.bucket);
+            try kept.append(self.gpa, e.value_ptr.*.kept);
         }
-        const i = lruVictim(keys.items, used.items, buckets.items, self.graph_bucket_max, keep) orelse return false;
+        const i = lruVictim(keys.items, used.items, kept.items, keep) orelse return false;
         try stream.synchronize();
         const g = self.execs.fetchRemove(keys.items[i]).?.value;
         for (&g.execs) |*e| if (e.*) |*x| {
@@ -1223,7 +1235,7 @@ pub const RoundRunner = struct {
         _ = self.d.api.cuMemGetInfo_v2(&free1, &total);
         const took = free0 -| free1;
         g.bytes += took;
-        if (g.bucket > self.graph_bucket_max) {
+        if (!g.kept) {
             self.long_bytes += took;
             self.long_most = @max(self.long_most, g.bytes);
             if (k + 1 == g.n) self.long_records += 1;

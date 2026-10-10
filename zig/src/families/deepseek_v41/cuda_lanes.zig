@@ -74,6 +74,10 @@ pub const Error = error{ WorldNotTwo, BadMaster, NoRankCache, NoRopeTables, Rope
 /// 0.65 GiB).
 pub const warm_bucket_max: usize = 8192;
 
+/// The most rows of the round graphs recorded at load (`Streams.warm`) and kept; wider rounds' graphs are recorded on
+/// first use under TF_DS_GRAPH_MIB, as the wider buckets' are (their row counts are few in a served run).
+pub const warm_rows_max: usize = rounds.rows_default;
+
 /// A drafting round's widest window by default: the pending token and DSpark's block of drafts (engine.py: drafts
 /// + 1 rows); TF_DS_DRAFTS sets the drafts (`Settings.most_drafts`).
 pub const draft_width: usize = 6;
@@ -1716,12 +1720,13 @@ pub const Streams = struct {
         } else self.logits = try self.runner.forward(&w, gather, self.stream);
     }
 
-    /// Records the round graphs of 1 .. `rows` rows at the buckets bucket_min .. `warm_bucket_max` the runner scans
-    /// (wider buckets stay eager) and the batched drafts' of 1 .. `passStreams` streams, ahead of the rounds and drafts
+    /// Records the round graphs of 1 .. min(`rows`, `warm_rows_max`) rows at the buckets bucket_min ..
+    /// `warm_bucket_max` the runner scans (the others are recorded on first use) and the batched drafts' of 1 .. `passStreams` streams, ahead of the rounds and drafts
     /// that replay them; nothing runs (TF_DS_GRAPHS=0: nothing to record). Every rank calls it at the same point with
     /// the same streams.
     pub fn warm(self: *Streams, gather: forward.Gather) !void {
         self.runner.graph_bucket_max = warm_bucket_max;
+        self.runner.graph_rows_max = warm_rows_max;
         self.runner.graph_budget = try rounds.graphBudgetFromEnv();
         var rows: [round_rows_most]usize = undefined;
         for (&rows, 1..) |*r, i| r.* = i;
