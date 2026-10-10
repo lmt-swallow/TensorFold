@@ -601,6 +601,41 @@ pub const Caches = struct {
 /// (cos, sin) fp32 [rows, rd / 2] of this layer's rope kind (ops.py `rope_cs`; here loaded, not computed).
 pub const Rope = struct { cos: cuda.DeviceBuffer, sin: cuda.DeviceBuffer, rows: usize };
 
+/// rope.cu: rows of a rope kind's (cos, sin) table computed on the device, the same bits as ops.py `rope_cs`'s.
+pub const RopeGen = struct {
+    module: cuda.Module,
+    rows_fn: cuda.Function,
+
+    pub const block: u32 = 256; // rope.cu's launch bounds
+
+    pub fn load(d: *const cuda.Driver) !RopeGen {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_rope);
+        errdefer module.unload();
+        return .{ .module = module, .rows_fn = try module.function("tf_dsv41_rope_rows") };
+    }
+
+    pub fn deinit(self: *RopeGen) void {
+        self.module.unload();
+    }
+
+    /// cos, sin fp32 [n, half]: row r is the table's row at position pos[r] (`pos` int64 [n]; 0: position start + r),
+    /// from `freqs` fp32 [half] (dump_rope.py's rope_<kind>_freqs.bin).
+    pub fn rows(self: *const RopeGen, pos: Ptr, start: u64, n: usize, freqs: Ptr, half: usize, cos: Ptr, sin: Ptr, stream: cuda.Stream) !void {
+        if (n == 0) return;
+        const total = n * half;
+        var a: cuda.Args = .{};
+        a.add(pos);
+        a.add(@as(c_longlong, @intCast(start)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(freqs);
+        a.add(@as(c_int, @intCast(half)));
+        a.add(cos);
+        a.add(sin);
+        try cuda.launch.launch(self.rows_fn, .{ .grid = .{ .x = @intCast((total + block - 1) / block) }, .block = .{ .x = block } }, stream, &a);
+    }
+};
+
 /// The picks a compressed layer attends through: its own (an index source) or the latest index layer's before it
 /// (the fork's shared["topk"]): cidx [n, kk] int64 (-1: none). Past the candidate source they also carry its pool
 /// (shared["cand"]): the block mask [n, cand_ld] u8 on the device, or on the host under the host selection.

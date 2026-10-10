@@ -37,6 +37,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_topk_glue", .src = "dsv41/topk_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the indexer's selection (topk_indices, the candidate pool and its mask) on the device
     .{ .name = "dsv41_exl3_grouped", .src = "dsv41/linear_grouped", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // the same extension's linear_grouped.cu: rot_many, glinear (grouped launches, rotation / RoPE epilogues)
     .{ .name = "dsv41_l2_prefetch", .src = "dsv41/l2_prefetch", .flags = &.{"-O3"} }, // cuda/exl3/prefetch.py, tensorfold_exl3_l2_prefetch_v6: paced L2 prefetch of weight ranges
+    .{ .name = "dsv41_rope", .src = "dsv41/rope", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: ops.py rope_cs's table rows (glibc's sinf / cosf) at given positions
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
