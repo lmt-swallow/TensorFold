@@ -2179,9 +2179,37 @@ pub const Lanes = struct {
     next: u64 = 0,
     window_costs: [draft_width]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
     shared_costs: [max_rows]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
+    /// Keeps not yet sent (TF_DS_TAIL on): the next step carries them, and a drafts step whose absorb keeps the same
+    /// rows of a stream makes its keep moot (`Streams.draft` sets the length there itself). Every other step sends
+    /// them first, so each rank sees the same lengths at every step as without the deferral.
+    defer_keeps: bool = false,
+    keeps: [max_slots]KeepAsk = undefined,
+    n_keeps: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine) Lanes {
-        return .{ .gpa = gpa, .e = e };
+        return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv() };
+    }
+
+    /// The deferred keeps as one keeps step (none: nothing sent).
+    fn sendKeeps(self: *Lanes) !void {
+        if (self.n_keeps == 0) return;
+        const n = self.n_keeps;
+        self.n_keeps = 0;
+        try self.e.both(Keeps.encode(self.e.op_buf, self.keeps[0..n]));
+    }
+
+    /// Whether a drafts step of `requests` makes every deferred keep moot: each kept stream absorbs exactly its kept
+    /// rows of the same window (same start), which leaves its length where the keep would (`Streams.draft`).
+    fn keepsMoot(self: *const Lanes, requests: []const be.DraftRequest) bool {
+        for (self.keeps[0..self.n_keeps]) |k| {
+            const moot = for (requests) |r| {
+                const slot = self.slotOf(r.stream) catch continue;
+                const rows = r.rows orelse continue;
+                if (slot == k.slot and rows.len == k.kept and r.start == k.start) break true;
+            } else false;
+            if (!moot) return false;
+        }
+        return true;
     }
 
     pub fn backend(self: *Lanes) be.Backend {
@@ -2203,6 +2231,7 @@ pub const Lanes = struct {
     /// both); a lone window of w rows is a round of w rows.
     pub fn measure(self: *Lanes, reps: u8) !void {
         const e = self.e;
+        try self.sendKeeps();
         try e.measure(reps);
         const per = if (e.drafter) |dr| draftBatch(dr.dims.block) else 1;
         for (&self.shared_costs, 0..) |*c, i| {
@@ -2256,6 +2285,7 @@ pub const Lanes = struct {
     /// it shares with a kept prompt (`s.cached`, usage's cached tokens) or from 0; its first token is drawn.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
+        try self.sendKeeps();
         const e = self.e;
         const st = &e.streams;
         if (s.sampling) |sm| if (sm.temperature > 0) return error.SamplingNotSupported;
@@ -2307,6 +2337,7 @@ pub const Lanes = struct {
     /// or host tokens, at its length; each row's draw greedy.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        try self.sendKeeps();
         const e = self.e;
         const st = &e.streams;
         if (windows.len > st.lanes.len) return error.WindowTooWide;
@@ -2358,7 +2389,16 @@ pub const Lanes = struct {
             asks[n] = .{ .slot = slot, .start = l.verify_start, .kept = path.len };
             n += 1;
         }
-        if (n > 0) try e.both(Keeps.encode(e.op_buf, asks[0..n]));
+        if (n == 0) return;
+        if (!self.defer_keeps) return e.both(Keeps.encode(e.op_buf, asks[0..n]));
+        // held for the next step (a stream already holding one, which takes another round between, sends first)
+        for (asks[0..n]) |a| for (self.keeps[0..self.n_keeps]) |k| {
+            if (k.slot == a.slot) try self.sendKeeps();
+        };
+        for (asks[0..n]) |a| {
+            self.keeps[self.n_keeps] = a;
+            self.n_keeps += 1;
+        }
     }
 
     /// Every request in one drafts step: absorb its kept rows (none after the prompt: its chunks absorbed theirs),
@@ -2369,6 +2409,9 @@ pub const Lanes = struct {
         const st = &e.streams;
         if (e.drafter == null) return error.NoDraftHead;
         if (requests.len > max_slots) return error.WindowTooWide;
+        // the deferred keeps: moot when every kept stream absorbs its kept rows here, else sent before the asks
+        // read the streams' lengths
+        if (self.keepsMoot(requests)) self.n_keeps = 0 else try self.sendKeeps();
         var asks: [max_slots]DraftAsk = undefined;
         for (requests, asks[0..requests.len]) |r, *a| {
             if (r.lanes != null) return error.TreesNotBuilt;
@@ -2409,6 +2452,7 @@ pub const Lanes = struct {
         const slot = self.slotOf(s) catch return;
         self.owner[slot] = null;
         const e = self.e;
+        self.sendKeeps() catch |err| std.log.err("release: keeps: {s}", .{@errorName(err)});
         if (!e.streams.lanes[slot].busy or e.broken) return;
         // the kept prompts this stream's prompt covers go when it is kept (multi.py `_covered`)
         var drops: [kept_prompts.max_kept]u32 = undefined;
@@ -2439,6 +2483,32 @@ test "draft chances are non-increasing prefix survivals in [0, 1], the products 
             prev = x;
         }
     }
+}
+
+test "deferred keeps are moot only when every kept stream absorbs exactly its kept rows of the same window" {
+    var ss: [3]lanes.Stream = undefined;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .e = undefined, .defer_keeps = true };
+    for (&ss, 0..) |*x, i| ln.owner[i] = x;
+    const two = [_]u32{ 0, 1 };
+    const three = [_]u32{ 0, 1, 2 };
+    const absorb2: be.DraftRequest = .{ .stream = &ss[0], .follow = &.{ 7, 8 }, .rows = &two, .start = 40, .position = 43, .depth = 3 };
+    const fresh1: be.DraftRequest = .{ .stream = &ss[1], .follow = &.{}, .rows = null, .start = 0, .position = 0, .depth = 3 };
+    try std.testing.expect(ln.keepsMoot(&.{absorb2}));
+    ln.keeps[0] = .{ .slot = 0, .start = 40, .kept = 2 };
+    ln.n_keeps = 1;
+    try std.testing.expect(ln.keepsMoot(&.{absorb2}));
+    try std.testing.expect(ln.keepsMoot(&.{ fresh1, absorb2 }));
+    var other = absorb2;
+    other.rows = &three;
+    try std.testing.expect(!ln.keepsMoot(&.{other}));
+    other = absorb2;
+    other.start = 41;
+    try std.testing.expect(!ln.keepsMoot(&.{other}));
+    try std.testing.expect(!ln.keepsMoot(&.{fresh1}));
+    try std.testing.expect(!ln.keepsMoot(&.{}));
+    ln.keeps[1] = .{ .slot = 2, .start = 9, .kept = 1 };
+    ln.n_keeps = 2;
+    try std.testing.expect(!ln.keepsMoot(&.{absorb2}));
 }
 
 test "bounded replay starts the upper layers at the prompt's last window rows, at 0 for a prompt within the window" {
