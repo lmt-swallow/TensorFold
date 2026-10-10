@@ -20,8 +20,14 @@ const Envelope = struct { start: usize, end: usize, payload: []const u8 };
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value };
 
-const dsml_open = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
-const dsml_close = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
+const dsml_open = reply_text.dsml_calls[0][0];
+const dsml_close = reply_text.dsml_calls[0][1];
+/// (spelling the model's tokens decode to, the encoder's spelling) of each DSML tag name.
+const dsml_spaced = [_][2][]const u8{
+    .{ "\u{ff5c}DSML\u{ff5c} calls>", "\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    .{ "\u{ff5c}DSML\u{ff5c} invoke", "\u{ff5c}DSML\u{ff5c}invoke" },
+    .{ "\u{ff5c}DSML\u{ff5c} parameter", "\u{ff5c}DSML\u{ff5c}parameter" },
+};
 const invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke name=\"";
 const invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
 const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
@@ -76,11 +82,16 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
         try found.append(a, .{ .start = s, .end = e + 12, .payload = strip(text[s + 12 .. e]) });
         pos = e + 12;
     }
-    pos = 0;
-    while (find(text, dsml_open, pos)) |s| {
-        const e = find(text, dsml_close, s + dsml_open.len) orelse break;
-        try found.append(a, .{ .start = s, .end = e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
-        pos = e + dsml_close.len;
+    for (reply_text.dsml_calls) |tags| {
+        pos = 0;
+        while (find(text, tags[0], pos)) |s| {
+            const e = find(text, tags[1], s + tags[0].len) orelse break;
+            pos = e + tags[1].len;
+            // the payload in the encoder's spelling, so one parser reads both
+            var block = text[s..pos];
+            for (dsml_spaced) |r| block = try std.mem.replaceOwned(u8, a, block, r[0], r[1]);
+            try found.append(a, .{ .start = s, .end = pos, .payload = block });
+        }
     }
     std.mem.sort(Envelope, found.items, {}, struct {
         fn less(_: void, x: Envelope, y: Envelope) bool {

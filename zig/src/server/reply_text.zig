@@ -8,11 +8,18 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
 const think_open = "<think>";
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block.
+/// (opener, closer) of DeepSeek-V4's DSML block: as its encoder writes it, then as the model's tokens decode
+/// (``｜DSML｜`` followed by the pieces " calls", " invoke", " parameter").
+pub const dsml_calls = [_][2][]const u8{
+    .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    .{ "<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
+};
+/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, both spellings of DeepSeek-V4's DSML block.
 pub const calls = [_][2][]const u8{
     .{ "<tool_call>", "</tool_call>" },
     .{ "<|tool_call>", "<tool_call|>" },
-    .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    dsml_calls[0],
+    dsml_calls[1],
 };
 
 /// ``text.find(tag, from)`` led by a vector scan for the tag's first byte: markup is rare in prose, so it is fast.
@@ -317,6 +324,8 @@ test "splits and holds" {
     const held = try splitThinking(a, "plan</thi", false, think_markers);
     try std.testing.expectEqualStrings("plan", held.reasoning);
     try std.testing.expectEqualStrings("a b", try hideToolCalls(a, "a <tool_call>x</tool_call>b<tool", false));
+    try std.testing.expectEqualStrings("Hi.\n\n", try hideToolCalls(a, "Hi.\n\n<\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} inv", false));
+    try std.testing.expectEqualStrings("Hi. ", try hideToolCalls(a, "Hi. <\u{ff5c}DSML\u{ff5c} ca", false));
     const stops: Stops = .{ .strings = &.{"END"} };
     try std.testing.expectEqualStrings("ab", stops.visible("abEN", true));
     try std.testing.expectEqualStrings("x", pyStrip(" \u{3000}x\u{a0}\n"));
