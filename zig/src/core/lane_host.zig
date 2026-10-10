@@ -45,6 +45,12 @@ pub const LaneHost = struct {
     /// not stall the streams already decoding; 0: a pass runs whole before the next round (`Engine.addStream`). One
     /// pass runs at a time, in admission order. The order changes no stream's tokens.
     interleave: u32 = 0,
+    /// With `interleave` > 0: the next part of a pass starts once the backend's last one is done computing
+    /// (`Engine.fillReady`), or at once when no stream decodes, and rounds run while it computes, one at a time, in
+    /// place of `interleave` rounds after each part. For a backend whose parts run beside its rounds (issued by
+    /// `prefill_part`, computed after it returns): the decoding streams keep their pace and the pass loses at most a
+    /// round's time a part. The order changes no stream's tokens.
+    overlap: bool = false,
     filling: ?*Job = null, // the admitted job whose prompt pass is under way in parts (interleave > 0)
 
     const Mark = struct { at: i96, tokens: u64 };
@@ -481,8 +487,10 @@ pub const LaneHost = struct {
             h.unlock();
             var rounds: u32 = 1;
             if (h.filling) |job| {
-                h.fillPart(job);
-                rounds = h.interleave;
+                if (!h.overlap) {
+                    h.fillPart(job);
+                    rounds = h.interleave;
+                } else if (h.core.activeCount() == 0 or h.core.fillReady(&job.stream)) h.fillPart(job);
             }
             for (0..rounds) |_| {
                 if (h.core.activeCount() == 0) break;

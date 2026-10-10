@@ -43,6 +43,12 @@ pub const Fake = struct {
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     parts: bool = false, // the backend has `prefill_part` (a prompt pass of `prefill_chunks` chunks, in parts)
     rounds_mid_pass: u64 = 0, // verifies run while some stream's prompt pass stood between two parts
+    /// With `parts`: a part goes on computing for this many rounds after its call (`prefill_ready` false until
+    /// then); a call made earlier waits it out (counted in `waited`). 0: parts end inside their call.
+    part_rounds: u32 = 0,
+    computing: u32 = 0, // rounds left of the part under way
+    waited: u64 = 0, // part calls that came while the last part still computed
+    ready_parts: u64 = 0, // part calls that came once it was done
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -58,6 +64,7 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
+        if (x.parts and x.part_rounds > 0) return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .prefill_ready = prefillReady, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
         if (x.parts) return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
@@ -110,9 +117,17 @@ pub const Fake = struct {
     /// A pass starts at a stream's first part, one that stands between parts goes on.
     fn prefillPart(ptr: *anyopaque, s: *Stream, chunks: u32) anyerror!bool {
         const x = self(ptr);
+        if (x.part_rounds > 0) {
+            if (x.computing > 0) x.waited += 1 else x.ready_parts += 1;
+            x.computing = x.part_rounds;
+        }
         const l = x.lanes.getPtr(s);
         if (l == null or l.?.filled) try x.begin(s);
         return x.part(s, chunks);
+    }
+
+    fn prefillReady(ptr: *anyopaque, _: *Stream) bool {
+        return self(ptr).computing == 0;
     }
 
     fn begin(x: *Fake, s: *Stream) !void {
@@ -185,6 +200,7 @@ pub const Fake = struct {
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
         x.rounds += 1;
+        x.computing -|= 1;
         var it = x.lanes.valueIterator();
         while (it.next()) |l| if (!l.filled and l.chunks_run > 0) {
             x.rounds_mid_pass += 1;

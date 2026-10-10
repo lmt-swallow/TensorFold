@@ -182,7 +182,7 @@ const Host = struct {
     }
 
     /// The round loop and the lane host over the family's backend, its thread started.
-    fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain, interleave: u32) !void {
+    fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain, interleave: u32, overlap: bool) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
         errdefer h.cfg.deinit(h.gpa);
         h.clock = .{ .io = io };
@@ -192,6 +192,7 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         h.host.interleave = interleave;
+        h.host.overlap = overlap;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -216,6 +217,12 @@ const Host = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, chunks: u32) anyerror!bool {
                     const x = bind(p);
                     return x.inner.vtable.prefill_part.?(x.inner.ptr, s, chunks);
+                }
+            }.f else null,
+            .prefill_ready = if (v.prefill_ready != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_ready.?(x.inner.ptr, s);
                 }
             }.f else null,
             .first = struct {
@@ -310,7 +317,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
     // rounds of the decoding streams after each prompt chunk (LaneHost.interleave), the family's default unless set
-    const interleave = try setting(a, null, "TENSORFOLD_PREFILL_INTERLEAVE", if (@hasDecl(F, "prefill_interleave")) F.prefill_interleave else 0, problem) orelse return null;
+    var interleave = try setting(a, null, "TENSORFOLD_PREFILL_INTERLEAVE", if (@hasDecl(F, "prefill_interleave")) F.prefill_interleave else 0, problem) orelse return null;
+    // a family that can run a pass's parts beside its rounds (its `Options.prefill_overlap`) does so on 1, the
+    // family's default unless set; overlapping fills passes in parts (LaneHost.overlap), at least 1 round between
+    const overlap_default: u32 = if (@hasDecl(F, "prefill_overlap")) @intFromBool(F.prefill_overlap) else 0;
+    const overlap_setting = try setting(a, null, "TENSORFOLD_PREFILL_OVERLAP", overlap_default, problem) orelse return null;
+    const overlap = overlap_setting != 0 and @hasField(F.Options, "prefill_overlap");
+    if (overlap) interleave = @max(interleave, 1);
     const segments = try setting(a, o.segments, "TF_CUDA_SEGMENTS", 1, problem) orelse return null;
     if (segments < 1 or segments > F.max_segments) {
         const named = if (o.segments != null) "--segments " else "TF_CUDA_SEGMENTS=";
@@ -350,7 +363,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments }) catch |e| {
+    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
+    if (@hasField(F.Options, "prefill_overlap")) fo.prefill_overlap = overlap;
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, fo) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
         return null;
     };
@@ -390,7 +405,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain }, interleave);
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain }, interleave, overlap);
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
@@ -447,7 +462,7 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
     const h = try gpa.create(Host);
     defer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Nothing.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
-    try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 2 }, null, 0);
+    try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 2 }, null, 0, false);
     defer {
         h.host.stop();
         h.core.deinit();

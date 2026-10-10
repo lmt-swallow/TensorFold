@@ -109,6 +109,12 @@ pub const Engine = struct {
         return true;
     }
 
+    /// Whether the next `fillStream` call for `s` would start without waiting for the backend's last part
+    /// (`Backend.prefillReady`); true for a backend whose parts end inside their call.
+    pub fn fillReady(e: *Engine, s: *Stream) bool {
+        return e.backend.prefillReady(s);
+    }
+
     /// A prefilled stream's first token and first drafts; it joins the rounds unless that token finished it.
     fn join(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token

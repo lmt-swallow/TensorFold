@@ -55,6 +55,11 @@ pub const Backend = struct {
         /// After a call that returned false, the stream either gets further calls or is released. null: a pass
         /// runs whole (`prefill`).
         prefill_part: ?*const fn (ptr: *anyopaque, s: *Stream, chunks: u32) anyerror!bool = null,
+        /// Whether the stream's next `prefill_part` call would start without waiting: false while the part the last
+        /// call issued still computes, for a backend that returns from `prefill_part` once its part is issued (the
+        /// part then runs beside the rounds that follow; a call made earlier waits for it). Asks nothing of the
+        /// stream's pass, and its answer changes no token. null: always true (parts end inside their call).
+        prefill_ready: ?*const fn (ptr: *anyopaque, s: *Stream) bool = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.
@@ -89,6 +94,11 @@ pub const Backend = struct {
             return true;
         };
         return part(b.ptr, s, chunks);
+    }
+    /// `prefill_ready`, or true for a backend without it.
+    pub fn prefillReady(b: Backend, s: *Stream) bool {
+        const ready = b.vtable.prefill_ready orelse return true;
+        return ready(b.ptr, s);
     }
     pub fn first(b: Backend, s: *Stream, position: u64) !u64 {
         return b.vtable.first(b.ptr, s, position);
