@@ -40,6 +40,10 @@ pub const Loaded = struct {
     facts: lanes.Model,
     rows: u32,
     stream_bytes: usize,
+    /// The streams' pool: its positions (each stream reaches at most the context's) and its device bytes, allocated
+    /// by the load (the startup line names them).
+    pool_positions: usize = 0,
+    pool_bytes: usize = 0,
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
@@ -139,6 +143,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         // budget's room is what is left after them, so a stream needs no more (counting the pool again refused
         // streams the pool already holds)
         .stream_bytes = 0,
+        .pool_positions = s.poolPositions(),
+        .pool_bytes = e.streamBytes() * s.slots,
         .ctx = own,
         .deinit = release,
         .lone = null,
