@@ -52,6 +52,7 @@ const rounds = @import("cuda_rounds.zig");
 pub const kept_prompts = @import("cuda_keep.zig");
 const RankCache = @import("rank_cache.zig").RankCache;
 const mem_note = @import("mem_note.zig");
+const draft_stats = @import("draft_stats.zig");
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -2278,9 +2279,52 @@ pub const Lanes = struct {
     defer_keeps: bool = false,
     keeps: [max_slots]KeepAsk = undefined,
     n_keeps: usize = 0,
+    /// TF_DS_DRAFT_STATS=1: each slot's stream's draft tallies, logged as it leaves, the served streams' summed,
+    /// and the rounds by their rows (index: rows)
+    stats_on: bool = false,
+    stats: [max_slots]draft_stats.Stats = @splat(.{}),
+    stats_all: draft_stats.Stats = .{},
+    round_rows: [max_rows + 1]u64 = @splat(0),
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine) Lanes {
-        return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv() };
+        return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv(), .stats_on = draft_stats.enabled() };
+    }
+
+    /// The window verified for `slot`: host tokens, or `w.held` of the drafter's held drafts with their predicted
+    /// survivals.
+    fn offerStats(self: *Lanes, slot: usize, w: be.Window) void {
+        const st = &self.stats[slot];
+        if (w.tokens.len > 0) {
+            st.host_rounds += 1;
+            st.pending = null;
+            return;
+        }
+        const l = &self.e.streams.lanes[slot];
+        var p: [draft_stats.max_drafts]f64 = undefined;
+        const n = @min(w.held, l.drafts.len, p.len);
+        survivals(l.drafts.conf[0..n], p[0..n]);
+        st.offer(w.held, l.held, p[0..n]);
+    }
+
+    fn logStats(self: *Lanes, slot: usize) void {
+        const st = &self.stats[slot];
+        st.pending = null;
+        self.stats_all.add(st.*);
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        st.write(&w) catch {};
+        std.log.info("deepseek_v41: draft stats, slot {d}: {s}", .{ slot, w.buffered() });
+        var ab: [1024]u8 = undefined;
+        var aw: std.Io.Writer = .fixed(&ab);
+        self.stats_all.write(&aw) catch {};
+        aw.writeAll(" rows=") catch {};
+        var first = true;
+        for (self.round_rows, 0..) |c, r| if (c > 0) {
+            aw.print("{s}{d}:{d}", .{ if (first) "" else ",", r, c }) catch {};
+            first = false;
+        };
+        std.log.info("deepseek_v41: draft stats, every stream so far: {s}", .{aw.buffered()});
+        st.* = .{};
     }
 
     /// The deferred keeps as one keeps step (none: nothing sent).
@@ -2453,7 +2497,9 @@ pub const Lanes = struct {
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
             rw.* = .{ .slot = slot, .base = l.base, .size = l.size, .position = l.pos, .ids = win };
             r += rows;
+            if (self.stats_on) self.offerStats(slot, w);
         }
+        if (self.stats_on) self.round_rows[r] += 1;
         try e.both(Round.encode(e.op_buf, rws[0..windows.len]));
         // every window's rows in one draw (one read back), then each window's share
         var sampled: [max_rows]u32 = undefined;
@@ -2477,6 +2523,7 @@ pub const Lanes = struct {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
             const slot = try self.slotOf(w.stream);
+            if (self.stats_on) self.stats[slot].land(path.len - 1);
             const l = &st.lanes[slot];
             if (l.pos == l.verify_start + path.len) continue;
             asks[n] = .{ .slot = slot, .start = l.verify_start, .kept = path.len };
@@ -2514,6 +2561,7 @@ pub const Lanes = struct {
             if (r.rows) |rows| {
                 if (rows.len == 0 or r.follow.len < rows.len) return error.EmptyPath;
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+                if (self.stats_on) self.stats[slot].land(rows.len - 1);
                 if (r.start != l.verify_start) return error.PositionMismatch;
                 a.start = l.verify_start;
                 a.absorb = rows.len;
@@ -2544,6 +2592,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const slot = self.slotOf(s) catch return;
         self.owner[slot] = null;
+        if (self.stats_on) self.logStats(slot);
         const e = self.e;
         self.sendKeeps() catch |err| std.log.err("release: keeps: {s}", .{@errorName(err)});
         if (!e.streams.lanes[slot].busy or e.broken) return;

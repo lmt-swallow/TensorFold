@@ -20,6 +20,7 @@ pub const rank_cache = @import("rank_cache.zig");
 pub const engram_hash = @import("engram_hash.zig");
 pub const engram_rows = @import("engram_rows.zig");
 pub const engram_apply = @import("cuda_engram_apply.zig");
+pub const draft_stats = @import("draft_stats.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
