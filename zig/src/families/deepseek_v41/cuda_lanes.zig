@@ -68,12 +68,16 @@ pub const Error = error{ WorldNotTwo, BadMaster, NoRankCache, NoRopeTables, Rope
 /// (`RoundRunner.graph_bucket_max`: a bucket's graphs take about 0.65 GiB).
 pub const warm_bucket_max: usize = 8192;
 
-/// A drafting round's widest window: the pending token and DSpark's block of drafts (engine.py: drafts + 1 rows).
+/// A drafting round's widest window by default: the pending token and DSpark's block of drafts (engine.py: drafts
+/// + 1 rows); TF_DS_DRAFTS sets the drafts (`Settings.most_drafts`).
 pub const draft_width: usize = 6;
 
+/// The drafts a window holds at most (TF_DS_DRAFTS): a window is at most a round's rows.
+pub const most_drafts_max: usize = max_rows - 1;
+
 /// The DSpark head's acceptance at depth 1, 2, ... given the ones before it, until a stream measures its own (the
-/// fork's served acceptance is about 0.75 a depth).
-pub const draft_prior = [_]f64{ 0.75, 0.75, 0.75, 0.75, 0.75 };
+/// fork's served acceptance is about 0.75 a depth), to the deepest window TF_DS_DRAFTS allows.
+pub const draft_prior: [most_drafts_max]f64 = @splat(0.75);
 
 /// Prompt rows a chunk unless TF_DS_PREFILL_CHUNK says otherwise (the fork's production setting).
 pub const default_chunk: usize = prompt.max_chunk;
@@ -250,12 +254,21 @@ pub const Settings = struct {
     pool: usize = 0,
     /// CED bounded replay (TF_DS_REPLAY=1): a prompt's layers from n_layers / 2 run only its last `window` rows.
     replay: bool = false,
+    /// The drafts a stream's window holds at most (TF_DS_DRAFTS), 1 to the checkpoint's DSpark block; 0: the block.
+    /// A deeper window would need a deeper drafter block, whose kernels' row-count variants (the MoE gate's
+    /// `_rowmm_parts` RB) the captured kernel sets do not hold.
+    most_drafts: usize = 0,
 
     /// The pool's positions: `pool`, or the context when it is 0.
     pub fn poolPositions(self: Settings) usize {
         return if (self.pool == 0) self.context else self.pool;
     }
 };
+
+/// The drafts a window holds at most for a checkpoint block of `block` and a TF_DS_DRAFTS of `most` (0: unset).
+pub fn draftsFor(block: usize, most: usize) usize {
+    return if (most == 0) block else most;
+}
 
 /// engine.py prefill_steps' `replay`: with bounded replay, the first position the upper layers run (the prompt's
 /// last `window` rows); null without.
@@ -765,8 +778,8 @@ pub const Keeps = struct {
 };
 
 /// The measure step's record: the opcode, the repetitions (u8), the pool's slots (u8), the flags (u8: bit 0 Engram,
-/// bit 1 the drafter), the window's positions (u64) and a stream's most (u64, `Streams.most`): ranks whose pools or
-/// per-stream contexts differ stop at load.
+/// bit 1 the drafter, bits 2 .. 5 a window's drafts at most), the window's positions (u64) and a stream's most (u64,
+/// `Streams.most`): ranks whose pools, per-stream contexts or drafts differ stop at load.
 pub const Measure = struct {
     reps: u8,
     slots: usize,
@@ -774,6 +787,8 @@ pub const Measure = struct {
     drafts: bool,
     total: usize,
     most: usize,
+    /// a window's drafts at most (0 .. most_drafts_max)
+    width: usize = 0,
 
     pub const bytes: usize = 20;
 
@@ -781,15 +796,15 @@ pub const Measure = struct {
         buf[0] = @intFromEnum(Op.measure);
         buf[1] = m.reps;
         buf[2] = @intCast(m.slots);
-        buf[3] = @as(u8, @intFromBool(m.engram)) | @as(u8, @intFromBool(m.drafts)) << 1;
+        buf[3] = @as(u8, @intFromBool(m.engram)) | @as(u8, @intFromBool(m.drafts)) << 1 | @as(u8, @intCast(m.width)) << 2;
         std.mem.writeInt(u64, buf[4..12], @intCast(m.total), .little);
         std.mem.writeInt(u64, buf[12..20], @intCast(m.most), .little);
         return buf[0..bytes];
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Measure {
-        if (op.len != bytes or op[0] != @intFromEnum(Op.measure) or op[3] > 3) return error.BadRecord;
-        return .{ .reps = op[1], .slots = op[2], .engram = op[3] & 1 != 0, .drafts = op[3] & 2 != 0, .total = @intCast(std.mem.readInt(u64, op[4..12], .little)), .most = @intCast(std.mem.readInt(u64, op[12..20], .little)) };
+        if (op.len != bytes or op[0] != @intFromEnum(Op.measure) or op[3] >> 2 > most_drafts_max) return error.BadRecord;
+        return .{ .reps = op[1], .slots = op[2], .engram = op[3] & 1 != 0, .drafts = op[3] & 2 != 0, .total = @intCast(std.mem.readInt(u64, op[4..12], .little)), .most = @intCast(std.mem.readInt(u64, op[12..20], .little)), .width = op[3] >> 2 };
     }
 };
 
@@ -1693,6 +1708,10 @@ pub const Engine = struct {
         clock.d = ctx.d;
         mem_note.note(ctx.d, "before the load", .{});
         e.cfg = try Config.read(gpa, io, dir);
+        if (s.drafts and s.most_drafts > e.cfg.dspark_block) {
+            std.log.err("TF_DS_DRAFTS is {d}: the drafter's block holds {d} drafts", .{ s.most_drafts, e.cfg.dspark_block });
+            return error.WindowTooWide;
+        }
         e.set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, s.kernels_dir);
         errdefer e.set.deinit();
         clock.mark("the Triton set", .{});
@@ -2020,7 +2039,7 @@ pub const Engine = struct {
             },
             .measure => {
                 const m = Measure.parse(op) catch return false;
-                return m.slots == st.lanes.len and m.total == st.extents.total and m.most == st.most and m.engram == (e.engram != null) and m.drafts == (e.drafter != null) and st.idle();
+                return m.slots == st.lanes.len and m.total == st.extents.total and m.most == st.most and m.engram == (e.engram != null) and m.drafts == (e.drafter != null) and m.width == e.drafts() and st.idle();
             },
             else => return false,
         }
@@ -2056,7 +2075,13 @@ pub const Engine = struct {
     pub fn measure(e: *Engine, reps: u8) !void {
         if (e.settings.rank != 0) return;
         var buf: [Measure.bytes]u8 = undefined;
-        try e.both(Measure.encode(&buf, .{ .reps = reps, .slots = e.streams.lanes.len, .engram = e.engram != null, .drafts = e.drafter != null, .total = e.streams.extents.total, .most = e.streams.most }));
+        try e.both(Measure.encode(&buf, .{ .reps = reps, .slots = e.streams.lanes.len, .engram = e.engram != null, .drafts = e.drafter != null, .total = e.streams.extents.total, .most = e.streams.most, .width = e.drafts() }));
+    }
+
+    /// The drafts a window holds at most: TF_DS_DRAFTS, else the drafter's block (0 without the drafter).
+    pub fn drafts(e: *const Engine) usize {
+        if (e.drafter == null) return 0;
+        return draftsFor(e.cfg.dspark_block, e.settings.most_drafts);
     }
 
     pub fn stop(e: *Engine) void {
@@ -2217,18 +2242,23 @@ fn loadRopeTable(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir:
 }
 
 /// The round loop's facts: shared rounds of up to `slots` streams and `max_rows` rows (`hidden_rows`), windows of
-/// up to `draft_width` rows; with the drafter, every drafting stream's drafts in one batch (`draft_streams`) and
+/// up to `draft_width` rows (`factsWith`: `width`); with the drafter, every drafting stream's drafts in one batch (`draft_streams`) and
 /// the depths priced by `window_costs` (a lone stream's window, its draft included) and `shared_costs` (a round's
 /// rows); without it, host-token windows only.
 pub fn factsOf(drafting: bool, slots: usize, window_costs: []const lanes.config.Cost, shared_costs: []const lanes.config.Cost) lanes.Model {
+    return factsWith(drafting, draft_width, slots, window_costs, shared_costs);
+}
+
+/// `factsOf` with windows of up to `width` rows (a window's drafts at most, plus the pending token).
+pub fn factsWith(drafting: bool, width: usize, slots: usize, window_costs: []const lanes.config.Cost, shared_costs: []const lanes.config.Cost) lanes.Model {
     return .{
-        .exact_width = draft_width,
+        .exact_width = @intCast(width),
         .gpu_tokens = false,
         .mtp = drafting,
         .speculate = drafting,
         .speculate_early = false,
         .draft_prior = &draft_prior,
-        .drafts = @intCast(draft_width - 1),
+        .drafts = @intCast(width - 1),
         .window_costs = window_costs,
         .mtp_step_ms = 0,
         .streams_exact = true,
@@ -2253,7 +2283,8 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
-/// `Loaded.rows` (lanes.Config's max_rows: it caps a window's width and its drafts).
+/// `Loaded.rows` at the default drafts (lanes.Config's max_rows: it caps a window's width and its drafts;
+/// `Lanes.windowRows` follows TF_DS_DRAFTS).
 pub fn rowsOf(drafting: bool) u32 {
     _ = drafting;
     return draft_width;
@@ -2268,7 +2299,7 @@ pub const Lanes = struct {
     owner: [max_slots]?*const lanes.Stream = @splat(null),
     drawn: [1024]u32 = undefined,
     next: u64 = 0,
-    window_costs: [draft_width]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
+    window_costs: [max_rows]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
     shared_costs: [max_rows]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
     /// Keeps not yet sent (TF_DS_TAIL on): the next step carries them, and a drafts step whose absorb keeps the same
     /// rows of a stream makes its keep moot (`Streams.draft` sets the length there itself). Every other step sends
@@ -2372,23 +2403,29 @@ pub const Lanes = struct {
             const rows = i + 1;
             var ms = e.round_ms[i];
             if (e.drafter != null and rows > 1) {
-                var streams = @min((rows + draft_width - 1) / draft_width, e.streams.lanes.len);
+                var streams = @min((rows + self.width() - 1) / self.width(), e.streams.lanes.len);
                 while (streams > 0) : (streams -|= per) ms += e.draft_ms[@min(streams, per) - 1];
             }
             c.* = .{ .width = @intCast(rows), .ms = ms };
         }
-        for (&self.window_costs, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
+        for (self.window_costs[0..self.width()], 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
         std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket ({d} and {d} rows {any} ms at the {d}-position bucket), batched drafts of 1..{d} streams {any} ms", .{ max_rows, e.round_ms, rounds.bucket_min, 1, max_rows, e.round_deep_ms, e.streams.runner.bucket, max_slots, e.draft_ms });
     }
 
     pub fn facts(self: *const Lanes) lanes.Model {
         const timed = self.shared_costs[0].ms > 0;
-        return factsOf(self.e.drafter != null, self.e.streams.lanes.len, if (timed) &self.window_costs else &.{}, if (timed) &self.shared_costs else &.{});
+        return factsWith(self.e.drafter != null, self.width(), self.e.streams.lanes.len, if (timed) self.window_costs[0..self.width()] else &.{}, if (timed) &self.shared_costs else &.{});
     }
 
-    /// The window rows the host sizes the round loop for (`Loaded.rows`).
+    /// The window rows the host sizes the round loop for (`Loaded.rows`): a window's drafts at most and the pending
+    /// token (without the drafter, `rowsOf`'s).
     pub fn windowRows(self: *const Lanes) u32 {
-        return rowsOf(self.e.drafter != null);
+        return @intCast(self.width());
+    }
+
+    /// A window's rows at most: the drafts (TF_DS_DRAFTS, else the drafter's block) and the pending token.
+    pub fn width(self: *const Lanes) usize {
+        return if (self.e.drafter != null) self.e.drafts() + 1 else draft_width;
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -2483,7 +2520,7 @@ pub const Lanes = struct {
             const l = &st.lanes[slot];
             if (w.parents != null) return error.TreesNotBuilt;
             const rows = w.rows();
-            if (rows > draft_width or r + rows > max_rows) return error.WindowTooWide;
+            if (rows > self.width() or r + rows > max_rows) return error.WindowTooWide;
             for (w.positions, 0..) |p, i| if (p != l.pos + 1 + i) return error.PositionMismatch;
             if (w.held > l.held) return error.NoHeldDrafts;
             const win = ids[r..][0..rows];
@@ -2554,7 +2591,7 @@ pub const Lanes = struct {
             if (r.lanes != null) return error.TreesNotBuilt;
             const slot = try self.slotOf(r.stream);
             const l = &st.lanes[slot];
-            a.* = .{ .slot = slot, .start = l.pos, .absorb = 0, .token = 0, .q0 = l.pos, .depth = @min(r.depth, e.cfg.dspark_block) };
+            a.* = .{ .slot = slot, .start = l.pos, .absorb = 0, .token = 0, .q0 = l.pos, .depth = @min(r.depth, e.drafts()) };
             if (r.rows) |rows| {
                 if (rows.len == 0 or r.follow.len < rows.len) return error.EmptyPath;
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
@@ -2600,6 +2637,19 @@ pub const Lanes = struct {
         e.both(op) catch |err| std.log.err("release: {s}", .{@errorName(err)});
     }
 };
+
+test "TF_DS_DRAFTS: unset, the checkpoint's block; set, that many drafts; the facts follow" {
+    try std.testing.expectEqual(@as(usize, 5), draftsFor(5, 0));
+    try std.testing.expectEqual(@as(usize, 3), draftsFor(5, 3));
+    for (1..most_drafts_max + 1) |m| {
+        // a window fits a round
+        try std.testing.expect(draftsFor(5, m) + 1 <= max_rows);
+        const f = factsWith(true, draftsFor(5, m) + 1, 4, &.{}, &.{});
+        try std.testing.expectEqual(@as(u32, @intCast(m)), f.drafts);
+        try std.testing.expectEqual(f.drafts + 1, f.exact_width);
+        try std.testing.expect(draft_prior.len >= f.drafts);
+    }
+}
 
 test "draft chances are non-increasing prefix survivals in [0, 1], the products of the confidences' sigmoids" {
     var prng = std.Random.DefaultPrng.init(0xc0f1);
@@ -2879,7 +2929,7 @@ test "admission, free, round, drafts, keeps and measure records parse back to wh
         try std.testing.expectError(error.BadRecord, Keeps.parse(kop[0 .. kop.len - 1], &kr));
         try std.testing.expectError(error.BadRecord, DraftsRec.parse(kop, &dr));
 
-        const m: Measure = .{ .reps = r.int(u8), .slots = r.intRangeAtMost(usize, 1, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .total = r.int(u40), .most = r.int(u40) };
+        const m: Measure = .{ .reps = r.int(u8), .slots = r.intRangeAtMost(usize, 1, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .total = r.int(u40), .most = r.int(u40), .width = r.intRangeAtMost(usize, 0, most_drafts_max) };
         const mop = Measure.encode(&buf, m);
         try std.testing.expectEqual(m, try Measure.parse(mop));
         try std.testing.expectError(error.BadRecord, Measure.parse(mop[0 .. mop.len - 1]));

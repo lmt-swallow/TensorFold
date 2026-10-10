@@ -9,7 +9,8 @@
 //! the context (`--context`: at most the model's window); TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks)
 //! sets the pool's slots. With drafts (the default;
 //! `--no-drafts` turns them off on both ranks) the rank cache's DSpark blocks load and every stream verifies drafted
-//! windows of up to 6 rows, the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
+//! windows of up to 6 rows (TF_DS_DRAFTS: up to that many drafts and the pending token, 1 to the checkpoint's block
+//! of 5, the same on both ranks), the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
 //! time (`info:` lines); each rank loads on its own and the ranks meet after their loads, so both may start at once.
 //! TF_DS_PROFILE=1 logs every prompt chunk's GPU time by sublayer group and its host time (a host sync a chunk).
 //! TF_DS_DRAFT_STATS=1 has rank 0 log each stream's draft tallies as it leaves (draft_stats.zig).
@@ -90,7 +91,12 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
         std.log.err("TF_DS_POOL is {s}: it takes a number of positions, at least the context's {d}, a multiple of {d}", .{ getenv("TF_DS_POOL").?, context, lanesmod.extent_align });
         return error.BadEnvironment;
     };
-    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false };
+    const most_drafts = try envInt("TF_DS_DRAFTS", 0);
+    if (most_drafts > lanesmod.most_drafts_max) {
+        std.log.err("TF_DS_DRAFTS is {d}: it takes 1 to {d} drafts a window, at most the checkpoint's DSpark block (unset: the block)", .{ most_drafts, lanesmod.most_drafts_max });
+        return error.BadEnvironment;
+    }
+    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false, .most_drafts = most_drafts };
 }
 
 /// TF_DS_POOL's positions for a context of `context`: unset, the context; else a whole number at least the
@@ -194,9 +200,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.SamplingNotSupported => "this engine decodes greedily for now: send temperature 0",
-        error.WindowTooWide, error.NoDraftHead, error.TreesNotBuilt => "this engine verifies drafted windows of up to 6 rows, 16 rows a round, no trees",
+        error.WindowTooWide, error.NoDraftHead, error.TreesNotBuilt => "this engine verifies drafted windows of up to TF_DS_DRAFTS + 1 rows (6 by default), 16 rows a round, no trees",
         error.NoRoom => "every stream slot is busy, or the context window shared by the running requests has no room for this one: retry when one finishes, or lower max_tokens",
-        error.OutOfStep => "the two ranks planned different steps (or one cannot run a step: check both ranks' TF_DS_PREFILL_CHUNK, TF_DS_SLOTS, TF_DS_ENGRAM and --no-drafts); restart both ranks",
+        error.OutOfStep => "the two ranks planned different steps (or one cannot run a step: check both ranks' TF_DS_PREFILL_CHUNK, TF_DS_SLOTS, TF_DS_ENGRAM, TF_DS_DRAFTS and --no-drafts); restart both ranks",
         else => null,
     };
 }
