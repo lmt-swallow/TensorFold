@@ -82,8 +82,8 @@ pub const draft_prior: [most_drafts_max]f64 = @splat(0.75);
 /// Prompt rows a chunk unless TF_DS_PREFILL_CHUNK says otherwise (the fork's production setting).
 pub const default_chunk: usize = prompt.max_chunk;
 
-/// Step opcodes. The served engine sends `measure` and `admit` .. `free`; the others are `Sequence`'s records.
-pub const Op = enum(u8) { prefill = 1, round = 2, release = 3, stop = 4, verify = 5, keep = 6, draft = 7, measure = 8, admit = 9, rounds = 10, drafts = 11, keeps = 12, free = 13 };
+/// Step opcodes. The served engine sends `measure` and `admit` .. `fill`; the others are `Sequence`'s records.
+pub const Op = enum(u8) { prefill = 1, round = 2, release = 3, stop = 4, verify = 5, keep = 6, draft = 7, measure = 8, admit = 9, rounds = 10, drafts = 11, keeps = 12, free = 13, fill = 14 };
 
 /// The bytes a step's record takes at most for a context of `context` positions (a prompt of the whole context).
 pub fn maxOpBytes(context: usize) usize {
@@ -532,11 +532,12 @@ pub const Extents = kept_prompts.Extents;
 
 /// The admission step's record: the opcode, the slot (u8), the flags (u8: bit 0 Engram on, bit 1 DSpark taps
 /// absorbed, bit 2 CED bounded replay, bit 3 the prompt continues a kept prompt, bit 4 that continuation checked
-/// against a prefill from 0 (TF_DS_KEEP_CHECK), bit 5 kept prompts on), the chunk rows (u32), the extent's base and
-/// size (u64 each), the kept prompt's id (u32) and boundary (u64), the window book's fingerprint before the step
-/// (u64), the prompt's length (u32), its ids (i64 each). Every rank places the extent the same way (cuda_keep.zig
-/// `Book.place`: the record's base is rank 0's) and fills it through the prompt path in the record's chunks, from
-/// position 0 or, continuing a kept prompt, from its boundary.
+/// against a prefill from 0 (TF_DS_KEEP_CHECK), bit 5 kept prompts on, bit 6 the prompt filled in parts), the chunk
+/// rows (u32), the extent's base and size (u64 each), the kept prompt's id (u32) and boundary (u64), the window
+/// book's fingerprint before the step (u64), the prompt's length (u32), its ids (i64 each). Every rank places the
+/// extent the same way (cuda_keep.zig `Book.place`: the record's base is rank 0's) and fills it through the prompt
+/// path in the record's chunks, from position 0 or, continuing a kept prompt, from its boundary: all of them in this
+/// step, or with `parts` none, the chunks then run by `Fill` steps (rounds of the other streams may run between).
 pub const Admit = struct {
     slot: usize,
     engram: bool,
@@ -548,6 +549,7 @@ pub const Admit = struct {
     reuse: ?kept_prompts.Reuse = null,
     check: bool = false,
     keep: bool = false,
+    parts: bool = false,
     book: u64 = 0,
     ids: []const u8,
 
@@ -557,7 +559,8 @@ pub const Admit = struct {
         buf[0] = @intFromEnum(Op.admit);
         buf[1] = @intCast(a.slot);
         buf[2] = @as(u8, @intFromBool(a.engram)) | @as(u8, @intFromBool(a.drafts)) << 1 | @as(u8, @intFromBool(a.replay)) << 2 |
-            @as(u8, @intFromBool(a.reuse != null)) << 3 | @as(u8, @intFromBool(a.check)) << 4 | @as(u8, @intFromBool(a.keep)) << 5;
+            @as(u8, @intFromBool(a.reuse != null)) << 3 | @as(u8, @intFromBool(a.check)) << 4 | @as(u8, @intFromBool(a.keep)) << 5 |
+            @as(u8, @intFromBool(a.parts)) << 6;
         std.mem.writeInt(u32, buf[3..7], @intCast(a.chunk), .little);
         std.mem.writeInt(u64, buf[7..15], @intCast(a.base), .little);
         std.mem.writeInt(u64, buf[15..23], @intCast(a.size), .little);
@@ -570,7 +573,7 @@ pub const Admit = struct {
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Admit {
-        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 63) return error.BadRecord;
+        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 127) return error.BadRecord;
         const n = std.mem.readInt(u32, op[43..47], .little);
         if (op.len != header + 8 * @as(usize, n)) return error.BadRecord;
         return .{
@@ -581,6 +584,7 @@ pub const Admit = struct {
             .reuse = if (op[2] & 8 != 0) .{ .eid = std.mem.readInt(u32, op[23..27], .little), .cut = @intCast(std.mem.readInt(u64, op[27..35], .little)) } else null,
             .check = op[2] & 16 != 0,
             .keep = op[2] & 32 != 0,
+            .parts = op[2] & 64 != 0,
             .chunk = std.mem.readInt(u32, op[3..7], .little),
             .base = @intCast(std.mem.readInt(u64, op[7..15], .little)),
             .size = @intCast(std.mem.readInt(u64, op[15..23], .little)),
@@ -626,6 +630,32 @@ pub const Free = struct {
         var f: Free = .{ .slot = op[1], .book = std.mem.readInt(u64, op[3..11], .little), .n = op[2] };
         for (f.drops[0..f.n], 0..) |*d, i| d.* = std.mem.readInt(u32, op[header + 4 * i ..][0..4], .little);
         return f;
+    }
+};
+
+/// The fill step's record: the opcode, the slot (u8), the chunks to run (u32, at least 1) and the position the
+/// slot's prompt pass stands at before them (u64). Every rank runs the next `chunks` chunks of the pass an
+/// admission in parts began (`Streams.fillPart`), the pass's last chunk drawing its first token's logits.
+pub const Fill = struct {
+    slot: usize,
+    chunks: u32,
+    at: usize,
+
+    pub const bytes: usize = 14;
+
+    pub fn encode(buf: []u8, f: Fill) []const u8 {
+        buf[0] = @intFromEnum(Op.fill);
+        buf[1] = @intCast(f.slot);
+        std.mem.writeInt(u32, buf[2..6], f.chunks, .little);
+        std.mem.writeInt(u64, buf[6..14], @intCast(f.at), .little);
+        return buf[0..bytes];
+    }
+
+    pub fn parse(op: []const u8) error{BadRecord}!Fill {
+        if (op.len != bytes or op[0] != @intFromEnum(Op.fill)) return error.BadRecord;
+        const chunks = std.mem.readInt(u32, op[2..6], .little);
+        if (chunks < 1) return error.BadRecord;
+        return .{ .slot = op[1], .chunks = chunks, .at = @intCast(std.mem.readInt(u64, op[6..14], .little)) };
     }
 };
 
@@ -815,6 +845,18 @@ pub const Measure = struct {
 /// extent), its host ids from position 0 (Engram's hashes; the prompt's first `prompt_len`), its prompt's ring
 /// snapshots at its chunk boundaries (`marks`: kept prompts), the last round's window (its start, rows and first row
 /// among the round's), the positions its drafter rings absorbed, its last drafts (the first `held` of them held).
+/// A prompt pass in parts: the position it stands at (a chunk boundary, or the prompt's end once done) and the
+/// admission's settings each part runs with.
+pub const Pass = struct {
+    at: usize,
+    cut: usize,
+    chunk: usize,
+    replay: bool,
+    check: bool,
+    marks: ?kept_prompts.Points,
+    t0: i128,
+};
+
 pub const Lane = struct {
     busy: bool = false,
     base: usize = 0,
@@ -829,6 +871,7 @@ pub const Lane = struct {
     absorbed: usize = 0,
     drafts: dspark.Drafts = undefined,
     held: usize = 0,
+    pass: ?Pass = null, // the prompt pass under way in parts (an admission with `parts`), until its last chunk
 
     /// The positions a window may reach: the extent less its tail (the round's rows, 8, and the scratch row's).
     pub fn limit(self: *const Lane) usize {
@@ -1118,6 +1161,14 @@ pub const Streams = struct {
     /// (`Book.marksFor`). With `check`, the continued prompt is then prefilled again from 0 and the two compared
     /// (logged: the last row's logits and the caches the prompt wrote). Returns the placement.
     pub fn admitKept(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool) !kept_prompts.How {
+        const how = try self.begin(slot, base, size, ids, chunk, replay, reuse, check);
+        _ = try self.fillPart(gather, slot, ids, std.math.maxInt(u32));
+        return how;
+    }
+
+    /// `admitKept` up to its first chunk: the extent placed and the kept prompt's rows and slot state restored, the
+    /// pass standing at the boundary (`Lane.pass`); `fillPart` runs its chunks. Returns the placement.
+    pub fn begin(self: *Streams, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool) !kept_prompts.How {
         if (!self.admitsKept(slot, base, size, ids, chunk, replay, reuse)) return error.PositionMismatch;
         const lane = &self.lanes[slot];
         // the kept prompt's snapshots to the boundary become the stream's too (it may be forgotten placing)
@@ -1160,32 +1211,71 @@ pub const Streams = struct {
         self.settle();
         if (reuse != null) self.keep_stats[@intFromEnum(placed.how)] += 1;
         const marks: ?kept_prompts.Points = if (self.keeping(replay) and chunk == self.book.chunk) self.book.marksFor(ids.len) else null;
-        const t0 = nowNs();
-        try self.fill(gather, slot, ids, cut, chunk, replay, if (marks) |*m| m else null);
-        if (ids.len - cut > max_rows) {
-            try self.stream.synchronize();
-            const ms = msSince(t0);
-            std.log.info("deepseek_v41 rank {d}: a prompt of {d} rows from {d} in {d} chunks: {d:.0} ms, {d:.0} tok/s", .{ self.base.w.rank, ids.len, cut, (ids.len - cut + chunk - 1) / chunk, ms, @as(f64, @floatFromInt(ids.len - cut)) * 1000 / ms });
-        }
-        if (check and reuse != null) try self.checkKept(gather, slot, ids, cut, chunk, replay);
+        lane.pass = .{ .at = cut, .cut = cut, .chunk = chunk, .replay = replay, .check = check and reuse != null, .marks = marks, .t0 = nowNs() };
+        try self.fillStart(slot, ids, cut, chunk);
         return placed.how;
+    }
+
+    /// Whether `fillPart(slot, …, chunks)` can run here: a pass under way in the slot, standing at `at`.
+    pub fn fills(self: *const Streams, slot: usize, at: usize, chunks: u32) bool {
+        if (slot >= self.lanes.len or chunks < 1) return false;
+        const l = &self.lanes[slot];
+        const p = l.pass orelse return false;
+        return l.busy and p.at == at;
+    }
+
+    /// The next at most `chunks` chunks of the pass `begin` started in `slot` (its prompt `ids`); true once its last
+    /// chunk ran: the stream then stands at its prompt's end, the last row's logits in `logits`, exactly as after a
+    /// whole `admitKept` (the rounds that ran between parts read and wrote other slots' state only).
+    pub fn fillPart(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, chunks: u32) !bool {
+        const lane = &self.lanes[slot];
+        var p = lane.pass orelse return error.PositionMismatch;
+        if (ids.len != lane.prompt_len) return error.PositionMismatch;
+        // another slot's rounds and drafts may have moved the view and the drafter's ring views since the last part
+        self.point(slot, lane.base, lane.size);
+        if (self.engram) |g| g.history = lane.hist[0..ids.len];
+        p.at = try self.fillChunks(gather, slot, ids, p.at, chunks, p.chunk, p.replay, if (p.marks) |*m| m else null);
+        lane.pass = p;
+        if (p.at < ids.len) return false;
+        lane.pass = null;
+        if (ids.len - p.cut > max_rows) {
+            try self.stream.synchronize();
+            const ms = msSince(p.t0);
+            std.log.info("deepseek_v41 rank {d}: a prompt of {d} rows from {d} in {d} chunks: {d:.0} ms, {d:.0} tok/s", .{ self.base.w.rank, ids.len, p.cut, (ids.len - p.cut + p.chunk - 1) / p.chunk, ms, @as(f64, @floatFromInt(ids.len - p.cut)) * 1000 / ms });
+        }
+        if (p.check) try self.checkKept(gather, slot, ids, p.cut, p.chunk, p.replay);
+        return true;
     }
 
     /// The prompt's chunks from `from` (a chunk boundary whose rows and slot state are in place) to its end:
     /// engine.py prefill_steps(start=from) on the slot's view; a ring snapshot after each chunk that ends on one of
     /// `marks`.
     fn fill(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, from: usize, chunk: usize, replay: bool, marks: ?*const kept_prompts.Points) !void {
+        try self.fillStart(slot, ids, from, chunk);
+        _ = try self.fillChunks(gather, slot, ids, from, std.math.maxInt(u32), chunk, replay, marks);
+    }
+
+    /// A pass from `from`: no logits yet, nothing absorbed, the first chunk's Engram rows read ahead.
+    fn fillStart(self: *Streams, slot: usize, ids: []const i64, from: usize, chunk: usize) !void {
         const lane = &self.lanes[slot];
-        if (self.engram) |g| g.history = lane.hist[0..ids.len];
         self.logits = 0;
         lane.absorbed = 0;
-        var dc: ?dspark.Cache = if (self.spark != null) self.slotCache(slot) else null;
         if (self.engram) |g| {
+            g.history = lane.hist[0..ids.len];
             try g.resetAhead();
             try g.prefetch(lane.hist[0..ids.len], from, @min(ids.len, from + chunk) - from);
         }
+    }
+
+    /// At most `chunks` of the pass's chunks from `from` (`fill`'s loop); the position after them. The pass's last
+    /// chunk leaves its last row's logits in `logits` and the stream at the prompt's end; every chunk but the last
+    /// reads the next one's Engram rows ahead, across a part's end too (rounds leave those batches pending).
+    fn fillChunks(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, from: usize, chunks: u32, chunk: usize, replay: bool, marks: ?*const kept_prompts.Points) !usize {
+        const lane = &self.lanes[slot];
+        var dc: ?dspark.Cache = if (self.spark != null) self.slotCache(slot) else null;
         var s: usize = from;
-        while (s < ids.len) {
+        var ran: u32 = 0;
+        while (s < ids.len and ran < chunks) : (ran += 1) {
             const e = @min(ids.len, s + chunk);
             const last = e == ids.len;
             // the next chunk's Engram rows read while this one runs (engine.py prefill_steps' `ahead`)
@@ -1210,8 +1300,9 @@ pub const Streams = struct {
             };
             s = e;
         }
-        lane.pos = ids.len;
         lane.absorbed = if (dc) |c| c.absorbed else 0;
+        if (s == ids.len) lane.pos = ids.len;
+        return s;
     }
 
     /// What the book let go, freed: its snapshots' holds dropped, its kept ids' storage.
@@ -1528,6 +1619,7 @@ pub const Streams = struct {
         l.marks = .{};
         l.busy = false;
         l.held = 0;
+        l.pass = null;
     }
 
     /// multi.py `_finish` for the stream in `slot`: with kept prompts on and a snapshot taken, its prompt stays as a
@@ -1542,6 +1634,7 @@ pub const Streams = struct {
             l.marks = .{};
             l.busy = false;
             l.held = 0;
+            l.pass = null;
         } else self.free(slot);
         self.book.finish(&self.extents, drops);
         self.settle();
@@ -1902,7 +1995,7 @@ pub const Engine = struct {
         const head = op[0..@min(op.len, 48)];
         std.log.err("rank {d}: step {d} record {s}, {d} bytes, runnable here {}, first bytes {x}; digests {any}", .{ e.settings.rank, e.stepped, code, op.len, can_run, head, every });
         for (e.streams.lanes, 0..) |l, i| if (l.busy) {
-            std.log.err("rank {d}:   slot {d}: extent [{d}, +{d}), pos {d}, window {d}+{d} (row {d}), absorbed {d}, held {d}, prompt {d}, {d} snapshots", .{ e.settings.rank, i, l.base, l.size, l.pos, l.verify_start, l.verify_rows, l.row0, l.absorbed, l.held, l.prompt_len, l.marks.n });
+            std.log.err("rank {d}:   slot {d}: extent [{d}, +{d}), pos {d}, window {d}+{d} (row {d}), absorbed {d}, held {d}, prompt {d}, {d} snapshots, pass at {?d}", .{ e.settings.rank, i, l.base, l.size, l.pos, l.verify_start, l.verify_rows, l.row0, l.absorbed, l.held, l.prompt_len, l.marks.n, if (l.pass) |p| p.at else null });
         };
         for (e.streams.book.slice()) |k| std.log.err("rank {d}:   kept prompt {d}: extent [{d}, +{d}), top {d}, tick {d}, {d} snapshots", .{ e.settings.rank, k.eid, k.base, k.size, k.top, k.tick, k.marks.n });
         std.log.err("rank {d}:   window book fingerprint {x}", .{ e.settings.rank, e.streams.fingerprint() });
@@ -1944,7 +2037,11 @@ pub const Engine = struct {
             .admit => {
                 const a = try Admit.parse(op);
                 if (a.len() > e.ids_buf.len) return error.PromptTooLong;
-                const how = try e.streams.admitKept(e.gather(), a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk, a.replay, a.reuse, a.check);
+                const ids = a.idsInto(e.ids_buf);
+                const how = if (a.parts)
+                    try e.streams.begin(a.slot, a.base, a.size, ids, a.chunk, a.replay, a.reuse, a.check)
+                else
+                    try e.streams.admitKept(e.gather(), a.slot, a.base, a.size, ids, a.chunk, a.replay, a.reuse, a.check);
                 if (a.reuse) |r| if (e.settings.rank == 0) std.log.info("deepseek_v41: kept prompt {d}: continued at {d} of {d} ({s}); {d} kept prompts", .{ r.eid, r.cut, a.len(), @tagName(how), e.streams.book.n });
             },
             .rounds => {
@@ -1965,6 +2062,14 @@ pub const Engine = struct {
             .free => {
                 const f = try Free.parse(op);
                 e.streams.finish(f.slot, f.drops[0..f.n]);
+            },
+            .fill => {
+                const f = try Fill.parse(op);
+                if (!e.streams.fills(f.slot, f.at, f.chunks)) return error.PositionMismatch;
+                const l = &e.streams.lanes[f.slot];
+                const ids = e.ids_buf[0..l.prompt_len];
+                for (ids, l.hist[0..l.prompt_len]) |*id, h| id.* = h;
+                _ = try e.streams.fillPart(e.gather(), f.slot, ids, f.chunks);
             },
             .measure => try e.runMeasure(try Measure.parse(op)),
             else => return error.BadRecord,
@@ -2045,6 +2150,10 @@ pub const Engine = struct {
             .free => {
                 const f = Free.parse(op) catch return false;
                 return f.slot < st.lanes.len and st.lanes[f.slot].busy and f.book == st.fingerprint();
+            },
+            .fill => {
+                const f = Fill.parse(op) catch return false;
+                return st.fills(f.slot, f.at, f.chunks);
             },
             .measure => {
                 const m = Measure.parse(op) catch return false;
@@ -2390,6 +2499,7 @@ pub const Lanes = struct {
     pub fn backend(self: *Lanes) be.Backend {
         return .{ .ptr = self, .vtable = &.{
             .prefill = prefillFn,
+            .prefill_part = prefillPartFn,
             .first = firstFn,
             .queue = queueFn,
             .read = readFn,
@@ -2466,6 +2576,37 @@ pub const Lanes = struct {
     /// it shares with a kept prompt (`s.cached`, usage's cached tokens) or from 0; its first token is drawn.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
+        try self.admit(s, false);
+        try self.drawFirst();
+    }
+
+    /// `prefillFn` in parts: the first call announces the admission (`Admit.parts`), each call then runs the next
+    /// `chunks` chunks on every rank (the fill step); the last draws the first token. A cancel is honoured between
+    /// parts (the engine releases the stream, freeing its slot on every rank).
+    fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream, chunks: u32) anyerror!bool {
+        const self = of(ptr);
+        const slot = self.slotOf(s) catch blk: {
+            try self.admit(s, true);
+            break :blk try self.slotOf(s);
+        };
+        try self.sendKeeps();
+        const e = self.e;
+        const pass = e.streams.lanes[slot].pass orelse return error.PositionMismatch;
+        try e.both(Fill.encode(e.op_buf, .{ .slot = slot, .chunks = @max(chunks, 1), .at = pass.at }));
+        if (e.streams.lanes[slot].pass != null) return false;
+        try self.drawFirst();
+        return true;
+    }
+
+    /// The first token from the prompt's last row (the logits its last chunk left), held for `firstFn`.
+    fn drawFirst(self: *Lanes) !void {
+        var first: [1]u32 = undefined;
+        try self.e.streams.argmaxRows(0, &first);
+        _ = self.take(first[0]);
+    }
+
+    /// The admission step for `s` (all its chunks, or with `parts` none of them) and its slot owned.
+    fn admit(self: *Lanes, s: *lanes.Stream, parts: bool) !void {
         try self.sendKeeps();
         const e = self.e;
         const st = &e.streams;
@@ -2489,14 +2630,11 @@ pub const Lanes = struct {
         for (ids, ptoks) |*id, t| id.* = t;
         const op = Admit.encode(e.op_buf, .{
             .slot = free, .engram = e.engram != null, .drafts = e.drafter != null, .replay = e.settings.replay, .chunk = e.chunk, .base = placed.base, .size = size,
-            .reuse = reuse, .check = st.book.set.check and reuse != null, .keep = st.book.set.on, .book = st.fingerprint(), .ids = &.{},
+            .reuse = reuse, .check = st.book.set.check and reuse != null, .keep = st.book.set.on, .parts = parts, .book = st.fingerprint(), .ids = &.{},
         }, ids);
         try e.both(op);
         s.cached = if (reuse) |r| @intCast(r.cut) else 0;
         self.owner[free] = s;
-        var first: [1]u32 = undefined;
-        try st.argmaxRows(0, &first);
-        _ = self.take(first[0]);
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -2870,7 +3008,7 @@ test "extents: first fit, taken extents never overlap, freed extents merge back 
     try std.testing.expect(!ex.takeAt(1, 10));
 }
 
-test "admission, free, round, drafts, keeps and measure records parse back to what was encoded; cut or foreign ones are refused" {
+test "admission, free, fill, round, drafts, keeps and measure records parse back to what was encoded; cut or foreign ones are refused" {
     var prng = std.Random.DefaultPrng.init(0x9a7a);
     const r = prng.random();
     var buf: [Admit.header + 8 * 64]u8 = undefined;
@@ -2880,11 +3018,21 @@ test "admission, free, round, drafts, keeps and measure records parse back to wh
         const n = r.intRangeAtMost(usize, 0, ids.len);
         for (ids[0..n]) |*id| id.* = r.int(i64);
         const reuse: ?kept_prompts.Reuse = if (r.boolean()) .{ .eid = r.int(u32), .cut = r.int(u40) } else null;
-        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .reuse = reuse, .check = r.boolean(), .keep = r.boolean(), .book = r.int(u64), .ids = &.{} };
+        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .reuse = reuse, .check = r.boolean(), .keep = r.boolean(), .parts = r.boolean(), .book = r.int(u64), .ids = &.{} };
         const op = Admit.encode(&buf, a, ids[0..n]);
         const p = try Admit.parse(op);
         try std.testing.expect(p.slot == a.slot and p.engram == a.engram and p.drafts == a.drafts and p.replay == a.replay and p.chunk == a.chunk and p.base == a.base and p.size == a.size);
-        try std.testing.expect(std.meta.eql(p.reuse, a.reuse) and p.check == a.check and p.keep == a.keep and p.book == a.book);
+        try std.testing.expect(std.meta.eql(p.reuse, a.reuse) and p.check == a.check and p.keep == a.keep and p.parts == a.parts and p.book == a.book);
+
+        const fill: Fill = .{ .slot = a.slot, .chunks = r.intRangeAtMost(u32, 1, std.math.maxInt(u32)), .at = r.int(u40) };
+        var lbuf: [Fill.bytes]u8 = undefined;
+        const lop = Fill.encode(&lbuf, fill);
+        try std.testing.expect(std.meta.eql(fill, try Fill.parse(lop)));
+        try std.testing.expectError(error.BadRecord, Fill.parse(lop[0 .. lop.len - 1]));
+        try std.testing.expectError(error.BadRecord, Admit.parse(lop));
+        var none = lbuf;
+        std.mem.writeInt(u32, none[2..6], 0, .little);
+        try std.testing.expectError(error.BadRecord, Fill.parse(&none)); // a fill of no chunks
 
         var drops: [kept_prompts.max_kept]u32 = undefined;
         const nd = r.intRangeAtMost(usize, 0, drops.len);
@@ -2952,4 +3100,3 @@ test "admission, free, round, drafts, keeps and measure records parse back to wh
     var rr: Round = undefined;
     try std.testing.expectError(error.BadRecord, Round.parse(&wide, &rr));
 }
-

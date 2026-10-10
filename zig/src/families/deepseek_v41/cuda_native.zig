@@ -32,6 +32,12 @@ pub const formats: []const []const u8 = &.{"exl3"};
 pub const default_context: i64 = 16384;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = @intCast(lanesmod.default_chunk);
+/// Rounds of the decoding streams after each prompt chunk of another stream's pass (LaneHost.interleave), unless
+/// TENSORFOLD_PREFILL_INTERLEAVE says otherwise (0: a prompt pass runs whole before the next round). One round
+/// after each 2048-row chunk (about 1 s) costs the pass about 19% at 64k and keeps the decoding streams at about 7% of
+/// their speed; 2, 4 and 8 rounds cost 33%, 45% and 70% for 13%, 24% and 33% (three streams decoding during a cold
+/// 64k prompt).
+pub const prefill_interleave: u32 = 1;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 

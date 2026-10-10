@@ -203,14 +203,15 @@ pub const Engram = struct {
         try self.apply(layer, h, self.history, start, n, mm, gather, stream);
     }
 
-    /// The `RoundRunner.engram` hook: every stream's rows of a round with their own histories (`applySpans`).
+    /// The `RoundRunner.engram` hook: every stream's rows of a round with their own histories (`applySpans`), read
+    /// now; a prompt's read-ahead batches stay pending for its next chunk (a round may run between two chunks).
     pub fn roundHook(self: *Engram) rounds.Engram {
         return .{ .ctx = self, .call = roundFn };
     }
 
     fn roundFn(ctx: *anyopaque, layer: usize, h: Ptr, spans: []const rounds.EngramSpan, gather: forward.Gather, stream: cuda.Stream) anyerror!void {
         const self: *Engram = @ptrCast(@alignCast(ctx));
-        try self.applySpans(layer, h, spans, null, gather, stream);
+        try self.spansRead(layer, h, spans, null, gather, stream, false);
     }
 
     /// h [n, 4, d] bf16 (positions start .. start + n - 1 of the sequence `ids`, which holds at least start + n ids)
@@ -224,6 +225,11 @@ pub const Engram = struct {
     /// one gate over all of them. The bits of a row are those `apply` gives it alone (the decode linear and the gate
     /// are row-invariant).
     pub fn applySpans(self: *Engram, layer: usize, h: Ptr, spans: []const rounds.EngramSpan, mm: ?forward.Mm, gather: forward.Gather, stream: cuda.Stream) !void {
+        try self.spansRead(layer, h, spans, mm, gather, stream, true);
+    }
+
+    /// `applySpans`, its rows taken from a read-ahead batch only with `ahead` (else read now, the batches kept).
+    fn spansRead(self: *Engram, layer: usize, h: Ptr, spans: []const rounds.EngramSpan, mm: ?forward.Mm, gather: forward.Gather, stream: cuda.Stream, ahead: bool) !void {
         var n: usize = 0;
         for (spans) |sp| {
             if (sp.ids.len < sp.start + sp.n) return error.HistoryShort;
@@ -253,7 +259,8 @@ pub const Engram = struct {
         };
         // the rows: a prefetched batch's (read ahead into its own pinned buffers), else read now into this layer's
         // pinned staging (its previous copy to the device has run); then to the device
-        const st = if (try self.takeAhead(slot, spans, n, per, stream)) |ahead| ahead else blk: {
+        const taken = if (ahead) try self.takeAhead(slot, spans, n, per, stream) else null;
+        const st = if (taken) |batch| batch else blk: {
             try self.idleAhead();
             const st = &self.staging[slot];
             if (self.pending[slot]) try self.uploaded[slot].synchronize();
