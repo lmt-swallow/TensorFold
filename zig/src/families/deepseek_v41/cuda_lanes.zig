@@ -90,7 +90,9 @@ pub const most_drafts_max: usize = max_rows - 1;
 pub const draft_prior: [most_drafts_max]f64 = @splat(0.75);
 
 /// Prompt rows a chunk unless TF_DS_PREFILL_CHUNK says otherwise (the fork's production setting).
-pub const default_chunk: usize = prompt.max_chunk;
+pub const default_chunk: usize = 2048;
+/// The widest prompt chunk TF_DS_PREFILL_CHUNK may name.
+pub const max_chunk: usize = prompt.max_chunk;
 
 /// Step opcodes. The served engine sends `measure` and `admit` .. `fill`; the others are `Sequence`'s records.
 pub const Op = enum(u8) { prefill = 1, round = 2, release = 3, stop = 4, verify = 5, keep = 6, draft = 7, measure = 8, admit = 9, rounds = 10, drafts = 11, keeps = 12, free = 13, fill = 14 };
@@ -1258,10 +1260,11 @@ pub const Streams = struct {
         lane.pass = p;
         if (p.at < ids.len) return false;
         lane.pass = null;
-        if (ids.len - p.cut > max_rows) {
+        if (ids.len - p.cut > max_rows or self.pr.trace != null) {
             try self.stream.synchronize();
             const ms = msSince(p.t0);
             std.log.info("deepseek_v41 rank {d}: a prompt of {d} rows from {d} in {d} chunks: {d:.0} ms, {d:.0} tok/s", .{ self.base.w.rank, ids.len, p.cut, (ids.len - p.cut + p.chunk - 1) / p.chunk, ms, @as(f64, @floatFromInt(ids.len - p.cut)) * 1000 / ms });
+            try self.pr.traceReport(ids.len - p.cut, ms);
         }
         if (p.check) try self.checkKept(gather, slot, ids, p.cut, p.chunk, p.replay);
         return true;
@@ -1913,6 +1916,7 @@ pub const Engine = struct {
         }
         clock.mark("the stream pool and the kept prompts' snapshots", .{});
         if (getenv("TF_DS_PROFILE") != null) try e.streams.pr.enableProfile();
+        if (getenv("TF_DS_PREFILL_TRACE") != null) try e.streams.pr.enableTrace();
         // the communicator after the loads: each rank loads on its own, then they meet (rank 1 retries its
         // connection for up to 30 minutes while rank 0 still loads, so the ranks may start in either order)
         e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);

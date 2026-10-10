@@ -3,7 +3,7 @@
 //! --master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT), the weights from the Python
 //! family's rank cache (TF_DS_RANK_CACHE), the RoPE frequencies (TF_DS_ROPE=device, the default: each pass's rows
 //! computed on the device) or whole tables (TF_DS_ROPE=table) from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
-//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048). Up to four streams decode together in shared
+//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 4096). Up to four streams decode together in shared
 //! rounds (TF_DS_MAX_ROWS rows a round at most: default 16, up to 32, the same on both ranks), their caches in one
 //! pool of TF_DS_POOL positions (cuda_lanes.zig `Streams`; default the context, else at least the context and a
 //! multiple of 2048, the same on both ranks), each stream within the context (`--context`: at most the model's
@@ -14,6 +14,8 @@
 //! time (`info:` lines); each rank loads on its own and the ranks meet after their loads, so both may start at once.
 //! TF_DS_PROFILE=1 logs every prompt chunk's GPU time by sublayer group and its host time (a host sync a chunk).
 //! TF_DS_DRAFT_STATS=1 has rank 0 log each stream's draft tallies as it leaves (draft_stats.zig).
+//! TF_DS_PREFILL_TRACE=1 logs each prompt's chunk timeline (GPU time, gathers, idle time between chunks) without a sync a
+//! chunk.
 //! Kept prompts (cuda_keep.zig) are on unless TF_DS_KEEP=0: a prompt that starts with a finished one prefills from
 //! their longest shared kept chunk boundary (TF_DS_KEEP_ENTRIES, TF_DS_KEEP_MARKS, TF_DS_KEEP_SHRINK,
 //! TF_DS_KEEP_SHRINK_MIN as in the fork; TF_DS_KEEP_SNAPS ring snapshots, default 32; TF_DS_KEEP_CHECK=1 compares
@@ -85,8 +87,8 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
     const rope_dir = if (getenv("TF_DS_ROPE_DIR")) |r| try gpa.dupe(u8, r) else try std.fs.path.join(gpa, &.{ kernels_dir, "rope" });
     const cache_dir = try gpa.dupe(u8, getenv("TF_DS_RANK_CACHE") orelse return error.NoRankCache);
     const chunk = try envInt("TF_DS_PREFILL_CHUNK", @intCast(lanesmod.default_chunk));
-    if (chunk < 1 or chunk > lanesmod.default_chunk) {
-        std.log.err("TF_DS_PREFILL_CHUNK is {d}: it takes 1 to {d} rows", .{ chunk, lanesmod.default_chunk });
+    if (chunk < 1 or chunk > lanesmod.max_chunk) {
+        std.log.err("TF_DS_PREFILL_CHUNK is {d}: it takes 1 to {d} rows", .{ chunk, lanesmod.max_chunk });
         return error.BadEnvironment;
     }
     const slots = try envInt("TF_DS_SLOTS", @intCast(lanesmod.max_slots));

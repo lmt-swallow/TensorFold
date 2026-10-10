@@ -33,7 +33,8 @@ const Gather = forward.Gather;
 
 pub const Error = error{ TooManyRows, BadShape, OutOfMemory, NoCandidateSource } || cuda.Error || exl3.Error || experts.Error || cuda.cublaslt.Error;
 
-pub const max_chunk: usize = 2048;
+/// The widest chunk a `Prompt` holds buffers for (TF_DS_PREFILL_CHUNK at most this).
+pub const max_chunk: usize = 4096;
 const decode_rows: usize = 16; // kernels.DECODE_ROWS: rows at most of a window; more is a prompt chunk
 const linear_rows: usize = 128; // model.py mm: the row-invariant linear up to here, the prompt GEMM beyond
 const exact_rows: usize = 64; // experts.EXACT_ROWS: the experts' prompt path from here
@@ -214,6 +215,12 @@ pub const Gemm32 = struct {
     }
 
     pub fn run(self: *Gemm32, x: Ptr, w: Ptr, out: Ptr, m: usize, n: usize, k: usize, stream: cuda.Stream) !void {
+        return self.runAs(x, w, out, m, m, n, k, stream);
+    }
+
+    /// `run` on m rows with the algorithm the heuristic picks for `as_rows` rows (the rows of a whole chunk when it
+    /// runs in pieces).
+    pub fn runAs(self: *Gemm32, x: Ptr, w: Ptr, out: Ptr, m: usize, as_rows: usize, n: usize, k: usize, stream: cuda.Stream) !void {
         const lt = &self.lt;
         const api = lt.api;
         var desc: cuda.cublaslt.MatmulDesc = null;
@@ -229,9 +236,9 @@ pub const Gemm32 = struct {
         var lc: cuda.cublaslt.Layout = null;
         try lt.check(api.cublasLtMatrixLayoutCreate(&la, .f32, k, n, @intCast(k)), "layout W");
         defer _ = api.cublasLtMatrixLayoutDestroy(la);
-        try lt.check(api.cublasLtMatrixLayoutCreate(&lb, .f32, k, m, @intCast(k)), "layout X");
+        try lt.check(api.cublasLtMatrixLayoutCreate(&lb, .f32, k, as_rows, @intCast(k)), "layout X");
         defer _ = api.cublasLtMatrixLayoutDestroy(lb);
-        try lt.check(api.cublasLtMatrixLayoutCreate(&lc, .f32, n, m, @intCast(n)), "layout OUT");
+        try lt.check(api.cublasLtMatrixLayoutCreate(&lc, .f32, n, as_rows, @intCast(n)), "layout OUT");
         defer _ = api.cublasLtMatrixLayoutDestroy(lc);
         var pref: cuda.cublaslt.Preference = null;
         try lt.check(api.cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate");
@@ -242,6 +249,18 @@ pub const Gemm32 = struct {
         var count: c_int = 0;
         try lt.check(api.cublasLtMatmulAlgoGetHeuristic(self.handle, desc, la, lb, lc, lc, pref, 1, &found, &count), "cublasLtMatmulAlgoGetHeuristic");
         if (count < 1 or found[0].state != 0) return error.NoAlgorithm;
+        if (as_rows != m) {
+            var lb2: cuda.cublaslt.Layout = null;
+            var lc2: cuda.cublaslt.Layout = null;
+            try lt.check(api.cublasLtMatrixLayoutCreate(&lb2, .f32, k, m, @intCast(k)), "layout X");
+            defer _ = api.cublasLtMatrixLayoutDestroy(lb2);
+            try lt.check(api.cublasLtMatrixLayoutCreate(&lc2, .f32, n, m, @intCast(n)), "layout OUT");
+            defer _ = api.cublasLtMatrixLayoutDestroy(lc2);
+            const one: f32 = 1;
+            const zero: f32 = 0;
+            try lt.check(api.cublasLtMatmul(self.handle, desc, &one, w, la, x, lb2, &zero, out, lc2, out, lc2, &found[0].algo, self.workspace.ptr, workspace_bytes, stream.handle), "cublasLtMatmul");
+            return;
+        }
         const one: f32 = 1;
         const zero: f32 = 0;
         try lt.check(api.cublasLtMatmul(self.handle, desc, &one, w, la, x, lb, &zero, out, lc, out, lc, &found[0].algo, self.workspace.ptr, workspace_bytes, stream.handle), "cublasLtMatmul");
@@ -294,6 +313,98 @@ pub const Profile = struct {
     }
 };
 
+/// A prompt's chunk timeline without a host sync a chunk (`Prompt.enableTrace`, TF_DS_PREFILL_TRACE=1 in the served
+/// engine): CUDA events at each chunk's ends and around each of its gathers, in two sets that alternate between
+/// chunks. A set is read when the chunk after next starts (a wait on its end event: the host runs at most about a
+/// chunk ahead, so the GPU stays busy) and the rest by `Prompt.traceReport` after the prompt's sync. Sums the chunks'
+/// GPU time, the time in gathers (waiting for the other rank included), and the GPU's idle time between one chunk's
+/// end and the next one's start.
+pub const Trace = struct {
+    pub const max_gathers = 128;
+    const Set = struct {
+        begin: cuda.Event,
+        end: cuda.Event,
+        gathers: [max_gathers][2]cuda.Event,
+        n: usize = 0,
+        live: bool = false,
+    };
+    sets: [2]Set,
+    k: usize = 0,
+    chunks: usize = 0,
+    gpu_ms: f64 = 0,
+    gather_ms: f64 = 0,
+    gap_ms: f64 = 0,
+    gathers: usize = 0,
+
+    pub fn init(d: *const cuda.Driver) !Trace {
+        var t: Trace = .{ .sets = undefined };
+        for (&t.sets) |*s| {
+            s.* = .{ .begin = try cuda.Event.init(d, true), .end = try cuda.Event.init(d, true), .gathers = undefined };
+            for (&s.gathers) |*g| g.* = .{ try cuda.Event.init(d, true), try cuda.Event.init(d, true) };
+        }
+        return t;
+    }
+
+    pub fn deinit(self: *Trace) void {
+        for (&self.sets) |*s| {
+            s.begin.deinit();
+            s.end.deinit();
+            for (&s.gathers) |*g| {
+                g[0].deinit();
+                g[1].deinit();
+            }
+        }
+    }
+
+    /// Folds set `i` (its chunk waited for) into the sums, with the gap to the next chunk when that one has begun.
+    fn drain(self: *Trace, i: usize) !void {
+        const s = &self.sets[i];
+        if (!s.live) return;
+        try s.end.synchronize();
+        self.chunks += 1;
+        self.gpu_ms += try cuda.Event.elapsedMs(s.begin, s.end);
+        for (s.gathers[0..s.n]) |g| self.gather_ms += try cuda.Event.elapsedMs(g[0], g[1]);
+        self.gathers += s.n;
+        const next = &self.sets[1 - i];
+        if (next.live) {
+            try next.begin.synchronize();
+            self.gap_ms += @max(0, try cuda.Event.elapsedMs(s.end, next.begin));
+        }
+        s.live = false;
+    }
+
+    /// A chunk begins on `stream`: the set it takes (the one of the chunk before last, read first).
+    fn begin(self: *Trace, stream: cuda.Stream) !void {
+        const i = self.k % 2;
+        try self.drain(i);
+        const s = &self.sets[i];
+        s.n = 0;
+        try s.begin.record(stream);
+        s.live = true;
+    }
+
+    fn end(self: *Trace, stream: cuda.Stream) !void {
+        const s = &self.sets[self.k % 2];
+        try s.end.record(stream);
+        self.k += 1;
+    }
+
+    /// The gather's two events (null past max_gathers: that gather is not timed).
+    fn gatherEvents(self: *Trace) ?*[2]cuda.Event {
+        const s = &self.sets[self.k % 2];
+        if (s.n == max_gathers) return null;
+        s.n += 1;
+        return &s.gathers[s.n - 1];
+    }
+
+    /// Every set read; the sums reset after the caller took them.
+    fn finish(self: *Trace) !void {
+        // the older chunk first: its gap reaches the newer one's begin
+        try self.drain(self.k % 2);
+        try self.drain((self.k + 1) % 2);
+    }
+};
+
 fn nowNs() i128 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
@@ -306,6 +417,9 @@ pub const Prompt = struct {
     fwd: *Forward,
     /// Per-chunk timing when set (`enableProfile`).
     profile: ?Profile = null,
+    /// The chunks' timeline when set (`enableTrace`), and the gather it wraps during a chunk.
+    trace: ?Trace = null,
+    traced: Gather = undefined,
     kernels: *const exl3.Kernels,
     glue: Glue,
     pk: ExpertKernels,
@@ -409,6 +523,7 @@ pub const Prompt = struct {
         self.d = d;
         self.fwd = fwd;
         self.profile = null;
+        self.trace = null;
         self.kernels = kernels;
         self.rows = rows;
         self.glue = try Glue.load(d);
@@ -551,7 +666,39 @@ pub const Prompt = struct {
         if (self.profile == null) self.profile = try Profile.init(self.gpa, self.d, self.fwd.w.layers.len);
     }
 
+    /// Traces every chunk from now on (see `Trace`; `traceReport` logs a prompt's sums).
+    pub fn enableTrace(self: *Prompt) !void {
+        if (self.trace == null) self.trace = try Trace.init(self.d);
+    }
+
+    /// After the prompt's last chunk has run (the caller synchronized): its chunks' sums as one `info:` line
+    /// (nothing without a trace or a traced chunk), and the sums reset.
+    pub fn traceReport(self: *Prompt, rows: usize, wall_ms: f64) !void {
+        const t = &(self.trace orelse return);
+        try t.finish();
+        defer {
+            t.chunks = 0;
+            t.gpu_ms = 0;
+            t.gather_ms = 0;
+            t.gap_ms = 0;
+            t.gathers = 0;
+        }
+        if (t.chunks == 0) return;
+        std.log.info("deepseek_v41 rank {d}: prefill trace: {d} rows in {d} chunks, wall {d:.0} ms: GPU {d:.0} ms in the chunks ({d:.0} ms in {d} gathers), {d:.0} ms idle between chunks", .{
+            self.fwd.w.rank, rows, t.chunks, wall_ms, t.gpu_ms, t.gather_ms, t.gathers, t.gap_ms,
+        });
+    }
+
+    fn tracedGather(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
+        const self: *Prompt = @ptrCast(@alignCast(ctx));
+        const ev = self.trace.?.gatherEvents();
+        if (ev) |e| try e[0].record(stream);
+        try self.traced.run(partial, words, out, stream);
+        if (ev) |e| try e[1].record(stream);
+    }
+
     pub fn deinit(self: *Prompt) void {
+        if (self.trace) |*t| t.deinit();
         if (self.profile) |*p| p.deinit();
         for (self.gate_w32) |*b| b.free();
         self.gpa.free(self.gate_w32);
@@ -587,7 +734,14 @@ pub const Prompt = struct {
         const t0 = nowNs();
         var engram_ns: i128 = 0;
         try self.mark(0, stream);
-        const out = try self.layers(gather, ids, start, o, stream, &engram_ns);
+        var g = gather;
+        if (self.trace) |*t| {
+            try t.begin(stream);
+            self.traced = gather;
+            g = .{ .ctx = self, .call = tracedGather };
+        }
+        const out = try self.layers(g, ids, start, o, stream, &engram_ns);
+        if (self.trace) |*t| try t.end(stream);
         try self.mark(1 + self.fwd.w.layers.len * Profile.groups.len, stream);
         if (self.profile != null and o.replay == null) try self.report(start, n, nowNs() - t0, engram_ns, stream);
         return out;
