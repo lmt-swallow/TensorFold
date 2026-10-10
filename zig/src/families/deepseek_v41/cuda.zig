@@ -10,6 +10,7 @@ pub const hc = @import("cuda_hc.zig");
 pub const route = @import("cuda_route.zig");
 pub const native = @import("cuda_native.zig");
 pub const serve_lanes = @import("cuda_lanes.zig");
+pub const kept_prompts = @import("cuda_keep.zig");
 pub const dspark = @import("cuda_dspark.zig");
 pub const rounds = @import("cuda_rounds.zig");
 pub const weights = @import("cuda_weights.zig");

@@ -9,6 +9,10 @@
 //! windows of up to 6 rows, the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
 //! time (`info:` lines); each rank loads on its own and the ranks meet after their loads, so both may start at once.
 //! TF_DS_PROFILE=1 logs every prompt chunk's GPU time by sublayer group and its host time (a host sync a chunk).
+//! Kept prompts (cuda_keep.zig) are on unless TF_DS_KEEP=0: a prompt that starts with a finished one prefills from
+//! their longest shared kept chunk boundary (TF_DS_KEEP_ENTRIES, TF_DS_KEEP_MARKS, TF_DS_KEEP_SHRINK,
+//! TF_DS_KEEP_SHRINK_MIN as in the fork; TF_DS_KEEP_SNAPS ring snapshots, default 32; TF_DS_KEEP_CHECK=1 compares
+//! every continuation with a prefill from 0). Both ranks must set the same values.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");

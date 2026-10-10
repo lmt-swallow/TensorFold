@@ -20,6 +20,13 @@
 //! the same state, so the records carry ids and positions only; every rank drafts the same tokens. Sampling above
 //! temperature 0 is refused (the keyed draw is not ported).
 //!
+//! Kept prompts (cuda_keep.zig, multi.py `Kept`, TF_DS_KEEP=1 by default): a finished stream's prompt rows stay in
+//! the window with ring snapshots at its chunk boundaries, and a later prompt that starts the same is admitted at the
+//! longest boundary they share (its rows copied or its extent grown in place, its slot's rings restored), prefilling
+//! only the rest; usage's cached tokens are that boundary. Rank 0 matches and sends the kept prompt and boundary in
+//! the admission record and the kept prompts a finished prompt covers in the free record; every rank places, keeps
+//! and evicts by the same book, whose fingerprint each record carries.
+//!
 //! Engram (cuda_engram_apply.zig) runs on its layers when TF_DS_ENGRAM names the tables' dir (the token map from
 //! TF_DS_TOKEN_MAP, default `<kernels>/token_map.json`; TF_DS_ENGRAM_THREADS reader threads, default 32): every rank
 //! keeps each stream's ids on the host (`Lane.hist`) and hashes them the same way, so the ranks' Engram gathers
@@ -40,6 +47,7 @@ const prompt = @import("cuda_prompt.zig");
 const engram_apply = @import("cuda_engram_apply.zig");
 const dspark = @import("cuda_dspark.zig");
 const rounds = @import("cuda_rounds.zig");
+pub const kept_prompts = @import("cuda_keep.zig");
 const RankCache = @import("rank_cache.zig").RankCache;
 
 const be = lanes.backend;
@@ -488,9 +496,9 @@ pub fn ropeRows(context: usize) usize {
 
 /// Slots the served engine holds: a round's 16 rows hold four streams' windows of up to four rows (the fork's
 /// DEPTH_BY "5,5,3,3" at three and four streams).
-pub const max_slots: usize = 4;
+pub const max_slots: usize = kept_prompts.max_slots;
 /// Extents start and end on multiples of this many positions (multi.py ALIGN).
-pub const extent_align: usize = 2048;
+pub const extent_align: usize = kept_prompts.extent_align;
 /// Positions an extent holds past its stream's prompt and reply (multi.py `_need`: a round's rows, 8, and the
 /// scratch row's 4).
 pub const extent_tail: usize = max_rows + 8 + 4;
@@ -499,88 +507,16 @@ pub fn draftBatch(block: usize) usize {
     return @max(1, dspark.Drafter.max_rows / @max(1, block));
 }
 
-/// multi.py `Extents`: first-fit extents of a window of `total` positions in `extent_align` steps; a freed extent
-/// merges with its neighbours. The gaps are free, disjoint, sorted, and never touch.
-pub const Extents = struct {
-    total: usize,
-    gaps: [max_slots + 2][2]usize = undefined,
-    n: usize = 0,
-
-    pub fn init(positions: usize) Extents {
-        var e: Extents = .{ .total = positions / extent_align * extent_align };
-        if (e.total > 0) {
-            e.gaps[0] = .{ 0, e.total };
-            e.n = 1;
-        }
-        return e;
-    }
-
-    /// `rows` aligned up to `extent_align`.
-    pub fn size(rows: usize) usize {
-        return (rows + extent_align - 1) / extent_align * extent_align;
-    }
-
-    /// The start of the first gap that holds `rows` (aligned up), nothing taken; null when none does.
-    pub fn first(self: *const Extents, rows: usize) ?usize {
-        const n = size(rows);
-        for (self.gaps[0..self.n]) |g| if (g[1] - g[0] >= n) return g[0];
-        return null;
-    }
-
-    /// `rows` (aligned up) from `start` if they are free (and `start` is aligned); false leaves the extents as
-    /// they were.
-    pub fn takeAt(self: *Extents, start: usize, rows: usize) bool {
-        const n = size(rows);
-        if (n == 0 or start % extent_align != 0) return false;
-        for (self.gaps[0..self.n], 0..) |g, i| {
-            if (g[0] > start or start + n > g[1]) continue;
-            const left = start > g[0];
-            const right = start + n < g[1];
-            if (left and right) {
-                if (self.n == self.gaps.len) return false;
-                std.mem.copyBackwards([2]usize, self.gaps[i + 2 .. self.n + 1], self.gaps[i + 1 .. self.n]);
-                self.gaps[i] = .{ g[0], start };
-                self.gaps[i + 1] = .{ start + n, g[1] };
-                self.n += 1;
-            } else if (left) {
-                self.gaps[i] = .{ g[0], start };
-            } else if (right) {
-                self.gaps[i] = .{ start + n, g[1] };
-            } else {
-                std.mem.copyForwards([2]usize, self.gaps[i .. self.n - 1], self.gaps[i + 1 .. self.n]);
-                self.n -= 1;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    /// Positions [start, start + size(rows)) are free again (they must have been taken).
-    pub fn give(self: *Extents, start: usize, rows: usize) void {
-        const end = start + size(rows);
-        var i: usize = 0;
-        while (i < self.n and self.gaps[i][0] < start) i += 1;
-        const joins_left = i > 0 and self.gaps[i - 1][1] == start;
-        const joins_right = i < self.n and self.gaps[i][0] == end;
-        if (joins_left and joins_right) {
-            self.gaps[i - 1][1] = self.gaps[i][1];
-            std.mem.copyForwards([2]usize, self.gaps[i .. self.n - 1], self.gaps[i + 1 .. self.n]);
-            self.n -= 1;
-        } else if (joins_left) {
-            self.gaps[i - 1][1] = end;
-        } else if (joins_right) {
-            self.gaps[i][0] = start;
-        } else {
-            std.mem.copyBackwards([2]usize, self.gaps[i + 1 .. self.n + 1], self.gaps[i..self.n]);
-            self.gaps[i] = .{ start, end };
-            self.n += 1;
-        }
-    }
-};
+/// multi.py `Extents` (cuda_keep.zig, beside the kept prompts' book that shares the window).
+pub const Extents = kept_prompts.Extents;
 
 /// The admission step's record: the opcode, the slot (u8), the flags (u8: bit 0 Engram on, bit 1 DSpark taps
-/// absorbed, bit 2 CED bounded replay), the chunk rows (u32), the extent's base and size (u64 each), the prompt's length (u32), its ids (i64
-/// each). Every rank fills the slot's extent from position 0 through the prompt path in the record's chunks.
+/// absorbed, bit 2 CED bounded replay, bit 3 the prompt continues a kept prompt, bit 4 that continuation checked
+/// against a prefill from 0 (TF_DS_KEEP_CHECK), bit 5 kept prompts on), the chunk rows (u32), the extent's base and
+/// size (u64 each), the kept prompt's id (u32) and boundary (u64), the window book's fingerprint before the step
+/// (u64), the prompt's length (u32), its ids (i64 each). Every rank places the extent the same way (cuda_keep.zig
+/// `Book.place`: the record's base is rank 0's) and fills it through the prompt path in the record's chunks, from
+/// position 0 or, continuing a kept prompt, from its boundary.
 pub const Admit = struct {
     slot: usize,
     engram: bool,
@@ -589,34 +525,46 @@ pub const Admit = struct {
     chunk: usize,
     base: usize,
     size: usize,
+    reuse: ?kept_prompts.Reuse = null,
+    check: bool = false,
+    keep: bool = false,
+    book: u64 = 0,
     ids: []const u8,
 
-    pub const header: usize = 27;
+    pub const header: usize = 47;
 
     pub fn encode(buf: []u8, a: Admit, ids: []const i64) []const u8 {
         buf[0] = @intFromEnum(Op.admit);
         buf[1] = @intCast(a.slot);
-        buf[2] = @as(u8, @intFromBool(a.engram)) | @as(u8, @intFromBool(a.drafts)) << 1 | @as(u8, @intFromBool(a.replay)) << 2;
+        buf[2] = @as(u8, @intFromBool(a.engram)) | @as(u8, @intFromBool(a.drafts)) << 1 | @as(u8, @intFromBool(a.replay)) << 2 |
+            @as(u8, @intFromBool(a.reuse != null)) << 3 | @as(u8, @intFromBool(a.check)) << 4 | @as(u8, @intFromBool(a.keep)) << 5;
         std.mem.writeInt(u32, buf[3..7], @intCast(a.chunk), .little);
         std.mem.writeInt(u64, buf[7..15], @intCast(a.base), .little);
         std.mem.writeInt(u64, buf[15..23], @intCast(a.size), .little);
-        std.mem.writeInt(u32, buf[23..27], @intCast(ids.len), .little);
+        std.mem.writeInt(u32, buf[23..27], if (a.reuse) |r| r.eid else 0, .little);
+        std.mem.writeInt(u64, buf[27..35], if (a.reuse) |r| @intCast(r.cut) else 0, .little);
+        std.mem.writeInt(u64, buf[35..43], a.book, .little);
+        std.mem.writeInt(u32, buf[43..47], @intCast(ids.len), .little);
         for (ids, 0..) |id, i| std.mem.writeInt(i64, buf[header + 8 * i ..][0..8], id, .little);
         return buf[0 .. header + 8 * ids.len];
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Admit {
-        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 7) return error.BadRecord;
-        const n = std.mem.readInt(u32, op[23..27], .little);
+        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 63) return error.BadRecord;
+        const n = std.mem.readInt(u32, op[43..47], .little);
         if (op.len != header + 8 * @as(usize, n)) return error.BadRecord;
         return .{
             .slot = op[1],
             .engram = op[2] & 1 != 0,
             .drafts = op[2] & 2 != 0,
             .replay = op[2] & 4 != 0,
+            .reuse = if (op[2] & 8 != 0) .{ .eid = std.mem.readInt(u32, op[23..27], .little), .cut = @intCast(std.mem.readInt(u64, op[27..35], .little)) } else null,
+            .check = op[2] & 16 != 0,
+            .keep = op[2] & 32 != 0,
             .chunk = std.mem.readInt(u32, op[3..7], .little),
             .base = @intCast(std.mem.readInt(u64, op[7..15], .little)),
             .size = @intCast(std.mem.readInt(u64, op[15..23], .little)),
+            .book = std.mem.readInt(u64, op[35..43], .little),
             .ids = op[header..],
         };
     }
@@ -629,6 +577,35 @@ pub const Admit = struct {
         const n = self.len();
         for (out[0..n], 0..) |*id, i| id.* = std.mem.readInt(i64, self.ids[8 * i ..][0..8], .little);
         return out[0..n];
+    }
+};
+
+/// The free step's record: the opcode, the slot (u8), the kept prompts the stream's prompt covers (u8, then their
+/// ids, u32 each: rank 0's `Streams.covered`), the window book's fingerprint before the step (u64). With kept
+/// prompts on, the stream's prompt stays as a kept prompt (`Streams.finish`).
+pub const Free = struct {
+    slot: usize,
+    book: u64,
+    drops: [kept_prompts.max_kept]u32 = undefined,
+    n: usize = 0,
+
+    pub const header: usize = 11;
+
+    pub fn encode(buf: []u8, slot: usize, book: u64, drops: []const u32) []const u8 {
+        buf[0] = @intFromEnum(Op.free);
+        buf[1] = @intCast(slot);
+        buf[2] = @intCast(drops.len);
+        std.mem.writeInt(u64, buf[3..11], book, .little);
+        for (drops, 0..) |d, i| std.mem.writeInt(u32, buf[header + 4 * i ..][0..4], d, .little);
+        return buf[0 .. header + 4 * drops.len];
+    }
+
+    pub fn parse(op: []const u8) error{BadRecord}!Free {
+        if (op.len < header or op[0] != @intFromEnum(Op.free) or op[2] > kept_prompts.max_kept) return error.BadRecord;
+        if (op.len != header + 4 * @as(usize, op[2])) return error.BadRecord;
+        var f: Free = .{ .slot = op[1], .book = std.mem.readInt(u64, op[3..11], .little), .n = op[2] };
+        for (f.drops[0..f.n], 0..) |*d, i| d.* = std.mem.readInt(u32, op[header + 4 * i ..][0..4], .little);
+        return f;
     }
 };
 
@@ -807,7 +784,8 @@ pub const Measure = struct {
 };
 
 /// A stream's state in its slot: its extent of the window, the position its next row takes (relative to the
-/// extent), its host ids from position 0 (Engram's hashes), the last round's window (its start, rows and first row
+/// extent), its host ids from position 0 (Engram's hashes; the prompt's first `prompt_len`), its prompt's ring
+/// snapshots at its chunk boundaries (`marks`: kept prompts), the last round's window (its start, rows and first row
 /// among the round's), the positions its drafter rings absorbed, its last drafts (the first `held` of them held).
 pub const Lane = struct {
     busy: bool = false,
@@ -815,6 +793,8 @@ pub const Lane = struct {
     size: usize = 0,
     pos: usize = 0,
     hist: []i32 = &.{},
+    prompt_len: usize = 0,
+    marks: kept_prompts.Marks = .{},
     verify_start: usize = 0,
     verify_rows: usize = 0,
     row0: usize = 0,
@@ -860,6 +840,21 @@ pub const Streams = struct {
     /// The last admission's last row's logits [1, V], or the last round's [R, V] (window order).
     logits: Ptr = 0,
     stream: cuda.Stream,
+    /// Kept prompts (cuda_keep.zig): the book of them, what its operations let go (`settle` frees it), and the ring
+    /// snapshots (`snap_count` of `snap_bytes` each: the window rings of the first `snap_layers` layers, then every
+    /// compressor's inputs, of one slot), each held by the streams and kept prompts counted in `snap_refs`.
+    book: kept_prompts.Book,
+    released: kept_prompts.Released = .{},
+    snaps: cuda.DeviceBuffer,
+    snap_bytes: usize = 0,
+    snap_layers: usize = 0,
+    snap_refs: []u8 = &.{},
+    /// The bounded replay the snapshots were laid out for: only admissions with the same take or continue kept
+    /// prompts.
+    keep_replay: bool = false,
+    /// Admissions that continued a kept prompt, by placement (`How`), and the checked ones that differed.
+    keep_stats: [4]u64 = @splat(0),
+    keep_differed: u64 = 0,
 
     /// `base`: the decode loop whose weights, kernels, scratch and RoPE tables the view and the round share (its
     /// own caches go unused). `rows`: the widest prompt chunk. `cap`: the window's positions (the context and the
@@ -875,7 +870,9 @@ pub const Streams = struct {
             .gpa = gpa, .d = d, .cfg = cfg, .base = base, .view = base.*, .view_rings = &.{}, .view_planes = &.{}, .pool = undefined,
             .runner = undefined, .pr = undefined, .extents = Extents.init(cap), .engram = engram, .spark = spark, .dpool = null,
             .dc_rings = &.{}, .taps = .{ .d = d, .ptr = 0, .len = 0 }, .kept_taps = .{ .d = d, .ptr = 0, .len = 0 }, .lanes = &.{}, .logits_h = &.{}, .stream = stream,
+            .book = .{ .set = .{ .on = false }, .chunk = rows, .window = cfg.window }, .snaps = .{ .d = d, .ptr = 0, .len = 0 },
         };
+        self.book.released = &self.released;
         self.pool = try rounds.Pool.init(gpa, d, cfg, L, slots, cap);
         errdefer self.pool.deinit();
         self.view_rings = try gpa.alloc(cuda.DeviceBuffer, L);
@@ -918,6 +915,9 @@ pub const Streams = struct {
 
     pub fn deinit(self: *Streams) void {
         const gpa = self.gpa;
+        for (self.book.slice()) |k| gpa.free(k.ids);
+        if (self.snap_refs.len > 0) gpa.free(self.snap_refs);
+        if (self.snaps.len > 0) self.snaps.free();
         if (self.dc_rings.len > 0) gpa.free(self.dc_rings);
         if (self.dpool) |*p| p.deinit(gpa);
         if (self.taps.len > 0) self.taps.free();
@@ -1002,36 +1002,152 @@ pub const Streams = struct {
     /// cannot see a cancel).
     pub fn admit(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool) !void {
         if (!self.admits(slot, base, size, ids.len, chunk)) return error.PositionMismatch;
-        if (!self.extents.takeAt(base, size)) return error.PositionMismatch;
+        _ = try self.admitKept(gather, slot, base, size, ids, chunk, replay, null, false);
+    }
+
+    /// Kept prompts are on for admissions with bounded replay `replay` (the snapshots' layout).
+    pub fn keeping(self: *const Streams, replay: bool) bool {
+        return self.book.set.on and replay == self.keep_replay;
+    }
+
+    /// Kept prompts on (cuda_keep.zig `Settings`): `set.snaps` ring snapshots allocated, boundaries every `chunk`
+    /// rows. Off (nothing allocated) when the settings say so or a compressor's ratio does not divide `chunk` (a
+    /// boundary must end every compressor's group). Every rank calls it with the same arguments.
+    pub fn enableKeep(self: *Streams, set: kept_prompts.Settings, chunk: usize, replay: bool) !void {
+        if (!set.on or chunk == 0) return;
+        const cfg = self.cfg;
+        const p = &self.pool;
+        for (p.planes, 0..) |pl, li| if (pl != null and chunk % @max(cfg.ratio(li), 1) != 0) return;
+        const L = p.rings.len;
+        self.snap_layers = if (replay) @min(cfg.n_layers / 2, L) else L;
+        const ring_bytes = p.ring * cfg.head_dim * 2;
+        const raw_bytes = rounds.raw_rows * cfg.head_dim * 4;
+        var bytes = self.snap_layers * ring_bytes;
+        for (p.planes) |pl| if (pl) |x| if (x.raw_kv.len > 0) {
+            bytes += 2 * raw_bytes;
+        };
+        self.snap_bytes = bytes;
+        self.snaps = try cuda.DeviceBuffer.alloc(self.d, set.snaps * bytes);
+        errdefer self.snaps.free();
+        self.snap_refs = try self.gpa.alloc(u8, set.snaps);
+        @memset(self.snap_refs, 0);
+        self.book.set = set;
+        self.book.chunk = chunk;
+        self.keep_replay = replay;
+    }
+
+    /// The window book's and extents' fingerprint (the records carry rank 0's).
+    pub fn fingerprint(self: *const Streams) u64 {
+        return self.book.fingerprint(&self.extents);
+    }
+
+    /// Where an admission of `size` positions continuing `reuse` would go (the book and extents untouched); null:
+    /// no room even with every kept prompt gone.
+    pub fn trialPlace(self: *const Streams, size: usize, reuse: ?kept_prompts.Reuse) ?kept_prompts.Placed {
+        var b = self.book.trial();
+        var ex = self.extents;
+        return b.place(&ex, size, if (reuse) |r| r.eid else null);
+    }
+
+    /// Whether an admission of the prompt `ids` into `slot` at [base, base + size), continuing `reuse`, can run
+    /// here: the slot free, the prompt and a round's rows inside the extent, the kept prompt held with a snapshot at
+    /// the boundary and the same ids before it, and the book placing the extent at `base`.
+    pub fn admitsKept(self: *const Streams, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse) bool {
+        if (slot >= self.lanes.len or self.lanes[slot].busy or chunk < 1 or chunk > self.pr.rows) return false;
+        const n = ids.len;
+        if (n < 1 or size % extent_align != 0 or n + extent_tail > size) return false;
+        if (reuse) |r| {
+            if (!self.keeping(replay) or chunk != self.book.chunk) return false;
+            const i = self.book.find(r.eid) orelse return false;
+            const k = &self.book.kept[i];
+            if (k.replay != replay or k.marks.find(r.cut) == null or r.cut % chunk != 0 or r.cut >= n or r.cut > k.top) return false;
+            for (k.keys()[0..r.cut], ids[0..r.cut]) |a, b| if (a != b) return false;
+        }
+        const placed = self.trialPlace(size, reuse) orelse return false;
+        return placed.base == base;
+    }
+
+    /// multi.py `_admit` with kept prompts + `_fill` to the end: the extent placed by the book (`Book.place`, at
+    /// `base`), and continuing `reuse` the kept prompt's rows to its boundary copied in (unless the extent grew in
+    /// place) and its slot's rings and compressor inputs restored from the snapshot there, so the prompt's chunks
+    /// from the boundary are a fresh prefill's own; the ring snapshots taken at the prompt's boundaries
+    /// (`Book.marksFor`). With `check`, the continued prompt is then prefilled again from 0 and the two compared
+    /// (logged: the last row's logits and the caches the prompt wrote). Returns the placement.
+    pub fn admitKept(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool) !kept_prompts.How {
+        if (!self.admitsKept(slot, base, size, ids, chunk, replay, reuse)) return error.PositionMismatch;
         const lane = &self.lanes[slot];
-        lane.* = .{ .busy = true, .base = base, .size = size, .hist = lane.hist };
+        // the kept prompt's snapshots to the boundary become the stream's too (it may be forgotten placing)
+        var inherited: kept_prompts.Marks = .{};
+        var src_base: usize = 0;
+        var cut: usize = 0;
+        var cut_snap: u16 = 0;
+        if (reuse) |r| {
+            const k = &self.book.kept[self.book.find(r.eid).?];
+            cut = r.cut;
+            src_base = k.base;
+            cut_snap = k.marks.find(cut).?;
+            for (k.marks.slice()) |m| if (m.at <= cut) {
+                inherited.add(m);
+                self.snap_refs[m.snap] += 1;
+            };
+        }
+        self.book.ticks += 1;
+        const placed = self.book.place(&self.extents, size, if (reuse) |r| r.eid else null) orelse return error.NoRoom;
+        if (placed.base != base) return error.PositionMismatch;
+        if (placed.how == .copy) {
+            const k = &self.book.kept[self.book.find(reuse.?.eid).?];
+            k.tick = self.book.ticks;
+            k.hits += 1;
+        }
+        lane.* = .{ .busy = true, .base = base, .size = size, .hist = lane.hist, .prompt_len = ids.len, .marks = inherited };
         errdefer {
             self.extents.give(base, size);
             lane.busy = false;
         }
         for (lane.hist[0..ids.len], ids) |*hv, id| hv.* = @intCast(id);
-        if (self.engram) |g| g.history = lane.hist[0..ids.len];
         self.point(slot, base, size);
-        self.logits = 0;
-        var dc: ?dspark.Cache = if (self.spark != null) self.slotCache(slot) else null;
+        if (placed.how == .copy or placed.how == .move) try self.copyRows(src_base, base, cut);
+        if (reuse != null) try self.restore(slot, cut_snap);
+        self.settle();
+        if (reuse != null) self.keep_stats[@intFromEnum(placed.how)] += 1;
+        const marks: ?kept_prompts.Points = if (self.keeping(replay) and chunk == self.book.chunk) self.book.marksFor(ids.len) else null;
         const t0 = nowNs();
+        try self.fill(gather, slot, ids, cut, chunk, replay, if (marks) |*m| m else null);
+        if (ids.len - cut > max_rows) {
+            try self.stream.synchronize();
+            const ms = msSince(t0);
+            std.log.info("deepseek_v41 rank {d}: a prompt of {d} rows from {d} in {d} chunks: {d:.0} ms, {d:.0} tok/s", .{ self.base.w.rank, ids.len, cut, (ids.len - cut + chunk - 1) / chunk, ms, @as(f64, @floatFromInt(ids.len - cut)) * 1000 / ms });
+        }
+        if (check and reuse != null) try self.checkKept(gather, slot, ids, cut, chunk, replay);
+        return placed.how;
+    }
+
+    /// The prompt's chunks from `from` (a chunk boundary whose rows and slot state are in place) to its end:
+    /// engine.py prefill_steps(start=from) on the slot's view; a ring snapshot after each chunk that ends on one of
+    /// `marks`.
+    fn fill(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, from: usize, chunk: usize, replay: bool, marks: ?*const kept_prompts.Points) !void {
+        const lane = &self.lanes[slot];
+        if (self.engram) |g| g.history = lane.hist[0..ids.len];
+        self.logits = 0;
+        lane.absorbed = 0;
+        var dc: ?dspark.Cache = if (self.spark != null) self.slotCache(slot) else null;
         if (self.engram) |g| {
             try g.resetAhead();
-            try g.prefetch(lane.hist[0..ids.len], 0, @min(ids.len, chunk));
+            try g.prefetch(lane.hist[0..ids.len], from, @min(ids.len, from + chunk) - from);
         }
-        var s: usize = 0;
+        var s: usize = from;
         while (s < ids.len) {
             const e = @min(ids.len, s + chunk);
             const last = e == ids.len;
             // the next chunk's Engram rows read while this one runs (engine.py prefill_steps' `ahead`)
             if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
-            const from = replayFrom(replay, ids.len, self.cfg.window);
+            const from_row = replayFrom(replay, ids.len, self.cfg.window);
             var top: [2]usize = .{ s, e - s };
-            const out = if (self.spark != null and e - s <= max_rows and (from orelse 0) <= s)
+            const out = if (self.spark != null and e - s <= max_rows and (from_row orelse 0) <= s)
                 try self.rowsTapped(gather, ids[s..e], s)
             else blk: {
                 const o = try self.pr.chunk(gather, ids[s..e], s, .{
-                    .replay = from,
+                    .replay = from_row,
                     .logits = last or e - s <= max_rows,
                     .taps = if (self.spark != null) .{ .buf = self.taps.ptr, .stride = self.tapCols() } else null,
                 }, self.stream);
@@ -1040,15 +1156,165 @@ pub const Streams = struct {
             };
             if (self.spark) |sp| if (top[1] > 0) try sp.absorb(&dc.?, self.taps.ptr, top[0], top[1], self.draftRope(), self.stream);
             if (last) self.logits = out orelse return error.BadChunk;
+            if (marks) |m| if (e % chunk == 0 and m.has(e) and lane.marks.find(e) == null and lane.marks.n < kept_prompts.max_marks) {
+                if (try self.snapshot(slot)) |id| lane.marks.add(.{ .at = e, .snap = id });
+            };
             s = e;
         }
         lane.pos = ids.len;
         lane.absorbed = if (dc) |c| c.absorbed else 0;
-        if (ids.len > max_rows) {
-            try self.stream.synchronize();
-            const ms = msSince(t0);
-            std.log.info("deepseek_v41 rank {d}: a prompt of {d} rows in {d} chunks: {d:.0} ms, {d:.0} tok/s", .{ self.base.w.rank, ids.len, (ids.len + chunk - 1) / chunk, ms, @as(f64, @floatFromInt(ids.len)) * 1000 / ms });
+    }
+
+    /// What the book let go, freed: its snapshots' holds dropped, its kept ids' storage.
+    fn settle(self: *Streams) void {
+        const r = &self.released;
+        for (r.snaps[0..r.n_snaps]) |id| self.snap_refs[id] -|= 1;
+        for (r.ids[0..r.n_ids]) |ids| self.gpa.free(ids);
+        r.* = .{};
+    }
+
+    /// Slot `slot`'s window rings (the first `snap_layers` layers') and compressor inputs into a free snapshot (multi.py
+    /// `_snapshot`); with none free, the least recently used kept prompts give theirs back first; null when no
+    /// snapshot frees (the boundary is not kept).
+    fn snapshot(self: *Streams, slot: usize) !?u16 {
+        var open = std.mem.indexOfScalar(u8, self.snap_refs, 0);
+        while (open == null) {
+            if (!self.book.forgetOldest(&self.extents)) return null;
+            self.settle();
+            open = std.mem.indexOfScalar(u8, self.snap_refs, 0);
         }
+        const id = open.?;
+        self.snap_refs[id] = 1;
+        var off = id * self.snap_bytes;
+        const ring_bytes = self.pool.ring * self.cfg.head_dim * 2;
+        for (self.pool.rings[0..self.snap_layers]) |r| {
+            try self.snaps.copyFrom(off, r.ptr + slot * ring_bytes, ring_bytes, self.stream.handle);
+            off += ring_bytes;
+        }
+        const raw = rounds.raw_rows * self.cfg.head_dim * 4;
+        for (self.pool.planes) |pl| if (pl) |x| if (x.raw_kv.len > 0) {
+            try self.snaps.copyFrom(off, x.raw_kv.ptr + slot * raw, raw, self.stream.handle);
+            try self.snaps.copyFrom(off + raw, x.raw_score.ptr + slot * raw, raw, self.stream.handle);
+            off += 2 * raw;
+        };
+        return @intCast(id);
+    }
+
+    /// Snapshot `id` back into slot `slot`'s rings and compressor inputs (multi.py `_restore`).
+    fn restore(self: *Streams, slot: usize, id: u16) !void {
+        var off = @as(usize, id) * self.snap_bytes;
+        const ring_bytes = self.pool.ring * self.cfg.head_dim * 2;
+        for (self.pool.rings[0..self.snap_layers]) |r| {
+            try sub(r, slot * ring_bytes, ring_bytes).copyFrom(0, self.snaps.ptr + off, ring_bytes, self.stream.handle);
+            off += ring_bytes;
+        }
+        const raw = rounds.raw_rows * self.cfg.head_dim * 4;
+        for (self.pool.planes) |pl| if (pl) |x| if (x.raw_kv.len > 0) {
+            try sub(x.raw_kv, slot * raw, raw).copyFrom(0, self.snaps.ptr + off, raw, self.stream.handle);
+            try sub(x.raw_score, slot * raw, raw).copyFrom(0, self.snaps.ptr + off + raw, raw, self.stream.handle);
+            off += 2 * raw;
+        };
+    }
+
+    /// The compressed and indexer rows of positions [src, src + n) of the window to [dst, dst + n) (multi.py
+    /// `_copy_rows`; `n` a multiple of every ratio). Overlapping ranges copy in pieces no longer than their distance,
+    /// in the direction that reads every row before it is overwritten.
+    fn copyRows(self: *Streams, src: usize, dst: usize, n: usize) !void {
+        if (src == dst or n == 0) return;
+        const cfg = self.cfg;
+        for (self.pool.planes, 0..) |pl, li| if (pl) |x| {
+            const r = cfg.ratio(li);
+            const a = src / r;
+            const b = dst / r;
+            const k = n / r;
+            const parts = [_]struct { buf: cuda.DeviceBuffer, row: usize }{
+                .{ .buf = x.comp_codes, .row = cfg.head_dim / 2 },
+                .{ .buf = x.comp_scales, .row = cfg.head_dim / 16 },
+                .{ .buf = x.idxk_codes, .row = cfg.idx_dim / 2 },
+                .{ .buf = x.idxk_scales, .row = cfg.idx_dim / 32 },
+            };
+            for (parts) |part| {
+                if (part.buf.len == 0) continue;
+                const gap = if (a > b) a - b else b - a;
+                const piece = @max(1, @min(k, gap));
+                var done: usize = 0;
+                while (done < k) {
+                    const m = @min(piece, k - done);
+                    // forward when moving down, backward when moving up
+                    const at = if (b < a) done else k - done - m;
+                    try part.buf.copyFrom((b + at) * part.row, part.buf.ptr + (a + at) * part.row, m * part.row, self.stream.handle);
+                    done += m;
+                }
+            }
+        };
+    }
+
+    /// TF_DS_KEEP_CHECK: the continued prompt's last row's logits and the caches it wrote (its extent's compressed
+    /// and indexer rows to its end, its slot's rings and compressor inputs) against the same prompt prefilled from 0
+    /// in the same slot and extent, which the stream then decodes from. Logged on every rank (each holds its own
+    /// shard).
+    fn checkKept(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, cut: usize, chunk: usize, replay: bool) !void {
+        const v = self.cfg.vocab;
+        try self.stream.synchronize();
+        const cont = try self.gpa.alloc(f32, v);
+        defer self.gpa.free(cont);
+        try (cuda.DeviceBuffer{ .d = self.d, .ptr = self.logits, .len = v * 4 }).download(0, std.mem.sliceAsBytes(cont));
+        const a = try self.cacheDigest(ids.len);
+        try self.fill(gather, slot, ids, 0, chunk, replay, null);
+        try self.stream.synchronize();
+        const fresh = try self.gpa.alloc(f32, v);
+        defer self.gpa.free(fresh);
+        try (cuda.DeviceBuffer{ .d = self.d, .ptr = self.logits, .len = v * 4 }).download(0, std.mem.sliceAsBytes(fresh));
+        const b = try self.cacheDigest(ids.len);
+        const same_logits = std.mem.eql(u8, std.mem.sliceAsBytes(cont), std.mem.sliceAsBytes(fresh));
+        const same_caches = std.mem.eql(u8, &a, &b);
+        if (!same_logits or !same_caches) self.keep_differed += 1;
+        std.log.info("deepseek_v41 rank {d}: keep check: a prompt of {d} rows continued at {d}: last row's logits {s}, caches {s} (against a prefill from 0)", .{ self.base.w.rank, ids.len, cut, if (same_logits) "equal" else "DIFFER", if (same_caches) "equal" else "DIFFER" });
+    }
+
+    /// sha256 of the view's caches (its slot's and extent's) after a prompt of `n` rows: its extent's compressed and indexer rows of the
+    /// prompt's positions (each layer's up to its last whole group), every layer's window ring, every compressor's
+    /// inputs.
+    fn cacheDigest(self: *Streams, n: usize) ![32]u8 {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        var host: std.ArrayList(u8) = .empty;
+        defer host.deinit(self.gpa);
+        for (self.view_planes, 0..) |pl, li| if (pl) |x| {
+            const rows = n / self.cfg.ratio(li);
+            for ([_]struct { buf: cuda.DeviceBuffer, row: usize }{
+                .{ .buf = x.comp_codes, .row = self.cfg.head_dim / 2 },
+                .{ .buf = x.comp_scales, .row = self.cfg.head_dim / 16 },
+                .{ .buf = x.idxk_codes, .row = self.cfg.idx_dim / 2 },
+                .{ .buf = x.idxk_scales, .row = self.cfg.idx_dim / 32 },
+            }) |part| {
+                if (part.buf.len == 0) continue;
+                try host.resize(self.gpa, rows * part.row);
+                try part.buf.download(0, host.items);
+                h.update(host.items);
+            }
+            if (x.raw_kv.len > 0) for ([_]cuda.DeviceBuffer{ x.raw_kv, x.raw_score }) |raw| {
+                try host.resize(self.gpa, raw.len);
+                try raw.download(0, host.items);
+                h.update(host.items);
+            };
+        };
+        for (self.view_rings) |r| {
+            try host.resize(self.gpa, r.len);
+            try r.download(0, host.items);
+            h.update(host.items);
+        }
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
+    }
+
+    /// Rank 0: the kept prompts stream `slot`'s prompt will cover when it finishes (`Book.covered`), into `out`.
+    pub fn covered(self: *const Streams, slot: usize, out: []u32) usize {
+        const l = &self.lanes[slot];
+        if (!self.book.set.on or l.marks.n == 0) return 0;
+        var have: [kept_prompts.max_marks]usize = undefined;
+        for (l.marks.slice(), have[0..l.marks.n]) |m, *at| at.* = m.at;
+        return self.book.covered(l.hist[0..l.prompt_len], have[0..l.marks.n], self.keep_replay, out);
     }
 
     /// The view's decode loop with the window's taps written into `taps` (dspark's tap layers' inputs).
@@ -1204,13 +1470,32 @@ pub const Streams = struct {
         }
     }
 
-    /// The stream in `slot` leaves: its extent free again (multi.py `_release`).
+    /// The stream in `slot` leaves: its extent free again (multi.py `_release`), its snapshots let go.
     pub fn free(self: *Streams, slot: usize) void {
         if (slot >= self.lanes.len or !self.lanes[slot].busy) return;
         const l = &self.lanes[slot];
         self.extents.give(l.base, l.size);
+        for (l.marks.slice()) |m| self.snap_refs[m.snap] -|= 1;
+        l.marks = .{};
         l.busy = false;
         l.held = 0;
+    }
+
+    /// multi.py `_finish` for the stream in `slot`: with kept prompts on and a snapshot taken, its prompt stays as a
+    /// kept prompt (`Book.keep`: its rows to its last kept boundary, the rest of its extent free again), else it
+    /// leaves (`free`); then the kept prompts `drops` (rank 0's `covered`) go, and the oldest past the entries.
+    pub fn finish(self: *Streams, slot: usize, drops: []const u32) void {
+        if (slot >= self.lanes.len or !self.lanes[slot].busy) return;
+        const l = &self.lanes[slot];
+        const owned: ?[]i32 = if (self.book.set.on and l.marks.n > 0) self.gpa.alloc(i32, l.marks.last().?) catch null else null;
+        if (owned) |o| {
+            self.book.keep(&self.extents, l.base, l.size, l.hist[0..l.prompt_len], &l.marks, self.keep_replay, o);
+            l.marks = .{};
+            l.busy = false;
+            l.held = 0;
+        } else self.free(slot);
+        self.book.finish(&self.extents, drops);
+        self.settle();
     }
 
     /// Whether no stream holds a slot.
@@ -1431,6 +1716,17 @@ pub const Engine = struct {
         try e.streams.init(gpa, ctx.d, &e.fwd, &e.kernels, e.engram, e.chunk, e.stream, e.drafter, s.slots, s.context + extra);
         errdefer e.streams.deinit();
         if (s.rank == 0) std.log.info("deepseek_v41: {d} stream slots over a window of {d} positions ({d:.2} GiB), prompts in chunks of {d} rows{s}", .{ s.slots, e.streams.extents.total, @as(f64, @floatFromInt(cuda.usage(false).device - before)) / (1 << 30), e.chunk, if (s.replay) ", bounded replay (TF_DS_REPLAY=1)" else "" });
+        {
+            const ks = kept_prompts.Settings.fromEnv();
+            try e.streams.enableKeep(ks, e.chunk, s.replay);
+            const st = &e.streams;
+            if (s.rank == 0) {
+                if (st.book.set.on)
+                    std.log.info("deepseek_v41: kept prompts (TF_DS_KEEP): up to {d}, {d} boundaries each, {d} ring snapshots of {d:.1} MiB ({d:.0} MiB){s}", .{ ks.entries, ks.marks, ks.snaps, @as(f64, @floatFromInt(st.snap_bytes)) / (1 << 20), @as(f64, @floatFromInt(st.snaps.len)) / (1 << 20), if (ks.check) "; every continuation checked against a prefill from 0 (TF_DS_KEEP_CHECK=1)" else "" })
+                else
+                    std.log.info("deepseek_v41: kept prompts off{s}", .{if (ks.on) " (a compressor's ratio does not divide the chunk)" else " (TF_DS_KEEP=0)"});
+            }
+        }
         clock.mark("the stream pool", .{});
         if (getenv("TF_DS_PROFILE") != null) try e.streams.pr.enableProfile();
         // the communicator after the loads: each rank loads on its own, then they meet (rank 1 retries its
@@ -1533,8 +1829,10 @@ pub const Engine = struct {
         const head = op[0..@min(op.len, 48)];
         std.log.err("rank {d}: step {d} record {s}, {d} bytes, runnable here {}, first bytes {x}; digests {any}", .{ e.settings.rank, e.stepped, code, op.len, can_run, head, every });
         for (e.streams.lanes, 0..) |l, i| if (l.busy) {
-            std.log.err("rank {d}:   slot {d}: extent [{d}, +{d}), pos {d}, window {d}+{d} (row {d}), absorbed {d}, held {d}", .{ e.settings.rank, i, l.base, l.size, l.pos, l.verify_start, l.verify_rows, l.row0, l.absorbed, l.held });
+            std.log.err("rank {d}:   slot {d}: extent [{d}, +{d}), pos {d}, window {d}+{d} (row {d}), absorbed {d}, held {d}, prompt {d}, {d} snapshots", .{ e.settings.rank, i, l.base, l.size, l.pos, l.verify_start, l.verify_rows, l.row0, l.absorbed, l.held, l.prompt_len, l.marks.n });
         };
+        for (e.streams.book.slice()) |k| std.log.err("rank {d}:   kept prompt {d}: extent [{d}, +{d}), top {d}, tick {d}, {d} snapshots", .{ e.settings.rank, k.eid, k.base, k.size, k.top, k.tick, k.marks.n });
+        std.log.err("rank {d}:   window book fingerprint {x}", .{ e.settings.rank, e.streams.fingerprint() });
     }
 
     /// Rank 0 sends the step to every other rank, then every rank agrees on it. A failure breaks the lane: a
@@ -1570,7 +1868,8 @@ pub const Engine = struct {
             .admit => {
                 const a = try Admit.parse(op);
                 if (a.len() > e.ids_buf.len) return error.PromptTooLong;
-                try e.streams.admit(e.gather(), a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk, a.replay);
+                const how = try e.streams.admitKept(e.gather(), a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk, a.replay, a.reuse, a.check);
+                if (a.reuse) |r| if (e.settings.rank == 0) std.log.info("deepseek_v41: kept prompt {d}: continued at {d} of {d} ({s}); {d} kept prompts", .{ r.eid, r.cut, a.len(), @tagName(how), e.streams.book.n });
             },
             .rounds => {
                 var r: Round = undefined;
@@ -1587,7 +1886,10 @@ pub const Engine = struct {
                 try Keeps.parse(op, &k);
                 for (k.asks[0..k.count]) |a| try e.streams.keep(a);
             },
-            .free => e.streams.free(op[1]),
+            .free => {
+                const f = try Free.parse(op);
+                e.streams.finish(f.slot, f.drops[0..f.n]);
+            },
             .measure => try e.runMeasure(try Measure.parse(op)),
             else => return error.BadRecord,
         }
@@ -1638,7 +1940,9 @@ pub const Engine = struct {
         switch (code) {
             .admit => {
                 const a = Admit.parse(op) catch return false;
-                return a.engram == (e.engram != null) and a.drafts == (e.drafter != null) and a.len() <= e.ids_buf.len and st.admits(a.slot, a.base, a.size, a.len(), a.chunk);
+                if (a.engram != (e.engram != null) or a.drafts != (e.drafter != null) or a.len() > e.ids_buf.len) return false;
+                if (a.keep != st.book.set.on or a.check != (st.book.set.check and a.reuse != null) or a.book != st.fingerprint()) return false;
+                return st.admitsKept(a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk, a.replay, a.reuse);
             },
             .rounds => {
                 var r: Round = undefined;
@@ -1656,7 +1960,10 @@ pub const Engine = struct {
                 for (k.asks[0..k.count]) |a| if (!st.keepable(a)) return false;
                 return true;
             },
-            .free => return op.len == 2 and op[1] < st.lanes.len and st.lanes[op[1]].busy,
+            .free => {
+                const f = Free.parse(op) catch return false;
+                return f.slot < st.lanes.len and st.lanes[f.slot].busy and f.book == st.fingerprint();
+            },
             .measure => {
                 const m = Measure.parse(op) catch return false;
                 return m.slots == st.lanes.len and m.total == st.extents.total and m.engram == (e.engram != null) and m.drafts == (e.drafter != null) and st.idle();
@@ -1873,8 +2180,9 @@ pub const Lanes = struct {
         return error.UnknownStream;
     }
 
-    /// The stream into the lowest free slot and the first extent that holds its prompt, its reply and a round's
-    /// rows (multi.py `admit`): its prompt fills the slot now, on every rank; its first token is drawn.
+    /// The stream into the lowest free slot and the extent the window book places for its prompt, its reply and a
+    /// round's rows (multi.py `admit`): its prompt fills the slot now, on every rank, from the longest kept boundary
+    /// it shares with a kept prompt (`s.cached`, usage's cached tokens) or from 0; its first token is drawn.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
         const e = self.e;
@@ -1889,13 +2197,20 @@ pub const Lanes = struct {
             break;
         };
         const free = slot orelse return error.NoRoom;
-        const base = st.extents.first(need) orelse return error.NoRoom;
+        // the kept prompt this one continues the furthest (multi.py `_match`), and where the book will place it
+        const reuse = if (st.keeping(e.settings.replay)) st.book.match(ptoks, e.settings.replay) else null;
+        const size = Extents.size(need);
+        const placed = st.trialPlace(size, reuse) orelse return error.NoRoom;
         // a cancel is honoured only before the step is announced
         if (s.isCancelled()) return error.Cancelled;
         const ids = e.ids_buf[0..ptoks.len];
         for (ids, ptoks) |*id, t| id.* = t;
-        const op = Admit.encode(e.op_buf, .{ .slot = free, .engram = e.engram != null, .drafts = e.drafter != null, .replay = e.settings.replay, .chunk = e.chunk, .base = base, .size = Extents.size(need), .ids = &.{} }, ids);
+        const op = Admit.encode(e.op_buf, .{
+            .slot = free, .engram = e.engram != null, .drafts = e.drafter != null, .replay = e.settings.replay, .chunk = e.chunk, .base = placed.base, .size = size,
+            .reuse = reuse, .check = st.book.set.check and reuse != null, .keep = st.book.set.on, .book = st.fingerprint(), .ids = &.{},
+        }, ids);
         try e.both(op);
+        s.cached = if (reuse) |r| @intCast(r.cut) else 0;
         self.owner[free] = s;
         var first: [1]u32 = undefined;
         try st.argmaxRows(0, &first);
@@ -2006,8 +2321,11 @@ pub const Lanes = struct {
         self.owner[slot] = null;
         const e = self.e;
         if (!e.streams.lanes[slot].busy or e.broken) return;
-        const op = [_]u8{ @intFromEnum(Op.free), @intCast(slot) };
-        e.both(&op) catch |err| std.log.err("release: {s}", .{@errorName(err)});
+        // the kept prompts this stream's prompt covers go when it is kept (multi.py `_covered`)
+        var drops: [kept_prompts.max_kept]u32 = undefined;
+        const n = e.streams.covered(slot, &drops);
+        const op = Free.encode(e.op_buf, slot, e.streams.fingerprint(), drops[0..n]);
+        e.both(op) catch |err| std.log.err("release: {s}", .{@errorName(err)});
     }
 };
 
@@ -2171,7 +2489,7 @@ test "extents: first fit, taken extents never overlap, freed extents merge back 
     try std.testing.expect(!ex.takeAt(1, 10));
 }
 
-test "admission, round, drafts, keeps and measure records parse back to what was encoded; cut or foreign ones are refused" {
+test "admission, free, round, drafts, keeps and measure records parse back to what was encoded; cut or foreign ones are refused" {
     var prng = std.Random.DefaultPrng.init(0x9a7a);
     const r = prng.random();
     var buf: [Admit.header + 8 * 64]u8 = undefined;
@@ -2180,10 +2498,23 @@ test "admission, round, drafts, keeps and measure records parse back to what was
     for (0..300) |_| {
         const n = r.intRangeAtMost(usize, 0, ids.len);
         for (ids[0..n]) |*id| id.* = r.int(i64);
-        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .ids = &.{} };
+        const reuse: ?kept_prompts.Reuse = if (r.boolean()) .{ .eid = r.int(u32), .cut = r.int(u40) } else null;
+        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .reuse = reuse, .check = r.boolean(), .keep = r.boolean(), .book = r.int(u64), .ids = &.{} };
         const op = Admit.encode(&buf, a, ids[0..n]);
         const p = try Admit.parse(op);
         try std.testing.expect(p.slot == a.slot and p.engram == a.engram and p.drafts == a.drafts and p.replay == a.replay and p.chunk == a.chunk and p.base == a.base and p.size == a.size);
+        try std.testing.expect(std.meta.eql(p.reuse, a.reuse) and p.check == a.check and p.keep == a.keep and p.book == a.book);
+
+        var drops: [kept_prompts.max_kept]u32 = undefined;
+        const nd = r.intRangeAtMost(usize, 0, drops.len);
+        for (drops[0..nd]) |*d| d.* = r.int(u32);
+        var fbuf: [Free.header + 4 * kept_prompts.max_kept]u8 = undefined;
+        const fop = Free.encode(&fbuf, a.slot, a.book, drops[0..nd]);
+        const f = try Free.parse(fop);
+        try std.testing.expect(f.slot == a.slot and f.book == a.book);
+        try std.testing.expectEqualSlices(u32, drops[0..nd], f.drops[0..f.n]);
+        try std.testing.expectError(error.BadRecord, Free.parse(fop[0 .. fop.len - 1]));
+        try std.testing.expectError(error.BadRecord, Admit.parse(fop));
         try std.testing.expectEqualSlices(i64, ids[0..n], p.idsInto(&back));
         try std.testing.expectError(error.BadRecord, Admit.parse(op[0 .. op.len - 1]));
         try std.testing.expectError(error.BadRecord, Prefill.parse(op));
