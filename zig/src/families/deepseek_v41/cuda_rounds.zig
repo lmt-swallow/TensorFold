@@ -36,9 +36,12 @@
 //! once as CUDA graphs, one a stretch of layers (cut before each Engram layer when Engram runs: its host read and
 //! upload stay eager between the stretches, as the fork's ENGRAM_SPLIT), and replayed; a replay runs the eager path's
 //! launches with the same arguments, so it writes the same bytes. The gathers are recorded with the rest (the
-//! communicator's all-gather runs on the round's stream). The host selection (TF_DS_TOPK=host), a probe and buckets
-//! past `graph_bucket_max` stay eager. Every rank records the same graphs in the same order: the keys follow from
-//! the windows alone.
+//! communicator's all-gather runs on the round's stream). The host selection (TF_DS_TOPK=host) and a probe stay
+//! eager. Keys at buckets up to `graph_bucket_max` are kept once recorded; keys at wider buckets are recorded on first
+//! use and held under `graph_budget` bytes (TF_DS_GRAPH_MIB), the least recently replayed dropped first
+//! (TF_DS_GRAPH_ALL=0, or a budget of 0: wider buckets run eager). Every rank records the same keys in the same order:
+//! they follow from the windows alone. A capture issues no collective (the gathers are recorded, not run), so a rank
+//! that drops and records a key again where the other replays it still runs the same gathers in the same order.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -247,6 +250,21 @@ pub const GraphLaunch = struct {
 pub fn graphsFromEnv() bool {
     const v = std.mem.span(std.c.getenv("TF_DS_GRAPHS") orelse return true);
     return !std.mem.eql(u8, v, "0");
+}
+
+/// MiB the keys of buckets past the kept ones may hold unless TF_DS_GRAPH_MIB says otherwise.
+pub const graph_mib_default: usize = 1024;
+
+/// `RoundRunner.graph_budget` from the environment: 0 when TF_DS_GRAPH_ALL is "0" (rounds past the kept buckets run
+/// eager), else TF_DS_GRAPH_MIB (default `graph_mib_default`) MiB; error.BadEnvironment when that is not a number.
+pub fn graphBudgetFromEnv() error{BadEnvironment}!usize {
+    if (std.c.getenv("TF_DS_GRAPH_ALL")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return 0;
+    const n = if (std.c.getenv("TF_DS_GRAPH_MIB")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadEnvironment else graph_mib_default;
+    return n << 20;
+}
+
+fn mib(bytes: usize) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1 << 20);
 }
 
 /// The distinct compress ratios a runner keeps tables for.
@@ -560,10 +578,40 @@ const SegState = struct {
 /// One key's graphs: a stretch's executable (null until recorded), the gathers it replays, the state at its end.
 const Graphs = struct {
     n: usize,
+    bucket: usize,
     execs: [max_segments]?cuda.graph.Exec = @splat(null),
     gathers: [max_segments]usize = @splat(0),
     after: [max_segments]SegState = @splat(.{}),
+    /// The device memory its stretches took when recorded (the drop in cuMemGetInfo's free bytes, at least 0).
+    bytes: usize = 0,
+    /// The round (`RoundRunner.rounds`) that last replayed it.
+    used: u64 = 0,
 };
+
+/// The key to drop for room (`RoundRunner.graph_budget`): among `keys`' wider-than-`kept` buckets other than
+/// `current`, the least recently used (`used`, then the smaller key: the same on every rank); null when none is.
+fn lruVictim(keys: []const u64, used: []const u64, buckets: []const usize, kept: usize, current: u64) ?usize {
+    var best: ?usize = null;
+    for (keys, used, buckets, 0..) |k, u, b, i| {
+        if (b <= kept or k == current) continue;
+        if (best) |j| {
+            if (u > used[j] or (u == used[j] and k > keys[j])) continue;
+        }
+        best = i;
+    }
+    return best;
+}
+
+test "lruVictim: the least recently used key past the kept buckets, never the current one" {
+    const keys = [_]u64{ 10, 11, 12, 13 };
+    const used = [_]u64{ 5, 2, 2, 1 };
+    const buckets = [_]usize{ 16384, 16384, 32768, 8192 };
+    // 13 is older but kept (bucket 8192); 11 and 12 tie: the smaller key
+    try std.testing.expectEqual(@as(?usize, 1), lruVictim(&keys, &used, &buckets, 8192, 99));
+    try std.testing.expectEqual(@as(?usize, 2), lruVictim(&keys, &used, &buckets, 8192, 11));
+    try std.testing.expectEqual(@as(?usize, null), lruVictim(keys[3..], used[3..], buckets[3..], 8192, 99));
+    try std.testing.expectEqual(@as(?usize, null), lruVictim(keys[0..1], used[0..1], buckets[0..1], 8192, 10));
+}
 
 /// A gather that counts its calls (a capture's).
 const Counted = struct {
@@ -630,9 +678,20 @@ pub const RoundRunner = struct {
     captures: usize,
     /// Called before each graph launch (tests' gather supplies; the communicator needs none).
     launch_hook: ?GraphLaunch = null,
-    /// Rounds at wider buckets run eager: each bucket's graphs hold their recorded all-gathers' resources (about
-    /// 0.65 GiB a bucket for 16 row counts at 43 layers), so recording every bucket of a long context would not fit.
+    /// Keys at buckets up to this one are kept once recorded (`Streams.warm` records them at load). Each key's
+    /// graphs hold their recorded all-gathers' resources (about 40 MiB a key of 3 stretches at 43 layers), so the
+    /// keys of wider buckets are held under `graph_budget`.
     graph_bucket_max: usize = std.math.maxInt(usize),
+    /// Bytes the keys past `graph_bucket_max` may hold (their `Graphs.bytes`); 0: rounds at those buckets run eager.
+    graph_budget: usize = 0,
+    /// The bytes the keys past `graph_bucket_max` hold now, and the most one of them took.
+    long_bytes: usize = 0,
+    long_most: usize = 0,
+    /// Keys past `graph_bucket_max` recorded and dropped so far.
+    long_records: usize = 0,
+    long_drops: usize = 0,
+    /// The rounds run (each key's `used` is one of these).
+    rounds: u64 = 0,
     // the layer loop's state between stretches (`segment`)
     st: SegState,
     // the scored indexer (buckets past idx_topk compressed entries)
@@ -787,6 +846,12 @@ pub const RoundRunner = struct {
         self.captures = 0;
         self.launch_hook = null;
         self.graph_bucket_max = std.math.maxInt(usize);
+        self.graph_budget = 0;
+        self.long_bytes = 0;
+        self.long_most = 0;
+        self.long_records = 0;
+        self.long_drops = 0;
+        self.rounds = 0;
         self.st = .{};
         self.iq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
         self.iqq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
@@ -977,7 +1042,10 @@ pub const RoundRunner = struct {
         if (self.engram != null) {
             for (windows, 0..) |wd, i| spans[i] = .{ .ids = wd.host, .start = wd.position, .n = wd.ids.len };
         }
-        const entry: ?*Graphs = if (self.graphed() and self.round_bucket <= self.graph_bucket_max) try self.graphsFor(R, self.round_bucket, ns) else null;
+        self.rounds += 1;
+        const entry: ?*Graphs = if (self.graphed()) try self.graphsFor(R, self.round_bucket, ns, stream) else null;
+        if (entry) |g| g.used = self.rounds;
+        const fresh = if (entry) |g| g.execs[0] == null and g.bucket > self.graph_bucket_max else false;
         var nb: [48]u8 = undefined;
         for (segs[0..ns], 0..) |sg, k| {
             if (k > 0) {
@@ -993,6 +1061,7 @@ pub const RoundRunner = struct {
                 self.st = g.after[k];
             } else try self.segment(segs[0..ns], k, R, gather, stream);
         }
+        if (fresh) std.log.info("deepseek_v41: round graphs of {d} rows at bucket {d} recorded ({d:.1} MiB); the buckets past {d} hold {d:.0} of {d} MiB ({d} keys recorded, {d} dropped)", .{ R, self.round_bucket, mib(entry.?.bytes), self.graph_bucket_max, mib(self.long_bytes), self.graph_budget >> 20, self.long_records, self.long_drops });
         return self.logits.ptr;
     }
 
@@ -1014,7 +1083,7 @@ pub const RoundRunner = struct {
             for (rows) |R| {
                 if (R < 1 or R > max_rows) return error.TooManyRows;
                 self.round_bucket = b;
-                const g = try self.graphsFor(R, b, ns);
+                const g = (try self.graphsFor(R, b, ns, stream)) orelse continue;
                 for (0..ns) |k| {
                     try self.record(g, segs[0..ns], k, R, gather, stream);
                     self.st = g.after[k];
@@ -1045,25 +1114,74 @@ pub const RoundRunner = struct {
             self.gpa.destroy(g.*);
         }
         self.execs.clearRetainingCapacity();
+        self.long_bytes = 0;
     }
 
-    fn graphsFor(self: *RoundRunner, R: usize, bucket: usize, ns: usize) !*Graphs {
-        const key: u64 = @as(u64, R) | @as(u64, ns) << 5 | @as(u64, bucket) << 9;
-        const got = try self.execs.getOrPut(self.gpa, key);
-        if (!got.found_existing) {
-            got.value_ptr.* = self.gpa.create(Graphs) catch |err| {
-                _ = self.execs.remove(key);
-                return err;
-            };
-            got.value_ptr.*.* = .{ .n = ns };
+    /// The device memory every recorded key holds (each `Graphs.bytes`).
+    pub fn graphBytes(self: *const RoundRunner) usize {
+        var n: usize = 0;
+        var it = self.execs.valueIterator();
+        while (it.next()) |g| n += g.*.bytes;
+        return n;
+    }
+
+    /// The key (R, bucket, stretches)'s graphs, made (none recorded) when missing; null when the round runs eager:
+    /// a bucket past `graph_bucket_max` with no budget, or with no room for one more key after dropping every
+    /// other key past it.
+    fn graphsFor(self: *RoundRunner, R: usize, bucket: usize, ns: usize, stream: cuda.Stream) !?*Graphs {
+        const key: u64 = @as(u64, R) | @as(u64, ns) << 6 | @as(u64, bucket) << 10;
+        if (self.execs.get(key)) |g| return g;
+        if (bucket > self.graph_bucket_max) {
+            if (self.graph_budget == 0) return null;
+            // room for one more key of the size the widest so far took (the first: assumed to fit)
+            while (self.long_bytes + self.long_most > self.graph_budget) {
+                if (!try self.dropOne(key, stream)) return null;
+            }
         }
+        const got = try self.execs.getOrPut(self.gpa, key);
+        got.value_ptr.* = self.gpa.create(Graphs) catch |err| {
+            _ = self.execs.remove(key);
+            return err;
+        };
+        got.value_ptr.*.* = .{ .n = ns, .bucket = bucket };
         return got.value_ptr.*;
+    }
+
+    /// Drops the least recently replayed key past `graph_bucket_max` other than `keep` (`lruVictim`), after the
+    /// launches queued on `stream` (which may replay it) finish. False when there is none.
+    fn dropOne(self: *RoundRunner, keep: u64, stream: cuda.Stream) !bool {
+        var keys: std.ArrayList(u64) = .empty;
+        defer keys.deinit(self.gpa);
+        var used: std.ArrayList(u64) = .empty;
+        defer used.deinit(self.gpa);
+        var buckets: std.ArrayList(usize) = .empty;
+        defer buckets.deinit(self.gpa);
+        var it = self.execs.iterator();
+        while (it.next()) |e| {
+            try keys.append(self.gpa, e.key_ptr.*);
+            try used.append(self.gpa, e.value_ptr.*.used);
+            try buckets.append(self.gpa, e.value_ptr.*.bucket);
+        }
+        const i = lruVictim(keys.items, used.items, buckets.items, self.graph_bucket_max, keep) orelse return false;
+        try stream.synchronize();
+        const g = self.execs.fetchRemove(keys.items[i]).?.value;
+        for (&g.execs) |*e| if (e.*) |*x| {
+            x.deinit();
+            e.* = null;
+        };
+        self.long_bytes -|= g.bytes;
+        self.long_drops += 1;
+        self.gpa.destroy(g);
+        return true;
     }
 
     /// Stretch `k` of `g` recorded (from the state the stretch before it left) unless it already is.
     fn record(self: *RoundRunner, g: *Graphs, segs: []const Seg, k: usize, R: usize, gather: fwd.Gather, stream: cuda.Stream) !void {
         if (g.execs[k] != null) return;
         if (k > 0) self.st = g.after[k - 1];
+        var free0: usize = 0;
+        var total: usize = 0;
+        _ = self.d.api.cuMemGetInfo_v2(&free0, &total);
         var counted: Counted = .{ .inner = gather };
         const cg: fwd.Gather = .{ .ctx = &counted, .call = Counted.call };
         try cuda.graph.beginCapture(stream, .thread_local);
@@ -1083,6 +1201,15 @@ pub const RoundRunner = struct {
         g.gathers[k] = counted.n;
         g.after[k] = self.st;
         self.captures += 1;
+        var free1: usize = 0;
+        _ = self.d.api.cuMemGetInfo_v2(&free1, &total);
+        const took = free0 -| free1;
+        g.bytes += took;
+        if (g.bucket > self.graph_bucket_max) {
+            self.long_bytes += took;
+            self.long_most = @max(self.long_most, g.bytes);
+            if (k + 1 == g.n) self.long_records += 1;
+        }
     }
 
     /// The round's stretches: one, or (an Engram hook set) cut before each Engram layer (layer 0's: after the

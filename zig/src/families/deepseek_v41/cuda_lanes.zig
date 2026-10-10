@@ -64,8 +64,9 @@ pub const rope_align: usize = 4096;
 
 pub const Error = error{ WorldNotTwo, BadMaster, NoRankCache, NoRopeTables, RopeRowsShort, OutOfStep, LinkClosed, SamplingNotSupported, WindowTooWide, PositionMismatch, UnknownStream, StreamBusy, PromptTooLong, Cancelled, NoDraftHead, NotPipelined, TreesNotBuilt, EmptyPath, BadChunk, BadRecord, NoHeldDrafts, NoFirstToken, BadTapLayers, BadSlots, NoRoom };
 
-/// The widest bucket whose round graphs are recorded (at load, `Streams.warm`); rounds at wider buckets run eager
-/// (`RoundRunner.graph_bucket_max`: a bucket's graphs take about 0.65 GiB).
+/// The widest bucket whose round graphs are recorded at load (`Streams.warm`) and kept; the keys of wider buckets
+/// are recorded on first use under TF_DS_GRAPH_MIB (`RoundRunner.graph_budget`: a bucket's 16 row counts take about
+/// 0.65 GiB).
 pub const warm_bucket_max: usize = 8192;
 
 /// A drafting round's widest window by default: the pending token and DSpark's block of drafts (engine.py: drafts
@@ -1705,6 +1706,7 @@ pub const Streams = struct {
     /// the same streams.
     pub fn warm(self: *Streams, gather: forward.Gather) !void {
         self.runner.graph_bucket_max = warm_bucket_max;
+        self.runner.graph_budget = try rounds.graphBudgetFromEnv();
         var rows: [max_rows]usize = undefined;
         for (&rows, 1..) |*r, i| r.* = i;
         var buckets: [8]usize = undefined;
@@ -1905,7 +1907,7 @@ pub const Engine = struct {
             try e.streams.warm(e.gather());
             mem_note.note(ctx.d, "the round and draft graphs", .{});
             const free1 = (try ctx.memInfo()).free;
-            if (s.rank == 0 and e.streams.runner.graphs) std.log.info("deepseek_v41: {d} round graphs and {d} draft graphs recorded in {d:.1} s, {d:.0} MiB (buckets {d} .. {d}; wider ones run eager)", .{ e.streams.runner.graphCount(), if (e.drafter) |dr| dr.captures else 0, msSince(t0) / 1000, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20), rounds.bucket_min, @min(warm_bucket_max, e.streams.runner.bucket) });
+            if (s.rank == 0 and e.streams.runner.graphs) std.log.info("deepseek_v41: {d} round graphs and {d} draft graphs recorded in {d:.1} s, {d:.0} MiB (buckets {d} .. {d}; wider ones {s} {d} MiB)", .{ e.streams.runner.graphCount(), if (e.drafter) |dr| dr.captures else 0, msSince(t0) / 1000, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20), rounds.bucket_min, @min(warm_bucket_max, e.streams.runner.bucket), if (e.streams.runner.graph_budget > 0) "recorded on first use, held under" else "eager (TF_DS_GRAPH_ALL=0), budget", e.streams.runner.graph_budget >> 20 });
         }
         e.agree_send = try cuda.DeviceBuffer.alloc(ctx.d, 16);
         errdefer e.agree_send.free();
