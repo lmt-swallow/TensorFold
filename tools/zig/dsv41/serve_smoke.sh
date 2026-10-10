@@ -10,7 +10,8 @@
 #
 # Environment: R0/R1 (ssh names, default spark-616b/spark-9e43), MASTER (rank 0's address on the NCCL link, 10.0.1.1),
 # ROPE (device: the RoPE frequencies ~/aot/$KERNELS/rope/rope_{c,w}_freqs.bin; table: the whole tables), BUILD_HOST and BUILD_BIN (where the built binary is: spark-9e43, ~/src/TensorFold/zig-out/native/bin/tensorfold-native),
-# CONTEXT (16384), MAX_TOKENS (64), ENGRAM (the Engram tables under ~/models, DeepSeek-V4.1-Flash-Engram; empty: run
+# CONTEXT (16384: a stream's positions at most), POOL (TF_DS_POOL: the positions the streams share, at least CONTEXT and
+# a multiple of 2048; empty: CONTEXT), MAX_TOKENS (64), ENGRAM (the Engram tables under ~/models, DeepSeek-V4.1-Flash-Engram; empty: run
 # without them, degraded; the token map is ~/aot/$KERNELS/token_map.json on both nodes), LOG_DIR (where both ranks' logs are kept), FORCE=1 (start even when the GPU
 # already has compute processes), NO_COPY=1 (use the ~/bin/tensorfold-native already on each node).
 set -euo pipefail
@@ -25,6 +26,7 @@ BUILD_BIN=${BUILD_BIN:-src/TensorFold/zig-out/native/bin/tensorfold-native}
 IMAGE=${IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}
 MODEL=${MODEL:-DeepSeek-V4.1-Flash-EXL3-2.9bpw}
 CONTEXT=${CONTEXT:-16384}
+POOL=${POOL:-}                 # TF_DS_POOL (empty: the context)
 MAX_TOKENS=${MAX_TOKENS:-64}
 ENGRAM=${ENGRAM-DeepSeek-V4.1-Flash-Engram}
 KERNELS=${KERNELS:-dsv41-all}   # the captured Triton set under ~/aot (aot.json, cubins, rope/, token_map.json)
@@ -128,7 +130,7 @@ fi
 sum0=$(on "$R0" "sha256sum \$HOME/bin/tensorfold-native | cut -c1-16")
 sum1=$(on "$R1" "sha256sum \$HOME/bin/tensorfold-native | cut -c1-16")
 [ "$sum0" = "$sum1" ] || die "the binaries differ between the nodes ($sum0 vs $sum1)"
-say "binary $sum0 on both nodes; context $CONTEXT, RoPE $ROPE ($ROWS positions)"
+say "binary $sum0 on both nodes; context $CONTEXT, pool ${POOL:-$CONTEXT}, RoPE $ROPE ($ROWS positions)"
 
 # -- the ranks ----------------------------------------------------------------------------------------------------
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
@@ -136,6 +138,7 @@ DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/
 ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE -e TF_DS_REPLAY=$REPLAY -e TF_DS_ROPE=$ROPE"
 ENVS="$ENVS -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
+[ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
 [ "$DRAFTS" = 0 ] && SERVE="$SERVE --no-drafts"
