@@ -514,11 +514,6 @@ pub const extent_align: usize = kept_prompts.extent_align;
 /// Positions an extent holds past its stream's prompt and reply (multi.py `_need`: a round's rows, 8, and the
 /// scratch row's 4).
 pub const extent_tail: usize = max_rows + 8 + 4;
-/// Streams a batched draft takes at most: their blocks' rows fit the drafter's 16 (dspark.Drafter.max_rows).
-pub fn draftBatch(block: usize) usize {
-    return @max(1, dspark.Drafter.max_rows / @max(1, block));
-}
-
 /// multi.py `Extents` (cuda_keep.zig, beside the kept prompts' book that shares the window).
 pub const Extents = kept_prompts.Extents;
 
@@ -1455,7 +1450,7 @@ pub const Streams = struct {
     /// The drafts step (multi.py `_round`'s absorb of the kept rows, then `_drafts`): every stream's kept rows' taps
     /// into its slot's rings in one pass (dspark.py `absorb_many`, the rows in request order), each stream's length
     /// at them; then the drafting streams' blocks in batched passes over the DraftPool (dspark.py
-    /// `BatchDraftGraph`, at most `draftBatch` streams a pass), each stream holding its first `depth` drafts.
+    /// `BatchDraftGraph`, at most the drafter's `passStreams` a pass: every slot's), each stream holding its first `depth` drafts.
     pub fn draft(self: *Streams, asks: []const DraftAsk) !void {
         if (!self.draftable(asks)) return error.PositionMismatch;
         const sp = self.spark.?;
@@ -1491,7 +1486,7 @@ pub const Streams = struct {
             depth[n] = a.depth;
             n += 1;
         };
-        const per = draftBatch(sp.dims.block);
+        const per = sp.passStreams();
         var out: [max_slots]dspark.Drafts = undefined;
         var at: usize = 0;
         while (at < n) {
@@ -1594,7 +1589,7 @@ pub const Streams = struct {
     }
 
     /// Records the round graphs of 1 .. max_rows rows at the buckets bucket_min .. `warm_bucket_max` the runner scans
-    /// (wider buckets stay eager) and the batched drafts' of 1 .. `draftBatch` streams, ahead of the rounds and drafts
+    /// (wider buckets stay eager) and the batched drafts' of 1 .. `passStreams` streams, ahead of the rounds and drafts
     /// that replay them; nothing runs (TF_DS_GRAPHS=0: nothing to record). Every rank calls it at the same point with
     /// the same streams.
     pub fn warm(self: *Streams, gather: forward.Gather) !void {
@@ -1609,7 +1604,7 @@ pub const Streams = struct {
             nb += 1;
         }
         try self.runner.warm(&rows, buckets[0..nb], gather, self.stream);
-        if (self.spark) |sp| try sp.warmBatch(&self.dpool.?, @min(draftBatch(sp.dims.block), self.lanes.len), self.draftRope(), self.stream);
+        if (self.spark) |sp| try sp.warmBatch(&self.dpool.?, @min(sp.passStreams(), self.lanes.len), self.draftRope(), self.stream);
     }
 
     /// The timing step's drafts: `n` slots (0 ..) absorb the last probe round's first row at position 0, then one
@@ -1756,7 +1751,9 @@ pub const Engine = struct {
             mem_note.note(ctx.d, "the DSpark weights", .{});
             e.stages = try gpa.alloc(dspark.Stage, e.ds.?.blocks.len);
             for (e.stages, e.ds.?.blocks) |*st, *b| st.* = dspark.Stage.of(b);
-            e.drafter = try dspark.Drafter.init(gpa, ctx.d, dspark.dimsOf(&e.cfg, s.rank, s.world), &e.set, &e.glue, &e.ek, e.stages, dspark.headOf(&e.ds.?, &e.w.head), &e.comm);
+            var dims = dspark.dimsOf(&e.cfg, s.rank, s.world);
+            dims.streams = s.slots; // every slot's block in one pass
+            e.drafter = try dspark.Drafter.init(gpa, ctx.d, dims, &e.set, &e.glue, &e.ek, e.stages, dspark.headOf(&e.ds.?, &e.w.head), &e.comm);
             try e.drafter.?.enableWide(&e.kernels);
             std.log.info("deepseek_v41 rank {d}: DSpark drafter ({d} stages, taps of layers {any})", .{ s.rank, e.stages.len, e.cfg.dspark_taps.slice() });
             clock.mark("the DSpark drafter", .{});
@@ -1953,7 +1950,7 @@ pub const Engine = struct {
     }
 
     /// The measure step (every rank): rounds of 1 .. max_rows rows at position 0 of slot 0 (the least bucket), of
-    /// 1 and max_rows rows at the widest bucket (`probeDeep`), then batched drafts of 1 .. draftBatch streams, each
+    /// 1 and max_rows rows at the widest bucket (`probeDeep`), then batched drafts of 1 .. passStreams streams, each
     /// timed after a warm-up run. Rank 0 keeps the times. The positions follow from the record's window alone, so
     /// every rank runs the same buckets.
     fn runMeasure(e: *Engine, m: Measure) !void {
@@ -1962,7 +1959,7 @@ pub const Engine = struct {
         for (1..max_rows + 1) |n| e.round_ms[n - 1] = try e.timeRound(reps, n, 0);
         for ([_]usize{ 1, max_rows }, &e.round_deep_ms) |n, *ms| ms.* = try e.timeRound(reps, n, st.probeDeep(n));
         if (st.spark) |sp| {
-            const most = @min(draftBatch(sp.dims.block), st.lanes.len);
+            const most = @min(sp.passStreams(), st.lanes.len);
             for (1..most + 1) |n| {
                 var best: f64 = std.math.inf(f64);
                 for (0..reps + 1) |rep| {
@@ -2370,7 +2367,7 @@ pub const Lanes = struct {
         const e = self.e;
         try self.sendKeeps();
         try e.measure(reps);
-        const per = if (e.drafter) |dr| draftBatch(dr.dims.block) else 1;
+        const per = if (e.drafter) |dr| dr.passStreams() else 1;
         for (&self.shared_costs, 0..) |*c, i| {
             const rows = i + 1;
             var ms = e.round_ms[i];

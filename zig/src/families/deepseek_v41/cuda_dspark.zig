@@ -63,6 +63,10 @@ pub const Dims = struct {
     route_scale: f32,
     /// markov.py SPLIT (TP > 1): each rank scores its vocabulary half, the bests go through one gather a step.
     markov_split: bool = true,
+    /// The streams a batched draft takes at most (the pool's slots): the drafter's buffers hold their blocks'
+    /// rows, so every drafting stream of a round drafts in one pass (multi.py `_drafts`, one BatchDraftGraph a
+    /// stream count).
+    streams: usize = 4,
 };
 
 /// One draft block's device weights, as the drafter reads them (a view of cuda_weights.Layer or a fixture's).
@@ -315,6 +319,8 @@ pub const Drafter = struct {
     stages: []const Stage,
     head: Head,
     comm: ?*const cuda.comm.Comm,
+    /// Rows a draft pass holds: dims.streams blocks (every per-row buffer's rows).
+    rows: usize,
     /// When set, every gather goes here instead of `comm` (a test's supply of the other ranks' partials).
     gather_hook: ?GatherHook = null,
     /// The prompt GEMM for absorbs past 128 rows (`enableWide`); null: 128-row pieces of the row kernel.
@@ -402,8 +408,8 @@ pub const Drafter = struct {
     l2: rounds.L2,
 
     pub const max_absorb = 2048;
-    /// Rows a draft pass holds at most (kernels.DECODE_ROWS): N streams x the block.
-    pub const max_rows = 16;
+    /// Rows a draft pass may hold (its host tables' bound): `rows`, N streams x the block, is at most this.
+    pub const max_rows = 64;
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const attention.Glue, ex_kernels: *const experts_mod.Kernels, stages: []const Stage, head: Head, comm: ?*const cuda.comm.Comm) !*Drafter {
         return initWith(gpa, d, dims, set, glue, ex_kernels, stages, head, comm, null);
@@ -411,8 +417,8 @@ pub const Drafter = struct {
 
     /// `init` with the gathers going to `hook` when given (then `comm` may be null at any world).
     pub fn initWith(gpa: std.mem.Allocator, d: *const cuda.Driver, dims: Dims, set: *const aot.Set, glue: *const attention.Glue, ex_kernels: *const experts_mod.Kernels, stages: []const Stage, head: Head, comm: ?*const cuda.comm.Comm, hook: ?GatherHook) !*Drafter {
-        const n = max_rows; // every per-row buffer holds a batched draft's rows (N streams x the block)
-        if (dims.block > max_rows or dims.block < 1) return error.TooManyRows;
+        if (dims.block < 1 or dims.streams < 1 or dims.streams > Markov.np or dims.streams * dims.block > max_rows) return error.TooManyRows;
+        const n = dims.streams * dims.block; // every per-row buffer holds a batched draft's rows (N streams x the block)
         if (dims.world > 1 and comm == null and hook == null) return error.NoComm;
         const self = try gpa.create(Drafter);
         errdefer gpa.destroy(self);
@@ -426,6 +432,7 @@ pub const Drafter = struct {
         self.stages = stages;
         self.head = head;
         self.comm = comm;
+        self.rows = n;
         self.gather_hook = hook;
         self.wide = null;
         self.graphs = rounds.graphsFromEnv();
@@ -433,10 +440,13 @@ pub const Drafter = struct {
         self.captures = 0;
         self.launch_hook = null;
         self.counting = null;
-        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(2, max_absorb * 8) + attention.Uploads.room(5, max_rows * max_rows * 8) + attention.Uploads.room(Markov.np, 8));
+        self.uploads = try attention.Uploads.init(d, attention.Uploads.room(2, max_absorb * 8) + attention.Uploads.room(5, n * n * 8) + attention.Uploads.room(Markov.np, 8));
         errdefer self.uploads.deinit();
         self.hc = hc_mod.Hc.init(set, @intCast(dims.d), dims.hc_iters, dims.eps, dims.hc_eps);
         self.route = route_mod.Route.init(set, @intCast(dims.d), @intCast(dims.n_routed), @intCast(dims.topk), dims.route_scale, @intCast(dims.n_routed));
+        // a pass of more rows than one gate launch holds routes whole blocks a launch: the kernel set holds the
+        // gate's variants for a few streams' blocks
+        self.route.block = @intCast(dims.block);
         self.ex_scratch = try experts_mod.Scratch.init(d, stages[0].experts, n, dims.topk + 1);
         errdefer self.ex_scratch.deinit();
         self.markov = try Markov.init(gpa, d, set, dims);
@@ -444,7 +454,7 @@ pub const Drafter = struct {
         const D = dims.d;
         const nd = n * D;
         // the row tables
-        var tab: [16]i64 = @splat(0);
+        var tab: [max_rows]i64 = @splat(0);
         self.ids = try cuda.DeviceBuffer.alloc(d, n * 8);
         self.pos = try cuda.DeviceBuffer.alloc(d, n * 8);
         self.wpos = try cuda.DeviceBuffer.alloc(d, n * 8);
@@ -456,7 +466,7 @@ pub const Drafter = struct {
         self.zero = try cuda.DeviceBuffer.alloc(d, n * 8);
         try self.zero.fill8(0, null);
         self.emb_ids = try cuda.DeviceBuffer.alloc(d, n * 8);
-        self.emb2 = try cuda.DeviceBuffer.alloc(d, (max_rows + 1) * D * 2);
+        self.emb2 = try cuda.DeviceBuffer.alloc(d, (dims.streams + 1) * D * 2);
         // activations
         self.h = try cuda.DeviceBuffer.alloc(d, nd * hc_mod.hc_streams * 2);
         self.pre = try cuda.DeviceBuffer.alloc(d, n * 4 * 4);
@@ -568,6 +578,11 @@ pub const Drafter = struct {
             }
         }
         return self;
+    }
+
+    /// The streams one batched draft takes at most.
+    pub fn passStreams(self: *const Drafter) usize {
+        return self.rows / self.dims.block;
     }
 
     pub fn deinit(self: *Drafter) void {
@@ -685,10 +700,10 @@ pub const Drafter = struct {
     }
 
     /// dspark.py `BatchDraftGraph`: drafts for N streams in one pass, each stream's block at its own positions in its
-    /// own slot's rings (`pool`), the Markov loop batched. `embed`: the target's table; N x block rows <= max_rows.
+    /// own slot's rings (`pool`), the Markov loop batched. `embed`: the target's table; N <= `passStreams()`.
     pub fn batchDraft(self: *Drafter, pool: *const DraftPool, tokens: []const u32, q0: []const usize, slots: []const usize, embed: Ptr, rope: Rope, stream: cuda.Stream, out: []Drafts) !void {
         const N = tokens.len;
-        if (N == 0 or N * self.dims.block > max_rows or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
+        if (N == 0 or N > self.passStreams() or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
         const D = self.dims.d;
         for (tokens, 0..) |t, s| try self.emb2.copyFrom(s * D * 2, embed + @as(u64, t) * D * 2, D * 2, stream.handle);
         try self.emb2.copyFrom(N * D * 2, embed + @as(u64, self.dims.noise) * D * 2, D * 2, stream.handle);
@@ -699,7 +714,7 @@ pub const Drafter = struct {
     /// hook (tests; with a hook the pass runs eager, without one it replays its graph as `batchDraft`).
     pub fn batchDraftWithTable(self: *Drafter, pool: *const DraftPool, tokens: []const u32, q0: []const usize, slots: []const usize, table: Ptr, rope: Rope, stream: cuda.Stream, ctx: ?*anyopaque, hook: ?Hook, out: []Drafts) !void {
         const N = tokens.len;
-        if (N == 0 or N * self.dims.block > max_rows or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
+        if (N == 0 or N > self.passStreams() or q0.len != N or slots.len != N or out.len < N) return error.TooManyRows;
         try self.emb2.copyFrom(0, table, (N + 1) * self.dims.d * 2, stream.handle);
         try self.runRows(N, tokens, q0, slots, pool.rings, rope, stream, ctx, hook, out);
     }
@@ -969,7 +984,7 @@ pub const Drafter = struct {
     pub fn warmBatch(self: *Drafter, pool: *const DraftPool, most: usize, rope: Rope, stream: cuda.Stream) !void {
         if (!self.graphs or pool.rings.len > BatchGraph.max_rings) return;
         for (1..most + 1) |N| {
-            if (N * self.dims.block > max_rows) break;
+            if (N > self.passStreams()) break;
             _ = try self.batchGraph(N, pool.rings, rope, stream);
         }
         try stream.synchronize();
@@ -1026,7 +1041,7 @@ pub const Drafter = struct {
         try self.ropeHeads(self.q.ptr, ra, R, dm.heads, dm.hd, false, stream);
         // the block's keys, normalized, roped and quantized like the ring's, not stored (slots -1)
         try self.kvNormRope(self.ykv.ptr, s.kv_norm, ra, self.neg.ptr, ring, self.kvb.ptr, R, stream);
-        if (R > max_rows) return error.TooManyRows;
+        if (R > self.rows) return error.TooManyRows;
         const groups_h = dm.heads / 16;
         const picks: usize = (n + 31) / 32;
         const nblk: usize = dm.window / 32 + picks;

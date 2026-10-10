@@ -1,4 +1,4 @@
-//! The MoE gate of a decode or verify window (rows <= 16), as the Python family routes it at its defaults
+//! The MoE gate of a decode or verify window (rows <= 16; a batched draft's more rows in launches of 16), as the Python family routes it at its defaults
 //! (`kernels.py: rowmm_gate` + `route`, switches "rowmm" and "rowmm_parts" on): the gate's logits as chunk sums
 //! S [rows, K / 256, N] f32 (`_rowmm_parts`: a program a block of outputs and a 256-column chunk, every row of the
 //! window in it), then `_route_parts` adds a row's chunks in K order (rowmm2's accumulation, so rowmm's bits),
@@ -21,6 +21,10 @@ pub const Route = struct {
     scale: f32, // routed_scaling_factor
     shared_id: i32, // the shared expert's id (the experts' count minus one)
     pdl: bool = true,
+    /// Rows come in blocks of this many (a batched draft's streams' blocks; 1: any rows): more than `max_rows` rows
+    /// run in as few launches as hold them, each of the same whole blocks as near as can be (`launches`), so the
+    /// launches' row counts are the ones a few streams' passes use, whose variants the kernel sets hold.
+    block: u32 = 1,
 
     pub fn init(set: *const aot.Set, k: u32, n: u32, topk: u32, scale: f32, shared_id: i32) Route {
         return .{ .set = set, .k = k, .n = n, .topk = topk, .scale = scale, .shared_id = shared_id };
@@ -44,8 +48,32 @@ pub const Route = struct {
         return if (rows <= 6) .{ .bn = 16, .cpg = 1 } else .{ .bn = 8, .cpg = 1 };
     }
 
-    /// parts [rows, K / 256, N] = chunk sums of x [rows, K] bf16 . gate_w [N, K] fp16.
+    /// parts [rows, K / 256, N] = chunk sums of x [rows, K] bf16 . gate_w [N, K] fp16. A row's sums do not depend
+    /// on the rows beside it (kernels.py: rowmm_parts has rowmm's bits), so more than `max_rows` rows (a batched
+    /// draft's) run as `launches` launches.
     pub fn gate(self: *const Route, stream: cuda.Stream, x: Ptr, gate_w: Ptr, parts: Ptr, rows: u32) !void {
+        if (rows < 1) return error.BadShape;
+        var at: u32 = 0;
+        while (at < rows) {
+            const n = launchRows(rows, self.block, at);
+            try self.gateRows(stream, x + @as(u64, at) * self.k * 2, gate_w, parts + @as(u64, at) * self.chunks() * self.n * 4, n);
+            at += n;
+        }
+    }
+
+    /// The rows of the gate launch starting at row `at` of `rows` in blocks of `block`: the fewest launches of at
+    /// most `max_rows` whole blocks each, the blocks spread evenly (the later launches no larger), the last block
+    /// possibly short.
+    pub fn launchRows(rows: u32, block: u32, at: u32) u32 {
+        const b = @max(1, @min(block, max_rows));
+        const blocks = (rows + b - 1) / b;
+        const per = max_rows / b;
+        const launches = (blocks + per - 1) / per;
+        const each = (blocks + launches - 1) / launches;
+        return @min(each * b, rows - at);
+    }
+
+    fn gateRows(self: *const Route, stream: cuda.Stream, x: Ptr, gate_w: Ptr, parts: Ptr, rows: u32) !void {
         if (rows < 1 or rows > max_rows) return error.BadShape;
         const t = tile(rows);
         const kc = self.chunks();
@@ -64,3 +92,28 @@ pub const Route = struct {
         }, &.{ aot.ci("NE", self.n), aot.ci("NB", nb), aot.ci("TOPK", self.topk), aot.ci("SLOTS", self.slots()), aot.ci("SP", sp), aot.ci("KC", self.chunks()), aot.ci("PDL", @intFromBool(self.pdl)) });
     }
 };
+
+test "gate launches: at most 16 rows of whole blocks each, the fewest, covering every row once" {
+    for ([_]u32{ 1, 2, 3, 5, 7, 8 }) |block| {
+        for (1..65) |r| {
+            const rows: u32 = @intCast(r);
+            var at: u32 = 0;
+            var n_launch: u32 = 0;
+            while (at < rows) {
+                const n = Route.launchRows(rows, block, at);
+                try std.testing.expect(n >= 1 and n <= max_rows);
+                if (at + n < rows) try std.testing.expect(n % block == 0);
+                at += n;
+                n_launch += 1;
+            }
+            try std.testing.expectEqual(rows, at);
+            const blocks = (rows + block - 1) / block;
+            try std.testing.expectEqual((blocks + max_rows / block - 1) / (max_rows / block), n_launch);
+        }
+    }
+    // a 16-row round: one launch; four streams' blocks of five: two launches of ten
+    try std.testing.expectEqual(@as(u32, 16), Route.launchRows(16, 1, 0));
+    try std.testing.expectEqual(@as(u32, 10), Route.launchRows(20, 5, 0));
+    try std.testing.expectEqual(@as(u32, 10), Route.launchRows(20, 5, 10));
+    try std.testing.expectEqual(@as(u32, 15), Route.launchRows(15, 5, 0));
+}

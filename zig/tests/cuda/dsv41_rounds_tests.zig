@@ -191,10 +191,69 @@ pub fn draftPool(gpu: Gpu, dir: []const u8, aot_override: ?[]const u8) !void {
         }
     }
     try check.expect(h.failures == 0, "dsv41-draft-pool: {d} stage(s) differ from the Python fork", .{h.failures});
+    try rowInvariance(gpa, gpu, drafter, stages_n, slots_n, dims, rope, h.stream);
     if (getenv("TF_DS_DRAFT_TIME")) |v| try timeDrafts(gpa, gpu, drafter, stages_n, slots_n, dims, rope, h.stream, try std.fmt.parseInt(usize, v, 10));
 }
 
-/// Batched draft passes of 2 and 3 streams (the fixture's cases: its AOT set holds their variants) (slots 0 .., each absorbed to 40 positions of noise taps), eager and
+/// A batched pass of every stream the drafter takes in one pass (each slot absorbed to its own length of its own
+/// taps): each stream's drafts and confidences bit for bit the ones it drafts in a pass of two streams (whose bits the
+/// fixture's cases check against the fork's), eager and replayed.
+fn rowInvariance(gpa: std.mem.Allocator, gpu: Gpu, drafter: *dsp.Drafter, stages_n: usize, slots_n: usize, dims: dsp.Dims, rope: dsp.Rope, stream: cuda.Stream) !void {
+    const N = @min(slots_n, drafter.passStreams(), 4);
+    if (N < 3) return;
+    var pool = try dsp.DraftPool.init(gpa, gpu.d, stages_n, slots_n, dims);
+    defer pool.deinit(gpa);
+    const lens = [_]usize{ 37, 23, 40, 31 }; // within the fixture's RoPE rows, as `timeDrafts`
+    var taps = try cuda.DeviceBuffer.alloc(gpu.d, 64 * 3 * dims.d * 2);
+    defer taps.free();
+    for (0..N) |s_| {
+        try taps.fill8(@intCast(0x3a + s_), null);
+        try gpu.ctx.synchronize();
+        try drafter.absorbSlot(&pool, s_, taps.ptr, 0, lens[s_], rope, stream);
+        try stream.synchronize();
+    }
+    var table = try cuda.DeviceBuffer.alloc(gpu.d, (N + 1) * dims.d * 2);
+    defer table.free();
+    var pair = try cuda.DeviceBuffer.alloc(gpu.d, 3 * dims.d * 2);
+    defer pair.free();
+    for (0..N + 1) |r| {
+        const row: cuda.DeviceBuffer = .{ .d = table.d, .ptr = table.ptr + r * dims.d * 2, .len = dims.d * 2 };
+        try row.fill8(@intCast(0x3c + r), null);
+    }
+    const tokens = [_]u32{ 11, 22, 33, 44 };
+    const q0 = lens;
+    const slots = [_]usize{ 0, 1, 2, 3 };
+    const graphs = drafter.graphs;
+    defer drafter.graphs = graphs;
+    for ([_]bool{ false, true }) |g| {
+        if (g and !graphs) continue;
+        drafter.graphs = g;
+        var all: [4]dsp.Drafts = undefined;
+        try drafter.batchDraftWithTable(&pool, tokens[0..N], q0[0..N], slots[0..N], table.ptr, rope, stream, null, null, all[0..N]);
+        var differ: usize = 0;
+        var s0: usize = 0;
+        while (s0 < N) : (s0 += 2) {
+            // streams s0 and s0 + 1 (or s0 and stream 0 when N is odd), then the noise's row
+            const two = [2]usize{ s0, if (s0 + 1 < N) s0 + 1 else 0 };
+            for (two, 0..) |s_, i| try pair.copyFrom(i * dims.d * 2, table.ptr + s_ * dims.d * 2, dims.d * 2, stream.handle);
+            try pair.copyFrom(2 * dims.d * 2, table.ptr + N * dims.d * 2, dims.d * 2, stream.handle);
+            const tk = [2]u32{ tokens[two[0]], tokens[two[1]] };
+            const qq = [2]usize{ q0[two[0]], q0[two[1]] };
+            const sl = [2]usize{ slots[two[0]], slots[two[1]] };
+            var got: [2]dsp.Drafts = undefined;
+            try drafter.batchDraftWithTable(&pool, &tk, &qq, &sl, pair.ptr, rope, stream, null, null, &got);
+            for (two, got) |s_, o| {
+                const n = all[s_].len;
+                if (o.len != n or !std.mem.eql(u32, o.tokens[0..n], all[s_].tokens[0..n]) or
+                    !std.mem.eql(u8, std.mem.sliceAsBytes(o.conf[0..n]), std.mem.sliceAsBytes(all[s_].conf[0..n]))) differ += 1;
+            }
+        }
+        try check.expect(differ == 0, "dsv41 draft-pool rows ({s}): {d} streams draft other bits in one pass of {d} than in passes of two", .{ if (g) "graph" else "eager", differ, N });
+        check.pass("BITEXACT dsv41 draft-pool rows ({s}): {d} streams in one pass ({d} rows) draft each stream's drafts and confidences of a pass of two", .{ if (g) "graph" else "eager", N, N * dims.block });
+    }
+}
+
+/// Batched draft passes of 2 to 4 streams (as many as the fixture's slots) (slots 0 .., each absorbed to 40 positions of noise taps), eager and
 /// replayed as graphs: the best of `reps` after a warm-up, in ms (TF_DS_DRAFT_TIME=<reps>).
 fn timeDrafts(gpa: std.mem.Allocator, gpu: Gpu, drafter: *dsp.Drafter, stages_n: usize, slots_n: usize, dims: dsp.Dims, rope: dsp.Rope, stream: cuda.Stream, reps: usize) !void {
     var pool = try dsp.DraftPool.init(gpa, gpu.d, stages_n, slots_n, dims);
@@ -203,19 +262,19 @@ fn timeDrafts(gpa: std.mem.Allocator, gpu: Gpu, drafter: *dsp.Drafter, stages_n:
     var taps = try cuda.DeviceBuffer.alloc(gpu.d, len * 3 * dims.d * 2);
     defer taps.free();
     try taps.fill8(0x3c, null);
-    for (0..@min(3, slots_n)) |s_| try drafter.absorbSlot(&pool, s_, taps.ptr, 0, len, rope, stream);
-    var table = try cuda.DeviceBuffer.alloc(gpu.d, 4 * dims.d * 2);
+    for (0..@min(4, slots_n)) |s_| try drafter.absorbSlot(&pool, s_, taps.ptr, 0, len, rope, stream);
+    var table = try cuda.DeviceBuffer.alloc(gpu.d, 5 * dims.d * 2); // four streams' rows and the noise's
     defer table.free();
     try table.fill8(0x3c, null);
     const graphs = drafter.graphs;
     defer drafter.graphs = graphs;
     for ([_]bool{ false, true }) |g| {
         drafter.graphs = g;
-        for (2..4) |N| {
-            if (N > slots_n or N * dims.block > dsp.Drafter.max_rows) break;
-            const tokens = [_]u32{ 11, 22, 33 };
-            const q0 = [_]usize{ len, len, len };
-            const slots = [_]usize{ 0, 1, 2 };
+        for (2..5) |N| {
+            if (N > slots_n or N > drafter.passStreams()) break;
+            const tokens = [_]u32{ 11, 22, 33, 44 };
+            const q0 = [_]usize{ len, len, len, len };
+            const slots = [_]usize{ 0, 1, 2, 3 };
             var out: [16]dsp.Drafts = undefined;
             var best: f64 = std.math.inf(f64);
             for (0..reps + 1) |rep| {
