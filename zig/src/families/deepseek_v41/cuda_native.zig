@@ -4,10 +4,10 @@
 //! family's rank cache (TF_DS_RANK_CACHE), the RoPE frequencies (TF_DS_ROPE=device, the default: each pass's rows
 //! computed on the device) or whole tables (TF_DS_ROPE=table) from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
 //! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048). Up to four streams decode together in shared
-//! rounds (16 rows a round at most), their caches in one pool of TF_DS_POOL positions (cuda_lanes.zig `Streams`;
-//! default the context, else at least the context and a multiple of 2048, the same on both ranks), each stream within
-//! the context (`--context`: at most the model's window); TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks)
-//! sets the pool's slots. With drafts (the default;
+//! rounds (TF_DS_MAX_ROWS rows a round at most: default 16, up to 32, the same on both ranks), their caches in one
+//! pool of TF_DS_POOL positions (cuda_lanes.zig `Streams`; default the context, else at least the context and a
+//! multiple of 2048, the same on both ranks), each stream within the context (`--context`: at most the model's
+//! window); TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks) sets the pool's slots. With drafts (the default;
 //! `--no-drafts` turns them off on both ranks) the rank cache's DSpark blocks load and every stream verifies drafted
 //! windows of up to 6 rows (TF_DS_DRAFTS: up to that many drafts and the pending token, 1 to the checkpoint's block
 //! of 5, the same on both ranks), the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
@@ -22,6 +22,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const lanesmod = @import("cuda_lanes.zig");
+const rounds = @import("cuda_rounds.zig");
 const Engine = lanesmod.Engine;
 const Lanes = lanesmod.Lanes;
 const RankCache = @import("rank_cache.zig").RankCache;
@@ -102,7 +103,11 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
         std.log.err("TF_DS_DRAFTS is {d}: it takes 1 to {d} drafts a window, at most the checkpoint's DSpark block (unset: the block)", .{ most_drafts, lanesmod.most_drafts_max });
         return error.BadEnvironment;
     }
-    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false, .most_drafts = most_drafts };
+    const rows = rounds.rowsFromEnv() catch {
+        std.log.err("TF_DS_MAX_ROWS is {s}: it takes 1 to {d} rows a round", .{ getenv("TF_DS_MAX_ROWS").?, rounds.max_rows });
+        return error.BadEnvironment;
+    };
+    return .{ .rows = rows, .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false, .most_drafts = most_drafts };
 }
 
 /// TF_DS_POOL's positions for a context of `context`: unset, the context; else a whole number at least the

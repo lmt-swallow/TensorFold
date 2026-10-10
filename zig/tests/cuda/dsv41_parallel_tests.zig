@@ -273,7 +273,7 @@ pub fn parallel(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []c
     var fwd = try F.Forward.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, L.max_rows, L.extent_align, bucket, rope_c, rope_w, stream);
     defer fwd.deinit();
     var st: L.Streams = undefined;
-    try st.init(gpa, gpu.d, &fwd, &kernels, null, chunk, stream, drafter, slots, cap, cap);
+    try st.init(gpa, gpu.d, &fwd, &kernels, null, chunk, stream, drafter, slots, cap, cap, try dsv41.rounds.rowsFromEnv());
     defer st.deinit();
     try check.expect(st.extents.total == total, "the window's positions: {d}, the fork's {d}", .{ st.extents.total, total });
 
@@ -406,7 +406,7 @@ pub fn parallel(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []c
         try check.expect(st.roundable(rec.windows[0..rec.count]), "{s}: the record is runnable", .{label});
         const t0 = check.now(io);
         try st.round(gather, rec.windows[0..rec.count]);
-        var picks: [L.max_rows]u32 = undefined;
+        var picks: [L.round_rows_most]u32 = undefined;
         try st.argmaxRows(0, picks[0..at]);
         const ns = check.now(io) - t0;
         var ok = supply.next == marks[3];

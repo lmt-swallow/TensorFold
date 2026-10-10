@@ -459,7 +459,7 @@ pub fn rounds(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []con
     }
     var nb: [96]u8 = undefined;
     try loadBefore(&h, &pool, layers);
-    var runner = try Rounds.RoundRunner.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, bucket, rope_c, rope_w, &pool);
+    var runner = try Rounds.RoundRunner.init(gpa, gpu.d, &cfg, &w, &set, &glue, &ek, world, try Rounds.rowsFromEnv(), bucket, rope_c, rope_w, &pool);
     defer runner.deinit();
     var supply: Supply = .{ .gpu = gpu, .rank = rank, .rank1 = .empty, .names = .empty, .probes = .empty };
     defer supply.deinit();
@@ -620,7 +620,7 @@ fn timeRounds(gpu: Gpu, runner: *Rounds.RoundRunner, cap: usize, reps: usize, st
     defer runner.least = least;
     for ([_]usize{ least, runner.bucket }) |lb| {
         runner.least = lb;
-        for ([_]usize{ 1, Rounds.max_rows }) |rows| {
+        for ([_]usize{ 1, runner.rows }) |rows| {
             const deep = @min(@min(cap, rope_rows), runner.bucket) - rows;
             for ([_]usize{ 0, deep }) |p| {
                 const w = [1]Rounds.Window{.{ .slot = 0, .base = 0, .size = cap, .position = p, .ids = ids[0..rows] }};

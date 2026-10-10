@@ -58,7 +58,21 @@ const Ptr = cuda.abi.DevicePtr;
 
 pub const Error = error{ TooManyRows, BadShape, Unsupported, OutOfMemory } || cuda.Error || exl3.Error || experts.Error;
 
-pub const max_rows = 16;
+/// The rows a round takes at most (the tables' layout); a runner's own most is its `rows` (TF_DS_MAX_ROWS).
+pub const max_rows = 32;
+/// The rows a round takes unless TF_DS_MAX_ROWS says otherwise (the fork's DECODE_ROWS).
+pub const rows_default = 16;
+
+/// The rows a round takes at most from TF_DS_MAX_ROWS: `rows_default` unless set; error.BadEnvironment unless a
+/// number from 1 to `max_rows`. Every kernel of a round keeps a row's bits whatever rows share its launch (the
+/// fork's decode kernels: one row a program, or a row's dot in a fixed order; the MoE gate past 16 rows in several
+/// launches, cuda_route.zig), so a row's bits are the same in a round of any width.
+pub fn rowsFromEnv() error{BadEnvironment}!usize {
+    const v = std.c.getenv("TF_DS_MAX_ROWS") orelse return rows_default;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadEnvironment;
+    if (n < 1 or n > max_rows) return error.BadEnvironment;
+    return n;
+}
 pub const raw_rows = 64; // compressor inputs kept by position a slot (model.py RAW)
 /// The smallest context bucket (graph.py BUCKET_MIN).
 pub const bucket_min = 1024;
@@ -625,7 +639,7 @@ const Counted = struct {
     }
 };
 
-/// A round's forward over one pool: R <= 16 rows of several streams, the fork's `RoundDecoder`.
+/// A round's forward over one pool: R <= `rows` rows of several streams, the fork's `RoundDecoder`.
 pub const RoundRunner = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -637,6 +651,8 @@ pub const RoundRunner = struct {
     hc: hcmod.Hc,
     route: routemod.Route,
     world: u32,
+    /// The rows a round takes at most (the per-round buffers' rows): 1 .. max_rows.
+    rows: usize,
     /// The widest bucket a round may scan (the per-round buffers' size): the context's.
     bucket: usize,
     /// The least bucket a round scans (graph.py BUCKET_MIN; the pool's widest makes every round scan it whole).
@@ -773,9 +789,10 @@ pub const RoundRunner = struct {
     side_live: bool,
     l2: L2,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, w: *const weights.Weights, set: *const aot.Set, glue: *const attention.Glue, ek: *const experts.Kernels, world: u32, bucket: usize, rope_c: attention.Rope, rope_w: attention.Rope, pool: *Pool) !RoundRunner {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, w: *const weights.Weights, set: *const aot.Set, glue: *const attention.Glue, ek: *const experts.Kernels, world: u32, rows: usize, bucket: usize, rope_c: attention.Rope, rope_w: attention.Rope, pool: *Pool) !RoundRunner {
+        if (rows < 1 or rows > max_rows) return error.TooManyRows;
         const D = cfg.dim;
-        const R = max_rows;
+        const R = rows;
         const heads = cfg.n_heads / world;
         const groups = cfg.o_groups / world;
         const hd = cfg.head_dim;
@@ -788,6 +805,7 @@ pub const RoundRunner = struct {
         self.glue = glue;
         self.ek = ek;
         self.world = world;
+        self.rows = rows;
         self.bucket = bucket;
         self.least = bucket_min;
         self.round_bucket = 0;
@@ -831,7 +849,7 @@ pub const RoundRunner = struct {
         self.uploads = try attention.Uploads.init(d, attention.Uploads.room(1, Tab.words(kk) * 8) + attention.Uploads.room(w.layers.len, R * kk * 8));
         self.t_all = try cuda.DeviceBuffer.alloc(d, Tab.words(kk) * 8);
         try self.t_all.fill8(0, null);
-        self.rr = try attention.RopeRows.init(gpa, d, glue, max_rows, 2 + max_ratios, cfg.rope_dim / 2);
+        self.rr = try attention.RopeRows.init(gpa, d, glue, R, 2 + max_ratios, cfg.rope_dim / 2);
         self.ra_pos = .{ self.rr.view(rope_c, 0, self.tab(Tab.row(Tab.pos))), self.rr.view(rope_w, 1, self.tab(Tab.row(Tab.pos))) };
         for (&self.ra_gpos, 0..) |*v, j| v.* = self.rr.view(rope_c, 2 + j, self.tab(Tab.ratio(j, Tab.gpos)));
         self.t_cidx = try cuda.DeviceBuffer.alloc(d, R * kk * 8);
@@ -1024,7 +1042,7 @@ pub const RoundRunner = struct {
         const D = self.cfg.dim;
         var R: usize = 0;
         for (windows) |wd| R += wd.ids.len;
-        if (R < 1 or R > max_rows) return error.TooManyRows;
+        if (R < 1 or R > self.rows) return error.TooManyRows;
         // every row inside its extent, the extent inside the window and no wider than a stream's span, its
         // positions inside the RoPE tables
         const rope_rows = @min(self.rope_c.rows, self.rope_w.rows);
@@ -1070,7 +1088,7 @@ pub const RoundRunner = struct {
         return self.graphs and self.probe == null and !self.glue.hostSelect();
     }
 
-    /// Records the graphs of rounds of each row count in `rows` (1 .. max_rows) at each bucket of `buckets` the runner
+    /// Records the graphs of rounds of each row count in `rows` (1 .. self.rows) at each bucket of `buckets` the runner
     /// scans, ahead of the rounds that replay them; nothing runs. Every rank calls it with the same arguments, so
     /// the ranks record the same gathers in the same order (none is issued).
     pub fn warm(self: *RoundRunner, rows: []const usize, buckets: []const usize, gather: fwd.Gather, stream: cuda.Stream) !void {
@@ -1081,7 +1099,7 @@ pub const RoundRunner = struct {
         for (buckets) |b| {
             if (b > self.bucket or b < @min(self.least, self.bucket) or b > self.graph_bucket_max) continue;
             for (rows) |R| {
-                if (R < 1 or R > max_rows) return error.TooManyRows;
+                if (R < 1 or R > self.rows) return error.TooManyRows;
                 self.round_bucket = b;
                 const g = (try self.graphsFor(R, b, ns, stream)) orelse continue;
                 for (0..ns) |k| {
