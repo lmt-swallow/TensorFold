@@ -20,6 +20,7 @@ const lanesmod = @import("cuda_lanes.zig");
 const Engine = lanesmod.Engine;
 const Lanes = lanesmod.Lanes;
 const RankCache = @import("rank_cache.zig").RankCache;
+const mem_note = @import("mem_note.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3"};
@@ -112,6 +113,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         var clock = lanesmod.Clock.start(s.rank);
         try own.lanes.measure(2);
         clock.mark("the measure step", .{});
+        mem_note.note(ctx.d, "the measure step", .{});
     }
     return .{
         .backend = own.lanes.backend(),

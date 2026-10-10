@@ -49,6 +49,7 @@ const dspark = @import("cuda_dspark.zig");
 const rounds = @import("cuda_rounds.zig");
 pub const kept_prompts = @import("cuda_keep.zig");
 const RankCache = @import("rank_cache.zig").RankCache;
+const mem_note = @import("mem_note.zig");
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -873,8 +874,10 @@ pub const Streams = struct {
             .book = .{ .set = .{ .on = false }, .chunk = rows, .window = cfg.window }, .snaps = .{ .d = d, .ptr = 0, .len = 0 },
         };
         self.book.released = &self.released;
+        mem_note.note(d, "streams: before the pool", .{});
         self.pool = try rounds.Pool.init(gpa, d, cfg, L, slots, cap);
         errdefer self.pool.deinit();
+        mem_note.note(d, "streams: the pool ({d} slots, {d} positions)", .{ slots, cap });
         self.view_rings = try gpa.alloc(cuda.DeviceBuffer, L);
         errdefer gpa.free(self.view_rings);
         self.view_planes = try gpa.alloc(?forward.Planes, L);
@@ -889,8 +892,10 @@ pub const Streams = struct {
         self.view.engram = if (engram) |g| g.hook() else null;
         self.pr = try prompt.Prompt.init(gpa, d, &self.view, kernels, rows);
         errdefer self.pr.deinit();
+        mem_note.note(d, "streams: the prompt path ({d} rows)", .{rows});
         self.runner = try rounds.RoundRunner.init(gpa, d, cfg, base.w, base.set, base.glue, base.ek, base.world, base.bucket, base.rope_c, base.rope_w, &self.pool);
         errdefer self.runner.deinit();
+        mem_note.note(d, "streams: the round runner (bucket {d})", .{base.bucket});
         if (engram) |g| self.runner.engram = g.roundHook();
         self.lanes = try gpa.alloc(Lane, slots);
         errdefer gpa.free(self.lanes);
@@ -910,6 +915,7 @@ pub const Streams = struct {
             self.dpool = try dspark.DraftPool.init(gpa, d, sp.stages.len, slots, sp.dims);
             errdefer self.dpool.?.deinit(gpa);
             self.dc_rings = try gpa.alloc(cuda.DeviceBuffer, sp.stages.len);
+            mem_note.note(d, "streams: the taps and the draft pool", .{});
         }
     }
 
@@ -1650,6 +1656,8 @@ pub const Engine = struct {
         e.chunk = @min(s.chunk, s.context);
         e.broken = false;
         var clock = Clock.start(s.rank);
+        clock.d = ctx.d;
+        mem_note.note(ctx.d, "before the load", .{});
         e.cfg = try Config.read(gpa, io, dir);
         e.set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, s.kernels_dir);
         errdefer e.set.deinit();
@@ -1705,6 +1713,7 @@ pub const Engine = struct {
                 return error.NoDraftHead;
             }
             e.ds = try weights.loadDSpark(gpa, ctx.d, &e.cfg, &rc, &e.kernels, s.rank, s.world, .mul1);
+            mem_note.note(ctx.d, "the DSpark weights", .{});
             e.stages = try gpa.alloc(dspark.Stage, e.ds.?.blocks.len);
             for (e.stages, e.ds.?.blocks) |*st, *b| st.* = dspark.Stage.of(b);
             e.drafter = try dspark.Drafter.init(gpa, ctx.d, dspark.dimsOf(&e.cfg, s.rank, s.world), &e.set, &e.glue, &e.ek, e.stages, dspark.headOf(&e.ds.?, &e.w.head), &e.comm);
@@ -1727,7 +1736,7 @@ pub const Engine = struct {
                     std.log.info("deepseek_v41: kept prompts off{s}", .{if (ks.on) " (a compressor's ratio does not divide the chunk)" else " (TF_DS_KEEP=0)"});
             }
         }
-        clock.mark("the stream pool", .{});
+        clock.mark("the stream pool and the kept prompts' snapshots", .{});
         if (getenv("TF_DS_PROFILE") != null) try e.streams.pr.enableProfile();
         // the communicator after the loads: each rank loads on its own, then they meet (rank 1 retries its
         // connection for up to 30 minutes while rank 0 still loads, so the ranks may start in either order)
@@ -1739,6 +1748,7 @@ pub const Engine = struct {
             const t0 = nowNs();
             const free0 = (try ctx.memInfo()).free;
             try e.streams.warm(e.gather());
+            mem_note.note(ctx.d, "the round and draft graphs", .{});
             const free1 = (try ctx.memInfo()).free;
             if (s.rank == 0 and e.streams.runner.graphs) std.log.info("deepseek_v41: {d} round graphs and {d} draft graphs recorded in {d:.1} s, {d:.0} MiB (buckets {d} .. {d}; wider ones run eager)", .{ e.streams.runner.graphCount(), if (e.drafter) |dr| dr.captures else 0, msSince(t0) / 1000, @as(f64, @floatFromInt(@as(i64, @intCast(free0)) - @as(i64, @intCast(free1)))) / (1 << 20), rounds.bucket_min, @min(warm_bucket_max, e.streams.runner.bucket) });
         }
@@ -1752,6 +1762,7 @@ pub const Engine = struct {
         errdefer gpa.free(e.ids_buf);
         e.op_buf = try gpa.alloc(u8, maxOpBytes(s.context));
         errdefer gpa.free(e.op_buf);
+        mem_note.note(ctx.d, "the agreement buffers", .{});
         return e;
     }
 
@@ -2026,6 +2037,8 @@ pub const Clock = struct {
     rank: u32,
     t0: i128,
     last: i128,
+    /// Set: each mark also notes the phase's device memory (mem_note.zig, TF_DS_MEM_REPORT=1).
+    d: ?*const cuda.Driver = null,
 
     pub fn start(rank: u32) Clock {
         const t = nowNs();
@@ -2037,6 +2050,7 @@ pub const Clock = struct {
         var buf: [160]u8 = undefined;
         const name = std.fmt.bufPrint(&buf, what, args) catch what;
         std.log.info("deepseek_v41 rank {d}: {s} in {d:.0} ms ({d:.1} s since the load began)", .{ self.rank, name, @as(f64, @floatFromInt(t - self.last)) / 1e6, @as(f64, @floatFromInt(t - self.t0)) / 1e9 });
+        if (self.d) |d| mem_note.note(d, what, args);
         self.last = t;
     }
 };

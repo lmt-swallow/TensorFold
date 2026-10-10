@@ -14,6 +14,7 @@ const experts = @import("cuda_experts.zig");
 const hcmod = @import("cuda_hc.zig");
 const routemod = @import("cuda_route.zig");
 const attention = @import("cuda_attention.zig");
+const mem_note = @import("mem_note.zig");
 
 const aot = cuda.aot;
 const Ptr = cuda.abi.DevicePtr;
@@ -174,6 +175,7 @@ pub const Forward = struct {
         self.attn = try gpa.alloc(attention.Attention, L);
         self.idx_proj_h = try gpa.alloc(cuda.DeviceBuffer, L);
         var src: usize = 0;
+        var attn_bytes: u64 = 0;
         for (0..L) |li| {
             self.rings[li] = try cuda.DeviceBuffer.alloc(d, (cfg.window + 16) * cfg.head_dim * 2);
             try self.rings[li].fill8(0, null);
@@ -190,9 +192,13 @@ pub const Forward = struct {
                 try cuda.launch.launch(glue.f32_to_f16, .{ .grid = .{ .x = @intCast((p.count + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
             }
             const dims = self.dimsOf(li);
+            const before = cuda.usage(false).device;
             self.attn[li] = try attention.Attention.init(gpa, d, dims, set, glue, self.paramsOf(li).scratchWords(max_rows));
+            attn_bytes += cuda.usage(false).device - before;
         }
         try stream.synchronize();
+        if (mem_note.on()) std.log.info("mem: the decode loop's attention scratch {d:.1} MiB of its {d} layers (bucket {d})", .{ @as(f64, @floatFromInt(attn_bytes)) / (1 << 20), L, bucket });
+        mem_note.note(d, "the decode loop's layers (rings, planes of {d} positions, attention scratch)", .{cap});
         const r = max_rows;
         self.ids = try cuda.DeviceBuffer.alloc(d, r * 8);
         self.h = try cuda.DeviceBuffer.alloc(d, r * hcmod.hc_streams * dm * 2);
@@ -218,6 +224,7 @@ pub const Forward = struct {
         self.logits = try cuda.DeviceBuffer.alloc(d, r * cfg.vocab * 4);
         self.ids_h = try gpa.alloc(i64, r);
         self.uploads = try attention.Uploads.init(d, attention.Uploads.room(1, r * 8));
+        mem_note.note(d, "the decode loop's row buffers", .{});
         return self;
     }
 
