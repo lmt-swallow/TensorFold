@@ -4,8 +4,10 @@
 //! family's rank cache (TF_DS_RANK_CACHE), the RoPE frequencies (TF_DS_ROPE=device, the default: each pass's rows
 //! computed on the device) or whole tables (TF_DS_ROPE=table) from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
 //! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 2048). Up to four streams decode together in shared
-//! rounds (16 rows a round at most), their caches in one pool of the context's positions (cuda_lanes.zig `Streams`);
-//! TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks) sets the pool's slots. With drafts (the default;
+//! rounds (16 rows a round at most), their caches in one pool of TF_DS_POOL positions (cuda_lanes.zig `Streams`;
+//! default the context, else at least the context and a multiple of 2048, the same on both ranks), each stream within
+//! the context (`--context`: at most the model's window); TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks)
+//! sets the pool's slots. With drafts (the default;
 //! `--no-drafts` turns them off on both ranks) the rank cache's DSpark blocks load and every stream verifies drafted
 //! windows of up to 6 rows, the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
 //! time (`info:` lines); each rank loads on its own and the ranks meet after their loads, so both may start at once.
@@ -79,7 +81,20 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
         std.log.err("TF_DS_SLOTS is {d}: it takes 1 to {d} streams", .{ slots, lanesmod.max_slots });
         return error.BadEnvironment;
     }
-    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false };
+    const pool = poolSetting(getenv("TF_DS_POOL"), context) catch {
+        std.log.err("TF_DS_POOL is {s}: it takes a number of positions, at least the context's {d}, a multiple of {d}", .{ getenv("TF_DS_POOL").?, context, lanesmod.extent_align });
+        return error.BadEnvironment;
+    };
+    return .{ .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false };
+}
+
+/// TF_DS_POOL's positions for a context of `context`: unset, the context; else a whole number at least the
+/// context and a multiple of the extent alignment (error.BadPool otherwise).
+pub fn poolSetting(text: ?[]const u8, context: usize) error{BadPool}!usize {
+    const v = text orelse return context;
+    const pool = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return error.BadPool;
+    if (pool < context or pool % lanesmod.extent_align != 0) return error.BadPool;
+    return pool;
 }
 
 /// This rank's device bytes: every entry of the rank cache (the backbone, and the DSpark blocks drafts load).
@@ -189,6 +204,17 @@ fn release(p: *anyopaque) void {
 test "settings read the environment's rank and world" {
     _ = settings;
     try std.testing.expectEqual(@as(u32, 2048), prompt_rows);
+}
+
+test "TF_DS_POOL: the context unless set; at least the context, a multiple of the extent alignment" {
+    const m: usize = 1 << 20;
+    try std.testing.expectEqual(m, try poolSetting(null, m));
+    try std.testing.expectEqual(@as(usize, 100000), try poolSetting(null, 100000));
+    try std.testing.expectEqual(4 * m, try poolSetting("4194304", m));
+    try std.testing.expectEqual(m, try poolSetting(" 1048576", m));
+    try std.testing.expectError(error.BadPool, poolSetting("1046528", m)); // below the context
+    try std.testing.expectError(error.BadPool, poolSetting("2097153", m)); // not aligned
+    try std.testing.expectError(error.BadPool, poolSetting("4M", m));
 }
 
 /// A host-only stand-in for `Lanes` (the same facts and rows): records the core's calls, holds 5 drafts a draft

@@ -5,9 +5,11 @@
 //! (multi.py `_agree`): ranks that planned different steps, or a rank that cannot run one, stop instead of pairing
 //! collectives wrongly.
 //!
-//! The streams share one window of `context + extra` positions (multi.py MultiDecoder over model.py's PoolCache,
-//! `Streams`): a stream takes the lowest free slot (its window rings, compressor inputs and drafter rings) and the
-//! first free extent of the window aligned to 2048 that holds its prompt, its reply and a round's rows (`Extents`).
+//! The streams share one window of `pool + extra` positions (multi.py MultiDecoder over model.py's PoolCache,
+//! `Streams`; `pool` is TF_DS_POOL, the context unless set wider): a stream takes the lowest free slot (its window
+//! rings, compressor inputs and drafter rings) and the first free extent of the window aligned to 2048 that holds its
+//! prompt, its reply and a round's rows (`Extents`), an extent of at most the context's positions (`Streams.most`):
+//! a stream's positions, RoPE rows and round buckets are a lone stream's of that context whatever the pool.
 //! Its admission fills the extent from position 0 through the prompt path (cuda_prompt.zig) on a view of the pool,
 //! in chunks of TF_DS_PREFILL_CHUNK rows (default 2048; engine.py `prefill_steps`), each chunk's taps absorbed into
 //! its slot's drafter rings, and draws its first token from the last row. A round runs every stream's window (its
@@ -242,8 +244,16 @@ pub const Settings = struct {
     drafts: bool = false,
     /// Streams at once (the pool's slots), 1 to `max_slots`.
     slots: usize = max_slots,
+    /// Positions the streams' pool holds (TF_DS_POOL): at least `context`; 0 means `context`. Each stream still
+    /// reaches at most `context` positions.
+    pool: usize = 0,
     /// CED bounded replay (TF_DS_REPLAY=1): a prompt's layers from n_layers / 2 run only its last `window` rows.
     replay: bool = false,
+
+    /// The pool's positions: `pool`, or the context when it is 0.
+    pub fn poolPositions(self: Settings) usize {
+        return if (self.pool == 0) self.context else self.pool;
+    }
 };
 
 /// engine.py prefill_steps' `replay`: with bounded replay, the first position the upper layers run (the prompt's
@@ -759,15 +769,17 @@ pub const Keeps = struct {
 };
 
 /// The measure step's record: the opcode, the repetitions (u8), the pool's slots (u8), the flags (u8: bit 0 Engram,
-/// bit 1 the drafter) and the window's positions (u64): ranks whose pools differ stop at load.
+/// bit 1 the drafter), the window's positions (u64) and a stream's most (u64, `Streams.most`): ranks whose pools or
+/// per-stream contexts differ stop at load.
 pub const Measure = struct {
     reps: u8,
     slots: usize,
     engram: bool,
     drafts: bool,
     total: usize,
+    most: usize,
 
-    pub const bytes: usize = 12;
+    pub const bytes: usize = 20;
 
     pub fn encode(buf: []u8, m: Measure) []const u8 {
         buf[0] = @intFromEnum(Op.measure);
@@ -775,12 +787,13 @@ pub const Measure = struct {
         buf[2] = @intCast(m.slots);
         buf[3] = @as(u8, @intFromBool(m.engram)) | @as(u8, @intFromBool(m.drafts)) << 1;
         std.mem.writeInt(u64, buf[4..12], @intCast(m.total), .little);
+        std.mem.writeInt(u64, buf[12..20], @intCast(m.most), .little);
         return buf[0..bytes];
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Measure {
         if (op.len != bytes or op[0] != @intFromEnum(Op.measure) or op[3] > 3) return error.BadRecord;
-        return .{ .reps = op[1], .slots = op[2], .engram = op[3] & 1 != 0, .drafts = op[3] & 2 != 0, .total = @intCast(std.mem.readInt(u64, op[4..12], .little)) };
+        return .{ .reps = op[1], .slots = op[2], .engram = op[3] & 1 != 0, .drafts = op[3] & 2 != 0, .total = @intCast(std.mem.readInt(u64, op[4..12], .little)), .most = @intCast(std.mem.readInt(u64, op[12..20], .little)) };
     }
 };
 
@@ -810,7 +823,8 @@ pub const Lane = struct {
 };
 
 /// model.py `pool_view`'s single-stream paths and rounds.py's concurrent round over one pool (multi.py
-/// MultiDecoder without its scheduler): `slots` streams share one window of `cap` positions by extents. An
+/// MultiDecoder without its scheduler): `slots` streams share one window of `cap` positions by extents of at most
+/// `most` positions each (a stream's context and extra rows, aligned down to `extent_align`). An
 /// admission fills a stream's slot and extent through the prompt path (cuda_prompt.zig) on a view of the pool
 /// (`view`: a `Forward` whose rings, planes and capacity are the slot's and the extent's), its chunks' taps into its
 /// slot of the DraftPool; a round runs every window through one `RoundRunner.forward`; drafts run batched over the
@@ -828,6 +842,8 @@ pub const Streams = struct {
     runner: rounds.RoundRunner,
     pr: prompt.Prompt,
     extents: Extents,
+    /// The positions an extent holds at most: `span` (a stream's context and extra rows) aligned down.
+    most: usize,
     engram: ?*engram_apply.Engram,
     spark: ?*dspark.Drafter,
     dpool: ?dspark.DraftPool,
@@ -860,18 +876,20 @@ pub const Streams = struct {
     keep_differed: u64 = 0,
 
     /// `base`: the decode loop whose weights, kernels, scratch and RoPE tables the view and the round share (its
-    /// own caches go unused). `rows`: the widest prompt chunk. `cap`: the window's positions (the context and the
-    /// window's extra rows).
-    pub fn init(self: *Streams, gpa: std.mem.Allocator, d: *const cuda.Driver, base: *forward.Forward, kernels: *const exl3.Kernels, engram: ?*engram_apply.Engram, rows: usize, stream: cuda.Stream, spark: ?*dspark.Drafter, slots: usize, cap: usize) !void {
+    /// own caches go unused). `rows`: the widest prompt chunk. `cap`: the window's positions (the pool and the
+    /// window's extra rows). `span`: a stream's positions at most (its context and the extra rows), `cap` at most;
+    /// the prompt path's buffers, the round runner's buckets and the host ids are sized by it.
+    pub fn init(self: *Streams, gpa: std.mem.Allocator, d: *const cuda.Driver, base: *forward.Forward, kernels: *const exl3.Kernels, engram: ?*engram_apply.Engram, rows: usize, stream: cuda.Stream, spark: ?*dspark.Drafter, slots: usize, cap: usize, span: usize) !void {
         const cfg = base.cfg;
         const L = base.w.layers.len;
         if (slots < 1 or slots > max_slots) return error.BadSlots;
+        if (span > cap or span < extent_align) return error.BadPool;
         if (spark != null) for (cfg.dspark_taps.slice()) |t| {
             if (t < 1 or t >= @as(i64, @intCast(L))) return error.BadTapLayers;
         };
         self.* = .{
             .gpa = gpa, .d = d, .cfg = cfg, .base = base, .view = base.*, .view_rings = &.{}, .view_planes = &.{}, .pool = undefined,
-            .runner = undefined, .pr = undefined, .extents = Extents.init(cap), .engram = engram, .spark = spark, .dpool = null,
+            .runner = undefined, .pr = undefined, .extents = Extents.init(cap), .most = span / extent_align * extent_align, .engram = engram, .spark = spark, .dpool = null,
             .dc_rings = &.{}, .taps = .{ .d = d, .ptr = 0, .len = 0 }, .kept_taps = .{ .d = d, .ptr = 0, .len = 0 }, .lanes = &.{}, .logits_h = &.{}, .amax = .{ .d = d, .ptr = 0, .len = 0 }, .stream = stream,
             .book = .{ .set = .{ .on = false }, .chunk = rows, .window = cfg.window }, .snaps = .{ .d = d, .ptr = 0, .len = 0 },
         };
@@ -879,14 +897,15 @@ pub const Streams = struct {
         mem_note.note(d, "streams: before the pool", .{});
         self.pool = try rounds.Pool.init(gpa, d, cfg, L, slots, cap);
         errdefer self.pool.deinit();
-        mem_note.note(d, "streams: the pool ({d} slots, {d} positions)", .{ slots, cap });
+        self.pool.span = span;
+        mem_note.note(d, "streams: the pool ({d} slots, {d} positions, {d} a stream)", .{ slots, cap, span });
         self.view_rings = try gpa.alloc(cuda.DeviceBuffer, L);
         errdefer gpa.free(self.view_rings);
         self.view_planes = try gpa.alloc(?forward.Planes, L);
         errdefer gpa.free(self.view_planes);
-        // the view first spans the whole window (slot 0): the prompt buffers are sized for its capacity
-        self.point(0, 0, self.extents.total);
-        self.view.cap = cap;
+        // the view first spans a stream's widest extent (slot 0): the prompt buffers are sized for its capacity
+        self.point(0, 0, self.most);
+        self.view.cap = span;
         self.view.rings = self.view_rings;
         self.view.planes = self.view_planes;
         self.view.source = self.pool.source;
@@ -904,7 +923,7 @@ pub const Streams = struct {
         var made: usize = 0;
         errdefer for (self.lanes[0..made]) |l| gpa.free(l.hist);
         for (self.lanes) |*l| {
-            l.* = .{ .hist = try gpa.alloc(i32, cap) };
+            l.* = .{ .hist = try gpa.alloc(i32, span) };
             made += 1;
         }
         self.logits_h = try gpa.alloc(f32, max_rows * cfg.vocab);
@@ -999,10 +1018,10 @@ pub const Streams = struct {
     }
 
     /// Whether an admission of `n` prompt ids into `slot` at [base, base + size) can run here: the slot free, the
-    /// extent free and aligned, the prompt and a round's rows inside it.
+    /// extent free, aligned and at most `most` positions, the prompt and a round's rows inside it.
     pub fn admits(self: *const Streams, slot: usize, base: usize, size: usize, n: usize, chunk: usize) bool {
         if (slot >= self.lanes.len or self.lanes[slot].busy or chunk < 1 or chunk > self.pr.rows) return false;
-        if (n < 1 or size % extent_align != 0 or n + extent_tail > size) return false;
+        if (n < 1 or size % extent_align != 0 or size > self.most or n + extent_tail > size) return false;
         var probe = self.extents;
         return probe.takeAt(base, size);
     }
@@ -1066,7 +1085,7 @@ pub const Streams = struct {
     pub fn admitsKept(self: *const Streams, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse) bool {
         if (slot >= self.lanes.len or self.lanes[slot].busy or chunk < 1 or chunk > self.pr.rows) return false;
         const n = ids.len;
-        if (n < 1 or size % extent_align != 0 or n + extent_tail > size) return false;
+        if (n < 1 or size % extent_align != 0 or size > self.most or n + extent_tail > size) return false;
         if (reuse) |r| {
             if (!self.keeping(replay) or chunk != self.book.chunk) return false;
             const i = self.book.find(r.eid) orelse return false;
@@ -1540,25 +1559,25 @@ pub const Streams = struct {
         }
     }
 
-    /// The timing step's round: `rows` noise ids at position 0 of slot 0 over the whole window (no stream's state
+    /// The timing step's round: `rows` noise ids at position 0 of slot 0 over a stream's widest extent (no stream's state
     /// changes; every slot must be free: a later admission rewrites every row a later row reads). It scans the
     /// least bucket.
     pub fn probeRound(self: *Streams, gather: forward.Gather, rows: usize) !void {
         try self.probeRoundAt(gather, rows, 0);
     }
 
-    /// The deepest position a probe round of `rows` rows can take whose bucket is the runner's widest (or the
-    /// window's end, for a window narrower than it).
+    /// The deepest position a probe round of `rows` rows can take whose bucket is the runner's widest (or a
+    /// stream's widest extent's end, for one narrower than it).
     pub fn probeDeep(self: *const Streams, rows: usize) usize {
         const rope_rows = @min(self.runner.rope_c.rows, self.runner.rope_w.rows);
-        return @min(@min(self.extents.total, rope_rows), self.runner.bucket) -| rows;
+        return @min(@min(self.most, rope_rows), self.runner.bucket) -| rows;
     }
 
     /// `probeRound` with its rows at `position` .. `position + rows - 1`: the round scans their bucket.
     pub fn probeRoundAt(self: *Streams, gather: forward.Gather, rows: usize, position: usize) !void {
         const noise: i32 = @intCast(self.cfg.dspark_noise);
         var ids: [max_rows]i64 = @splat(noise);
-        const w = [1]rounds.Window{.{ .slot = 0, .base = 0, .size = self.extents.total, .position = position, .ids = ids[0..rows] }};
+        const w = [1]rounds.Window{.{ .slot = 0, .base = 0, .size = self.most, .position = position, .ids = ids[0..rows] }};
         if (self.engram != null) {
             // the rows' n-grams reach before them: noise there too (the history is otherwise unset)
             @memset(self.lanes[0].hist[position -| 64 .. position + rows], noise);
@@ -1735,9 +1754,9 @@ pub const Engine = struct {
             clock.mark("the DSpark drafter", .{});
         }
         const before = cuda.usage(false).device;
-        try e.streams.init(gpa, ctx.d, &e.fwd, &e.kernels, e.engram, e.chunk, e.stream, e.drafter, s.slots, s.context + extra);
+        try e.streams.init(gpa, ctx.d, &e.fwd, &e.kernels, e.engram, e.chunk, e.stream, e.drafter, s.slots, s.poolPositions() + extra, s.context + extra);
         errdefer e.streams.deinit();
-        if (s.rank == 0) std.log.info("deepseek_v41: {d} stream slots over a window of {d} positions ({d:.2} GiB), prompts in chunks of {d} rows{s}", .{ s.slots, e.streams.extents.total, @as(f64, @floatFromInt(cuda.usage(false).device - before)) / (1 << 30), e.chunk, if (s.replay) ", bounded replay (TF_DS_REPLAY=1)" else "" });
+        if (s.rank == 0) std.log.info("deepseek_v41: {d} stream slots over a window of {d} positions, each stream at most {d} ({d:.2} GiB), prompts in chunks of {d} rows{s}", .{ s.slots, e.streams.extents.total, e.streams.most, @as(f64, @floatFromInt(cuda.usage(false).device - before)) / (1 << 30), e.chunk, if (s.replay) ", bounded replay (TF_DS_REPLAY=1)" else "" });
         {
             const ks = kept_prompts.Settings.fromEnv();
             try e.streams.enableKeep(ks, e.chunk, s.replay);
@@ -1812,7 +1831,7 @@ pub const Engine = struct {
 
     /// The bytes a stream takes for admission (`Streams.bytesPerSlot` of this engine's pool and drafter).
     pub fn streamBytes(e: *const Engine) usize {
-        return Streams.bytesPerSlot(&e.cfg, e.w.layers.len, e.settings.context + extra, e.settings.slots, e.stages.len);
+        return Streams.bytesPerSlot(&e.cfg, e.w.layers.len, e.settings.poolPositions() + extra, e.settings.slots, e.stages.len);
     }
 
     fn gather(self: *Engine) forward.Gather {
@@ -1990,7 +2009,7 @@ pub const Engine = struct {
             },
             .measure => {
                 const m = Measure.parse(op) catch return false;
-                return m.slots == st.lanes.len and m.total == st.extents.total and m.engram == (e.engram != null) and m.drafts == (e.drafter != null) and st.idle();
+                return m.slots == st.lanes.len and m.total == st.extents.total and m.most == st.most and m.engram == (e.engram != null) and m.drafts == (e.drafter != null) and st.idle();
             },
             else => return false,
         }
@@ -2021,7 +2040,7 @@ pub const Engine = struct {
     pub fn measure(e: *Engine, reps: u8) !void {
         if (e.settings.rank != 0) return;
         var buf: [Measure.bytes]u8 = undefined;
-        try e.both(Measure.encode(&buf, .{ .reps = reps, .slots = e.streams.lanes.len, .engram = e.engram != null, .drafts = e.drafter != null, .total = e.streams.extents.total }));
+        try e.both(Measure.encode(&buf, .{ .reps = reps, .slots = e.streams.lanes.len, .engram = e.engram != null, .drafts = e.drafter != null, .total = e.streams.extents.total, .most = e.streams.most }));
     }
 
     pub fn stop(e: *Engine) void {
@@ -2291,7 +2310,7 @@ pub const Lanes = struct {
         if (s.sampling) |sm| if (sm.temperature > 0) return error.SamplingNotSupported;
         const ptoks = s.prompt();
         const need = ptoks.len + s.max_new + extent_tail;
-        if (ptoks.len == 0 or need > st.extents.total) return error.PromptTooLong;
+        if (ptoks.len == 0 or need > st.most) return error.PromptTooLong;
         var slot: ?usize = null;
         for (st.lanes, 0..) |l, i| if (!l.busy and self.owner[i] == null) {
             slot = i;
@@ -2740,7 +2759,7 @@ test "admission, free, round, drafts, keeps and measure records parse back to wh
         try std.testing.expectError(error.BadRecord, Keeps.parse(kop[0 .. kop.len - 1], &kr));
         try std.testing.expectError(error.BadRecord, DraftsRec.parse(kop, &dr));
 
-        const m: Measure = .{ .reps = r.int(u8), .slots = r.intRangeAtMost(usize, 1, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .total = r.int(u40) };
+        const m: Measure = .{ .reps = r.int(u8), .slots = r.intRangeAtMost(usize, 1, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .total = r.int(u40), .most = r.int(u40) };
         const mop = Measure.encode(&buf, m);
         try std.testing.expectEqual(m, try Measure.parse(mop));
         try std.testing.expectError(error.BadRecord, Measure.parse(mop[0 .. mop.len - 1]));

@@ -166,10 +166,13 @@ pub const PoolPlanes = struct {
 
 /// One window of `cap` positions shared by up to `slots` streams (model.py `new_pool`). Sizes are usize and the
 /// rows' positions, extents and compressed rows int64, so a window of 2^20 positions and more is addressed whole.
+/// A stream's extent holds at most `span` positions (the per-stream context and its extra rows, `cap` unless the
+/// pool is set wider): its rows' positions, RoPE rows and buckets stay those of a stream of that context.
 pub const Pool = struct {
     gpa: std.mem.Allocator,
     slots: usize,
     cap: usize,
+    span: usize,
     ring: usize, // rows a slot's window ring
     rings: []cuda.DeviceBuffer, // per layer bf16 [slots * ring, hd]
     planes: []?PoolPlanes, // per layer: its own when a kv source
@@ -182,7 +185,7 @@ pub const Pool = struct {
     }
 
     /// The device bytes `init(.., layers, slots, cap)` allocates, exactly: the rings, the kv sources' planes and the
-    /// token row; what a served engine reserves for its streams' caches at a context of `cap` positions.
+    /// token row; what a served engine reserves for its streams' caches over a pool of `cap` positions.
     pub fn bytesFor(cfg: *const Config, layers: usize, cap: usize, slots: usize) usize {
         var total: usize = cap * 8;
         for (0..layers) |li| {
@@ -219,7 +222,7 @@ pub const Pool = struct {
         var tokens = try cuda.DeviceBuffer.alloc(d, cap * 8);
         errdefer tokens.free();
         try tokens.fill8(0, null);
-        return .{ .gpa = gpa, .slots = slots, .cap = cap, .ring = ring, .rings = rings, .planes = planes, .source = source, .tokens = tokens };
+        return .{ .gpa = gpa, .slots = slots, .cap = cap, .span = cap, .ring = ring, .rings = rings, .planes = planes, .source = source, .tokens = tokens };
     }
 
     pub fn deinit(self: *Pool) void {
@@ -789,10 +792,10 @@ pub const RoundRunner = struct {
         self.iqq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
         self.wl = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 4);
         self.wts_i = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 2);
-        // the widest scan is the ratio-1 layers' at the widest bucket a round takes (`bucketFor` of the pool's last
-        // position: the context's bucket, or the pool's positions where they are fewer); the smallest is the fused
+        // the widest scan is the ratio-1 layers' at the widest bucket a round takes (`bucketFor` of a stream's last
+        // position: the context's bucket, or a stream's positions where they are fewer); the smallest is the fused
         // selection's candidate
-        const widest = @min(bucket, @max(pool.cap, bucket_min));
+        const widest = @min(bucket, @max(pool.span, bucket_min));
         const scored = widest > cfg.idx_topk;
         const host = glue.hostSelect();
         self.score = try cuda.DeviceBuffer.alloc(d, if (scored) R * widest * 4 else 16);
@@ -938,12 +941,13 @@ pub const RoundRunner = struct {
         if (self.probe) |p| try p.call(p.ctx, name, ptr, bytes, stream);
     }
 
-    /// The bucket a round of `windows` scans: `bucketFor` its deepest row (position + 1) over the pool, the
-    /// runner's `least` at least; error.BadShape past the runner's widest (its buffers).
+    /// The bucket a round of `windows` scans: `bucketFor` its deepest row (position + 1) over a stream's span
+    /// (`Pool.span`, not the pool: a wider pool leaves every round's bucket as it was), the runner's `least` at
+    /// least; error.BadShape past the runner's widest (its buffers).
     pub fn bucketOf(self: *const RoundRunner, windows: []const Window) error{BadShape}!usize {
         var deepest: usize = 1;
         for (windows) |wd| deepest = @max(deepest, wd.position + wd.ids.len);
-        const b = bucketFor(deepest, self.pool.cap, @min(self.least, self.bucket));
+        const b = bucketFor(deepest, self.pool.span, @min(self.least, self.bucket));
         if (b < deepest or b > self.bucket) return error.BadShape;
         return b;
     }
@@ -956,10 +960,11 @@ pub const RoundRunner = struct {
         var R: usize = 0;
         for (windows) |wd| R += wd.ids.len;
         if (R < 1 or R > max_rows) return error.TooManyRows;
-        // every row inside its extent, the extent inside the window, its positions inside the RoPE tables
+        // every row inside its extent, the extent inside the window and no wider than a stream's span, its
+        // positions inside the RoPE tables
         const rope_rows = @min(self.rope_c.rows, self.rope_w.rows);
         for (windows) |wd| {
-            if (wd.ids.len == 0 or wd.slot >= self.pool.slots or wd.base + wd.size > self.pool.cap) return error.BadShape;
+            if (wd.ids.len == 0 or wd.slot >= self.pool.slots or wd.base + wd.size > self.pool.cap or wd.size > self.pool.span) return error.BadShape;
             if (wd.position + wd.ids.len > wd.size or wd.position + wd.ids.len > rope_rows) return error.BadShape;
             if (self.engram != null and wd.host.len < wd.position + wd.ids.len) return error.BadShape;
         }
