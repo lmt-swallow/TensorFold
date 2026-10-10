@@ -482,7 +482,9 @@ pub const Prompt = struct {
         self.wl = try cuda.DeviceBuffer.alloc(d, r * c.idx_heads * 4);
         self.wts = try cuda.DeviceBuffer.alloc(d, r * c.idx_heads * 2);
         const nb_max: usize = fwd.cap + 2;
-        const score_words: usize = @max(score_bytes_limit / 4, 16 * nb_max);
+        // the indexer's [rows, n_comp] scores (or keys) of a row block: model.py's bound of 2^24 entries, one row's
+        // n_comp at least (`index` scores a block of decode rows a few rows at a time past it)
+        const score_words: usize = @max(score_bytes_limit / 4, nb_max);
         self.score = try cuda.DeviceBuffer.alloc(d, score_words * 8);
         // a row block's tile maxima: its rows x ceil(n_comp / 64), the block's rows x n_comp within score_words
         self.tmax = try cuda.DeviceBuffer.alloc(d, (score_words / 64 + r) * 8);
@@ -1059,6 +1061,10 @@ pub const Prompt = struct {
         }
         // scores in row blocks (the [rb, n_comp] matrix bounded), the top-k of each on the device (or the host)
         const rb = @max(16, @min(n, score_bytes_limit / (4 * @max(n_comp_end, 1))));
+        // a block of decode rows (rb at its least, 16) past the score buffer runs as steps of the rows it holds: the
+        // decode rows' kernel scores and selects each row on its own, so the steps write what one block would
+        const step = if (rb * n_comp_end <= self.score.len / 8) rb else @max(1, (self.score.len / 8) / @max(n_comp_end, 1));
+        if (step < rb and rb > decode_rows) return error.BadShape;
         const nt: usize = (n_comp_end + 63) / 64;
         const vis = self.tab[self.rows + 1 .. self.rows + 1 + n];
         const is_cand_source = c.cand_source >= 0 and li == @as(usize, @intCast(c.cand_source));
@@ -1075,8 +1081,8 @@ pub const Prompt = struct {
         const cb = @max(1, c.cand_block);
         const ccols = (n_comp_end + cb - 1) / cb;
         var r0: usize = 0;
-        while (r0 < n) : (r0 += rb) {
-            const r1 = @min(n, r0 + rb);
+        while (r0 < n) : (r0 += step) {
+            const r1 = @min(n, r0 + step);
             const rows = r1 - r0;
             const q = self.iqq.ptr + r0 * c.idx_heads * c.idx_dim * 2;
             const wt = self.wts.ptr + r0 * c.idx_heads * 2;
