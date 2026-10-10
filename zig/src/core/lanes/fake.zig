@@ -23,6 +23,8 @@ const Lane = struct {
     held: std.ArrayList(u32) = .empty, // drafts for the next round
     base: usize = 0, // the history length before the last verify
     rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
+    chunks_run: usize = 0, // the prompt pass's chunks run so far
+    filled: bool = false, // the prompt pass has ended
 };
 
 pub const Fake = struct {
@@ -39,6 +41,8 @@ pub const Fake = struct {
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+    parts: bool = false, // the backend has `prefill_part` (a prompt pass of `prefill_chunks` chunks, in parts)
+    rounds_mid_pass: u64 = 0, // verifies run while some stream's prompt pass stood between two parts
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -54,6 +58,7 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
+        if (x.parts) return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
 
@@ -98,17 +103,40 @@ pub const Fake = struct {
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        try x.begin(s);
+        _ = try x.part(s, std.math.maxInt(u32));
+    }
+
+    /// A pass starts at a stream's first part, one that stands between parts goes on.
+    fn prefillPart(ptr: *anyopaque, s: *Stream, chunks: u32) anyerror!bool {
+        const x = self(ptr);
+        const l = x.lanes.getPtr(s);
+        if (l == null or l.?.filled) try x.begin(s);
+        return x.part(s, chunks);
+    }
+
+    fn begin(x: *Fake, s: *Stream) !void {
         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
-        const chunks = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
-        for (0..chunks) |chunk| {
+    }
+
+    /// At most `chunks` more of the pass's chunks; true once it has ended (its prompt in the stream's history).
+    fn part(x: *Fake, s: *Stream, chunks: u32) !bool {
+        const l = x.lane(s);
+        const total = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
+        const end = @min(total, l.chunks_run +| chunks);
+        while (l.chunks_run < end) {
+            const chunk = l.chunks_run;
+            l.chunks_run += 1;
             x.prefill_count += 1;
             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
             if (s.isCancelled()) return error.Cancelled;
         }
-        const h = &got.value_ptr.history;
+        if (l.chunks_run < total) return false;
+        l.filled = true;
+        const h = &l.history;
         s.cached = 0;
         if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
             const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
@@ -119,6 +147,7 @@ pub const Fake = struct {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
+        return true;
     }
 
     /// A copy of the stream's cache at `at` tokens (the prompt pass stands there), for core/prompt_cache.zig.
@@ -156,7 +185,13 @@ pub const Fake = struct {
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
         x.rounds += 1;
+        var it = x.lanes.valueIterator();
+        while (it.next()) |l| if (!l.filled and l.chunks_run > 0) {
+            x.rounds_mid_pass += 1;
+            break;
+        };
         for (windows, out) |w, o| {
+            if (!x.lane(w.stream).filled) return error.StillFilling;
             const l = x.lane(w.stream);
             l.base = l.history.items.len;
             l.rows.clearRetainingCapacity();

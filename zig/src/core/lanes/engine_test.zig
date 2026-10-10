@@ -181,3 +181,102 @@ test "a cycle in the answer does not refire or reclose" {
     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
     try std.testing.expectEqual(@as(usize, 1), close_count);
 }
+
+const Interleaved = struct { emitted: [][]u32, mid_pass: u64, released: bool };
+
+/// `run`'s cases on a fake whose prompt passes take `chunks` parts: the first stream added whole, each later one
+/// filled a chunk at a time with `between` rounds of the live streams after each part; `cancel` (an index) is
+/// cancelled after its first part.
+fn runInterleaved(cases: []const Case, chunks: usize, between: usize, cancel: ?usize) !Interleaved {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .parts = true, .prefill_chunks = chunks };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    const streams = try gpa.alloc(sm.Stream, cases.len);
+    defer gpa.free(streams);
+    const proposers = try gpa.alloc(SuffixLookup, cases.len);
+    defer gpa.free(proposers);
+    var flags = try gpa.alloc(bool, cases.len);
+    defer gpa.free(flags);
+    @memset(flags, false);
+    const Flag = struct {
+        fn check(ptr: *anyopaque) bool {
+            return @as(*bool, @ptrCast(ptr)).*;
+        }
+    };
+    for (cases, streams, proposers, flags) |c, *s, *p, *flag| {
+        p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .cancel_check = .{ .ptr = flag, .check = Flag.check } });
+    }
+    defer for (streams, proposers) |*s, *p| {
+        s.deinit(gpa);
+        p.deinit();
+    };
+    try engine.addStream(&streams[0]);
+    for (streams[1..], 1..) |*s, i| {
+        var parts: usize = 0;
+        while (true) {
+            if (cancel == i and parts == 1) flags[i] = true;
+            const done = engine.fillStream(s, 1) catch |err| {
+                if (err != error.Cancelled) return err;
+                break;
+            };
+            parts += 1;
+            if (done) break;
+            for (0..between) |_| if (engine.activeCount() > 0) try engine.step();
+        }
+    }
+    while (engine.activeCount() > 0) try engine.step();
+    const out = try gpa.alloc([]u32, cases.len);
+    for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
+    return .{ .emitted = out, .mid_pass = target.rounds_mid_pass, .released = target.lanes.count() == 0 };
+}
+
+test "a prompt pass in parts between other streams' rounds commits what a whole pass commits, for every stream" {
+    const sampled: Sampling = .{ .seed = 4, .temperature = 0.8, .top_k = 0, .top_p = 0.9 };
+    const cases = [_]Case{ .{ .prompt = &p1, .max_new = 60 }, .{ .prompt = &p2, .sampling = sampled, .max_new = 30 }, .{ .prompt = &p1, .drafts = false, .max_new = 20 } };
+    const whole = try run(&cases);
+    defer free(whole);
+    for ([_]usize{ 1, 4 }) |chunks| for ([_]usize{ 0, 1, 3 }) |between| {
+        const parts = try runInterleaved(&cases, chunks, between, null);
+        defer free(parts.emitted);
+        for (whole, parts.emitted) |w, p| try std.testing.expectEqualSlices(u32, w, p);
+        // rounds ran between parts exactly when the policy asked for them and a pass had more than one part
+        try std.testing.expectEqual(chunks > 1 and between > 0, parts.mid_pass > 0);
+        try std.testing.expect(parts.released);
+    };
+}
+
+test "a stream cancelled between the parts of its pass is released and leaves the others' tokens unchanged" {
+    const cases = [_]Case{ .{ .prompt = &p1, .max_new = 60 }, .{ .prompt = &p2, .max_new = 30 }, .{ .prompt = &p2, .max_new = 25 } };
+    const whole = try run(&.{ cases[0], cases[2] });
+    defer free(whole);
+    const parts = try runInterleaved(&cases, 4, 2, 1);
+    defer free(parts.emitted);
+    try std.testing.expectEqual(@as(usize, 0), parts.emitted[1].len);
+    try std.testing.expectEqualSlices(u32, whole[0], parts.emitted[0]);
+    try std.testing.expectEqualSlices(u32, whole[1], parts.emitted[2]);
+    try std.testing.expect(parts.released);
+}
+
+test "without prefill_part a stream's pass runs whole at its first part" {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+    defer p.deinit();
+    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 8, .proposer = p.proposer() });
+    defer s.deinit(gpa);
+    try std.testing.expect(try engine.fillStream(&s, 1));
+    try std.testing.expectEqual(@as(usize, 3), target.prefill_count);
+    try std.testing.expectEqual(@as(usize, 1), engine.activeCount());
+    while (engine.activeCount() > 0) try engine.step();
+    try std.testing.expectEqual(@as(usize, 8), s.emitted().len);
+}

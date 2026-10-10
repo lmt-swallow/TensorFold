@@ -49,6 +49,12 @@ pub const Backend = struct {
     pub const VTable = struct {
         /// Prefill the stream's prompt into its caches (and its draft head's).
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
+        /// Run the next at most `chunks` (>= 1) chunks of the stream's prompt pass, the first call starting it as
+        /// `prefill` does; true once the pass has ended, the stream then as after `prefill`. Between two calls other
+        /// streams' rounds may run, never this stream's; a stream's caches and first token do not depend on them.
+        /// After a call that returned false, the stream either gets further calls or is released. null: a pass
+        /// runs whole (`prefill`).
+        prefill_part: ?*const fn (ptr: *anyopaque, s: *Stream, chunks: u32) anyerror!bool = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.
@@ -75,6 +81,14 @@ pub const Backend = struct {
 
     pub fn prefill(b: Backend, s: *Stream) !void {
         return b.vtable.prefill(b.ptr, s);
+    }
+    /// `prefill_part`, or with a backend that has none the whole pass at once (true).
+    pub fn prefillPart(b: Backend, s: *Stream, chunks: u32) !bool {
+        const part = b.vtable.prefill_part orelse {
+            try b.prefill(s);
+            return true;
+        };
+        return part(b.ptr, s, chunks);
     }
     pub fn first(b: Backend, s: *Stream, position: u64) !u64 {
         return b.vtable.first(b.ptr, s, position);

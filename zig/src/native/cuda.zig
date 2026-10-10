@@ -182,7 +182,7 @@ const Host = struct {
     }
 
     /// The round loop and the lane host over the family's backend, its thread started.
-    fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain) !void {
+    fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain, interleave: u32) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
         errdefer h.cfg.deinit(h.gpa);
         h.clock = .{ .io = io };
@@ -191,6 +191,7 @@ const Host = struct {
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
+        h.host.interleave = interleave;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -211,6 +212,12 @@ const Host = struct {
                     return x.inner.vtable.prefill(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_part = if (v.prefill_part != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, chunks: u32) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_part.?(x.inner.ptr, s, chunks);
+                }
+            }.f else null,
             .first = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
                     const x = bind(p);
@@ -302,6 +309,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
+    // rounds of the decoding streams after each prompt chunk (LaneHost.interleave), the family's default unless set
+    const interleave = try setting(a, null, "TENSORFOLD_PREFILL_INTERLEAVE", if (@hasDecl(F, "prefill_interleave")) F.prefill_interleave else 0, problem) orelse return null;
     const segments = try setting(a, o.segments, "TF_CUDA_SEGMENTS", 1, problem) orelse return null;
     if (segments < 1 or segments > F.max_segments) {
         const named = if (o.segments != null) "--segments " else "TF_CUDA_SEGMENTS=";
@@ -381,7 +390,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain }, interleave);
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
@@ -438,7 +447,7 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
     const h = try gpa.create(Host);
     defer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Nothing.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
-    try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 2 }, null);
+    try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 2 }, null, 0);
     defer {
         h.host.stop();
         h.core.deinit();

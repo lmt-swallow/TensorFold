@@ -83,6 +83,33 @@ pub const Engine = struct {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
         };
+        try e.join(s);
+    }
+
+    /// `addStream` in parts: run at most `chunks` (>= 1) more chunks of the stream's prompt pass (`Backend.prefillPart`;
+    /// the first call starts it); once the pass ends, the stream draws its first token and asks for its first drafts
+    /// exactly as `addStream` would, and true is returned (the stream may have finished at that token). The caller
+    /// may `step` the live streams between two calls, which neither sees nor changes this stream, so its tokens are
+    /// the ones `addStream` gives. A stream cancelled before a part, or in it, is released (error.Cancelled), as is
+    /// one whose pass the caller abandons through `discard`.
+    pub fn fillStream(e: *Engine, s: *Stream, chunks: u32) !bool {
+        _ = e.arena.reset(.retain_capacity);
+        if (s.isCancelled()) {
+            e.backend.release(s);
+            return error.Cancelled;
+        }
+        const done = e.backend.prefillPart(s, @max(chunks, 1)) catch |err| {
+            if (err == error.Cancelled) e.backend.release(s);
+            return err;
+        };
+        if (!done) return false;
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        try e.join(s);
+        return true;
+    }
+
+    /// A prefilled stream's first token and first drafts; it joins the rounds unless that token finished it.
+    fn join(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token
             e.backend.release(s);
             return error.Cancelled;
