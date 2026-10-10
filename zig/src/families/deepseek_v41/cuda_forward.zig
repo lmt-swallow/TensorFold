@@ -119,6 +119,7 @@ pub const Forward = struct {
     planes: []?Planes, // per layer: its own when a kv source
     source: []usize, // per layer: the kv source whose planes it reads
     attn: []attention.Attention,
+    attn_scratch: *attention.Scratch, // what every layer's attention shares (the layers run one after another)
     idx_proj_h: []cuda.DeviceBuffer, // per layer: fp16 [idx_heads, d] on index layers (empty otherwise)
     // the window's buffers
     ids: cuda.DeviceBuffer,
@@ -176,6 +177,7 @@ pub const Forward = struct {
         self.idx_proj_h = try gpa.alloc(cuda.DeviceBuffer, L);
         var src: usize = 0;
         var attn_bytes: u64 = 0;
+        self.attn_scratch = try gpa.create(attention.Scratch); // made after the layers, for the widest of them
         for (0..L) |li| {
             self.rings[li] = try cuda.DeviceBuffer.alloc(d, (cfg.window + 16) * cfg.head_dim * 2);
             try self.rings[li].fill8(0, null);
@@ -191,13 +193,19 @@ pub const Forward = struct {
                 a.add(@as(c_int, @intCast(p.count)));
                 try cuda.launch.launch(glue.f32_to_f16, .{ .grid = .{ .x = @intCast((p.count + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
             }
-            const dims = self.dimsOf(li);
             const before = cuda.usage(false).device;
-            self.attn[li] = try attention.Attention.init(gpa, d, dims, set, glue, self.paramsOf(li).scratchWords(max_rows));
+            self.attn[li] = try attention.Attention.initShared(gpa, d, self.dimsOf(li), set, glue, self.attn_scratch);
+            attn_bytes += cuda.usage(false).device - before;
+        }
+        {
+            const before = cuda.usage(false).device;
+            var need: attention.Scratch.Need = .{};
+            for (0..L) |li| need = need.merge(attention.Scratch.Need.of(self.dimsOf(li), self.paramsOf(li).scratchWords(max_rows), glue.hostSelect()));
+            self.attn_scratch.* = try attention.Scratch.init(gpa, d, self.dimsOf(0), need);
             attn_bytes += cuda.usage(false).device - before;
         }
         try stream.synchronize();
-        if (mem_note.on()) std.log.info("mem: the decode loop's attention scratch {d:.1} MiB of its {d} layers (bucket {d})", .{ @as(f64, @floatFromInt(attn_bytes)) / (1 << 20), L, bucket });
+        if (mem_note.on()) std.log.info("mem: the decode loop's attention {d:.1} MiB for its {d} layers (one shared scratch; bucket {d})", .{ @as(f64, @floatFromInt(attn_bytes)) / (1 << 20), L, bucket });
         mem_note.note(d, "the decode loop's layers (rings, planes of {d} positions, attention scratch)", .{cap});
         const r = max_rows;
         self.ids = try cuda.DeviceBuffer.alloc(d, r * 8);
@@ -232,6 +240,8 @@ pub const Forward = struct {
         for (self.rings) |*b| b.free();
         for (self.planes) |*p| if (p.*) |*pl| pl.deinit();
         for (self.attn) |*a| a.deinit();
+        self.attn_scratch.deinit();
+        self.gpa.destroy(self.attn_scratch);
         for (self.idx_proj_h) |*b| b.free();
         self.gpa.free(self.rings);
         self.gpa.free(self.planes);
