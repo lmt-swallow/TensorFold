@@ -32,7 +32,8 @@ short,agent,long,concurrent` (a subset; `concurrent`'s sequential-sha check need
 (free text kept in the result). On the node itself, drop `--host`; the result goes to `--out-dir` (default
 `results/bench/` beside the script's checkout).
 
-Run time on 47a5326: see the baseline's `seconds`; the default run is sized for under 25 minutes with `--full`.
+Run time on 47a5326 (baseline `results/bench/20261011-0453-0220ef9c6059.json`): 15 minutes with `--full`, of which
+the four 256k needles take 10.5; about 6 minutes without it.
 
 ## Scenarios
 
@@ -56,7 +57,7 @@ server start (the smoke's restart is one).
 | `prefill s` | the server's `tensorfold.prefill_seconds` |
 | `prefill tok/s` | (prompt - cached) / prefill s |
 | `TTFT s` | client time from the send to the first content chunk (includes queueing behind other streams) |
-| `tokens` | completion tokens |
+| `tokens` | completion tokens (a needle's answer is about 9, so its decode tok/s mostly measures the wait behind the other streams' prompts) |
 | `decode tok/s` | client-side (tokens - 1) / (last chunk - first chunk), kit_bench.py's definition |
 | `rounds`, `acc`, `drafted` | the server's `speculative` counters: decode rounds, draft tokens accepted and proposed |
 | `agg tok/s` | concurrent short: all completion tokens / the span from the first send to the last reply |
