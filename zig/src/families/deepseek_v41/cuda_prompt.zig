@@ -354,7 +354,7 @@ pub const Prompt = struct {
     wl: cuda.DeviceBuffer, // fp32 [rows, idx_heads]
     wts: cuda.DeviceBuffer, // bf16 [rows, idx_heads]
     score: cuda.DeviceBuffer, // fp32 scores or int64 keys [rb, n_comp]
-    tmax: cuda.DeviceBuffer, // int64 [rb, nt]: the keyed path's tile maxima (unread)
+    tmax: cuda.DeviceBuffer, // int64 [rb, nt]: the keyed path's tile maxima of a row block (unread)
     cidx: cuda.DeviceBuffer, // int64 [rows, idx_topk]
     cand: cuda.DeviceBuffer, // u8 [rows, cand cols]: the candidate pool of the chunk's rows (device selection)
     smax: cuda.DeviceBuffer, // fp32 [rb, cand cols]: a row block's block maxima
@@ -484,7 +484,8 @@ pub const Prompt = struct {
         const nb_max: usize = fwd.cap + 2;
         const score_words: usize = @max(score_bytes_limit / 4, 16 * nb_max);
         self.score = try cuda.DeviceBuffer.alloc(d, score_words * 8);
-        self.tmax = try cuda.DeviceBuffer.alloc(d, @max(16, r * ((nb_max + 63) / 64) * 8));
+        // a row block's tile maxima: its rows x ceil(n_comp / 64), the block's rows x n_comp within score_words
+        self.tmax = try cuda.DeviceBuffer.alloc(d, (score_words / 64 + r) * 8);
         self.cidx = try cuda.DeviceBuffer.alloc(d, @max(16, r * (c.idx_topk + 16) * 8));
         const cb = @max(1, c.cand_block);
         const cand_cols_max = (nb_max + cb - 1) / cb;
@@ -509,11 +510,12 @@ pub const Prompt = struct {
         self.head_logits = try cuda.DeviceBuffer.alloc(d, c.vocab * 4);
         self.ids_h = try gpa.alloc(i64, r);
         self.tab = try gpa.alloc(i64, 6 * (r + 1));
-        self.score_h = try gpa.alloc(f32, score_words * 2);
-        self.keys_h = try gpa.alloc(i64, @max(1, nb_max));
+        const host = fwd.glue.hostSelect(); // the host selection's copies of the scores and the pool
+        self.score_h = try gpa.alloc(f32, if (host) score_words * 2 else 0);
+        self.keys_h = try gpa.alloc(i64, if (host) @max(1, nb_max) else 0);
         self.cidx_h = try gpa.alloc(i64, @max(1, r * (c.idx_topk + 16)));
         self.cand_cols = (nb_max + c.cand_block - 1) / @max(1, c.cand_block);
-        self.cand_h = try gpa.alloc(u8, @max(1, r * self.cand_cols));
+        self.cand_h = try gpa.alloc(u8, if (host) @max(1, r * self.cand_cols) else 0);
         self.cand_rows = 0;
         self.cidx_cols = 0;
         self.cidx_stride = 0;
