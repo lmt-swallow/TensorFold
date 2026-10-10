@@ -778,8 +778,9 @@ pub const Keeps = struct {
 };
 
 /// The measure step's record: the opcode, the repetitions (u8), the pool's slots (u8), the flags (u8: bit 0 Engram,
-/// bit 1 the drafter, bits 2 .. 5 a window's drafts at most), the window's positions (u64) and a stream's most (u64,
-/// `Streams.most`): ranks whose pools, per-stream contexts or drafts differ stop at load.
+/// bit 1 the drafter, bits 2 .. 5 a window's drafts at most), the window's positions (u64), a stream's most (u64,
+/// `Streams.most`) and a position to also time rounds of every row count at (u64, 0: none; TF_DS_MEASURE_AT): ranks
+/// whose pools, per-stream contexts or drafts differ stop at load.
 pub const Measure = struct {
     reps: u8,
     slots: usize,
@@ -789,8 +790,9 @@ pub const Measure = struct {
     most: usize,
     /// a window's drafts at most (0 .. most_drafts_max)
     width: usize = 0,
+    at: usize = 0,
 
-    pub const bytes: usize = 20;
+    pub const bytes: usize = 28;
 
     pub fn encode(buf: []u8, m: Measure) []const u8 {
         buf[0] = @intFromEnum(Op.measure);
@@ -799,12 +801,13 @@ pub const Measure = struct {
         buf[3] = @as(u8, @intFromBool(m.engram)) | @as(u8, @intFromBool(m.drafts)) << 1 | @as(u8, @intCast(m.width)) << 2;
         std.mem.writeInt(u64, buf[4..12], @intCast(m.total), .little);
         std.mem.writeInt(u64, buf[12..20], @intCast(m.most), .little);
+        std.mem.writeInt(u64, buf[20..28], @intCast(m.at), .little);
         return buf[0..bytes];
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Measure {
         if (op.len != bytes or op[0] != @intFromEnum(Op.measure) or op[3] >> 2 > most_drafts_max) return error.BadRecord;
-        return .{ .reps = op[1], .slots = op[2], .engram = op[3] & 1 != 0, .drafts = op[3] & 2 != 0, .total = @intCast(std.mem.readInt(u64, op[4..12], .little)), .most = @intCast(std.mem.readInt(u64, op[12..20], .little)), .width = op[3] >> 2 };
+        return .{ .reps = op[1], .slots = op[2], .engram = op[3] & 1 != 0, .drafts = op[3] & 2 != 0, .total = @intCast(std.mem.readInt(u64, op[4..12], .little)), .most = @intCast(std.mem.readInt(u64, op[12..20], .little)), .width = op[3] >> 2, .at = @intCast(std.mem.readInt(u64, op[20..28], .little)) };
     }
 };
 
@@ -1971,12 +1974,18 @@ pub const Engine = struct {
     /// The measure step (every rank): rounds of 1 .. max_rows rows at position 0 of slot 0 (the least bucket), of
     /// 1 and max_rows rows at the widest bucket (`probeDeep`), then batched drafts of 1 .. passStreams streams, each
     /// timed after a warm-up run. Rank 0 keeps the times. The positions follow from the record's window alone, so
-    /// every rank runs the same buckets.
+    /// every rank runs the same buckets. With the record's `at`, rank 0 also logs rounds of 1 .. max_rows rows at
+    /// that position (at most `probeDeep`'s): the costs the facts leave out, for the record.
     fn runMeasure(e: *Engine, m: Measure) !void {
         const reps: usize = @max(m.reps, 1);
         const st = &e.streams;
         for (1..max_rows + 1) |n| e.round_ms[n - 1] = try e.timeRound(reps, n, 0);
         for ([_]usize{ 1, max_rows }, &e.round_deep_ms) |n, *ms| ms.* = try e.timeRound(reps, n, st.probeDeep(n));
+        if (m.at > 0) {
+            var at_ms: [max_rows]f64 = undefined;
+            for (&at_ms, 1..) |*ms, n| ms.* = try e.timeRound(reps, n, @min(m.at, st.probeDeep(n)));
+            if (e.settings.rank == 0) std.log.info("deepseek_v41: rounds of 1..{d} rows at position {d}: {any} ms", .{ max_rows, @min(m.at, st.probeDeep(max_rows)), at_ms });
+        }
         if (st.spark) |sp| {
             const most = @min(sp.passStreams(), st.lanes.len);
             for (1..most + 1) |n| {
@@ -2075,7 +2084,8 @@ pub const Engine = struct {
     pub fn measure(e: *Engine, reps: u8) !void {
         if (e.settings.rank != 0) return;
         var buf: [Measure.bytes]u8 = undefined;
-        try e.both(Measure.encode(&buf, .{ .reps = reps, .slots = e.streams.lanes.len, .engram = e.engram != null, .drafts = e.drafter != null, .total = e.streams.extents.total, .most = e.streams.most, .width = e.drafts() }));
+        const at: usize = if (getenv("TF_DS_MEASURE_AT")) |v| std.fmt.parseInt(usize, v, 10) catch 0 else 0;
+        try e.both(Measure.encode(&buf, .{ .reps = reps, .slots = e.streams.lanes.len, .engram = e.engram != null, .drafts = e.drafter != null, .total = e.streams.extents.total, .most = e.streams.most, .width = e.drafts(), .at = at }));
     }
 
     /// The drafts a window holds at most: TF_DS_DRAFTS, else the drafter's block (0 without the drafter).
@@ -2929,7 +2939,7 @@ test "admission, free, round, drafts, keeps and measure records parse back to wh
         try std.testing.expectError(error.BadRecord, Keeps.parse(kop[0 .. kop.len - 1], &kr));
         try std.testing.expectError(error.BadRecord, DraftsRec.parse(kop, &dr));
 
-        const m: Measure = .{ .reps = r.int(u8), .slots = r.intRangeAtMost(usize, 1, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .total = r.int(u40), .most = r.int(u40), .width = r.intRangeAtMost(usize, 0, most_drafts_max) };
+        const m: Measure = .{ .reps = r.int(u8), .slots = r.intRangeAtMost(usize, 1, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .total = r.int(u40), .most = r.int(u40), .width = r.intRangeAtMost(usize, 0, most_drafts_max), .at = r.int(u40) };
         const mop = Measure.encode(&buf, m);
         try std.testing.expectEqual(m, try Measure.parse(mop));
         try std.testing.expectError(error.BadRecord, Measure.parse(mop[0 .. mop.len - 1]));
