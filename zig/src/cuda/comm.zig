@@ -41,6 +41,24 @@ pub const Comm = struct {
         return self;
     }
 
+    /// A second communicator over the same ranks, its NCCL id sent over this one's control link: its collectives
+    /// order among themselves only, so two streams may each issue theirs on one communicator of their own (NCCL
+    /// forbids two streams issuing on one communicator at once). Every rank calls it at the same point, with no
+    /// control message in flight. It has no control link (`sendTo` and `recvFrom` fail with LinkClosed); its
+    /// `deinit` leaves this one's.
+    pub fn sibling(self: *const Comm) Error!Comm {
+        var lib = try nccl.Library.open();
+        errdefer lib.close();
+        var out: Comm = .{ .lib = lib, .comm = null, .rank = self.rank, .world = self.world, .links = @splat(-1) };
+        var uid: nccl.UniqueId = undefined;
+        if (self.rank == 0) {
+            try lib.check(lib.api.ncclGetUniqueId(&uid), "ncclGetUniqueId");
+            for (self.links[0 .. self.world - 1]) |fd| try writeAll(fd, std.mem.asBytes(&uid));
+        } else try readAll(self.links[0], std.mem.asBytes(&uid));
+        try lib.check(lib.api.ncclCommInitRank(&out.comm, @intCast(self.world), uid, @intCast(self.rank)), "ncclCommInitRank");
+        return out;
+    }
+
     pub fn deinit(self: *Comm) void {
         if (self.comm != null) _ = self.lib.api.ncclCommDestroy(self.comm);
         for (self.links[0 .. self.world - 1]) |fd| if (fd >= 0) {
