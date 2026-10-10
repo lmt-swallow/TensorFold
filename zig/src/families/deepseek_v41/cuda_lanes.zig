@@ -2146,7 +2146,20 @@ pub fn factsOf(drafting: bool, slots: usize, window_costs: []const lanes.config.
         .max_streams = @intCast(slots),
         .shared_costs = shared_costs,
         .draft_streams = drafting,
+        .draft_probabilities = drafting and rounds.tailFromEnv(),
     };
+}
+
+/// Prefix survivals of a block's confidences: out[j] = the product of sigmoid(conf[i]) for i <= j, in f64. A
+/// confidence's sigmoid is its draft's chance of landing once every earlier draft landed (multi.py's conf rule,
+/// dspark.py `choose_k` sums these products as the expected kept drafts), so out[j] is the chance that drafts 0 .. j
+/// all land: non-increasing in j, each in [0, 1], out.len <= conf.len.
+pub fn survivals(conf: []const f32, out: []f64) void {
+    var surv: f64 = 1.0;
+    for (out, conf[0..out.len]) |*o, cf| {
+        surv *= 1.0 / (1.0 + @exp(-@as(f64, cf)));
+        o.* = surv;
+    }
 }
 
 /// `Loaded.rows` (lanes.Config's max_rows: it caps a window's width and its drafts).
@@ -2180,6 +2193,7 @@ pub const Lanes = struct {
             .verify = verifyFn,
             .keep = keepFn,
             .draft = draftFn,
+            .probabilities = probabilitiesFn,
             .release = releaseFn,
         } };
     }
@@ -2375,6 +2389,21 @@ pub const Lanes = struct {
         try e.both(DraftsRec.encode(e.op_buf, asks[0..requests.len]));
     }
 
+    /// The backend's `probabilities` hook (the round loop's allocation trims each window's held drafts by them, and
+    /// with them the depth rule asks for the most drafts and leaves the cut to the allocation): out[j] is the chance
+    /// that the stream's held drafts 0 .. j all land, the prefix survivals of the confidence head's logits
+    /// (`survivals`). False, so the loop falls back to its per-depth acceptance rates, when the stream holds fewer
+    /// than out.len drafts or is not this backend's. The chances choose which rows a round verifies, never a row's
+    /// token: every verified row is drawn greedy from the target's logits.
+    fn probabilitiesFn(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
+        const self = of(ptr);
+        const slot = self.slotOf(s) catch return false;
+        const l = &self.e.streams.lanes[slot];
+        if (out.len > l.held or out.len > l.drafts.len) return false;
+        survivals(l.drafts.conf[0..out.len], out);
+        return true;
+    }
+
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const slot = self.slotOf(s) catch return;
@@ -2388,6 +2417,29 @@ pub const Lanes = struct {
         e.both(op) catch |err| std.log.err("release: {s}", .{@errorName(err)});
     }
 };
+
+test "draft chances are non-increasing prefix survivals in [0, 1], the products of the confidences' sigmoids" {
+    var prng = std.Random.DefaultPrng.init(0xc0f1);
+    const r = prng.random();
+    var out: [3]f64 = undefined;
+    survivals(&.{ 0.0, 0.0, 2.0 }, &out);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), out[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), out[1], 1e-12);
+    try std.testing.expectApproxEqAbs(0.25 / (1.0 + @exp(@as(f64, -2.0))), out[2], 1e-12);
+    for (0..500) |_| {
+        var conf: [16]f32 = undefined;
+        for (&conf) |*c| c.* = (r.float(f32) - 0.5) * 40;
+        const n = r.intRangeAtMost(usize, 0, conf.len);
+        var p: [16]f64 = undefined;
+        survivals(&conf, p[0..n]);
+        var prev: f64 = 1.0;
+        for (p[0..n], conf[0..n]) |x, c| {
+            try std.testing.expect(x >= 0 and x <= prev);
+            try std.testing.expectApproxEqRel(prev / (1.0 + @exp(-@as(f64, c))), x, 1e-12);
+            prev = x;
+        }
+    }
+}
 
 test "bounded replay starts the upper layers at the prompt's last window rows, at 0 for a prompt within the window" {
     try std.testing.expectEqual(@as(?usize, null), replayFrom(false, 600, 128));
