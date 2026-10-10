@@ -769,26 +769,34 @@ pub const RoundRunner = struct {
         self.iqq = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * cfg.idx_dim * 2);
         self.wl = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 4);
         self.wts_i = try cuda.DeviceBuffer.alloc(d, R * cfg.idx_heads * 2);
-        // the widest scan is the ratio-1 layers' (bucket entries); the smallest is the fused selection's candidate
-        const scored = bucket > cfg.idx_topk;
-        self.score = try cuda.DeviceBuffer.alloc(d, if (scored) R * bucket * 4 else 16);
+        // the widest scan is the ratio-1 layers' at the widest bucket a round takes (`bucketFor` of the pool's last
+        // position: the context's bucket, or the pool's positions where they are fewer); the smallest is the fused
+        // selection's candidate
+        const widest = @min(bucket, @max(pool.cap, bucket_min));
+        const scored = widest > cfg.idx_topk;
+        const host = glue.hostSelect();
+        self.score = try cuda.DeviceBuffer.alloc(d, if (scored) R * widest * 4 else 16);
         // the selection's keys: the plain path's fusedTopk scans up to 4096 entries; the fused path keys whole rows
         // (the candidate source's scores at ratio 1: bucket entries)
         self.fused = fusedFromEnv();
-        self.keys = try cuda.DeviceBuffer.alloc(d, if (!scored) 16 else if (self.fused) R * bucket * 8 else R * @as(usize, @min(bucket, 4096)) * 8);
+        self.keys = try cuda.DeviceBuffer.alloc(d, if (!scored) 16 else if (self.fused) R * widest * 8 else R * @as(usize, @min(widest, 4096)) * 8);
         const fused_scored = scored and self.fused;
-        self.tmax = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * ((bucket + 63) / 64) * 8 else 16);
+        self.tmax = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * ((widest + 63) / 64) * 8 else 16);
         self.tkeys = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * cfg.idx_topk * 64 * 8 else 16);
         self.tpos = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * cfg.idx_topk * 8 else 16);
         self.cblk = try cuda.DeviceBuffer.alloc(d, if (fused_scored) R * @max(1, cfg.cand_blocks) * 4 else 16);
         self.t_every = try cuda.DeviceBuffer.alloc(d, R * 8);
         try self.t_every.fill8(0x01, null);
-        const ccols = (bucket + @max(1, cfg.cand_block) - 1) / @max(1, cfg.cand_block);
+        const ccols = (widest + @max(1, cfg.cand_block) - 1) / @max(1, cfg.cand_block);
         self.smax = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols * 4 else 16);
-        self.cand_mask = try cuda.DeviceBuffer.alloc(d, if (scored) R * ccols else 16);
-        self.score_h = try gpa.alloc(f32, if (scored) R * bucket else 1);
-        self.keys_h = try gpa.alloc(i64, if (scored) bucket else 1);
-        self.cand_h = try gpa.alloc(u8, if (scored) R * ccols else 1);
+        // the pool's mask: the fused path makes it only while the pool takes every block (cand_blocks columns at
+        // most; past them its block ids, `cblk`), the plain one (`roundIndex`) at every bucket
+        const plain = !self.fused or host or !std.math.isPowerOfTwo(cfg.idx_topk);
+        const mask_cols = if (plain) ccols else @min(ccols, @max(1, cfg.cand_blocks));
+        self.cand_mask = try cuda.DeviceBuffer.alloc(d, if (scored) R * mask_cols else 16);
+        self.score_h = try gpa.alloc(f32, if (scored and host) R * widest else 0);
+        self.keys_h = try gpa.alloc(i64, if (scored and host) widest else 0);
+        self.cand_h = try gpa.alloc(u8, if (scored and host) R * ccols else 0);
         self.h = try cuda.DeviceBuffer.alloc(d, R * 4 * D * 2);
         self.pre = try cuda.DeviceBuffer.alloc(d, R * 16);
         self.pre_a = try cuda.DeviceBuffer.alloc(d, R * 16);
