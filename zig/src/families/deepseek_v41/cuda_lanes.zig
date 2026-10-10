@@ -1134,6 +1134,11 @@ pub const Streams = struct {
             self.extents.give(base, size);
             lane.busy = false;
         }
+        if (self.base.w.rank == 0) {
+            var busy: usize = 0;
+            for (self.lanes) |l| busy += @intFromBool(l.busy);
+            std.log.info("deepseek_v41: slot {d} takes extent [{d}, +{d}) ({t}) for a prompt of {d}; {d} streams and {d} kept prompts resident, {d} of {d} positions free", .{ slot, base, size, placed.how, ids.len, busy, self.book.n, self.extents.freePositions(), self.extents.total });
+        }
         for (lane.hist[0..ids.len], ids) |*hv, id| hv.* = @intCast(id);
         self.point(slot, base, size);
         if (placed.how == .copy or placed.how == .move) try self.copyRows(src_base, base, cut);

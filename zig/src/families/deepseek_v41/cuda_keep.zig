@@ -49,6 +49,13 @@ pub const Extents = struct {
         return e;
     }
 
+    /// The positions no extent holds (every gap's).
+    pub fn freePositions(self: *const Extents) usize {
+        var n: usize = 0;
+        for (self.gaps[0..self.n]) |g| n += g[1] - g[0];
+        return n;
+    }
+
     /// `rows` aligned up to `extent_align`.
     pub fn size(rows: usize) usize {
         return (rows + extent_align - 1) / extent_align * extent_align;
