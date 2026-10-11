@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Launch every Triton specialization the Zig Flash Next engine can need, under the recorder, for its serving kernel
 set: TensorFold 0.6.6's prompt path at row counts that hit each of its tile and divisibility choices, decode windows
-of 1 to 16 rows, and the indexer's block selection at every power-of-two block count up to the window (`_select`'s
+of 1 to 32 rows (a shared round's four windows), and the indexer's block selection at every power-of-two block count up to the window (`_select`'s
 registers, then `_select_tiles` for a decode window and for a prompt block), and the MTP head on each prompt's chunks
-and on draft windows of 1 to 7 rows (its draft head's requantized matmul included). Nothing is saved but the launches
+and on 1 to 28 rows (four streams' kept rows). Nothing is saved but the launches
 (capture_serve_kernels.sh packs them with the fixtures' captures).
 
 Run inside the reference image with TRITON_CACHE_DIR set:
@@ -45,9 +45,9 @@ def main() -> int:
 
     w = X.load(a.model, mtp=True, draft_vocab="default")
     cap = 16384                                       # a prompt's cache; selection runs on its own scratch below
-    st = State(w, cap, 16)
+    st = State(w, cap, 32)
     pb = Buffers(w, PREFILL_ROWS, cap, prefill=True)
-    db = Buffers(w, 16, cap, moe_prefill=True)
+    db = Buffers(w, 32, cap, moe_prefill=True)
     for n in PROMPTS:
         st.reset(w)
         ids = [(7 * i + 11) % 151000 + 1000 for i in range(n)]
@@ -64,19 +64,19 @@ def main() -> int:
                 start = end
         torch.cuda.synchronize()
         print(f"prompt {n}", flush=True)
-    for r in range(1, 17):
+    for r in range(1, 33):
         with rec.scope(f"decode_{r}", detail=True):
             F.forward(w, st, db, [1000 + i for i in range(r)])
             F.commit(w, st, db, r, max(1, r // 2))
         torch.cuda.synchronize()
-    print("decode windows 1..16", flush=True)
-    mb = Buffers(w, 16, cap)
-    for r in range(1, 8):
+    print("decode windows 1..32", flush=True)
+    mb = Buffers(w, 32, cap)
+    for r in range(1, 29):
         with rec.scope(f"mtp_{r}", detail=True):
             mtp_forward(w, st, mb, [1000 + i for i in range(r)], db.streams[:r])
             st.set_mtp_len(st.mtp_len + r)
         torch.cuda.synchronize()
-    print("MTP windows 1..7", flush=True)
+    print("MTP windows 1..28", flush=True)
     # the selection at every block count up to the window, a decode window's rows and a prompt block's
     for rows in (1, 16, 256):
         s = attn_mod.AttnScratch(rows, w.cfg.heads, w.cfg.head_dim, CAPACITY, torch.device("cuda"),
