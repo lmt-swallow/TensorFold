@@ -54,6 +54,7 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_qmm", .src = "qwen38fn/qmm", .flags = &.{"-O3"} }, // 0.6.6 cuda/kernels/qmm.py's qmm.cu, tensorfold_qmm_v5: the MTP draft head
     .{ .name = "qwen38fn_draft_pick", .src = "qwen38fn/draft_pick", .flags = &.{"-O3"} }, // the draft head's greedy pick and its probability on the device
     .{ .name = "qwen38fn_f16_rows", .src = "qwen38fn/f16_rows", .flags = &.{"-O3"} }, // ours: exl3_mm.py F16 matrices over a prompt chunk's rows with _f16_mm's and _reduce's bytes
+    .{ .name = "qwen38fn_select", .src = "qwen38fn/select", .flags = &.{"-O3"} }, // ours: attention.py _select / _select_tiles lists, one program a row
     .{ .name = "qwen38fn_scores", .src = "qwen38fn/scores", .flags = &.{"-O3"} }, // ours: attention.py _scores for 32 rows a program with the captured kernel's bytes
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
     .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2

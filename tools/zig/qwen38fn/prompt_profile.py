@@ -24,6 +24,7 @@ def main() -> None:
     p.add_argument("--depths", default="0,65536,204800")
     p.add_argument("--top", type=int, default=40)
     p.add_argument("--gap-ms", type=float, default=1000.0)
+    p.add_argument("--rows", type=int, default=2048, help="chunk rows (TF_QFN_PROMPT_ROWS)")
     a = p.parse_args()
     depths = a.depths.split(",")
     con = sqlite3.connect(a.db)
@@ -53,7 +54,7 @@ def main() -> None:
         total = sum(v[1] for v in acc.values())
         wall = (seg[-1][1] - seg[0][0]) / 1e6
         print(f"\n## depth {depth}: {total / per:.1f} ms of kernels a chunk, {wall / per:.1f} ms wall a chunk "
-              f"({2048 * per / wall * 1e3:.0f} tok/s)\n")
+              f"({a.rows * per / wall * 1e3:.0f} tok/s)\n")
         print("| kernel | launches/chunk | ms/chunk | share |")
         print("|---|---:|---:|---:|")
         for k, (n, ms) in sorted(acc.items(), key=lambda kv: -kv[1][1])[: a.top]:

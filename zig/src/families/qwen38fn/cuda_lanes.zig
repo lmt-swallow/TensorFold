@@ -88,7 +88,7 @@ pub const Lanes = struct {
         errdefer self.pr.deinit();
         self.b = try fwd.Buffers.init(gpa, d, m, shared_rows, capacity);
         errdefer self.b.deinit();
-        self.pb = try prompt_mod.Buffers.init(gpa, d, m, prompt_mod.chunk_rows, capacity);
+        self.pb = try prompt_mod.Buffers.init(gpa, d, m, try prompt_mod.chunkRows(), capacity);
         errdefer self.pb.deinit();
         self.stream = try cuda.Stream.init(d, true);
         errdefer self.stream.deinit();
@@ -108,7 +108,7 @@ pub const Lanes = struct {
         self.head = try mtp.Head.load(self.gpa, self.d, self.m, max_streams, self.stream);
         self.mb = try fwd.Buffers.init(self.gpa, self.d, self.m, shared_rows, self.capacity);
         self.sc = try mtp.Scratch.init(self.d, &self.m.cfg, shared_rows);
-        self.scp = try mtp.Scratch.init(self.d, &self.m.cfg, prompt_mod.chunk_rows);
+        self.scp = try mtp.Scratch.init(self.d, &self.m.cfg, self.pb.rows);
     }
 
     pub fn deinit(self: *Lanes) void {

@@ -22,6 +22,16 @@ const Linear = dsv41.exl3.Linear;
 
 /// decode.py PREFILL_ROWS: rows of a prompt chunk.
 pub const chunk_rows = 2048;
+
+/// The rows of a served prompt chunk: TF_QFN_PROMPT_ROWS (a multiple of att_rows up to 16,384), else chunk_rows. A
+/// row's bits do not depend on where a chunk starts or ends, so any chunk size gives the same bytes.
+pub fn chunkRows() !usize {
+    const v = std.mem.span(std.c.getenv("TF_QFN_PROMPT_ROWS") orelse return chunk_rows);
+    if (v.len == 0) return chunk_rows;
+    const n = std.fmt.parseInt(usize, v, 10) catch return error.BadPromptRows;
+    if (n == 0 or n % att_rows != 0 or n > 16384) return error.BadPromptRows;
+    return n;
+}
 /// state.py ATT_ROWS: a prompt's attention runs in blocks of this many rows.
 pub const att_rows = 256;
 /// exl3_pack.py MOE_WINDOW: most rows a routed-expert call takes.
@@ -44,6 +54,9 @@ pub const Kernels = struct {
     sc: cuda.Module, // scores.cu: the indexer's block scores for many rows a program
     sc_rows: cuda.Function,
     sc_diff: cuda.Function,
+    sel: cuda.Module, // select.cu: the indexer's block lists, one program a row
+    sel_rows: cuda.Function,
+    sel_diff: cuda.Function,
     sms: u32,
 
     pub fn load(d: *const cuda.Driver, sms: u32) !Kernels {
@@ -58,6 +71,8 @@ pub const Kernels = struct {
         errdefer f16_mod.unload();
         var sc = try cuda.Module.load(d, cuda.kernels.qwen38fn_scores);
         errdefer sc.unload();
+        var sel = try cuda.Module.load(d, cuda.kernels.qwen38fn_select);
+        errdefer sel.unload();
         return .{
             .io = io,
             .front = try io.function("_ZN13tf_qfn_gdn_io12front_kernelILi16ELi48EEEvPK13__nv_bfloat16PKxPKiS7_S3_PKfS9_PfSA_PS1_SA_SA_"),
@@ -75,6 +90,9 @@ pub const Kernels = struct {
             .sc = sc,
             .sc_rows = try sc.function("tf_qfn_scores_rows"),
             .sc_diff = try sc.function("tf_qfn_scores_diff"),
+            .sel = sel,
+            .sel_rows = try sel.function("tf_qfn_select_rows"),
+            .sel_diff = try sel.function("tf_qfn_select_diff"),
             .sms = sms,
         };
     }
@@ -85,6 +103,7 @@ pub const Kernels = struct {
         self.pglue.unload();
         self.f16_mod.unload();
         self.sc.unload();
+        self.sel.unload();
     }
 };
 
@@ -108,8 +127,12 @@ fn scoresMode() !F16Mode {
 }
 
 fn modeOf(comptime M: type, comptime name: [:0]const u8) !M {
-    const v = std.mem.span(std.c.getenv(name) orelse return .fused);
-    if (v.len == 0) return .fused;
+    return modeOr(M, name, .fused);
+}
+
+fn modeOr(comptime M: type, comptime name: [:0]const u8, default: M) !M {
+    const v = std.mem.span(std.c.getenv(name) orelse return default);
+    if (v.len == 0) return default;
     return std.meta.stringToEnum(M, v) orelse error.BadPromptMode;
 }
 
@@ -164,6 +187,8 @@ pub const Buffers = struct {
     logits: cuda.DeviceBuffer, // bf16 [1, vocab]: the chunk's last row
     f16_mode: F16Mode = .fused,
     scores_mode: F16Mode = .fused,
+    select_mode: F16Mode = .captured,
+    select_check: ?cuda.DeviceBuffer = null, // check: the fused lists (int32 ids [att_rows, idw], nk, sparse)
     scores_check: ?cuda.DeviceBuffer = null, // check: the fused scores (fp32 [att_rows, nb])
     f16_check: ?cuda.DeviceBuffer = null, // check: the fused call's rows (bf16 [rows, widest N])
     f16_part: ?cuda.DeviceBuffer = null, // fused: K slices' sums (fp32 [sk, rows, n], the largest matrix's)
@@ -240,11 +265,17 @@ pub const Buffers = struct {
         try b.moe.setMode(d, &m.layers[0].experts, try expertsMode(), rows);
         b.f16_mode = try f16Mode();
         b.scores_mode = try scoresMode();
+        // TF_QFN_PROMPT_SELECT: the indexer's block lists of a prompt block while they fit `_select`'s registers
+        // (131,072 keys): `captured` (default) 0.6.6's `_select`, `fused` select.cu (the same lists, one program a
+        // row), `check` both, compared. Past them `_select_tiles` runs in every mode.
+        b.select_mode = try modeOr(F16Mode, "TF_QFN_PROMPT_SELECT", .captured);
+        b.select_check = null;
         b.f16_check = null;
         b.f16_part = null;
         b.f16_diffs = null;
         b.scores_check = null;
-        if (b.f16_mode == .check or b.scores_mode == .check) b.f16_diffs = try cuda.DeviceBuffer.alloc(d, 8);
+        if (b.f16_mode == .check or b.scores_mode == .check or b.select_mode == .check) b.f16_diffs = try cuda.DeviceBuffer.alloc(d, 8);
+        if (b.select_mode == .check) b.select_check = try cuda.DeviceBuffer.alloc(d, (att_rows * b.attn.idw + 2 * att_rows) * 4);
         if (b.f16_mode == .check) b.f16_check = try cuda.DeviceBuffer.alloc(d, rows * wide * 2);
         if (b.f16_mode != .captured) {
             var most: usize = 0;
@@ -274,6 +305,7 @@ pub const Buffers = struct {
         if (self.f16_check) |*x| x.free();
         if (self.f16_part) |*x| x.free();
         if (self.scores_check) |*x| x.free();
+        if (self.select_check) |*x| x.free();
         if (self.f16_diffs) |*x| x.free();
         self.attn.deinit();
         self.moe.deinit();
@@ -548,49 +580,82 @@ pub const Prompt = struct {
     }
 
     /// attention.py `qsa_rows` for a prompt block of n rows at b.pos_blk (keys up to `context`): the scores on the
-    /// kernels b.scores_mode names, then the selection.
+    /// kernels b.scores_mode names, then the selection on b.select_mode's.
     fn rowsSelect(p: *Prompt, iq: Ptr, c: *const attn.Caches, b: *Buffers, n: usize, context: usize, stream: cuda.Stream) !void {
         const ak = p.f.ak;
         const s = &b.attn;
         const blocks = s.blocks(context);
-        if (b.scores_mode == .captured) return ak.rowsSelect(iq, c, b.pos_blk.ptr, s, n, context, stream);
-        const check = b.scores_mode == .check;
-        const sc = if (check) b.scores_check.? else s.scores;
-        if (check) {
-            try sc.copyFrom(0, s.scores.ptr, s.scores.len, stream.handle);
+        if (b.scores_mode == .captured) {
             try ak.scores(iq, c, b.pos_blk.ptr, s, s.scores.ptr, n, blocks, stream);
-        }
-        {
-            var a: cuda.Args = .{};
-            a.add(iq);
-            a.add(c.pooled.ptr);
-            a.add(b.pos_blk.ptr);
-            a.add(sc.ptr);
-            a.add(@as(c_int, @intCast(s.nb)));
-            a.add(@as(c_int, @intCast(n)));
-            try p.k.sc_rows.allowDynamicShared(scores_shared);
-            try cuda.launch.launch(p.k.sc_rows, .{ .grid = .{ .x = @intCast((n + 31) / 32), .y = @intCast((blocks + 63) / 64) }, .block = .{ .x = 256 }, .shared = scores_shared }, stream, &a);
-        }
-        if (check) {
-            const diffs = b.f16_diffs.?;
-            try diffs.fill8(0, stream.handle);
-            var a: cuda.Args = .{};
-            a.add(s.scores.ptr);
-            a.add(sc.ptr);
-            a.add(@as(c_int, @intCast(s.nb)));
-            a.add(@as(c_int, @intCast(n)));
-            a.add(@as(c_int, @intCast(blocks)));
-            a.add(diffs.ptr);
-            try cuda.launch.launch(p.k.sc_diff, .{ .grid = .{ .x = 1024 }, .block = .{ .x = 256 } }, stream, &a);
-            var nd: u64 = 0;
-            try diffs.downloadAsync(0, std.mem.asBytes(&nd), stream.handle);
-            try stream.synchronize();
-            if (nd != 0) {
-                std.debug.print("qwen38fn scores check: {d} of {d} scores differ ({d} rows, {d} blocks)\n", .{ nd, n * blocks, n, blocks });
-                return error.ScoresDiffer;
+        } else {
+            const check = b.scores_mode == .check;
+            const sc = if (check) b.scores_check.? else s.scores;
+            if (check) {
+                try sc.copyFrom(0, s.scores.ptr, s.scores.len, stream.handle);
+                try ak.scores(iq, c, b.pos_blk.ptr, s, s.scores.ptr, n, blocks, stream);
+            }
+            {
+                var a: cuda.Args = .{};
+                a.add(iq);
+                a.add(c.pooled.ptr);
+                a.add(b.pos_blk.ptr);
+                a.add(sc.ptr);
+                a.add(@as(c_int, @intCast(s.nb)));
+                a.add(@as(c_int, @intCast(n)));
+                try p.k.sc_rows.allowDynamicShared(scores_shared);
+                try cuda.launch.launch(p.k.sc_rows, .{ .grid = .{ .x = @intCast((n + 31) / 32), .y = @intCast((blocks + 63) / 64) }, .block = .{ .x = 256 }, .shared = scores_shared }, stream, &a);
+            }
+            if (check) {
+                var a: cuda.Args = .{};
+                a.add(s.scores.ptr);
+                a.add(sc.ptr);
+                a.add(@as(c_int, @intCast(s.nb)));
+                a.add(@as(c_int, @intCast(n)));
+                a.add(@as(c_int, @intCast(blocks)));
+                try countDiffs(p.k.sc_diff, b, &a, .{ .x = 1024 }, "scores", n * blocks, stream);
             }
         }
-        try ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
+        // select.cu below `_select`'s register width only: past it 0.6.6's `_select_tiles` is the faster one
+        const tiles = std.math.ceilPowerOfTwoAssert(usize, blocks) > attn.select_regs;
+        if (b.select_mode == .captured or tiles) return ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
+        const check = b.select_mode == .check;
+        if (check) try ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
+        const out = if (check) b.select_check.? else s.ids;
+        const nk = if (check) out.ptr + att_rows * s.idw * 4 else s.nk.ptr;
+        const sparse = if (check) nk + att_rows * 4 else s.sparse.ptr;
+        {
+            var a: cuda.Args = .{};
+            a.add(s.scores.ptr);
+            a.add(b.pos_blk.ptr);
+            a.add(out.ptr);
+            a.add(nk);
+            a.add(sparse);
+            for ([_]usize{ s.nb, s.ratio, s.budget / s.ratio, s.idw }) |v| a.add(@as(c_int, @intCast(v)));
+            try cuda.launch.launch(p.k.sel_rows, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, stream, &a);
+        }
+        if (check) {
+            var a: cuda.Args = .{};
+            for ([_]Ptr{ s.ids.ptr, s.nk.ptr, s.sparse.ptr, out.ptr, nk, sparse }) |v| a.add(v);
+            a.add(@as(c_int, @intCast(n)));
+            a.add(@as(c_int, @intCast(s.idw)));
+            try countDiffs(p.k.sel_diff, b, &a, .{ .x = @intCast(n) }, "selection rows", n, stream);
+        }
+    }
+
+    /// Check modes: `f` (a diff kernel whose last argument is the count) over `a`, then error.PromptCheckDiffers
+    /// unless the count is 0.
+    fn countDiffs(f: cuda.Function, b: *Buffers, a: *cuda.Args, grid: cuda.launch.Dim3, what: []const u8, of: usize, stream: cuda.Stream) !void {
+        const diffs = b.f16_diffs.?;
+        try diffs.fill8(0, stream.handle);
+        a.add(diffs.ptr);
+        try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = 256 } }, stream, a);
+        var nd: u64 = 0;
+        try diffs.downloadAsync(0, std.mem.asBytes(&nd), stream.handle);
+        try stream.synchronize();
+        if (nd != 0) {
+            std.debug.print("qwen38fn prompt check: {d} of {d} {s} differ\n", .{ nd, of, what });
+            return error.PromptCheckDiffers;
+        }
     }
 
     /// forward.py `attn_block` on the prompt path for one stream.
