@@ -295,10 +295,9 @@ pub fn forwardSegs(k: Kernels, lay: config.Layout, m: *const Model, segs: []cons
             const a = &layer.dsa.?;
             try A.dsaFront(k.g, lay, a, &w.ds, b.normed.ptr, b.sk.ptr, 0, R, stream);
             try A.dsaIndex(k.g, lay, a, &w.ds, b.normed.ptr, b.sk.ptr, R, sparse, stream);
-            for (segs) |sg| try A.dsaAttend(k.g, lay, a, &sg.st.caches[li], &w.ds, .{
-                .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = sg.st.pos_dev.ptr,
-                .host_pos = sg.st.pos,  .nch = (sg.st.pos + sg.n + 511) / 512, .R = sg.n,
-            }, sg.a0, stream);
+            // every stream's selection, then every stream's attention (a tier resolves all selections between)
+            for (segs, 0..) |sg, i| try A.dsaSelect(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), stream);
+            for (segs, 0..) |sg, i| try A.dsaAttendRows(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), stream);
             try A.dsaExpand(k.g, lay, a, &w.ds, R, stream);
             try A.dsaOut(k.g, lay, a, &w.ds, b.part.ptr, b.sk.ptr, 0, R, stream);
         }
@@ -319,7 +318,14 @@ pub fn forwardSegs(k: Kernels, lay: config.Layout, m: *const Model, segs: []cons
 }
 
 /// Streams a shared decode forward takes at most.
-pub const max_segs = 4;
+pub const max_segs = A.max_segs;
+
+fn segCall(b: *const F.Buffers, sg: Seg) A.Call {
+    return .{
+        .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = sg.st.pos_dev.ptr,
+        .host_pos = sg.st.pos,  .nch = (sg.st.pos + sg.n + 511) / 512, .R = sg.n,
+    };
+}
 
 /// forward.py `commit`: keep the window's first `keep` rows (a prompt chunk keeps all).
 pub fn commit(k: Kernels, lay: config.Layout, st: *State, R: usize, keep: usize, prefill: bool, w: *Work, stream: cuda.Stream) !void {

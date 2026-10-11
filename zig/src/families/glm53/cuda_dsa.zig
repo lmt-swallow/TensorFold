@@ -216,6 +216,10 @@ pub fn indexRing(capacity: usize, rows: usize) usize {
     return @min(capacity, cdiv(rows + 3, 64) * 64);
 }
 
+/// Streams a shared decode forward takes at most, and the rows of each one's window at most (TF_GLM_MAX_ROWS).
+pub const max_segs = 4;
+pub const seg_rows = 16;
+
 /// What a DSA block writes besides the shared buffers, for windows of up to `rows` rows (`prefill`: a prompt
 /// chunk's) over caches of up to `capacity` tokens.
 pub const Scratch = struct {
@@ -285,8 +289,10 @@ pub const Scratch = struct {
         const np_max = capacity / 4;
         s.scores = try a(d, @min(rows, select_rows) * @max(np_max, 1024) * 4);
         s.pools = try a(d, rows * 512 * 8);
-        s.tokens = try a(d, rows * glue_mod.sparse_tokens * 4);
-        s.counts = try a(d, rows * 4);
+        // a decode window's streams' selections each in a block of `seg_rows` rows (16-byte aligned starts)
+        const sel_rows = if (prefill) rows else @max(rows, max_segs * seg_rows);
+        s.tokens = try a(d, sel_rows * glue_mod.sparse_tokens * 4);
+        s.counts = try a(d, sel_rows * 4);
         // decode windows split rows over 8,192 scores or more; a prompt chunk its last selection block of fewer
         // than 64 rows (sizes grow with the scores, but the chunk width steps at 16,384: both sides of it)
         s.split = try a(d, if (prefill)
@@ -295,6 +301,11 @@ pub const Scratch = struct {
             glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
         s.at = try a(d, at_select + (rows / select_rows + 2) * 16);
         return s;
+    }
+
+    /// Stream `i`'s selection block of a shared decode window (block 0: a lone window's).
+    pub fn selection(s: *const Scratch, i: usize) Selection {
+        return .{ .tokens = s.tokens.ptr + i * seg_rows * glue_mod.sparse_tokens * 4, .counts = s.counts.ptr + i * seg_rows * 4 };
     }
 
     pub fn deinit(s: *Scratch) void {
@@ -384,26 +395,41 @@ pub fn dsaIndex(g: Glue, lay: config.Layout, a: *const Dsa, s: *const Scratch, n
     if (sparse) try g.bmm(s.qr.ptr, c.q_lora, a.qb.b16(), R, s.qi.ptr, false, sk, stream);
 }
 
-/// One stream's part of `dsa_rows`: its rows [r0, r0 + call.R) of the scratch (the latent rows, the indexer's keys,
-/// gates and queries, the absorbed queries) into its caches at its position, then attention over them (dense up to
-/// the dense limit, past it over each row's selected pools) into the read-out rows from r0.
+/// One stream's part of `dsa_rows`: `dsaSelect`, then `dsaAttendRows` on its selection in s.tokens / s.counts.
 pub fn dsaAttend(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, r0: usize, stream: cuda.Stream) !void {
+    const sel = s.selection(0);
+    try dsaSelect(g, lay, a, cache, s, call, r0, sel, stream);
+    try dsaAttendRows(g, lay, a, cache, s, call, r0, sel, stream);
+}
+
+/// Where one stream's selected tokens [R, 2051] i32 and their counts [R] go.
+pub const Selection = struct { tokens: Ptr, counts: Ptr };
+
+/// One stream's rows [r0, r0 + call.R) of the scratch (the latent rows, the indexer's keys, gates and queries) into
+/// its caches at its position, and, when a row attends sparsely, each such row's selected tokens into `sel`.
+pub fn dsaSelect(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, r0: usize, sel: Selection, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const R = call.R;
+    const lw = c.kv_lora;
+    const ikw = c.index_dim + c.index_heads;
+    const ikr = s.ikr.ptr + r0 * ikw * 2;
+    try g.latWrite(s.lat.ptr + r0 * lw * 2, lw, cache.latent.ptr, cache.kv, call.pos_dev, R, lw, stream);
+    try g.indexUpdate(ikr, ikw, s.igr.ptr + r0 * c.index_dim * 4, a.ln_w.ptr, a.ln_b.ptr, a.ape.ptr, cache.ik.ptr, cache.ig.ptr, cache.ring, cache.pk.ptr, cache.kv, call.pos_dev, R, stream);
+    if (sparseRows(c, call.host_pos, R)) try selectTokens(g, s, cache, call, s.qi.ptr + r0 * c.index_heads * c.index_dim * 2, ikr + c.index_dim * 2, ikw, sel.tokens, sel.counts, stream);
+}
+
+/// One stream's attention over its rows [r0, r0 + call.R) after `dsaSelect`: dense up to the dense limit, past it
+/// over the selected tokens in `sel`, into the read-out rows from r0.
+pub fn dsaAttendRows(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, r0: usize, sel: Selection, stream: cuda.Stream) !void {
     const c = lay.cfg;
     const R = call.R;
     const H = a.heads;
     const lw = c.kv_lora;
-    const prefill = s.prefill;
-    const ikw = c.index_dim + c.index_heads;
-    const lat = s.lat.ptr + r0 * lw * 2;
-    const ikr = s.ikr.ptr + r0 * ikw * 2;
-    const igr = s.igr.ptr + r0 * c.index_dim * 4;
     const qa = s.qa.ptr + r0 * H * lw * 2;
     const ol = s.ol.ptr + r0 * H * lw * 2;
-    try g.latWrite(lat, lw, cache.latent.ptr, cache.kv, call.pos_dev, R, lw, stream);
     const limit = c.denseLimit();
     const all_sparse = call.host_pos >= limit;
     const sparse_rows = sparseRows(c, call.host_pos, R);
-    try g.indexUpdate(ikr, ikw, igr, a.ln_w.ptr, a.ln_b.ptr, a.ape.ptr, cache.ik.ptr, cache.ig.ptr, cache.ring, cache.pk.ptr, cache.kv, call.pos_dev, R, stream);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(c.qk_dim), -0.5));
     if (!all_sparse) {
         // rows past the dense limit are recomputed sparsely below: the dense pass takes the rows before it
@@ -426,11 +452,10 @@ pub fn dsaAttend(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache
         }
     }
     if (sparse_rows) {
-        try selectTokens(g, s, cache, call, s.qi.ptr + r0 * c.index_heads * c.index_dim * 2, ikr + c.index_dim * 2, ikw, stream);
-        if (prefill) {
-            try g.sparseOnepass(qa, cache.latent.ptr, cache.kv, s.tokens.ptr, s.counts.ptr, ol, R, H, lw, glue_mod.sparse_tokens, scale, stream);
+        if (s.prefill) {
+            try g.sparseOnepass(qa, cache.latent.ptr, cache.kv, sel.tokens, sel.counts, ol, R, H, lw, glue_mod.sparse_tokens, scale, stream);
         } else {
-            try g.sparseAttention(qa, cache.latent.ptr, cache.kv, s.tokens.ptr, s.counts.ptr, s.sparse, ol, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
+            try g.sparseAttention(qa, cache.latent.ptr, cache.kv, sel.tokens, sel.counts, s.sparse, ol, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
         }
     }
 }
@@ -442,7 +467,7 @@ pub fn dsaExpand(g: Glue, lay: config.Layout, a: *const Dsa, s: *const Scratch, 
 }
 
 /// sparse.py `select_tokens` (no graph bucket): each row's attended tokens and their count into s.tokens / s.counts.
-fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi: Ptr, wts: Ptr, w_stride: usize, stream: cuda.Stream) !void {
+fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi: Ptr, wts: Ptr, w_stride: usize, tokens: Ptr, counts: Ptr, stream: cuda.Stream) !void {
     const R = call.R;
     const np_max = cache.poolRows();
     const qrow = 32 * 128 * 2;
@@ -463,7 +488,7 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi:
             if (n < split_rows and NP >= split_from) {
                 try g.selectSplitPools(s.scores.ptr, NP, s.split, s.pools.ptr, n, stream);
             } else try g.selectRows(s.scores.ptr, s.pools.ptr, NP, 0, n, stream);
-            try g.tokens(s.pools.ptr, at, s.tokens.ptr + a * glue_mod.sparse_tokens * 4, s.counts.ptr + a * 4, n, stream);
+            try g.tokens(s.pools.ptr, at, tokens + a * glue_mod.sparse_tokens * 4, counts + a * 4, n, stream);
         }
         return;
     }
@@ -471,10 +496,10 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi:
     const grid = @min(row_score_g, cdiv(np, 64));
     try g.scoresRows(qi, wts, w_stride, cache.pk.ptr, cache.kv, s.scores.ptr, call.pos_dev, R, np, grid, stream);
     if (R < split_rows and np >= split_from) {
-        try g.selectSplit(s.scores.ptr, np, call.pos_dev, s.split, s.tokens.ptr, s.counts.ptr, R, stream);
+        try g.selectSplit(s.scores.ptr, np, call.pos_dev, s.split, tokens, counts, R, stream);
     } else {
         try g.selectRows(s.scores.ptr, s.pools.ptr, np, call.pos_dev, R, stream);
-        try g.tokens(s.pools.ptr, call.pos_dev, s.tokens.ptr, s.counts.ptr, R, stream);
+        try g.tokens(s.pools.ptr, call.pos_dev, tokens, counts, R, stream);
     }
 }
 
