@@ -3096,6 +3096,10 @@ pub const Lanes = struct {
     stats_all: draft_stats.Stats = .{},
     round_rows: [round_rows_most + 1]u64 = @splat(0),
     round_rows_ms: [round_rows_most + 1]f64 = @splat(0),
+    /// the tokens the windows of those rounds landed (index: the round's rows; each window's kept rows, the pending
+    /// token's included), and the rows of the last round verified, which the landings that follow it count under
+    round_rows_tok: [round_rows_most + 1]u64 = @splat(0),
+    last_rows: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine) Lanes {
         return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv(), .stats_on = draft_stats.enabled() };
@@ -3138,6 +3142,12 @@ pub const Lanes = struct {
         first = true;
         for (self.round_rows, self.round_rows_ms, 0..) |c, ms, r| if (c > 0) {
             aw.print("{s}{d}:{d:.2}", .{ if (first) "" else ",", r, ms / @as(f64, @floatFromInt(c)) }) catch {};
+            first = false;
+        };
+        aw.writeAll(" tok=") catch {};
+        first = true;
+        for (self.round_rows, self.round_rows_tok, 0..) |c, t, r| if (c > 0) {
+            aw.print("{s}{d}:{d:.2}", .{ if (first) "" else ",", r, @as(f64, @floatFromInt(t)) / @as(f64, @floatFromInt(c)) }) catch {};
             first = false;
         };
         std.log.info("deepseek_v41: draft stats, every stream so far: {s}", .{aw.buffered()});
@@ -3397,7 +3407,10 @@ pub const Lanes = struct {
             r += rows;
             if (self.stats_on) self.offerStats(slot, w);
         }
-        if (self.stats_on) self.round_rows[r] += 1;
+        if (self.stats_on) {
+            self.round_rows[r] += 1;
+            self.last_rows = r;
+        }
         const t0 = nowNs();
         const fill = self.pending;
         self.pending = null;
@@ -3425,7 +3438,10 @@ pub const Lanes = struct {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
             const slot = try self.slotOf(w.stream);
-            if (self.stats_on) self.stats[slot].land(path.len - 1);
+            if (self.stats_on) {
+                if (self.stats[slot].pending != null) self.round_rows_tok[self.last_rows] += path.len;
+                self.stats[slot].land(path.len - 1);
+            }
             const l = &st.lanes[slot];
             if (l.pos == l.verify_start + path.len) continue;
             asks[n] = .{ .slot = slot, .start = l.verify_start, .kept = path.len };
@@ -3463,7 +3479,10 @@ pub const Lanes = struct {
             if (r.rows) |rows| {
                 if (rows.len == 0 or r.follow.len < rows.len) return error.EmptyPath;
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
-                if (self.stats_on) self.stats[slot].land(rows.len - 1);
+                if (self.stats_on) {
+                    if (self.stats[slot].pending != null) self.round_rows_tok[self.last_rows] += rows.len;
+                    self.stats[slot].land(rows.len - 1);
+                }
                 if (r.start != l.verify_start) return error.PositionMismatch;
                 a.start = l.verify_start;
                 a.absorb = rows.len;
