@@ -204,6 +204,10 @@ pub const Stream = struct {
     scratch: []gdn.Scratch,
     caches: []attn.Caches,
     ple_tail: cuda.DeviceBuffer, // bf16 [(ple_kernel - 1) * ngram, S * D]
+    // the last decode window's rows a commit reads (the stream's own, so another stream's window may run between)
+    rows: usize,
+    proj: cuda.DeviceBuffer, // bf16 [lin, rows, PW]: each DeltaNet layer's projection rows
+    ple_nrow: cuda.DeviceBuffer, // bf16 [rows, S * D]: the n-gram branch's normed rows
     history: [ngram.max_n]i64 = @splat(0),
     prompt_history: [ngram.max_n]i64 = @splat(0), // the history after the prompt chunk being run
     last: ?struct { history: [ngram.max_n]i64, tokens: [64]i64, n: usize } = null,
@@ -212,7 +216,11 @@ pub const Stream = struct {
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const Model, capacity: usize, rows: usize) !Stream {
         const cfg = &m.cfg;
         const lin = m.linearLayers();
-        var s: Stream = .{ .gpa = gpa, .pos_dev = undefined, .conv = undefined, .rec = undefined, .cur = undefined, .scratch = undefined, .caches = undefined, .ple_tail = undefined };
+        var s: Stream = .{ .gpa = gpa, .pos_dev = undefined, .conv = undefined, .rec = undefined, .cur = undefined, .scratch = undefined, .caches = undefined, .ple_tail = undefined, .rows = rows, .proj = undefined, .ple_nrow = undefined };
+        s.proj = try cuda.DeviceBuffer.alloc(d, @max(16, lin * rows * cfg.projWidth() * 2));
+        try s.proj.fill8(0, null);
+        s.ple_nrow = try cuda.DeviceBuffer.alloc(d, rows * cfg.wide() * 2);
+        try s.ple_nrow.fill8(0, null);
         s.pos_dev = try cuda.DeviceBuffer.alloc(d, 16);
         try s.pos_dev.fill8(0, null);
         s.conv = try cuda.DeviceBuffer.alloc(d, @max(16, lin * (cfg.conv_kernel - 1) * cfg.convDim() * 2));
@@ -232,6 +240,8 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Stream) void {
+        self.proj.free();
+        self.ple_nrow.free();
         self.pos_dev.free();
         self.conv.free();
         self.rec.free();
@@ -262,7 +272,6 @@ pub const Buffers = struct {
     rows: usize,
     w: hc_mod.Window,
     ids: cuda.DeviceBuffer, // int32 [rows]
-    proj: cuda.DeviceBuffer, // bf16 [lin, rows, PW]
     pa: cuda.DeviceBuffer, // bf16 [rows, attention projection width]
     q: cuda.DeviceBuffer, // bf16 [rows, heads, head_dim]
     iq: cuda.DeviceBuffer, // bf16 [rows, index_heads, index_dim]
@@ -282,7 +291,6 @@ pub const Buffers = struct {
     ple_vals: cuda.DeviceBuffer, // bf16 [rows, D]
     ple_gated: cuda.DeviceBuffer,
     ple_pss: cuda.DeviceBuffer, // fp32 [rows, S]
-    ple_nrow: cuda.DeviceBuffer, // bf16 [rows, S * D]
     streams: cuda.DeviceBuffer, // bf16 [rows, S * D]: the head's copy of the streams
     logits: cuda.DeviceBuffer, // bf16 [rows, vocab]
     gpa: std.mem.Allocator,
@@ -300,7 +308,6 @@ pub const Buffers = struct {
         part = @max(part, weights.f16Split(cfg.hidden, cfg.hidden) * rows * cfg.hidden);
         part = @max(part, weights.f16Split(wide, cfg.hidden) * rows * wide);
         b.w = try hc_mod.Window.init(d, cfg, rows, part);
-        const lin = m.linearLayers();
         const aw = cfg.heads * 2 * cfg.head_dim + 2 * cfg.kv_heads * cfg.head_dim + (cfg.index_heads + 1) * cfg.index_dim;
         var zmax: usize = 16;
         var kmax: usize = cfg.hidden;
@@ -319,7 +326,7 @@ pub const Buffers = struct {
         const ple_words: usize = if (m.table) |t| t.words else 1;
         const ple_heads: usize = if (m.ng) |g| g.heads() else 1;
         const sizes = [_]struct { *cuda.DeviceBuffer, usize }{
-            .{ &b.ids, rows * 4 },                         .{ &b.proj, @max(16, lin * rows * cfg.projWidth() * 2) },
+            .{ &b.ids, rows * 4 },
             .{ &b.pa, rows * aw * 2 },                     .{ &b.q, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.iq, rows * cfg.index_heads * cfg.index_dim * 2 }, .{ &b.gated, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.xs_gated, rows * cfg.heads * cfg.head_dim / 32 * 4 }, .{ &b.xh, rows * kmax * 2 },
@@ -328,7 +335,7 @@ pub const Buffers = struct {
             .{ &b.ple_dev, rows * ple_heads * ple_words * 2 }, .{ &b.ple_emb, rows * cfg.hidden * 2 },
             .{ &b.ple_keys, rows * wide * 2 },             .{ &b.ple_vals, rows * cfg.hidden * 2 },
             .{ &b.ple_gated, rows * wide * 2 },            .{ &b.ple_pss, rows * cfg.streams * 4 },
-            .{ &b.ple_nrow, rows * wide * 2 },             .{ &b.streams, rows * wide * 2 },
+            .{ &b.streams, rows * wide * 2 },
             .{ &b.logits, rows * cfg.vocab * 2 },
         };
         for (sizes) |s| {
@@ -343,7 +350,7 @@ pub const Buffers = struct {
 
     pub fn deinit(self: *Buffers) void {
         self.w.deinit();
-        for ([_]*cuda.DeviceBuffer{ &self.ids, &self.proj, &self.pa, &self.q, &self.iq, &self.gated, &self.xs_gated, &self.xh, &self.z, &self.logits_router, &self.pick, &self.wts, &self.ple_dev, &self.ple_emb, &self.ple_keys, &self.ple_vals, &self.ple_gated, &self.ple_pss, &self.ple_nrow, &self.streams, &self.logits }) |x| x.free();
+        for ([_]*cuda.DeviceBuffer{ &self.ids, &self.pa, &self.q, &self.iq, &self.gated, &self.xs_gated, &self.xh, &self.z, &self.logits_router, &self.pick, &self.wts, &self.ple_dev, &self.ple_emb, &self.ple_keys, &self.ple_vals, &self.ple_gated, &self.ple_pss, &self.streams, &self.logits }) |x| x.free();
         self.attn.deinit();
         self.moe.deinit();
         self.gpa.free(self.ple_host);
@@ -445,7 +452,7 @@ pub const Forward = struct {
             try hc_mod.block(g, w, &layer.attn_hc, cfg, R, pending, w.inj_a.ptr, stream);
             switch (layer.mixer) {
                 .gdn => |*gl| {
-                    const proj = b.proj.ptr + gl.li * b.rows * cfg.projWidth() * 2;
+                    const proj = st.proj.ptr + gl.li * st.rows * cfg.projWidth() * 2;
                     try f.stack(&.{ &gl.qkv, &gl.z }, &gl.w.ba, w.mixed.ptr, R, proj, cfg.projWidth(), b, stream);
                     const cur = st.cur[gl.li];
                     try gdn.chain(&m.gk, .{
@@ -494,12 +501,12 @@ pub const Forward = struct {
         try g.f16CallOf(&p.key, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_keys.ptr, cfg.wide(), b.w.part.ptr, stream);
         try g.f16CallOf(&p.value, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_vals.ptr, cfg.hidden, b.w.part.ptr, stream);
         try g.pleGate(b.ple_keys.ptr, b.ple_vals.ptr, b.w.h.ptr, p.norm_key.ptr, p.norm_query.ptr, b.ple_gated.ptr, b.ple_pss.ptr, cfg.eps, R, stream);
-        try g.pleConv(b.ple_gated.ptr, b.ple_pss.ptr, p.norm_conv.ptr, st.ple_tail.ptr, p.conv.ptr, p.taps, cfg.ngram, b.w.h.ptr, b.ple_nrow.ptr, cfg.eps, R, stream);
+        try g.pleConv(b.ple_gated.ptr, b.ple_pss.ptr, p.norm_conv.ptr, st.ple_tail.ptr, p.conv.ptr, p.taps, cfg.ngram, b.w.h.ptr, st.ple_nrow.ptr, cfg.eps, R, stream);
     }
 
     /// forward.py `commit(keep)`: the first `keep` of the window's R rows become the stream's (a rejected tail
     /// replays each DeltaNet state; conv windows and the n-gram tail shift; the position advances).
-    pub fn commit(f: *Forward, st: *Stream, b: *Buffers, R: usize, keep: usize, stream: cuda.Stream) !void {
+    pub fn commit(f: *Forward, st: *Stream, R: usize, keep: usize, stream: cuda.Stream) !void {
         const m = f.m;
         const cfg = &m.cfg;
         if (keep < 1 or keep > R) return error.BadKeep;
@@ -510,7 +517,7 @@ pub const Forward = struct {
             st.cur[li] = 1 - cur;
         }
         const taps = cfg.conv_kernel - 1;
-        if (lin > 0) try f.g.shiftWindows(st.conv.ptr, taps * cfg.convDim(), b.proj.ptr, b.rows * cfg.projWidth(), cfg.projWidth(), keep, lin, cfg.convDim(), taps, stream);
+        if (lin > 0) try f.g.shiftWindows(st.conv.ptr, taps * cfg.convDim(), st.proj.ptr, st.rows * cfg.projWidth(), cfg.projWidth(), keep, lin, cfg.convDim(), taps, stream);
         if (st.last) |last| {
             const ng = m.ng.?;
             var hist: [ngram.max_n]i64 = last.history;
@@ -518,7 +525,7 @@ pub const Forward = struct {
             st.history = hist;
             st.last = null;
             const t_rows = (cfg.ple_kernel - 1) * cfg.ngram;
-            try f.g.shiftWindows(st.ple_tail.ptr, t_rows * cfg.wide(), b.ple_nrow.ptr, b.rows * cfg.wide(), cfg.wide(), keep, 1, cfg.wide(), t_rows, stream);
+            try f.g.shiftWindows(st.ple_tail.ptr, t_rows * cfg.wide(), st.ple_nrow.ptr, st.rows * cfg.wide(), cfg.wide(), keep, 1, cfg.wide(), t_rows, stream);
         }
         st.pos += keep;
         const p: i32 = @intCast(st.pos);

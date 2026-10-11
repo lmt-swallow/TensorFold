@@ -5,12 +5,13 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const dsv41 = @import("dsv41");
+const qwen38fn = @import("qwen38fn");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const Pool = budget.Pool;
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, dsv41.native };
+const registry = .{ nemotron.native, dsv41.native, qwen38fn.native };
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {

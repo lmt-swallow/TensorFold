@@ -108,7 +108,7 @@ pub fn layers(gpu: Gpu, work: []const u8, model: []const u8, n_layers: ?usize, i
             const n = @min(rows, warm_n - w0);
             try fw.stage(&st, &b, warm[w0..][0..n], stream);
             try fw.compute(&st, &b, n, .{}, stream);
-            try fw.commit(&st, &b, n, n, stream);
+            try fw.commit(&st, n, n, stream);
         }
         try stream.synchronize();
         check.pass("qwen38fn: warmed up to position {d}", .{st.pos});
@@ -140,7 +140,7 @@ pub fn layers(gpu: Gpu, work: []const u8, model: []const u8, n_layers: ?usize, i
         try fw.compute(&st, &b, R, probe, stream);
         try stream.synchronize();
         if (with_head) _ = try ctx.cmp("logits", null, b.logits, 0);
-        try fw.commit(&st, &b, R, keep, stream);
+        try fw.commit(&st, R, keep, stream);
         try stream.synchronize();
         if (ctx.failures == before) check.pass("BITEXACT qwen38fn {d} layers window {d} ({d} rows, {d} kept, at {d}): every boundary{s} equal to 0.6.6's", .{ L, i, R, keep, pos, if (with_head) " and the logits" else "" });
     }

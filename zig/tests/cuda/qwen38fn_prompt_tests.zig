@@ -164,7 +164,7 @@ pub fn prompt(gpu: Gpu, work: []const u8, model: []const u8) !void {
             try fw.compute(&st, &b, R, dprobe, stream);
             try stream.synchronize();
             try ctx.logits(try std.fmt.bufPrint(&nb, "p{d}_d{d}_logits", .{ pi, j }), b.logits);
-            try fw.commit(&st, &b, R, keep, stream);
+            try fw.commit(&st, R, keep, stream);
         }
         try stream.synchronize();
         if (ctx.failures == before) check.pass("BITEXACT qwen38fn prompt {d}: {d} tokens in {d} chunks ({d:.0} ms, {d:.0} tok/s with the checks), every boundary, the logits and {d} decode windows after it equal to 0.6.6's", .{ pi, n, chunk, ms, @as(f64, @floatFromInt(n)) / ms * 1000, decodes });
