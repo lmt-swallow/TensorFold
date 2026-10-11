@@ -195,11 +195,11 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         try e1.synchronize();
         t_whole += try e0.elapsedMs(e1);
         const t_r = now(io);
-        const base = try tier.resolve(0, 0, tok_b.ptr, cnt.ptr, R, W, stream);
+        const res = try tier.resolve(0, 0, tok_b.ptr, cnt.ptr, R, W, stream);
         resolve_ms += ms(t_r, io);
         resolves += 1;
         try e0.record(stream);
-        try g.sparseAttention(qa.ptr, base, .bf16, tok_b.ptr, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
+        try g.sparseAttention(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
         try e1.record(stream);
         try e1.synchronize();
         t_slab += try e0.elapsedMs(e1);
@@ -239,10 +239,10 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         const tw = try e0.elapsedMs(e1);
         const t_r = now(io);
         const reads = tier.host.reads;
-        const base = try tier.resolve(0, 0, tok_b.ptr, cnt.ptr, R, W, stream);
+        const res = try tier.resolve(0, 0, tok_b.ptr, cnt.ptr, R, W, stream);
         const rms = ms(t_r, io);
         try e0.record(stream);
-        try g.sparseOnepass(qa.ptr, base, .bf16, tok_b.ptr, cnt.ptr, out_b.ptr, R, H, lw, W, scale, stream);
+        try g.sparseOnepass(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, out_b.ptr, R, H, lw, W, scale, stream);
         try e1.record(stream);
         try e1.synchronize();
         const ts = try e0.elapsedMs(e1);
@@ -281,8 +281,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
             try tok_b.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
             try cnt.upload(0, std.mem.sliceAsBytes(counts[0..R]));
             try g.sparseAttention(qa.ptr, whole_b.ptr, .bf16, tok_a.ptr, cnt.ptr, parts, out_a.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
-            const base = try tier.resolve(b, 0, tok_b.ptr, cnt.ptr, R, W, stream);
-            try g.sparseAttention(qa.ptr, base, .bf16, tok_b.ptr, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
+            const res = try tier.resolve(b, 0, tok_b.ptr, cnt.ptr, R, W, stream);
+            try g.sparseAttention(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
             try stream.synchronize();
             try out_a.download(0, ha[0 .. R * H * rb]);
             try out_b.download(0, hb[0 .. R * H * rb]);
@@ -296,8 +296,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         try tok_b.upload(0, std.mem.sliceAsBytes(tokens[0..W]));
         try cnt.upload(0, std.mem.sliceAsBytes(counts[0..1]));
         try g.sparseAttention(qa.ptr, whole_b.ptr, .bf16, tok_a.ptr, cnt.ptr, parts, out_a.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
-        const base = try tier.resolve(b, 0, tok_b.ptr, cnt.ptr, 1, W, stream);
-        try g.sparseAttention(qa.ptr, base, .bf16, tok_b.ptr, cnt.ptr, parts, out_b.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
+        const res = try tier.resolve(b, 0, tok_b.ptr, cnt.ptr, 1, W, stream);
+        try g.sparseAttention(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, parts, out_b.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
         try stream.synchronize();
         try out_a.download(0, ha[0 .. H * rb]);
         try out_b.download(0, hb[0 .. H * rb]);

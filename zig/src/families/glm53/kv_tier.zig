@@ -54,7 +54,7 @@ pub const Options = struct {
 };
 
 const none: u32 = std.math.maxInt(u32);
-const Kind = enum(u8) { free, linear, loose };
+const Kind = enum(u8) { free, linear, loose, taken }; // taken: handed out by takeRuns, linear next
 const Run = struct { kind: Kind = .free, key0: u32 = 0, held: u32 = 0 }; // held: slots owning a pool
 
 pub const Piece = struct {
@@ -491,6 +491,53 @@ pub const Tier = struct {
         try t.io.finish();
     }
 
+    /// Stream `s` (just opened, nothing written) starts holding `rows` rows of layer `l` given whole (`bytes`, row
+    /// p at p * row_bytes; a fixture's drawn cache, a synthetic context): the home block's and the last partial
+    /// pool's rows resident, every other full pool written to the file and left there (fetched when selected).
+    /// Load every layer before the stream's first window.
+    pub fn load(t: *Tier, s: usize, l: usize, bytes: []const u8, rows: usize) Error!void {
+        const st = &t.streams[s];
+        if (!st.open or l >= st.layers or st.parent != null) return error.BadShape;
+        if (rows == 0 or rows > t.o.capacity or bytes.len < rows * t.o.row_bytes) return error.PastCapacity;
+        try t.io.finish();
+        const full = rows / pool_rows;
+        const pb = pool_rows * t.o.row_bytes;
+        for (0..@min((rows + pool_rows - 1) / pool_rows, home_pools)) |p| {
+            const slot: usize = @intCast(t.map[t.key(s, l, p)]);
+            const n = @min(pb, rows * t.o.row_bytes - p * pb);
+            @memcpy(t.slotBytes(slot)[0..n], bytes[p * pb ..][0..n]);
+        }
+        if (full > home_pools) {
+            // through an aligned bounce, a run's pools a write
+            const bounce = try t.gpa.alignedAlloc(u8, .fromByteUnits(block), run_pools * block);
+            defer t.gpa.free(bounce);
+            var p: usize = home_pools;
+            while (p < full) {
+                const n: usize = @min(@as(usize, run_pools), full - p);
+                @memcpy(bounce[0 .. n * block], bytes[p * pb ..][0 .. n * block]);
+                try t.io.add(.write, bounce[0 .. n * block], fileOffset(t.key(s, l, p)));
+                try t.io.finish();
+                for (p..p + n) |q| {
+                    const k = t.key(s, l, q);
+                    if (!t.persisted.isSet(k) and t.map[k] < 0) t.away[k / t.pools] += 1;
+                    t.persisted.set(k);
+                }
+                t.writes += n;
+                p += n;
+            }
+        }
+        if (rows % pool_rows != 0 and full >= home_pools) {
+            const g = full / run_pools;
+            if (t.seg_run[(s * t.o.layers + l) * t.segs + g] == none) try t.placeLinear(s, l, g, try t.takeRuns(1));
+            const slot: usize = @intCast(t.map[t.key(s, l, full)]);
+            @memcpy(t.slotBytes(slot)[0 .. (rows % pool_rows) * t.o.row_bytes], bytes[full * pb ..][0 .. (rows % pool_rows) * t.o.row_bytes]);
+        }
+        try t.io.finish();
+        st.hi = @max(st.hi, (rows - 1) / seg_positions);
+        st.committed = @max(st.committed, rows);
+        st.dirty_lo = @max(st.dirty_lo, full);
+    }
+
     /// Stream `dst` (just opened, nothing written, `src`'s layers) starts as `src`'s first `rows` positions (a kept
     /// prompt continued): its home block and the pool at `rows` (when partial) are copied, the pools between are
     /// read through `src`, which stays (pending once closed) while `dst` lives. `dst` writes from `rows` on. A chain
@@ -627,12 +674,22 @@ pub const Tier = struct {
         t.ref.unset(slot);
     }
 
-    /// A loose slot holding nothing: a free one, else the clock's choice among written pools no current call names
+    /// A loose slot holding nothing: a free one (a free run turned loose if need be), else the clock's choice among written pools no current call names
     /// (first sparing the pools of the last hot_windows windows).
     fn allocLoose(t: *Tier) Error!u32 {
         while (t.free_slots.pop()) |slot| {
             if (t.runs[slot / run_pools].kind == .loose and t.owner[slot] == none) return slot;
         }
+        // a free run turns loose before anything is evicted
+        for (t.runs, 0..) |*r, i| if (r.kind == .free) {
+            r.kind = .loose;
+            var k: usize = run_pools;
+            while (k > 1) {
+                k -= 1;
+                try t.free_slots.append(t.gpa, @intCast(i * run_pools + k));
+            }
+            return @intCast(i * run_pools);
+        };
         const n = t.owner.len;
         for ([_]bool{ true, false }) |hot| {
             var steps: usize = 0;
@@ -664,6 +721,7 @@ pub const Tier = struct {
             if (run_len == n) {
                 const b = i + 1 - n;
                 for (b * run_pools..(b + n) * run_pools) |slot| if (t.owner[slot] != none) return error.TierFull; // a free run holds nothing
+                for (b..b + n) |x| t.runs[x].kind = .taken;
                 return @intCast(b);
             }
         }
@@ -676,7 +734,7 @@ pub const Tier = struct {
             var ok = true;
             for (a..a + n) |r| switch (t.runs[r].kind) {
                 .free => {},
-                .linear => {
+                .linear, .taken => {
                     ok = false;
                     break;
                 },
@@ -690,7 +748,7 @@ pub const Tier = struct {
         }
         const b = best orelse return error.TierFull;
         // out of the loose set first, so no move lands inside
-        for (b..b + n) |r| t.runs[r].kind = .free;
+        for (b..b + n) |r| t.runs[r].kind = .taken;
         for (b * run_pools..(b + n) * run_pools) |slot| {
             const k = t.owner[slot];
             if (k == none) continue;
@@ -1166,6 +1224,31 @@ test "aliases read their parents' pools: kept prompts continued, parents closed 
         t.close(a); // a no-op when closed before (then freed with its last alias)
         try t.check();
         for (t.streams) |st| try testing.expect(!st.open and !st.pending);
+    }
+}
+
+test "load: a whole drawn cache, then windows and selections over it" {
+    var prng = std.Random.DefaultPrng.init(0x10ad);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = 1, .layers = 2, .capacity = 32 * seg_positions, .recent_runs = 2, .depth = 16 };
+    const f = try Fixture.init(o, 30, 7);
+    defer f.deinit();
+    const t = &f.tier;
+    try t.open(0, 2);
+    const rows = 30 * seg_positions + 2;
+    for (0..2) |l| {
+        rnd.bytes(f.ref[l][0 .. rows * o.row_bytes]);
+        try t.load(0, l, f.ref[l][0 .. rows * o.row_bytes], rows);
+    }
+    f.end[0] = rows;
+    try t.check();
+    // a window inside the drawn rows (the fixture's run l writes at 40,000 then 600,000), then one past them
+    for ([_]usize{ 20_000, 20_003, rows }) |pos| {
+        try f.write(rnd, 0, pos, 3);
+        f.end[0] = @max(rows, pos + 3);
+        for (0..3) |_| try f.select(rnd, 0, 3, 512);
+        try t.commit(0, pos + 3);
+        try t.check();
     }
 }
 

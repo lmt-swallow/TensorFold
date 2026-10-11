@@ -6,8 +6,8 @@
 //!   `beginWindow`;
 //! - the latent write: `writes(s, l, pos, R, pos_dev)`, one or two (base, pos_dev, rows) pieces;
 //! - dense attention (rows before the dense limit): `denseBase(s, l)`, positions [0, kv_tier.home_positions);
-//! - sparse attention: after the selection wrote tokens [R, W] and counts [R], `resolve(...)` returns the base the
-//!   remapped tokens index (the stream syncs once when some written pool of the layer is on the file only; while
+//! - sparse attention: after the selection wrote tokens [R, W] and counts [R], `resolve(...)` returns the base and
+//!   the remapped rows the sparse kernels take (the stream syncs once when some written pool of the layer is on the file only; while
 //!   the context fits, no sync);
 //! - after the round's tokens are known: `commit(s, accepted_end)`, `rewind(s, end)`;
 //! - a kept prompt continued by another stream: `alias(src, dst, rows)` (no copy past the home block; `src` stays
@@ -32,6 +32,7 @@ pub const Tier = struct {
     map: cuda.HostBuffer,
     map_dev: Ptr,
     toks: cuda.HostBuffer, // the selection read back: tokens [rows, W] i32
+    rows_out: cuda.DeviceBuffer, // the remapped selections: slab rows [rows, W] i32
     cnts: cuda.HostBuffer, // counts [rows] i32
     at: cuda.HostBuffer, // second pieces' first positions (i32 16 bytes apart, mapped: Triton specializes pointers on 16-byte alignment), a ring
     at_dev: Ptr,
@@ -58,6 +59,8 @@ pub const Tier = struct {
         t.map_dev = try t.map.device();
         t.toks = try cuda.HostBuffer.alloc(d, rows * w * 4);
         errdefer t.toks.free();
+        t.rows_out = try cuda.DeviceBuffer.alloc(d, rows * w * 4 + max_sels * 256);
+        errdefer t.rows_out.free();
         t.cnts = try cuda.HostBuffer.alloc(d, rows * 4);
         errdefer t.cnts.free();
         t.at = try cuda.HostBuffer.allocMapped(d, ring * 16);
@@ -85,6 +88,7 @@ pub const Tier = struct {
         t.chains.free();
         t.at.free();
         t.cnts.free();
+        t.rows_out.free();
         t.toks.free();
         t.map.free();
         t.slab.free();
@@ -126,25 +130,34 @@ pub const Tier = struct {
         return t.slab_dev +% @as(u64, @bitCast(t.host.denseBase(s, l)));
     }
 
+    /// Selections a resolveMany takes at most.
+    pub const max_sels = 64;
+
     /// One stream-layer's selection on the device: rows [R], tokens [R, w] positions, counts [R].
     pub const Sel = struct { h: usize, layer: usize, tokens: Ptr, counts: Ptr, R: usize };
 
+    /// Where the sparse kernels read a resolved selection: latent rows at `base`, row indices at `tokens` [R, w]
+    /// (the tier's buffer: valid until the next resolve; the selection's positions stay as they were).
+    pub const Resolved = struct { base: Ptr, tokens: Ptr };
+
     /// After the selection of rows [R] (tokens [R, w] positions, counts [R]) ran on `stream`: every selected pool
-    /// resident, the tokens remapped in place; returns the base the sparse kernels read the latent rows at.
-    pub fn resolve(t: *Tier, s: usize, l: usize, tokens: Ptr, counts: Ptr, R: usize, w: usize, stream: cuda.Stream) !Ptr {
-        return t.resolveMany(&.{.{ .h = s, .layer = l, .tokens = tokens, .counts = counts, .R = R }}, w, stream);
+    /// resident and the positions remapped to slab rows.
+    pub fn resolve(t: *Tier, s: usize, l: usize, tokens: Ptr, counts: Ptr, R: usize, w: usize, stream: cuda.Stream) !Resolved {
+        var out: [1]Resolved = undefined;
+        try t.resolveMany(&.{.{ .h = s, .layer = l, .tokens = tokens, .counts = counts, .R = R }}, w, stream, &out);
+        return out[0];
     }
 
     /// `resolve` of several streams' selections at once (a round's streams on one DSA layer): their missing pools
-    /// read as one batch (the drive's latency paid once), then each remapped.
-    pub fn resolveMany(t: *Tier, sels: []const Sel, w: usize, stream: cuda.Stream) !Ptr {
+    /// read as one batch (the drive's latency paid once), then each remapped into out[i].
+    pub fn resolveMany(t: *Tier, sels: []const Sel, w: usize, stream: cuda.Stream, out: []Resolved) !void {
         var all_resident = true;
         var rows: usize = 0;
         for (sels) |x| {
             all_resident = all_resident and t.host.resident(x.h, x.layer);
             rows += x.R;
         }
-        if (rows * w * 4 > t.toks.bytes.len or rows * 4 > t.cnts.bytes.len or sels.len > 64) return error.BadShape;
+        if (rows * w * 4 > t.toks.bytes.len or rows * 4 > t.cnts.bytes.len or sels.len > max_sels or out.len < sels.len) return error.BadShape;
         // every written pool resident (the whole context fits): the device remap alone, no read-back, no sync
         if (!all_resident) {
             const api = t.d.api;
@@ -155,7 +168,7 @@ pub const Tier = struct {
                 at += x.R;
             }
             try stream.synchronize();
-            var hs: [64]kv.Tier.Selection = undefined;
+            var hs: [max_sels]kv.Tier.Selection = undefined;
             at = 0;
             for (sels, 0..) |x, i| {
                 hs[i] = .{ .s = x.h, .l = x.layer, .tokens = t.toks.slice(i32)[at * w ..][0 .. x.R * w], .counts = t.cnts.slice(i32)[at..][0..x.R], .W = w };
@@ -163,11 +176,16 @@ pub const Tier = struct {
             }
             try t.host.fetchMany(hs[0..sels.len]);
         }
-        for (sels) |x| try t.remap(x, w, stream);
-        return t.slab_dev;
+        // each selection's rows 256-byte aligned (Triton specializes pointers on 16-byte alignment)
+        var at: usize = 0;
+        for (sels, out[0..sels.len]) |x, *o| {
+            o.* = .{ .base = t.slab_dev, .tokens = t.rows_out.ptr + at };
+            try t.remap(x, o.tokens, w, stream);
+            at = std.mem.alignForward(usize, at + x.R * w * 4, 256);
+        }
     }
 
-    fn remap(t: *Tier, x: Sel, w: usize, stream: cuda.Stream) !void {
+    fn remap(t: *Tier, x: Sel, dst: Ptr, w: usize, stream: cuda.Stream) !void {
         var links: [kv.max_chain]kv.Tier.Link = undefined;
         const n = t.host.chain(x.h, &links);
         const k = t.chain_next % ring;
@@ -181,6 +199,7 @@ pub const Tier = struct {
         }
         var args: cuda.Args = .{};
         args.add(x.tokens);
+        args.add(dst);
         args.add(x.counts);
         args.add(t.chains_dev + k * 128);
         args.add(@as(i32, @intCast(w)));
