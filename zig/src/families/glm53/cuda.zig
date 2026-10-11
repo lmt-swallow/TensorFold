@@ -1,0 +1,13 @@
+//! GLM-5.3-Flash on CUDA (two DGX Sparks, tensor parallel, the EXL3 pack): the family's module root. The arithmetic
+//! follows the Mia fork's `glm5_next/cuda` (TensorFold v0.6.0 with the 70 patches of the recipe's v1.5 image,
+//! ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold@sha256:ef83797d…) in its strict setting
+//! (TF_GLM_DENSE=bf16, TF_GLM_KV=bf16, TF_GLM_KDA_CHUNKED=0, MTP drafts), the reference every piece is checked
+//! against bit for bit (tools/zig/glm53/ writes the fixtures and captures its Triton kernels).
+
+pub const config = @import("config.zig");
+pub const weights_map = @import("weights_map.zig");
+pub const plan = @import("plan.zig");
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

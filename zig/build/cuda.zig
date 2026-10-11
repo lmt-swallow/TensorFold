@@ -76,7 +76,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, dsv41: *std.Build.Module, qwen38fn: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, dsv41: *std.Build.Module, qwen38fn: *std.Build.Module, glm53: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -97,7 +97,8 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     qwen38fn.addImport("core", core);
     qwen38fn.addImport("dsv41", dsv41); // its EXL3 linear (0.6.6's kernel body) until that moves to the core
     qwen38fn.addImport("lanes", lanes);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41, .qwen38fn = qwen38fn };
+    const glm53 = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm53/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41, .qwen38fn = qwen38fn, .glm53 = glm53 };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -135,6 +136,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("dsv41", mods.dsv41);
     runner.addImport("qwen38fn", mods.qwen38fn);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+    // GLM-5.3-Flash's pack against the family's plan: headers only, no GPU (safe beside a serving rank)
+    const glm53_validate = b.createModule(.{ .root_source_file = b.path("zig/tests/glm53/validate.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53_validate.addImport("core", mods.core);
+    glm53_validate.addImport("glm53", mods.glm53);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-glm53-validate", .root_module = glm53_validate }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.tokenizer, build_options, true);
 }
 
@@ -180,7 +186,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const mods = family(b, host, .debug, cuda, draft_ids);
     const seam = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn);
     // the engine seam's own tests (lane_host.zig) too, as the Metal build runs them
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, seam.engines, seam.api, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.glm53, seam.engines, seam.api, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
