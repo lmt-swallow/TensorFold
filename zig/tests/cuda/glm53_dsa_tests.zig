@@ -65,11 +65,11 @@ const Run = struct {
     ds: [2]A.Scratch,
     pds: [2]A.Scratch,
 
-    fn init(d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize) !Run {
+    fn init(d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, kv: A.Kv) !Run {
         var r: Run = undefined;
         for (0..2) |i| {
             const lay: glm.config.Layout = .{ .rank = i, .world = 2, .cfg = cfg };
-            r.cache[i] = try A.Cache.init(d, cfg, capacity, A.indexRing(capacity, @max(max_rows, prompt_rows)));
+            r.cache[i] = try A.Cache.init(d, cfg, capacity, A.indexRing(capacity, @max(max_rows, prompt_rows)), kv);
             r.ds[i] = try A.Scratch.init(d, lay, max_rows, capacity, false);
             r.pds[i] = try A.Scratch.init(d, lay, prompt_rows, capacity, true);
         }
@@ -142,7 +142,16 @@ fn weightsOk(gpa: std.mem.Allocator, io: std.Io, work: []const u8, ranks: []Rank
     check.pass("glm53-dsa: every rank's layer-3 DSA tensors, head rows and 4-bit draft head equal the reference loader's ({d} sha256)", .{n});
 }
 
-pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void {
+/// The fixture's DSA cache format (params "kv": dump_*.py with TF_GLM53_REF_KV; absent: bf16), required to be `want`
+/// when given (the -fp8 subcommands).
+fn fixtureKv(params: std.json.ObjectMap, want: ?A.Kv) !A.Kv {
+    const kv = try A.Kv.parse(if (params.get("kv")) |v| v.string else "");
+    if (want) |w| try check.expect(kv == w, "glm53: the fixture's DSA caches are {t}, not {t} (capture it with KV={t})", .{ kv, w, w });
+    return kv;
+}
+
+/// `want`: the cache format the fixture must hold (glm53-dsa-fp8), or any (glm53-dsa).
+pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool, want: ?A.Kv) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
     var why: glm.config.Why = .{};
@@ -163,6 +172,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
     const layer: usize = @intCast(try h.fx.int("layer"));
     const capacity: usize = @intCast(try h.fx.int("capacity"));
     const long_capacity: usize = @intCast(try h.fx.int("long_capacity"));
+    const kv = try fixtureKv(h.fx.parsed.value.object.get("params").?.object, want);
 
     var hck = try glm.glue.Hc.load(d);
     defer hck.deinit();
@@ -198,7 +208,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
     const steps = h.fx.parsed.value.object.get("params").?.object.get("steps").?.object;
 
     {
-        var run_a = try Run.init(d, &cfg, capacity);
+        var run_a = try Run.init(d, &cfg, capacity, kv);
         defer run_a.deinit();
         try runSteps(&h, g, &mk, &cfg, &ranks, &run_a, steps.get("a").?.array.items, "a", false);
     }
@@ -206,12 +216,12 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
     {
         var tk = try T.Kernels.load(d);
         defer tk.deinit();
-        var run_m = try Run.init(d, &cfg, capacity);
+        var run_m = try Run.init(d, &cfg, capacity, kv);
         defer run_m.deinit();
         try runMtp(&h, g, &mk, &tk, &cfg, &ranks, &run_m, steps.get("m").?.array.items);
     }
 
-    var run_l = try Run.init(d, &cfg, long_capacity);
+    var run_l = try Run.init(d, &cfg, long_capacity, kv);
     defer run_l.deinit();
     for (&run_l.cache) |*c| {
         const lat = try h.fx.bytes("l_latent0");
@@ -223,7 +233,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
     }
     try runSteps(&h, g, &mk, &cfg, &ranks, &run_l, steps.get("l").?.array.items, "l", true);
     try check.expect(h.failures == 0, "glm53-dsa: {d} comparisons differ ({d} equal)", .{ h.failures, h.passes });
-    check.pass("glm53-dsa: runs a, m and l, {d} comparisons bit-exact{s}", .{ h.passes, if (isolated) " (isolated)" else "" });
+    check.pass("glm53-dsa: runs a, m and l on {t} caches, {d} comparisons bit-exact{s}", .{ kv, h.passes, if (isolated) " (isolated)" else "" });
 }
 
 fn runSteps(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, cfg: *const glm.config.Config, ranks: *[2]Rank, run_: *Run, steps: []const std.json.Value, comptime tag: []const u8, long: bool) !void {

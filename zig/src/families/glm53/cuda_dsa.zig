@@ -1,5 +1,5 @@
 //! GLM-5.3-Flash's DSA layers (and the MTP layer's attention) on one rank, as the Mia fork's `forward.py: dsa_rows`
-//! runs them on the latent cache in the strict setting (TF_GLM_KV=bf16, TF_GLM_KVB=bf16): the projection and norms,
+//! runs them on the latent cache in the strict setting (TF_GLM_KV=bf16 or fp8, TF_GLM_KVB=bf16): the projection and norms,
 //! the latent row written at its position, the indexer's keys, gates and pooled keys, the query absorbed into the
 //! 512-wide latent, attention (dense up to the dense limit; past it over each row's 512 best pools of 4 and its
 //! incomplete pool), the read-out expanded through kv_b's value rows, o_proj into the rank's fp32 partial.
@@ -17,6 +17,7 @@ const glue_mod = @import("cuda_glue.zig");
 const weights = @import("cuda_weights.zig");
 
 const Glue = glue_mod.Glue;
+pub const Kv = glue_mod.Kv;
 const Ptr = cuda.abi.DevicePtr;
 const Buf = cuda.DeviceBuffer;
 
@@ -135,9 +136,10 @@ pub const Dsa = struct {
     }
 };
 
-/// One stream's caches of one DSA layer (forward.py `Caches` bound to a stream at base 0): the latent rows [cap,
-/// kv_lora] bf16, the indexer's key and gate ring [ring, index_dim] bf16 (token t at t % ring) and the pooled keys
-/// [cap / 4 + 2, index_dim] bf16; all zeroed, as the pool's planes are.
+/// One stream's caches of one DSA layer (forward.py `Caches` bound to a stream at base 0): the latent rows
+/// [cap, kv_lora], the indexer's key and gate ring [ring, index_dim] bf16 (token t at t % ring) and the pooled keys
+/// [cap / 4 + 2, index_dim]; the latent rows and pooled keys in the format `kv` (TF_GLM_KV: bf16, or fp8's rows of
+/// `glue.Kv.rowBytes`); all zeroed, as the pool's planes are (a zero FP8 row reads as zeros).
 pub const Cache = struct {
     latent: Buf,
     ik: Buf,
@@ -145,18 +147,29 @@ pub const Cache = struct {
     pk: Buf,
     capacity: usize,
     ring: usize,
+    kv: Kv,
 
-    pub fn init(d: *const cuda.Driver, c: *const config.Config, capacity: usize, ring: usize) !Cache {
-        var lat = try Buf.alloc(d, capacity * c.kv_lora * 2);
+    pub fn init(d: *const cuda.Driver, c: *const config.Config, capacity: usize, ring: usize, kv: Kv) !Cache {
+        var lat = try Buf.alloc(d, capacity * kv.rowBytes(c.kv_lora));
         errdefer lat.free();
         var ik = try Buf.alloc(d, ring * c.index_dim * 2);
         errdefer ik.free();
         var ig = try Buf.alloc(d, ring * c.index_dim * 2);
         errdefer ig.free();
-        var pk = try Buf.alloc(d, (capacity / 4 + 2) * c.index_dim * 2);
+        var pk = try Buf.alloc(d, (capacity / 4 + 2) * kv.rowBytes(c.index_dim));
         errdefer pk.free();
         for ([_]*Buf{ &lat, &ik, &ig, &pk }) |b| try b.fill8(0, null);
-        return .{ .latent = lat, .ik = ik, .ig = ig, .pk = pk, .capacity = capacity, .ring = ring };
+        return .{ .latent = lat, .ik = ik, .ig = ig, .pk = pk, .capacity = capacity, .ring = ring, .kv = kv };
+    }
+
+    /// The device bytes `init` allocates for one layer's caches.
+    pub fn bytes(c: *const config.Config, capacity: usize, ring: usize, kv: Kv) usize {
+        return capacity * kv.rowBytes(c.kv_lora) + 2 * ring * c.index_dim * 2 + (capacity / 4 + 2) * kv.rowBytes(c.index_dim);
+    }
+
+    /// Latent row `pos`'s offset in `latent`.
+    pub fn latentAt(s: *const Cache, c: *const config.Config, pos: usize) usize {
+        return pos * s.kv.rowBytes(c.kv_lora);
     }
 
     pub fn deinit(s: *Cache) void {
@@ -307,14 +320,14 @@ pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache,
     try g.rmsnorm(s.dp.ptr + c.q_lora * 2, c.q_lora + lw, a.kv_norm.ptr, s.lat.ptr, lw, s.xs_lat.ptr, c.eps, R, lw, stream);
     try g.bmm(s.qr.ptr, c.q_lora, a.q_b.b16(), R, s.q.ptr, false, call.sk, stream);
     // dsa_rows: the latent row, the indexer, absorb, attention, expand
-    try g.latWrite(s.lat.ptr, lw, cache.latent.ptr, call.pos_dev, R, lw, stream);
+    try g.latWrite(s.lat.ptr, lw, cache.latent.ptr, cache.kv, call.pos_dev, R, lw, stream);
     const limit = c.denseLimit();
     const all_sparse = call.host_pos >= limit;
     const sparse_rows = all_sparse or call.host_pos + R - 1 >= limit;
     const ikw = c.index_dim + c.index_heads;
     try g.bmm(call.normed, c.hidden, a.kw.b16(), R, s.ikr.ptr, false, call.sk, stream);
     try g.router(call.normed, c.hidden, a.gate.ptr, c.index_dim, R, s.igr.ptr, s.gpart.ptr, stream);
-    try g.indexUpdate(s.ikr.ptr, ikw, s.igr.ptr, a.ln_w.ptr, a.ln_b.ptr, a.ape.ptr, cache.ik.ptr, cache.ig.ptr, cache.ring, cache.pk.ptr, call.pos_dev, R, stream);
+    try g.indexUpdate(s.ikr.ptr, ikw, s.igr.ptr, a.ln_w.ptr, a.ln_b.ptr, a.ape.ptr, cache.ik.ptr, cache.ig.ptr, cache.ring, cache.pk.ptr, cache.kv, call.pos_dev, R, stream);
     try g.absorbQ(s.q.ptr, a.wk.ptr, s.qa.ptr, R, H, c.qk_dim, lw, prefill, stream);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(c.qk_dim), -0.5));
     if (!all_sparse) {
@@ -323,7 +336,7 @@ pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache,
         const nch = @min(call.nch, s.nch);
         const hb = headBlock(R);
         if (dense <= s.part_rows) {
-            try g.denseAttention(s.qa.ptr, cache.latent.ptr, call.pos_dev, s.dense, s.ol.ptr, dense, H, lw, nch, hb, scale, stream);
+            try g.denseAttention(s.qa.ptr, cache.latent.ptr, cache.kv, call.pos_dev, s.dense, s.ol.ptr, dense, H, lw, nch, hb, scale, stream);
         } else {
             var r0: usize = 0;
             var i: usize = 0;
@@ -333,7 +346,7 @@ pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache,
             }) {
                 const r1 = @min(dense, r0 + s.part_rows);
                 const at = try devicePos(s, .dense, i, call.host_pos + r0, stream);
-                try g.denseAttention(s.qa.ptr + r0 * H * lw * 2, cache.latent.ptr, at, s.dense, s.ol.ptr + r0 * H * lw * 2, r1 - r0, H, lw, nch, hb, scale, stream);
+                try g.denseAttention(s.qa.ptr + r0 * H * lw * 2, cache.latent.ptr, cache.kv, at, s.dense, s.ol.ptr + r0 * H * lw * 2, r1 - r0, H, lw, nch, hb, scale, stream);
             }
         }
     }
@@ -341,9 +354,9 @@ pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache,
         try g.bmm(s.qr.ptr, c.q_lora, a.qb.b16(), R, s.qi.ptr, false, call.sk, stream);
         try selectTokens(g, s, cache, call, s.ikr.ptr + c.index_dim * 2, ikw, stream);
         if (prefill) {
-            try g.sparseOnepass(s.qa.ptr, cache.latent.ptr, s.tokens.ptr, s.counts.ptr, s.ol.ptr, R, H, lw, glue_mod.sparse_tokens, scale, stream);
+            try g.sparseOnepass(s.qa.ptr, cache.latent.ptr, cache.kv, s.tokens.ptr, s.counts.ptr, s.ol.ptr, R, H, lw, glue_mod.sparse_tokens, scale, stream);
         } else {
-            try g.sparseAttention(s.qa.ptr, cache.latent.ptr, s.tokens.ptr, s.counts.ptr, s.sparse, s.ol.ptr, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
+            try g.sparseAttention(s.qa.ptr, cache.latent.ptr, cache.kv, s.tokens.ptr, s.counts.ptr, s.sparse, s.ol.ptr, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
         }
     }
     try g.expandV(s.ol.ptr, a.wv.ptr, s.vn.ptr, R, H, c.v_dim, lw, prefill, stream);
@@ -367,7 +380,7 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, wts
         }) {
             const n = @min(B, R - a);
             const at = if (a == 0) call.pos_dev else try devicePos(s, .select, i, call.host_pos + a, stream);
-            try g.scores(s.qi.ptr + a * qrow, wts + a * w_stride * 2, w_stride, cache.pk.ptr, s.scores.ptr, at, n, NP, stream);
+            try g.scores(s.qi.ptr + a * qrow, wts + a * w_stride * 2, w_stride, cache.pk.ptr, cache.kv, s.scores.ptr, at, n, NP, stream);
             // top_pools: a block of fewer than 64 rows over 8,192 pools or more across chunk programs (the same pools)
             if (n < split_rows and NP >= split_from) {
                 try g.selectSplitPools(s.scores.ptr, NP, s.split, s.pools.ptr, n, stream);
@@ -378,7 +391,7 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, wts
     }
     const np = poolBucket(call.host_pos, R, np_max);
     const grid = @min(row_score_g, cdiv(np, 64));
-    try g.scoresRows(s.qi.ptr, wts, w_stride, cache.pk.ptr, s.scores.ptr, call.pos_dev, R, np, grid, stream);
+    try g.scoresRows(s.qi.ptr, wts, w_stride, cache.pk.ptr, cache.kv, s.scores.ptr, call.pos_dev, R, np, grid, stream);
     if (R < split_rows and np >= split_from) {
         try g.selectSplit(s.scores.ptr, np, call.pos_dev, s.split, s.tokens.ptr, s.counts.ptr, R, stream);
     } else {
