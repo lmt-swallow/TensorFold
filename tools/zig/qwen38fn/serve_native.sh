@@ -8,7 +8,8 @@
 #
 # Environment: NODE (spark-616b), BIN (the local tensorfold-native, default zig-out/native/bin/tensorfold-native),
 # KERNELS (~/aot/... serving kernel set on the node, capture_serve_kernels.sh), MODEL, PARALLEL (4), CONTEXT (262144),
-# RESERVE (2), MAX_TOKENS (64), LOG_DIR, EXTRA_ARGS.
+# RESERVE (2), MAX_TOKENS (64), LOG_DIR, EXTRA_ARGS, ENGINE_ENV (space-separated NAME=VALUE for the server, e.g.
+# TF_QFN_GRAPHS=0).
 set -euo pipefail
 
 NODE=${NODE:-spark-616b}
@@ -47,7 +48,7 @@ sum=$(on "sha256sum \$HOME/bin/qfn/tensorfold-native" | cut -c1-12)
 [ "$sum" = "$(shasum -a 256 "$BIN" | cut -c1-12)" ] || die "the copied binary differs"
 say "binary $sum; --parallel $PARALLEL --context $CONTEXT, kernels ~/aot/$KERNELS"
 on "docker run --rm -d --name $NAME --gpus all --ipc=host --net=host -v \$HOME/models/$MODEL:/model:ro -v \$HOME/aot/$KERNELS:/k:ro -v \$HOME/bin/qfn:/b:ro \
-  -e TENSORFOLD_CUDA_KERNELS=/k -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE $IMAGE \
+  -e TENSORFOLD_CUDA_KERNELS=/k -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE $(for e in ${ENGINE_ENV:-}; do printf -- '-e %s ' "$e"; done) $IMAGE \
   /b/tensorfold-native serve /model --context $CONTEXT --parallel $PARALLEL --temperature 0 --no-update-check --name qwen38fn \
   --host 0.0.0.0 --port $HTTP_PORT ${EXTRA_ARGS:-}" >/dev/null
 on "docker logs -f $NAME" >"$LOG_DIR/$NAME.log" 2>&1 &
