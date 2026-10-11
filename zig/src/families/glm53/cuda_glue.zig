@@ -22,6 +22,17 @@ const split_target = 192;
 const seq_rows = 256;
 /// glue.py ROUTER_KS.
 const router_ks = 8;
+/// sparse.py's score scales: index_dim ** -0.5 and the 32 heads' 1 / 5.656854249492381 (32 ** -0.5 as written).
+const index_scale: f32 = @floatCast(std.math.pow(f64, 128.0, -0.5));
+const index_wscale: f32 = @floatCast(1.0 / 5.656854249492381);
+/// sparse.py TOKENS: a sparse row's attended tokens (512 pools of 4, then its incomplete pool's 3).
+pub const sparse_tokens = 512 * 4 + 3;
+
+/// sparse.py `split_scratch`: select_split's int32s for R rows of np scores.
+pub fn splitScratchBytes(R: usize, np: usize) usize {
+    const chs: usize = if (np <= 16384) 2048 else 4096;
+    return R * (1024 + std.math.ceilPowerOfTwoAssert(usize, cdiv(np, chs)) * 257) * 4;
+}
 
 fn n32(v: usize) i32 {
     return @intCast(v);
@@ -241,6 +252,165 @@ pub const Glue = struct {
         try g.set.run(stream, "_combine_sy", .{ @intCast(rows), @intCast(g.hidden / block), 1 }, &.{
             aot.ptr("Y", "*fp32", y), aot.ptr("SY", "*fp32", sy), aot.ptr("WTS", "*fp32", wts), aot.ptr("OUT", "*fp32", out),
         }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("SLOTS", @intCast(slots)), aot.ci("BLOCK", @intCast(block)) });
+    }
+
+    // -- DSA: the latent cache, the indexer and the attention (latent.py, sparse.py) ------------------------------
+
+    /// latent.py `latent_write`: lat rows [R, 512] (row stride lat_stride) into cache rows pos .. pos + R - 1.
+    pub fn latWrite(g: Glue, lat: Ptr, lat_stride: usize, cache: Ptr, pos: Ptr, R: usize, lw: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_lat_write", .{ @intCast(R), 1, 1 }, &.{
+            aot.ptr("LAT", "*bf16", lat), aot.int("lat_stride", n32(lat_stride)), aot.ptr("LC", "*bf16", cache),
+            aot.ptr("LS", "*bf16", cache), aot.ptr("POS", "*i32", pos),
+        }, &.{ aot.ci("LW", @intCast(lw)), aot.ci("RS", @intCast(lw)), aot.ci("FP8", 0) });
+    }
+
+    /// sparse.py `index_update`: the rows' LayerNormed index keys and their gates into the ring (row t at t % ring),
+    /// then every pool of 4 the window completes into the pooled keys.
+    pub fn indexUpdate(g: Glue, kr: Ptr, k_stride: usize, gr: Ptr, ln_w: Ptr, ln_b: Ptr, ape: Ptr, ik: Ptr, ig: Ptr, ring: usize, pk: Ptr, pos: Ptr, R: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_index_write", .{ @intCast(R), 1, 1 }, &.{
+            aot.ptr("KR", "*bf16", kr), aot.int("k_stride", n32(k_stride)), aot.ptr("GR", "*fp32", gr), aot.ptr("LNW", "*bf16", ln_w),
+            aot.ptr("LNB", "*bf16", ln_b), aot.ptr("IK", "*bf16", ik), aot.ptr("IG", "*bf16", ig), aot.ptr("POS", "*i32", pos),
+            aot.int("RING", n32(ring)), aot.float("eps", 1e-6),
+        }, &.{aot.ci("D", 128)});
+        try g.set.run(stream, "_pool_keys", .{ @intCast(R / 4 + 2), 1, 1 }, &.{
+            aot.ptr("IK", "*bf16", ik), aot.ptr("IG", "*bf16", ig),   aot.ptr("APE", "*bf16", ape), aot.ptr("PK", "*bf16", pk),
+            aot.ptr("PKS", "*bf16", pk), aot.ptr("POS", "*i32", pos), aot.int("R", n32(R)),       aot.int("RING", n32(ring)),
+        }, &.{ aot.ci("D", 128), aot.ci("RS", 128), aot.ci("FP8", 0) });
+    }
+
+    /// latent.py `absorb_q` (bf16 kv_b): qa [R, H, LW] = q [R, H, D] @ wk [H, D, LW]; prompt rows on the tensor cores.
+    pub fn absorbQ(g: Glue, q: Ptr, wk: Ptr, qa: Ptr, R: usize, H: usize, D: usize, lw: usize, prompt: bool, stream: cuda.Stream) !void {
+        if (prompt) return g.set.run(stream, "_absorb_mma", .{ @intCast(H), @intCast(cdiv(R, 64)), @intCast(lw / 128) }, &.{
+            aot.ptr("Q", "*bf16", q), aot.ptr("WK", "*bf16", wk), aot.ptr("QA", "*bf16", qa), aot.int("R", n32(R)),
+        }, &.{ aot.ci("H", @intCast(H)), aot.ci("D", @intCast(D)), aot.ci("LW", @intCast(lw)), aot.ci("BM", 64), aot.ci("BN", 128), aot.ci("BK", 64) });
+        try g.set.run(stream, "_absorb_q", .{ @intCast(H), @intCast(lw / 32), 1 }, &.{
+            aot.ptr("Q", "*bf16", q), aot.ptr("WK", "*bf16", wk), aot.ptr("QA", "*bf16", qa), aot.int("R", n32(R)),
+        }, &.{ aot.ci("H", @intCast(H)), aot.ci("D", @intCast(D)), aot.ci("LW", @intCast(lw)), aot.ci("BN", 32) });
+    }
+
+    /// latent.py `expand_v` (bf16 kv_b): out [R, H, DV] = ol [R, H, LW] @ wv [H, DV, LW]^T.
+    pub fn expandV(g: Glue, ol: Ptr, wv: Ptr, out: Ptr, R: usize, H: usize, dv: usize, lw: usize, prompt: bool, stream: cuda.Stream) !void {
+        if (prompt) return g.set.run(stream, "_expand_mma", .{ @intCast(H), @intCast(cdiv(R, 64)), @intCast(dv / 128) }, &.{
+            aot.ptr("OL", "*bf16", ol), aot.ptr("WV", "*bf16", wv), aot.ptr("OUT", "*bf16", out), aot.int("R", n32(R)),
+        }, &.{ aot.ci("H", @intCast(H)), aot.ci("DV", @intCast(dv)), aot.ci("LW", @intCast(lw)), aot.ci("BM", 64), aot.ci("BN", 128), aot.ci("BK", 64) });
+        try g.set.run(stream, "_expand_v", .{ @intCast(H), @intCast(dv / 16), 1 }, &.{
+            aot.ptr("OL", "*bf16", ol), aot.ptr("WV", "*bf16", wv), aot.ptr("OUT", "*bf16", out), aot.int("R", n32(R)),
+        }, &.{ aot.ci("H", @intCast(H)), aot.ci("DV", @intCast(dv)), aot.ci("LW", @intCast(lw)), aot.ci("BN", 16) });
+    }
+
+    pub const Partials = struct { po: Ptr, pm: Ptr, pl: Ptr };
+
+    /// latent.py `attention`: rows 0 .. R at device position pos (keys 0 .. pos + r visible to row r) over `nch`
+    /// 512-key chunks into fp32 partials, then their merge in chunk order into out [R, H, LW].
+    pub fn denseAttention(g: Glue, qa: Ptr, cache: Ptr, pos: Ptr, p: Partials, out: Ptr, R: usize, H: usize, lw: usize, nch: usize, hb: usize, scale: f32, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_dense_chunks", .{ @intCast(R), @intCast(cdiv(H, hb)), @intCast(nch) }, &.{
+            aot.ptr("QA", "*bf16", qa), aot.ptr("LC", "*bf16", cache), aot.ptr("LS", "*bf16", cache), aot.ptr("POS", "*i32", pos),
+            aot.ptr("PO", "*fp32", p.po), aot.ptr("PM", "*fp32", p.pm), aot.ptr("PL", "*fp32", p.pl), aot.int("R", n32(R)),
+        }, &.{
+            aot.ci("H", @intCast(H)),   aot.ci("LW", @intCast(lw)), aot.ci("CH", 512), aot.cf("SCALE", scale),
+            aot.ci("HBT", @intCast(hb)), aot.ci("KTT", 32),          aot.ci("RS", @intCast(lw)), aot.ci("FP8", 0),
+        });
+        try g.merge(p, out, 0, R, H, lw, nch, false, stream);
+    }
+
+    /// latent.py `_merge`: each (row, head)'s chunk partials in chunk order -> out bf16; `sparse`: rows whose
+    /// count is 0 left alone.
+    pub fn merge(g: Glue, p: Partials, out: Ptr, counts: Ptr, R: usize, H: usize, lw: usize, nch: usize, sparse: bool, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_merge", .{ @intCast(R), @intCast(H), 1 }, &.{
+            aot.ptr("PO", "*fp32", p.po),  aot.ptr("PM", "*fp32", p.pm), aot.ptr("PL", "*fp32", p.pl), aot.ptr("OUT", "*bf16", out),
+            aot.ptr("CNT", "*i32", if (sparse) counts else p.pm), aot.int("R", n32(R)),
+        }, &.{ aot.ci("H", @intCast(H)), aot.ci("LW", @intCast(lw)), aot.ci("NCH", @intCast(nch)), aot.ci("SPARSE", @intFromBool(sparse)) });
+    }
+
+    /// latent.py `sparse_attention`: rows with a count over their selected tokens (W a row), chunks of 512 tokens
+    /// in list order, then the merge; other rows left alone.
+    pub fn sparseAttention(g: Glue, qa: Ptr, cache: Ptr, tok: Ptr, counts: Ptr, p: Partials, out: Ptr, R: usize, H: usize, lw: usize, w: usize, hb: usize, scale: f32, stream: cuda.Stream) !void {
+        const nch = cdiv(w, 512);
+        try g.set.run(stream, "_sparse_chunks", .{ @intCast(R), @intCast(cdiv(H, hb)), @intCast(nch) }, &.{
+            aot.ptr("QA", "*bf16", qa), aot.ptr("LC", "*bf16", cache), aot.ptr("LS", "*bf16", cache), aot.ptr("TOK", "*i32", tok),
+            aot.ptr("CNT", "*i32", counts), aot.ptr("PO", "*fp32", p.po), aot.ptr("PM", "*fp32", p.pm), aot.ptr("PL", "*fp32", p.pl),
+            aot.int("R", n32(R)),
+        }, &.{
+            aot.ci("W", @intCast(w)),   aot.ci("H", @intCast(H)), aot.ci("LW", @intCast(lw)), aot.ci("CH", 512), aot.cf("SCALE", scale),
+            aot.ci("HBT", @intCast(hb)), aot.ci("KTT", 32),        aot.ci("RS", @intCast(lw)), aot.ci("FP8", 0),
+        });
+        try g.merge(p, out, counts, R, H, lw, nch, true, stream);
+    }
+
+    /// latent.py `sparse_onepass` (prompt rows): one online softmax a row over its selected tokens, straight to out.
+    pub fn sparseOnepass(g: Glue, qa: Ptr, cache: Ptr, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_sparse_onepass", .{ @intCast(R), @intCast(cdiv(H, 32)), 1 }, &.{
+            aot.ptr("QA", "*bf16", qa),      aot.ptr("LC", "*bf16", cache), aot.ptr("LS", "*bf16", cache), aot.ptr("TOK", "*i32", tok),
+            aot.ptr("CNT", "*i32", counts), aot.ptr("OUT", "*bf16", out),
+        }, &.{
+            aot.ci("W", @intCast(w)), aot.ci("H", @intCast(H)), aot.ci("LW", @intCast(lw)), aot.cf("SCALE", scale), aot.ci("HBT", 32),
+            aot.ci("KTT", 32),        aot.ci("SPLIT", 1),        aot.ci("STAGES", 1),          aot.ci("PREFETCH", 1),   aot.ci("RS", @intCast(lw)),
+            aot.ci("FP8", 0),
+        });
+    }
+
+    /// sparse.py `_scores_rows` (decode rows from device position pos): row r's scores over its visible pools,
+    /// `grid` programs a row, into out [R, np] (row stride np).
+    pub fn scoresRows(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, out: Ptr, pos: Ptr, R: usize, np: usize, grid: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_scores_rows", .{ @intCast(R), @intCast(grid), 1 }, &.{
+            aot.ptr("QI", "*bf16", qi), aot.ptr("W", "*bf16", w),       aot.int("w_stride", n32(w_stride)), aot.ptr("PK", "*bf16", pk),
+            aot.ptr("PKS", "*bf16", pk), aot.ptr("OUT", "*fp32", out),  aot.int("o_stride", n32(np)),       aot.ptr("POS", "*i32", pos),
+            aot.ptr("SPR", "*i32", pos), aot.ptr("BASE", "*i32", pos), aot.int("R", n32(R)),              aot.int("NP", n32(np)),
+            aot.float("scale", index_scale), aot.float("wscale", index_wscale),
+        }, &.{
+            aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("G", @intCast(grid)), aot.ci("SEG", 0),
+            aot.ci("RS", 128), aot.ci("FP8", 0), aot.ci("K", 512),
+        });
+    }
+
+    /// sparse.py `_scores` (a prompt chunk's rows from device position pos, RB rows a program) into out [R, np].
+    pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
+        const rb = 4;
+        try g.set.run(stream, "_scores", .{ @intCast(cdiv(R, rb)), @intCast(cdiv(np, 64)), 1 }, &.{
+            aot.ptr("QI", "*bf16", qi),  aot.ptr("W", "*bf16", w),     aot.int("w_stride", n32(w_stride)), aot.ptr("PK", "*bf16", pk),
+            aot.ptr("PKS", "*bf16", pk), aot.ptr("OUT", "*fp32", out), aot.ptr("POS", "*i32", pos),        aot.int("R", n32(R)),
+            aot.int("NP", n32(np)),      aot.float("scale", index_scale), aot.float("wscale", index_wscale),
+        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", rb), aot.ci("RS", 128), aot.ci("FP8", 0) });
+    }
+
+    /// sparse.py `_select_rows`: each row's 512 best pools ascending (ties to the lower pool) into out int64 [R, 512];
+    /// `pos` 0: every one of the row's np scores, else decode rows at pos + r over their visible bound.
+    pub fn selectRows(g: Glue, s: Ptr, out: Ptr, np: usize, pos: Ptr, R: usize, stream: cuda.Stream) !void {
+        const wide = R < 64 and np > 1024;
+        try g.set.run(stream, "_select_rows", .{ @intCast(R), 1, 1 }, &.{
+            aot.ptr("S", "*fp32", s), aot.ptr("OUT", "*i64", out), aot.int("NPS", n32(np)),
+            if (pos != 0) aot.ptr("POS", "*i32", pos) else aot.ptr("POS", "*fp32", s),
+        }, &.{ aot.ci("K", 512), aot.ci("BLOCK", if (wide) 4096 else 1024), aot.ci("VIS", @intFromBool(pos != 0)) });
+    }
+
+    /// sparse.py `_tokens`: each row's pools' tokens ascending, then its incomplete pool's visible tokens; its count
+    /// past the dense limit (0 within it).
+    pub fn tokens(g: Glue, pools: Ptr, pos: Ptr, tok: Ptr, cnt: Ptr, R: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_tokens", .{ @intCast(R), 1, 1 }, &.{
+            aot.ptr("POOLS", "*i64", pools), aot.ptr("POS", "*i32", pos), aot.ptr("TOK", "*i32", tok), aot.ptr("CNT", "*i32", cnt),
+        }, &.{ aot.ci("W", sparse_tokens), aot.ci("K", 512), aot.ci("PL", 4), aot.ci("BLOCK", 1024) });
+    }
+
+    /// sparse.py `select_split` with tokens (decode rows of at least 8,192 scores): five passes of chunk programs,
+    /// the selection written as select_tokens' tokens and counts. `scratch`: split_scratch's int32s.
+    pub fn selectSplit(g: Glue, s: Ptr, np: usize, pos: Ptr, scratch_buf: cuda.DeviceBuffer, tok: Ptr, cnt: Ptr, R: usize, stream: cuda.Stream) !void {
+        const scratch = scratch_buf.ptr;
+        const chs: usize = if (np <= 16384) 2048 else 4096;
+        const cp = std.math.ceilPowerOfTwoAssert(usize, cdiv(np, chs));
+        const tot = scratch;
+        const hist = scratch + R * 1024 * 4;
+        const gt = scratch + R * (1024 + cp * 256) * 4;
+        if (scratch_buf.len < splitScratchBytes(R, np)) return error.ScratchTooSmall;
+        const zero: cuda.DeviceBuffer = .{ .d = scratch_buf.d, .ptr = tot, .len = R * 1024 * 4 };
+        try zero.fill8(0, stream.handle);
+        for (0..5) |step| try g.set.run(stream, "_select_split", .{ @intCast(R), @intCast(cp), 1 }, &.{
+            aot.ptr("S", "*fp32", s),  aot.int("s_stride", n32(np)), aot.int("NPC", n32(np)),  aot.ptr("POS", "*i32", pos),
+            aot.ptr("SPR", "*i32", scratch), aot.ptr("TOT", "*i32", tot), aot.ptr("HIST", "*i32", hist), aot.ptr("GT", "*i32", gt),
+            aot.ptr("OUT", "*i32", scratch), aot.ptr("TOK", "*i32", tok), aot.ptr("CNT", "*i32", cnt),
+        }, &.{
+            aot.ci("W", sparse_tokens), aot.ci("K", 512), aot.ci("PL", 4), aot.ci("CHS", @intCast(chs)), aot.ci("CP", @intCast(cp)),
+            aot.ci("STEP", @intCast(step)), aot.ci("SEG", 0), aot.ci("VIS", 1), aot.ci("TOKS", 1),
+        });
     }
 };
 

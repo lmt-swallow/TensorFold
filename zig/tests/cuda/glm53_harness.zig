@@ -21,23 +21,33 @@ pub const Harness = struct {
     fns: std.ArrayList([]const u8) = .empty,
     at: usize = 0,
     rank: usize = 0,
-    step: usize = 0,
+    step_buf: [16]u8 = undefined,
+    step_len: usize = 0,
     nbuf: [128]u8 = undefined,
+
+    fn stepName(h: *const Harness) []const u8 {
+        return h.step_buf[0..h.step_len];
+    }
 
     pub fn deinit(h: *Harness) void {
         h.seqs.deinit(h.gpu.gpa);
         h.fns.deinit(h.gpu.gpa);
     }
 
-    /// Points the harness at rank r's calls of step s.
+    /// Points the harness at rank r's calls of step `s{s}`.
     pub fn begin(h: *Harness, r: usize, s: usize) !void {
+        var sb: [16]u8 = undefined;
+        return h.beginStep(r, try std.fmt.bufPrint(&sb, "s{d}", .{s}));
+    }
+
+    /// Points the harness at rank r's calls of the step named `step` (a dump's step name: s0, a3, l1, ...).
+    pub fn beginStep(h: *Harness, r: usize, step: []const u8) !void {
         h.seqs.clearRetainingCapacity();
         h.fns.clearRetainingCapacity();
         h.at = 0;
         h.rank = r;
-        h.step = s;
-        var sb: [16]u8 = undefined;
-        const step = try std.fmt.bufPrint(&sb, "s{d}", .{s});
+        @memcpy(h.step_buf[0..step.len], step);
+        h.step_len = step.len;
         const trace = h.fx.parsed.value.object.get("trace").?.array.items;
         for (trace) |c| {
             const o = c.object;
@@ -56,12 +66,12 @@ pub const Harness = struct {
                 return h.seqs.items[h.at - 1];
             }
         }
-        std.debug.print("FAIL glm53 r{d} s{d}: the trace has no further {s} call\n", .{ h.rank, h.step, function });
+        std.debug.print("FAIL glm53 r{d} {s}: the trace has no further {s} call\n", .{ h.rank, h.stepName(), function });
         return error.TestFailed;
     }
 
     pub fn arrayName(h: *Harness, seq: i64, function: []const u8, what: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(&h.nbuf, "r{d}_s{d}_{d:0>3}_{s}_{s}", .{ h.rank, h.step, @as(u64, @intCast(seq)), function, what });
+        return std.fmt.bufPrint(&h.nbuf, "r{d}_{s}_{d:0>3}_{s}_{s}", .{ h.rank, h.stepName(), @as(u64, @intCast(seq)), function, what });
     }
 
     /// The device bytes at `ptr` against the fixture array `name` (its length): a PASS, or a FAIL counted with the
@@ -118,15 +128,23 @@ pub const Harness = struct {
         try h.same(try h.arrayName(h.seqs.items[h.at - 1], function, what), ptr);
     }
 
-    /// A per-step array `r{r}_s{s}_{what}` against `ptr`.
+    /// The same call's output `what` when the fixture has it (an argument the call left unchanged has no _out).
+    pub fn alsoIf(h: *Harness, function: []const u8, what: []const u8, ptr: cuda.abi.DevicePtr) !void {
+        const name = try h.arrayName(h.seqs.items[h.at - 1], function, what);
+        const arrays = h.fx.parsed.value.object.get("arrays").?.object;
+        if (arrays.get(name) == null) return;
+        try h.same(name, ptr);
+    }
+
+    /// A per-step array `r{r}_{step}_{what}` against `ptr`.
     pub fn stepArray(h: *Harness, what: []const u8, ptr: cuda.abi.DevicePtr) !void {
         var b: [96]u8 = undefined;
-        try h.same(try std.fmt.bufPrint(&b, "r{d}_s{d}_{s}", .{ h.rank, h.step, what }), ptr);
+        try h.same(try std.fmt.bufPrint(&b, "r{d}_{s}_{s}", .{ h.rank, h.stepName(), what }), ptr);
     }
 
     pub fn feed(h: *Harness, what: []const u8, buf: Buf) !void {
         var b: [96]u8 = undefined;
-        const w = try h.fx.bytes(try std.fmt.bufPrint(&b, "r{d}_s{d}_{s}", .{ h.rank, h.step, what }));
+        const w = try h.fx.bytes(try std.fmt.bufPrint(&b, "r{d}_{s}_{s}", .{ h.rank, h.stepName(), what }));
         defer h.gpu.gpa.free(w);
         try buf.upload(0, w);
     }

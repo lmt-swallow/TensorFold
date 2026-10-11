@@ -1,0 +1,383 @@
+//! GLM-5.3-Flash's DSA layers (and the MTP layer's attention) on one rank, as the Mia fork's `forward.py: dsa_rows`
+//! runs them on the latent cache in the strict setting (TF_GLM_KV=bf16, TF_GLM_KVB=bf16): the projection and norms,
+//! the latent row written at its position, the indexer's keys, gates and pooled keys, the query absorbed into the
+//! 512-wide latent, attention (dense up to the dense limit; past it over each row's 512 best pools of 4 and its
+//! incomplete pool), the read-out expanded through kv_b's value rows, o_proj into the rank's fp32 partial.
+//!
+//! Prompt chunks (prefill buffers) take other kernels than decode windows, each with its own bits and each
+//! independent of the other rows: absorb / expand on the tensor cores, dense attention in blocks of 512 rows with
+//! 32-head tiles, the pool selection in blocks of 512 rows scoring a multiple of 1,024 pools, one-pass sparse
+//! attention. Decode windows score a power-of-two bucket of pools (`pool_bucket`) and select per row, split across
+//! chunk programs from 8,192 pools on.
+const std = @import("std");
+const cuda = @import("cuda");
+const config = @import("config.zig");
+const map = @import("weights_map.zig");
+const glue_mod = @import("cuda_glue.zig");
+const weights = @import("cuda_weights.zig");
+
+const Glue = glue_mod.Glue;
+const Ptr = cuda.abi.DevicePtr;
+const Buf = cuda.DeviceBuffer;
+
+/// tensorfold/cuda/geometry.py MLA_PROMPT_ATT_ROWS and MLA_SELECT_ROWS.
+pub const prompt_att_rows = 512;
+pub const select_rows = 512;
+/// sparse.py PROMPT_ROWS (windows from this many rows take the prompt selection), SPLIT_FROM, SPLIT_ROWS,
+/// ROW_SCORE_G; latent.py CHUNK.
+const prompt_select_from = 64;
+const split_from = 8192;
+const split_rows = 64;
+const row_score_g = 128;
+const chunk = 512;
+
+fn cdiv(a: usize, b: usize) usize {
+    return (a + b - 1) / b;
+}
+
+/// latent.py `head_block`: a rank's 32 heads a tile for windows of 64 rows or more, else 16.
+pub fn headBlock(R: usize) usize {
+    return if (R >= 64) 32 else 16;
+}
+
+/// sparse.py `pool_bucket`: pools to score for rows pos .. pos + R - 1 (decode): the visible ones rounded up to a
+/// power of two, at least 1,024, at most `np_max`.
+pub fn poolBucket(pos: usize, R: usize, np_max: usize) usize {
+    const visible = (pos + R) / 4 + 1;
+    return @min(np_max, @max(1024, std.math.ceilPowerOfTwoAssert(usize, visible)));
+}
+
+/// sparse.py `pool_count`: pools a prompt chunk scores, the visible ones rounded up to a multiple of 1,024.
+pub fn poolCount(pos: usize, R: usize, np_max: usize) usize {
+    const visible = (pos + R) / 4 + 1;
+    return @min(np_max, cdiv(visible, 1024) * 1024);
+}
+
+/// A DSA layer's rank share (weights.py `DSAW` with `IndexW`, the latent path's `AbsorbW`).
+pub const Dsa = struct {
+    proj: weights.Matrix, // [q_a | kv_a] [q_lora + kv_lora, D]
+    q_norm: Buf,
+    kv_norm: Buf,
+    q_b: weights.Matrix, // [H qk_dim, q_lora]
+    wk: Buf, // [H, qk_dim, kv_lora] bf16: kv_b's key rows a head
+    wv: Buf, // [H, v_dim, kv_lora]: its value rows
+    o: weights.Matrix, // [D, H v_dim]
+    kw: weights.Matrix, // [wk | weights_proj] [index_dim + index_heads, D]
+    qb: weights.Matrix, // wq_b [index_heads index_dim, q_lora]
+    ln_w: Buf,
+    ln_b: Buf,
+    gate: Buf, // [index_dim, D] bf16: the pool compression's gate rows (glue.router's weight)
+    ape: Buf, // [kpool, index_dim] bf16
+    heads: usize,
+
+    pub fn load(l: weights.Loader, i: usize) !Dsa {
+        const c = l.lay.cfg;
+        var nb: [2]map.Name = @splat(.{});
+        const sa = map.lm ++ "layers.{d}.self_attn.";
+        var a: Dsa = undefined;
+        a.heads = l.lay.size(.heads);
+        a.proj = try l.matrix(&.{ nb[0].of(sa ++ "q_a_proj.weight", .{i}), nb[1].of(sa ++ "kv_a_proj_with_mqa.weight", .{i}) }, c.hidden);
+        errdefer a.proj.deinit();
+        a.q_norm = try l.share(nb[0].of(sa ++ "q_a_layernorm.weight", .{i}));
+        errdefer a.q_norm.free();
+        a.kv_norm = try l.share(nb[0].of(sa ++ "kv_a_layernorm.weight", .{i}));
+        errdefer a.kv_norm.free();
+        a.q_b = try l.matrix(&.{nb[0].of(sa ++ "q_b_proj.weight", .{i})}, c.q_lora);
+        errdefer a.q_b.deinit();
+        {
+            // kv_b's rank rows [H (qk_dim + v_dim), kv_lora]: a head's key rows first, then its value rows
+            const kvb = try l.hostShare(nb[0].of(sa ++ "kv_b_proj.weight", .{i}));
+            defer l.gpa.free(kvb);
+            const row = c.kv_lora * 2;
+            const per = (c.qk_dim + c.v_dim) * row;
+            if (kvb.len != a.heads * per) return error.UnexpectedTensor;
+            a.wk = try Buf.alloc(l.d, a.heads * c.qk_dim * row);
+            errdefer a.wk.free();
+            a.wv = try Buf.alloc(l.d, a.heads * c.v_dim * row);
+            errdefer a.wv.free();
+            for (0..a.heads) |h| {
+                try a.wk.upload(h * c.qk_dim * row, kvb[h * per ..][0 .. c.qk_dim * row]);
+                try a.wv.upload(h * c.v_dim * row, kvb[h * per + c.qk_dim * row ..][0 .. c.v_dim * row]);
+            }
+        }
+        errdefer a.wk.free();
+        errdefer a.wv.free();
+        a.o = try l.matrix(&.{nb[0].of(sa ++ "o_proj.weight", .{i})}, a.heads * c.v_dim);
+        errdefer a.o.deinit();
+        a.kw = try l.matrix(&.{ nb[0].of(sa ++ "indexer.wk.weight", .{i}), nb[1].of(sa ++ "indexer.weights_proj.weight", .{i}) }, c.hidden);
+        errdefer a.kw.deinit();
+        a.qb = try l.matrix(&.{nb[0].of(sa ++ "indexer.wq_b.weight", .{i})}, c.q_lora);
+        errdefer a.qb.deinit();
+        a.ln_w = try l.share(nb[0].of(sa ++ "indexer.k_norm.weight", .{i}));
+        errdefer a.ln_w.free();
+        a.ln_b = try l.share(nb[0].of(sa ++ "indexer.k_norm.bias", .{i}));
+        errdefer a.ln_b.free();
+        a.gate = try l.share(nb[0].of(sa ++ "indexer.index_kpool_compress_gate", .{i}));
+        errdefer a.gate.free();
+        a.ape = try l.share(nb[0].of(sa ++ "indexer.index_kpool_compress_ape", .{i}));
+        return a;
+    }
+
+    pub fn deinit(a: *Dsa) void {
+        a.proj.deinit();
+        a.q_norm.free();
+        a.kv_norm.free();
+        a.q_b.deinit();
+        a.wk.free();
+        a.wv.free();
+        a.o.deinit();
+        a.kw.deinit();
+        a.qb.deinit();
+        a.ln_w.free();
+        a.ln_b.free();
+        a.gate.free();
+        a.ape.free();
+    }
+};
+
+/// One stream's caches of one DSA layer (forward.py `Caches` bound to a stream at base 0): the latent rows [cap,
+/// kv_lora] bf16, the indexer's key and gate ring [ring, index_dim] bf16 (token t at t % ring) and the pooled keys
+/// [cap / 4 + 2, index_dim] bf16; all zeroed, as the pool's planes are.
+pub const Cache = struct {
+    latent: Buf,
+    ik: Buf,
+    ig: Buf,
+    pk: Buf,
+    capacity: usize,
+    ring: usize,
+
+    pub fn init(d: *const cuda.Driver, c: *const config.Config, capacity: usize, ring: usize) !Cache {
+        var lat = try Buf.alloc(d, capacity * c.kv_lora * 2);
+        errdefer lat.free();
+        var ik = try Buf.alloc(d, ring * c.index_dim * 2);
+        errdefer ik.free();
+        var ig = try Buf.alloc(d, ring * c.index_dim * 2);
+        errdefer ig.free();
+        var pk = try Buf.alloc(d, (capacity / 4 + 2) * c.index_dim * 2);
+        errdefer pk.free();
+        for ([_]*Buf{ &lat, &ik, &ig, &pk }) |b| try b.fill8(0, null);
+        return .{ .latent = lat, .ik = ik, .ig = ig, .pk = pk, .capacity = capacity, .ring = ring };
+    }
+
+    pub fn deinit(s: *Cache) void {
+        s.latent.free();
+        s.ik.free();
+        s.ig.free();
+        s.pk.free();
+    }
+
+    /// Pools the pooled-key plane holds (sparse.py's np_max: its rows less the 2 of pad).
+    pub fn poolRows(s: *const Cache) usize {
+        return s.capacity / 4;
+    }
+};
+
+/// forward.py `index_ring`: ring rows for windows of up to `rows` rows (and the 3 before them, rounded up to 64).
+pub fn indexRing(capacity: usize, rows: usize) usize {
+    return @min(capacity, cdiv(rows + 3, 64) * 64);
+}
+
+/// What a DSA block writes besides the shared buffers, for windows of up to `rows` rows (`prefill`: a prompt
+/// chunk's) over caches of up to `capacity` tokens.
+pub const Scratch = struct {
+    rows: usize,
+    prefill: bool,
+    dp: Buf, // [rows, q_lora + kv_lora] bf16
+    qr: Buf, // [rows, q_lora]
+    xs_qr: Buf,
+    lat: Buf, // [rows, kv_lora]
+    xs_lat: Buf,
+    q: Buf, // [rows, H, qk_dim]
+    ikr: Buf, // [rows, index_dim + index_heads] bf16
+    igr: Buf, // [rows, index_dim] fp32
+    gpart: Buf, // the gate router's K-slice partials [8, rows, index_dim] fp32
+    qi: Buf, // [rows, index_heads index_dim] bf16
+    qa: Buf, // [rows, H, kv_lora] bf16
+    ol: Buf, // [rows, H, kv_lora]
+    vn: Buf, // [rows, H v_dim] bf16
+    dense: Glue.Partials, // [chunks, part_rows, H, kv_lora + 2] fp32
+    dense_bufs: [3]Buf,
+    nch: usize, // dense chunks the partials hold
+    part_rows: usize,
+    sparse: Glue.Partials, // [5, rows, H, kv_lora + 2] fp32
+    sparse_bufs: [3]Buf,
+    scores: Buf, // [select rows, np] fp32
+    pools: Buf, // [rows, 512] i64
+    tokens: Buf, // [rows, 2051] i32
+    counts: Buf, // [rows] i32
+    split: Buf, // select_split's scratch
+    at: Buf, // [rows / 512 + 1] i32: a prompt chunk's blocks' first positions
+
+    pub fn init(d: *const cuda.Driver, lay: config.Layout, rows: usize, capacity: usize, prefill: bool) !Scratch {
+        const c = lay.cfg;
+        const H = lay.size(.heads);
+        const lw = c.kv_lora;
+        var s: Scratch = undefined;
+        s.rows = rows;
+        s.prefill = prefill;
+        const a = struct {
+            fn f(dd: *const cuda.Driver, n: usize) !Buf {
+                return Buf.alloc(dd, @max(n, 16));
+            }
+        }.f;
+        s.dp = try a(d, rows * (c.q_lora + lw) * 2);
+        s.qr = try a(d, rows * c.q_lora * 2);
+        s.xs_qr = try a(d, rows * c.q_lora / 64 * 4);
+        s.lat = try a(d, rows * lw * 2);
+        s.xs_lat = try a(d, rows * lw / 64 * 4);
+        s.q = try a(d, rows * H * c.qk_dim * 2);
+        s.ikr = try a(d, rows * (c.index_dim + c.index_heads) * 2);
+        s.igr = try a(d, rows * c.index_dim * 4);
+        s.gpart = try a(d, 8 * rows * c.index_dim * 4);
+        s.qi = try a(d, rows * c.index_heads * c.index_dim * 2);
+        s.qa = try a(d, rows * H * lw * 2);
+        s.ol = try a(d, rows * H * lw * 2);
+        s.vn = try a(d, rows * H * c.v_dim * 2);
+        // forward.py Buffers: LatentScratch(rows, H, chunks_for(min(capacity, 2560) + rows), part_rows)
+        s.part_rows = if (prefill) @min(rows, prompt_att_rows) else rows;
+        s.nch = cdiv(@min(capacity, 2560) + rows, chunk);
+        const n = s.nch * s.part_rows * H;
+        s.dense_bufs = .{ try a(d, n * lw * 4), try a(d, n * 4), try a(d, n * 4) };
+        s.dense = .{ .po = s.dense_bufs[0].ptr, .pm = s.dense_bufs[1].ptr, .pl = s.dense_bufs[2].ptr };
+        const ns = cdiv(glue_mod.sparse_tokens, chunk) * rows * H;
+        s.sparse_bufs = .{ try a(d, ns * lw * 4), try a(d, ns * 4), try a(d, ns * 4) };
+        s.sparse = .{ .po = s.sparse_bufs[0].ptr, .pm = s.sparse_bufs[1].ptr, .pl = s.sparse_bufs[2].ptr };
+        const np_max = capacity / 4;
+        s.scores = try a(d, @min(rows, select_rows) * @max(np_max, 1024) * 4);
+        s.pools = try a(d, rows * 512 * 8);
+        s.tokens = try a(d, rows * glue_mod.sparse_tokens * 4);
+        s.counts = try a(d, rows * 4);
+        s.split = try a(d, if (prefill) 16 else glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
+        s.at = try a(d, (rows / prompt_att_rows + 2) * 4);
+        return s;
+    }
+
+    pub fn deinit(s: *Scratch) void {
+        inline for (.{ "dp", "qr", "xs_qr", "lat", "xs_lat", "q", "ikr", "igr", "gpart", "qi", "qa", "ol", "vn", "scores", "pools", "tokens", "counts", "split", "at" }) |f| @field(s, f).free();
+        for (&s.dense_bufs) |*b| b.free();
+        for (&s.sparse_bufs) |*b| b.free();
+    }
+};
+
+/// One DSA block's call: the rows' inputs and where its output goes.
+pub const Call = struct {
+    normed: Ptr, // [R, D] bf16
+    part: Ptr, // [R, D] fp32 out
+    sk: Ptr, // split-K partials of the BF16 matmuls
+    pos_dev: Ptr, // the first row's position, int32 on the device
+    host_pos: usize, // the same on the host
+    nch: usize, // forward.py chunks_for(st, R): ceil((pos + R) / 512)
+    R: usize,
+};
+
+/// `at` + `pos`: a device int32 holding host position `pos` (a prompt chunk's block start, forward.py's
+/// pos_dev + starts[i]; the host knows the chunk's position).
+fn devicePos(s: *const Scratch, slot: usize, pos: usize, stream: cuda.Stream) !Ptr {
+    const v: i32 = @intCast(pos);
+    try s.at.uploadAsync(slot * 4, std.mem.asBytes(&v), stream.handle);
+    try stream.synchronize();
+    return s.at.ptr + slot * 4;
+}
+
+/// forward.py `dsa_front` and `dsa_rows` up to o_proj, then o_proj into call.part (forward.py `_dsa_latent`).
+pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const R = call.R;
+    const H = a.heads;
+    const lw = c.kv_lora;
+    const prefill = s.prefill;
+    // dsa_front: the projection, the query / latent norms, the query expansion
+    try g.bmm(call.normed, c.hidden, a.proj.b16(), R, s.dp.ptr, false, call.sk, stream);
+    try g.rmsnorm(s.dp.ptr, c.q_lora + lw, a.q_norm.ptr, s.qr.ptr, c.q_lora, s.xs_qr.ptr, c.eps, R, c.q_lora, stream);
+    try g.rmsnorm(s.dp.ptr + c.q_lora * 2, c.q_lora + lw, a.kv_norm.ptr, s.lat.ptr, lw, s.xs_lat.ptr, c.eps, R, lw, stream);
+    try g.bmm(s.qr.ptr, c.q_lora, a.q_b.b16(), R, s.q.ptr, false, call.sk, stream);
+    // dsa_rows: the latent row, the indexer, absorb, attention, expand
+    try g.latWrite(s.lat.ptr, lw, cache.latent.ptr, call.pos_dev, R, lw, stream);
+    const limit = c.denseLimit();
+    const all_sparse = call.host_pos >= limit;
+    const sparse_rows = all_sparse or call.host_pos + R - 1 >= limit;
+    const ikw = c.index_dim + c.index_heads;
+    try g.bmm(call.normed, c.hidden, a.kw.b16(), R, s.ikr.ptr, false, call.sk, stream);
+    try g.router(call.normed, c.hidden, a.gate.ptr, c.index_dim, R, s.igr.ptr, s.gpart.ptr, stream);
+    try g.indexUpdate(s.ikr.ptr, ikw, s.igr.ptr, a.ln_w.ptr, a.ln_b.ptr, a.ape.ptr, cache.ik.ptr, cache.ig.ptr, cache.ring, cache.pk.ptr, call.pos_dev, R, stream);
+    try g.absorbQ(s.q.ptr, a.wk.ptr, s.qa.ptr, R, H, c.qk_dim, lw, prefill, stream);
+    const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(c.qk_dim), -0.5));
+    if (!all_sparse) {
+        // rows past the dense limit are recomputed sparsely below: the dense pass takes the rows before it
+        const dense = if (sparse_rows) @min(R, limit -| call.host_pos) else R;
+        const nch = @min(call.nch, s.nch);
+        const hb = headBlock(R);
+        if (dense <= s.part_rows) {
+            try g.denseAttention(s.qa.ptr, cache.latent.ptr, call.pos_dev, s.dense, s.ol.ptr, dense, H, lw, nch, hb, scale, stream);
+        } else {
+            var r0: usize = 0;
+            var i: usize = 0;
+            while (r0 < dense) : ({
+                r0 += s.part_rows;
+                i += 1;
+            }) {
+                const r1 = @min(dense, r0 + s.part_rows);
+                const at = try devicePos(s, i, call.host_pos + r0, stream);
+                try g.denseAttention(s.qa.ptr + r0 * H * lw * 2, cache.latent.ptr, at, s.dense, s.ol.ptr + r0 * H * lw * 2, r1 - r0, H, lw, nch, hb, scale, stream);
+            }
+        }
+    }
+    if (sparse_rows) {
+        try g.bmm(s.qr.ptr, c.q_lora, a.qb.b16(), R, s.qi.ptr, false, call.sk, stream);
+        try selectTokens(g, s, cache, call, s.ikr.ptr + c.index_dim * 2, ikw, stream);
+        if (prefill) {
+            try g.sparseOnepass(s.qa.ptr, cache.latent.ptr, s.tokens.ptr, s.counts.ptr, s.ol.ptr, R, H, lw, glue_mod.sparse_tokens, scale, stream);
+        } else {
+            try g.sparseAttention(s.qa.ptr, cache.latent.ptr, s.tokens.ptr, s.counts.ptr, s.sparse, s.ol.ptr, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
+        }
+    }
+    try g.expandV(s.ol.ptr, a.wv.ptr, s.vn.ptr, R, H, c.v_dim, lw, prefill, stream);
+    try g.bmm(s.vn.ptr, H * c.v_dim, a.o.b16(), R, call.part, true, call.sk, stream);
+}
+
+/// sparse.py `select_tokens` (no graph bucket): each row's attended tokens and their count into s.tokens / s.counts.
+fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, wts: Ptr, w_stride: usize, stream: cuda.Stream) !void {
+    const R = call.R;
+    const np_max = cache.poolRows();
+    const qrow = 32 * 128 * 2;
+    if (R >= prompt_select_from) {
+        // _select_prompt: blocks of up to 512 rows scoring the chunk's pool_count pools
+        const NP = poolCount(call.host_pos, R, np_max);
+        const B = @min(R, select_rows);
+        var a: usize = 0;
+        var i: usize = 0;
+        while (a < R) : ({
+            a += B;
+            i += 1;
+        }) {
+            const n = @min(B, R - a);
+            // top_pools splits a block of fewer than 64 rows over 8,192 pools or more across chunk programs
+            // (select_split's pool form), which this port does not run yet: refused rather than selected otherwise
+            if (n < split_rows and NP >= split_from) return error.UnportedPromptSplitSelection;
+            const at = if (a == 0) call.pos_dev else try devicePos(s, i, call.host_pos + a, stream);
+            try g.scores(s.qi.ptr + a * qrow, wts + a * w_stride * 2, w_stride, cache.pk.ptr, s.scores.ptr, at, n, NP, stream);
+            try g.selectRows(s.scores.ptr, s.pools.ptr, NP, 0, n, stream);
+            try g.tokens(s.pools.ptr, at, s.tokens.ptr + a * glue_mod.sparse_tokens * 4, s.counts.ptr + a * 4, n, stream);
+        }
+        return;
+    }
+    const np = poolBucket(call.host_pos, R, np_max);
+    const grid = @min(row_score_g, cdiv(np, 64));
+    try g.scoresRows(s.qi.ptr, wts, w_stride, cache.pk.ptr, s.scores.ptr, call.pos_dev, R, np, grid, stream);
+    if (R < split_rows and np >= split_from) {
+        try g.selectSplit(s.scores.ptr, np, call.pos_dev, s.split, s.tokens.ptr, s.counts.ptr, R, stream);
+    } else {
+        try g.selectRows(s.scores.ptr, s.pools.ptr, np, call.pos_dev, R, stream);
+        try g.tokens(s.pools.ptr, call.pos_dev, s.tokens.ptr, s.counts.ptr, R, stream);
+    }
+}
+
+test "sparse.py's pool counts" {
+    // decode rows at 4,159: 1,040 visible pools score a bucket of 2,048
+    try std.testing.expectEqual(@as(usize, 2048), poolBucket(4159, 3, 2048));
+    try std.testing.expectEqual(@as(usize, 16384), poolBucket(40_000, 16, 150_016));
+    try std.testing.expectEqual(@as(usize, 150_016), poolBucket(600_000, 1, 150_016));
+    // a prompt chunk from 2,070: 1,030 visible pools score 2,048
+    try std.testing.expectEqual(@as(usize, 2048), poolCount(2070, 2048, 2048));
+    try std.testing.expectEqual(@as(usize, 2112), indexRing(8192, 2048));
+}

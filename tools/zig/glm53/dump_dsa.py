@@ -19,7 +19,8 @@ manifest's "trace") and the manifest's params ("steps": kind, rows, keep, positi
      decode absorbs, chained one-row drafts and their rewind (decode.absorb / draft), a 2,048-row absorb past the
      dense limit, a sparse draft. Per step also logits (the draft head's) and draft (the sampled token).
   l  synthetic long contexts: latents and pooled keys of positions before P drawn from a seeded generator, then
-     decode windows at P = 40,000 (the split top-k selection, past 8,192 pools) and P = 600,000 (past 524,288).
+     decode windows at P = 40,000 (the split top-k selection, past 8,192 pools) and P = 600,000 (past 524,288);
+     the drawn caches as l_latent0 and l_pk0 (layer 3's latent rows and pooled keys before the first window).
 
 weights.json: the sha256 of every tensor each rank's layers 3 and 45, head and draft head hold.
 
@@ -174,6 +175,9 @@ def main() -> int:
             pk = st.index[di][2]
             pk.copy_(torch.randn(pk.shape, generator=g, device=ref.DEV).to(pk.dtype))
         torch.cuda.synchronize()
+        if r == 0:                       # the drawn caches (the same on both ranks), for the Zig test to start from
+            arrays["l_latent0"] = st.kc[0].clone()
+            arrays["l_pk0"] = st.index[0][2].clone()
         k = 0
         for P, run in LONG:
             st.set_pos(P)

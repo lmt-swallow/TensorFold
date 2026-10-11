@@ -12,6 +12,7 @@ pub const kda = @import("cuda_kda.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const forward = @import("cuda_forward.zig");
 pub const moe = @import("cuda_moe.zig");
+pub const dsa = @import("cuda_dsa.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
