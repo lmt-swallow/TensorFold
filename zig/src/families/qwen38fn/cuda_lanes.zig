@@ -23,6 +23,9 @@ pub const max_rows = 16;
 /// The streams a round runs at most (multi.py `MultiDecoder` slots): the shared buffers hold this many windows.
 pub const max_streams = 4;
 
+/// Captured lone-stream rounds kept at most (each key: a slot, a row count, a DeltaNet parity, a context bucket).
+const max_graphs = 256;
+
 /// A shared round's rows at most.
 const shared_rows = max_streams * max_rows;
 
@@ -66,6 +69,8 @@ pub const Lanes = struct {
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu)
     drawn_dev: cuda.DeviceBuffer, // int32 [shared_rows]
     rounds: u64 = 0,
+    // a lone stream's rounds from captured graphs (TF_QFN_GRAPHS=0: every round eager)
+    graphs: ?fwd.Graphs = null,
     slots: [max_streams]?Slot = @splat(null),
     head: ?*mtp.Head = null,
     mb: ?fwd.Buffers = null, // the head's decode buffers
@@ -88,6 +93,8 @@ pub const Lanes = struct {
         errdefer self.argmax_mod.unload();
         self.argmax_fn = try self.argmax_mod.function("tf_argmax_rows_i32_kernel");
         self.drawn_dev = try cuda.DeviceBuffer.alloc(d, shared_rows * 4);
+        const off = if (std.c.getenv("TF_QFN_GRAPHS")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+        if (!off) self.graphs = .{ .gpa = gpa, .most = max_graphs };
         return self;
     }
 
@@ -111,6 +118,7 @@ pub const Lanes = struct {
         if (self.scp) |*x| x.deinit();
         if (self.head) |h| h.deinit();
         self.lanes.deinit(self.gpa);
+        if (self.graphs) |*g| g.deinit();
         self.drawn_dev.free();
         self.argmax_mod.unload();
         self.stream.deinit();
@@ -328,7 +336,9 @@ pub const Lanes = struct {
         }
         if (R == 0) return;
         try self.f.stageSegs(segs[0..windows.len], &self.b, ids[0..R], self.stream);
-        try self.f.computeSegs(segs[0..windows.len], &self.b, .{}, self.stream);
+        if (self.graphs != null and windows.len == 1) {
+            try self.graphs.?.compute(&self.f, segs[0].st, &self.b, R, self.stream);
+        } else try self.f.computeSegs(segs[0..windows.len], &self.b, .{}, self.stream);
         var drawn: [shared_rows]u32 = undefined;
         try self.argmax(self.b.logits, R, drawn[0..R]);
         self.rounds += 1;

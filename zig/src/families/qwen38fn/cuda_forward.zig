@@ -717,6 +717,7 @@ pub const Graphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
     captures: usize = 0,
+    most: usize = std.math.maxInt(usize), // graphs kept at most; past it a new key runs eager
 
     const Key = struct { st: usize, rows: usize, parity: u1, bucket: usize };
 
@@ -750,6 +751,7 @@ pub const Graphs = struct {
         const key: Key = .{ .st = @intFromPtr(st), .rows = R, .parity = if (st.cur.len > 0) st.cur[0] else 0, .bucket = attn.bucket(st.pos + R, st.caches[ai].capacity) };
         if (g.map.get(key)) |e| return e.launchOn(stream);
         try f.computeSegs(&seg, b, .{}, stream);
+        if (g.map.count() >= g.most) return;
         try cuda.graph.beginCapture(stream, .thread_local);
         f.computeSegs(&seg, b, .{}, stream) catch |err| {
             if (cuda.graph.endCapture(stream)) |gr| {
