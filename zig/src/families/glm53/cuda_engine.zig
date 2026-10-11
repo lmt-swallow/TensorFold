@@ -28,6 +28,9 @@ pub const draft_k = 20 + margin;
 /// drafter_choice.py: backlog rows the MTP head may owe before it absorbs them.
 const cap = 256;
 pub const rows = 16; // TF_GLM_MAX_ROWS: the widest verify window
+/// multi.py MAX_WINDOW: rows of every stream's windows together in one shared forward (below the MoE's 64-row prompt
+/// path, so every row takes the decode kernels it takes alone).
+pub const batch_rows = 32;
 pub const prompt_rows = 2048; // decode.PREFILL_ROWS
 
 /// How a rank reaches the other: the all-gather of fp32 partials and of the samples' candidates.
@@ -133,7 +136,7 @@ pub const Runner = struct {
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
         var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_part = undefined, .stage_rows = undefined };
-        r.w = try M.Work.init(d, lay, rows, prompt_rows, capacity);
+        r.w = try M.Work.init(d, lay, batch_rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
         errdefer r.mb.deinit();
@@ -287,6 +290,33 @@ pub const Runner = struct {
         try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, false, r.gather(), null, r.stream);
         try q.last.copyFrom(0, r.w.fnormed.ptr, R * D * 2, r.stream.handle);
         for (0..R) |row| out[row] = try r.sample(r.w.logits, row, 1, null);
+    }
+
+    /// One stream's verify window in a shared forward: its ids (the pending token, then the drafts) and where its
+    /// rows' samples go.
+    pub const Window = struct { q: *Seq, ids: []const u32, out: []u32 };
+
+    /// Several streams' verify windows as one forward (`M.forwardSegs`): every row's greedy sample into its window's
+    /// `out`; each sequence's rows stay uncommitted until its `commit`.
+    pub fn windows(r: *Runner, wins: []const Window) !void {
+        const D = r.lay.cfg.hidden;
+        var segs: [M.max_segs]M.Seg = undefined;
+        if (wins.len == 0 or wins.len > M.max_segs) return error.TooManyStreams;
+        var R: usize = 0;
+        for (wins, segs[0..wins.len]) |w, *sg| {
+            const n = w.ids.len;
+            if (n == 0 or n > rows) return error.WindowTooWide;
+            if (w.q.st.pos + n >= w.q.st.caches[0].capacity) return error.PromptTooLong;
+            if (R + n > batch_rows) return error.WindowTooWide;
+            try r.w.b.ids.uploadAsync(R * 4, std.mem.sliceAsBytes(w.ids), r.stream.handle);
+            sg.* = .{ .st = &w.q.st, .a0 = R, .n = n };
+            R += n;
+        }
+        try M.forwardSegs(r.k, r.lay, r.model, segs[0..wins.len], &r.w, R, r.gather(), r.stream);
+        for (wins, segs[0..wins.len]) |w, sg| {
+            try w.q.last.copyFrom(0, r.w.fnormed.ptr + sg.a0 * D * 2, sg.n * D * 2, r.stream.handle);
+            for (0..sg.n) |row| w.out[row] = try r.sample(r.w.logits, sg.a0 + row, 1, null);
+        }
     }
 
     /// Keep the last window's first `keep` of its `R` rows.

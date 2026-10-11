@@ -264,6 +264,63 @@ pub fn forward(k: Kernels, lay: config.Layout, m: *const Model, st: *State, w: *
     try k.g.bmm(w.fnormed.ptr + first * D * 2, D, m.head.b16(), R - first, w.logits.ptr, false, b.sk.ptr, stream);
 }
 
+/// One stream's window in a decode forward several streams share: rows [a0, a0 + n) of the buffers.
+pub const Seg = struct { st: *State, a0: usize, n: usize };
+
+/// `forward` of a decode window made of several streams' windows (`segs`, in row order, R rows in all, ids in
+/// work.b.ids): the row-wise blocks (hyper-connections, projections, MLPs and MoE, the gathers, the head) over every
+/// row at once, each stream's KDA chains and DSA attention over its own rows, caches and states. Every row gets the
+/// bits of its stream's window alone when the row-wise kernels give a row the same bits whatever the rows beside it.
+pub fn forwardSegs(k: Kernels, lay: config.Layout, m: *const Model, segs: []const Seg, w: *Work, R: usize, gather: Gather, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const D = c.hidden;
+    const b = &w.b;
+    if (R > b.rows or segs.len == 0 or segs.len > max_segs) return error.WindowTooWide;
+    const cx: F.Ctx = .{ .g = k.g, .kk = k.kk, .temp = &w.temp, .prompt_scratch = &w.pscratch, .lay = lay };
+    var sparse = false;
+    for (segs) |sg| {
+        const p32: i32 = @intCast(sg.st.pos);
+        try sg.st.pos_dev.uploadAsync(0, std.mem.asBytes(&p32), stream.handle);
+        sparse = sparse or A.sparseRows(c, sg.st.pos, sg.n);
+    }
+    try k.g.embed(b.ids.ptr, m.embed.ptr, b.x.ptr, R, c.streams, stream);
+    var ks: [max_segs]F.KdaSeg = undefined;
+    for (m.layers) |*layer| {
+        try F.hcPre(cx, &layer.frame, false, b, R, stream);
+        const li = segs[0].st.kda_index[layer.index];
+        if (layer.kda) |*x| {
+            for (segs, ks[0..segs.len]) |sg, *kg| kg.* = .{ .st = &sg.st.kda, .li = li, .a0 = sg.a0, .n = sg.n };
+            try F.kdaSegs(cx, x, ks[0..segs.len], b, R, stream);
+        } else {
+            const a = &layer.dsa.?;
+            try A.dsaFront(k.g, lay, a, &w.ds, b.normed.ptr, b.sk.ptr, 0, R, stream);
+            try A.dsaIndex(k.g, lay, a, &w.ds, b.normed.ptr, b.sk.ptr, R, sparse, stream);
+            for (segs) |sg| try A.dsaAttend(k.g, lay, a, &sg.st.caches[li], &w.ds, .{
+                .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = sg.st.pos_dev.ptr,
+                .host_pos = sg.st.pos,  .nch = (sg.st.pos + sg.n + 511) / 512, .R = sg.n,
+            }, sg.a0, stream);
+            try A.dsaExpand(k.g, lay, a, &w.ds, R, stream);
+            try A.dsaOut(k.g, lay, a, &w.ds, b.part.ptr, b.sk.ptr, 0, R, stream);
+        }
+        try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
+        try F.hcPost(cx, b, R, stream);
+        try F.hcPre(cx, &layer.frame, true, b, R, stream);
+        if (layer.mlp) |*x| {
+            try F.mlpBlock(cx, x, b, R, stream);
+        } else {
+            try M.moeBlock(k.g, k.mk, lay, &layer.moe.?, &w.ms, b.normed.ptr, b.part.ptr, b.sk.ptr, R, stream);
+        }
+        try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
+        try F.hcPost(cx, b, R, stream);
+    }
+    try k.g.streamMean(b.x.ptr, b.hidden.ptr, R, stream);
+    try k.g.rmsnorm(b.hidden.ptr, D, m.norm.ptr, w.fnormed.ptr, D, w.fxs.ptr, c.eps, R, D, stream);
+    try k.g.bmm(w.fnormed.ptr, D, m.head.b16(), R, w.logits.ptr, false, b.sk.ptr, stream);
+}
+
+/// Streams a shared decode forward takes at most.
+pub const max_segs = 4;
+
 /// forward.py `commit`: keep the window's first `keep` rows (a prompt chunk keeps all).
 pub fn commit(k: Kernels, lay: config.Layout, st: *State, R: usize, keep: usize, prefill: bool, w: *Work, stream: cuda.Stream) !void {
     const cx: F.Ctx = .{ .g = k.g, .kk = k.kk, .temp = &w.temp, .prompt_scratch = &w.pscratch, .lay = lay };

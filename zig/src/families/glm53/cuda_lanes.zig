@@ -5,8 +5,8 @@
 //!
 //! Each stream owns a sequence (cuda_engine.zig `Seq`: the backbone's states and caches, the MTP head's cache and
 //! the rows it owes) in one of `max_streams` slots; the window and prompt buffers are shared. A round's windows run
-//! one stream after another, each as that stream alone would run it, so a stream's tokens never depend on the
-//! others'. Greedy decoding only: a row's token is the best of both ranks' best (value, then the lower id), drawn on
+//! as one forward of up to `engine.batch_rows` rows (cuda_model.zig `forwardSegs`): the row-wise blocks over every
+//! row, each stream's KDA chains and DSA attention over its own rows, so a stream's tokens are its own alone. Greedy decoding only: a row's token is the best of both ranks' best (value, then the lower id), drawn on
 //! the host. With drafts, a stream's drafts are its MTP head's greedy chain (up to 3, cut where the product of their
 //! confidences falls under 0.35, decode.py `draft`); the head absorbs the kept rows only when it drafts (or when it
 //! owes 256), as drafter_choice.py's backlog does. Drafts never change a token, only how many a round lands.
@@ -144,13 +144,14 @@ pub const Lanes = struct {
         } };
     }
 
-    /// The facts the round loop reads: up to `max_streams` streams a round, each window as wide as `max_rows` (every
-    /// width keeps a one-token step's bits), greedy draws on the host; with drafts, the head's chain of up to
-    /// `depth` with each draft's confidence (no cost table: the round loop keeps every draft it holds).
+    /// The facts the round loop reads: up to `max_streams` streams a round in one forward of up to
+    /// `engine.batch_rows` rows, each window as wide as `max_rows` (every width keeps a one-token step's bits),
+    /// greedy draws on the host; with drafts, the head's chain of up to `depth` with each draft's confidence (no cost
+    /// table: the round loop keeps every draft it holds).
     pub fn facts(self: *const Lanes) lanes.Model {
-        const rows = max_streams * max_rows;
-        if (!self.drafts) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = false, .max_streams = max_streams, .batch_rows = rows };
-        return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = false, .max_streams = max_streams, .batch_rows = rows };
+        const rows = engine.batch_rows;
+        if (!self.drafts) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
+        return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
     }
 
     pub fn windowRows(_: *const Lanes) u32 {
@@ -371,14 +372,20 @@ pub const Lanes = struct {
             },
             .verify => {
                 const n = rd.byte().?;
-                for (0..n) |_| {
+                var ids: [max_streams][max_rows]u32 = undefined;
+                var wins: [max_streams]engine.Runner.Window = undefined;
+                var which: [max_streams]*Slot = undefined;
+                for (0..n) |i| {
                     const s = &self.slots[rd.byte().?];
                     const rows = rd.byte().?;
-                    var ids: [max_rows]u32 = undefined;
-                    for (ids[0..rows]) |*t| t.* = rd.int().?;
+                    for (ids[i][0..rows]) |*t| t.* = rd.int().?;
                     try self.bind(s, null);
-                    try self.r.window(&s.seq.?, ids[0..rows], &s.sampled);
-                    s.pending = rows;
+                    wins[i] = .{ .q = &s.seq.?, .ids = ids[i][0..rows], .out = &s.sampled };
+                    which[i] = s;
+                }
+                try self.r.windows(wins[0..n]);
+                for (wins[0..n], which[0..n]) |w, s| {
+                    s.pending = w.ids.len;
                     s.nheld = 0;
                 }
             },
@@ -587,6 +594,7 @@ pub const Lanes = struct {
         w.byte(@intCast(windows.len));
         var slots: [max_streams]u8 = undefined;
         var echo: [max_streams][depth]u32 = undefined; // the held drafts each window carries (`run` drops them)
+        var total: usize = 0;
         for (windows, 0..) |win, i| {
             if (win.parents != null) return error.TreesNotBuilt;
             const slot = self.slotOf(win.stream) orelse return error.UnknownStream;
@@ -596,6 +604,8 @@ pub const Lanes = struct {
             if (win.held > sl.nheld) return error.NoHeldDrafts;
             const rows = win.rows();
             if (rows > max_rows) return error.WindowTooWide;
+            total += rows;
+            if (total > engine.batch_rows) return error.WindowTooWide;
             // a window left uncommitted keeps all its rows before this one
             const len = sl.seq.?.len() + (sl.pending orelse 0);
             for (win.positions, 0..) |p, r| if (p != len + 1 + r) return error.PositionMismatch;
