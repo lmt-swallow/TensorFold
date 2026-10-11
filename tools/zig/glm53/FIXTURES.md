@@ -19,6 +19,8 @@ The per-file lists, including `extensions/`, are on the node in `~/glm53fx/<name
 | moe | 2464dd3ab5ad1f49241bad1fb0e9903a799b1d50d779d907520e7d0704ee43b5 | 5ab543c75cae01a45a44176f61f4818784868699a2abb1be1e43ba9d63d98b74 | 547 | 2,229,724,806 |
 | dsa | 0e37decbe600f775db1814efde54b351b5b3af2cd8654b89b53cd0b2df7c74a5 | 0629630da3ee75cb7fea3c428e22acc9a7b1901f14490b0691356b23376df7c6 | 9,352 | 27,323,757,831 |
 | prompt | 0405547653a2c6c7d25262173e8e063880ab3a813bfe08f8305fd7437f769259 | e0ace6c62f9bfe92bf9a5f1e5b8d3be9772ca1c6920bf4122b52300f412b05ea | 327 | 43,518,206 |
+| dsa-fp8 | 2080c8c25f1ce387aba2f27aad14aaa163e761e272c9304a4daf88c028513cc2 | 4f5659072eeb6c281e32bbf91f1cfefcfc742ecba16e39cd9a3f01361ab6ff77 | 9,352 | 25,650,449,036 |
+| prompt-fp8 | c494f68fc7b188dfc1c3968c61f8d3ec254fdd6574e62a5159092f1e5b78cd59 | 8c2badc17609ebafc0a0f5b2b8cbde5e55517c75e4945d1e7bf9879b00599031 | 327 | 44,021,584 |
 
 The Triton kernels each capture launched: hc 8, kda 33, moe 26, dsa 127, prompt 140. The prompt fixture holds
 sha256 digests of each traced call's outputs instead of the arrays (dump_prompt.py), hence its size. In every fixture both ranks' streams
@@ -27,3 +29,8 @@ were byte-equal at every step.
 `tf-cuda-test glm53-kda`, `glm53-moe` and `glm53-dsa` match these fixtures byte for byte, on both ranks: 418, 166 and
 1,154 comparisons, plus every loaded tensor's sha256. `glm53-prompt` matches the prompt fixture: 45 chunks, 8,586
 digests.
+
+`dsa-fp8` and `prompt-fp8` are the same dumps on FP8 DSA caches (`KV=fp8 bash capture.sh dsa|prompt`, the
+GLM-5.3-Flash-2 reference, 2026-10-12 on spark-9e43). Their FP8 variants are `_lat_write`, `_pool_keys`,
+`_dense_chunks`, `_sparse_chunks` (dsa only), `_sparse_onepass`, `_scores_rows` and `_scores`. `tf-cuda-test
+glm53-dsa-fp8` matches 1,154 comparisons, and `glm53-prompt-fp8` matches 45 chunks and 8,586 digests.
