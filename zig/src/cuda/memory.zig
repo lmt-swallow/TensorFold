@@ -122,6 +122,16 @@ pub const DeviceBuffer = struct {
         }
     }
 
+    /// `height` rows of `width` bytes from `src` (rows `src_pitch` bytes apart) into this buffer at `offset` (rows
+    /// `dst_pitch` bytes apart), one copy on `stream`.
+    pub fn copyRows(self: DeviceBuffer, offset: usize, dst_pitch: usize, src: abi.DevicePtr, src_pitch: usize, width: usize, height: usize, stream: abi.Stream) Error!void {
+        if (height == 0 or width == 0) return;
+        if (width > dst_pitch or width > src_pitch) return error.Invalid;
+        const dst = try self.span(offset, (height - 1) * dst_pitch + width);
+        const p: abi.Memcpy2D = .{ .src_device = src, .src_pitch = src_pitch, .dst_device = dst, .dst_pitch = dst_pitch, .width_bytes = width, .height = height };
+        try self.d.check(self.d.api.cuMemcpy2DAsync_v2(&p, stream), "cuMemcpy2DAsync");
+    }
+
     pub fn fill8(self: DeviceBuffer, value: u8, stream: ?abi.Stream) Error!void {
         if (self.len == 0) return;
         if (stream) |s| {

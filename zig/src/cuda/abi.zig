@@ -162,6 +162,29 @@ const CPtr = ?*const anyopaque;
 const Params = ?[*]?*anyopaque;
 
 /// Each field is the exact exported symbol, so the ABI is the one that symbol version documents.
+/// CUDA_MEMCPY2D: a copy of `height` rows of `width_bytes` bytes between two pitched layouts.
+pub const Memcpy2D = extern struct {
+    src_x_bytes: usize = 0,
+    src_y: usize = 0,
+    src_memory_type: c_int = memory_type_device,
+    src_host: ?*const anyopaque = null,
+    src_device: DevicePtr = 0,
+    src_array: ?*anyopaque = null,
+    src_pitch: usize,
+    dst_x_bytes: usize = 0,
+    dst_y: usize = 0,
+    dst_memory_type: c_int = memory_type_device,
+    dst_host: ?*anyopaque = null,
+    dst_device: DevicePtr = 0,
+    dst_array: ?*anyopaque = null,
+    dst_pitch: usize,
+    width_bytes: usize,
+    height: usize,
+};
+
+/// CU_MEMORYTYPE_DEVICE.
+pub const memory_type_device: c_int = 2;
+
 pub const Api = struct {
     cuInit: *const fn (c_uint) callconv(.c) R,
     cuDriverGetVersion: *const fn (*c_int) callconv(.c) R,
@@ -187,6 +210,7 @@ pub const Api = struct {
     cuMemcpyHtoDAsync_v2: *const fn (DevicePtr, CPtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoHAsync_v2: *const fn (Ptr, DevicePtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoDAsync_v2: *const fn (DevicePtr, DevicePtr, usize, Stream) callconv(.c) R,
+    cuMemcpy2DAsync_v2: *const fn (*const Memcpy2D, Stream) callconv(.c) R,
     cuMemsetD8_v2: *const fn (DevicePtr, u8, usize) callconv(.c) R,
     cuMemsetD32_v2: *const fn (DevicePtr, c_uint, usize) callconv(.c) R,
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
@@ -241,4 +265,5 @@ comptime {
     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
+    std.debug.assert(@sizeOf(Memcpy2D) == 128 and @offsetOf(Memcpy2D, "dst_x_bytes") == 56 and @offsetOf(Memcpy2D, "width_bytes") == 112);
 }
