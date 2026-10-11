@@ -50,6 +50,7 @@ const Lane = struct {
     held: [mtp.depth]u32 = undefined, // the drafts the head holds for the next window
     probs: [mtp.depth]f64 = undefined,
     nheld: usize = 0,
+    shared: bool = false, // its last window ran in a shared round (round stats)
 };
 
 pub const Lanes = struct {
@@ -374,6 +375,7 @@ pub const Lanes = struct {
             @memcpy(o.drafts, w.tokens);
             const l = self.lanes.getPtr(w.stream).?;
             l.pending_rows = sg.n;
+            l.shared = windows.len > 1;
             l.a0 = sg.a0;
             l.round = self.rounds;
         }
@@ -428,6 +430,8 @@ pub const Lanes = struct {
                 n = 1;
                 streams = l.last.ptr;
             }
+            // the drafts the last window verified: the first rows.len - 1 kept
+            if (self.stats) |*st| if (r.rows) |rows| st.drafts[@intFromBool(l.shared)].verified(l.probs[0..l.nheld], rows.len - 1);
             l.nheld = 0;
             held[i] = l;
             reqs[i] = .{ .st = l.st, .streams = streams, .next = next[i][0..n], .count = @min(r.depth, mtp.depth), .out = &l.held, .probs = &l.probs };
@@ -435,6 +439,7 @@ pub const Lanes = struct {
         try h.draftAll(&self.f, reqs[0..requests.len], &self.mb.?, &self.sc.?, self.stream);
         for (reqs[0..requests.len], held[0..requests.len]) |q, l| {
             l.nheld = q.n;
+            if (self.stats) |*st| if (q.count > 0) st.drafts[@intFromBool(requests.len > 1)].chain(l.probs[0..q.n], q.cut, mtp.confidence);
             // the next window: the pending token (the last kept row's follower) and the drafts
             var win: [max_rows]i64 = undefined;
             win[0] = q.next[q.next.len - 1];

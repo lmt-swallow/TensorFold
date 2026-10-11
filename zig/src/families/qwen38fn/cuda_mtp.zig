@@ -340,6 +340,7 @@ pub const Head = struct {
         out: []u32,
         probs: []f64,
         n: usize = 0,
+        cut: ?f64 = null, // the probability of the later draft below `confidence` that ended the chain
     };
 
     /// multi.py `_draft_all` (greedy): every request's head cache drops the drafted entries of its last chain and
@@ -354,6 +355,7 @@ pub const Head = struct {
         var r: usize = 0;
         for (reqs, 0..) |*q, i| {
             q.n = 0;
+            q.cut = null;
             if (q.st.mtp_drafted > 0) {
                 try q.st.setMtpLen(q.st.mtp_len - q.st.mtp_drafted, stream);
                 q.st.mtp_drafted = 0;
@@ -387,7 +389,10 @@ pub const Head = struct {
                 const q = &reqs[a.q];
                 const sd = try h.sampleDraft(lr);
                 const low = sd.prob < confidence;
-                if (low and j > 0) continue;
+                if (low and j > 0) {
+                    q.cut = sd.prob;
+                    continue;
+                }
                 q.out[q.n] = sd.token;
                 q.probs[q.n] = sd.prob;
                 q.n += 1;
