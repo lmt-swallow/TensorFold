@@ -2588,6 +2588,7 @@ pub const Engine = struct {
             .rounds => {
                 var r: Round = undefined;
                 Round.parse(op, &r) catch return false;
+                if (r.fill) |f| if (!st.fills(f.slot, f.at, f.chunks)) return false;
                 return st.roundable(r.windows[0..r.count]);
             },
             .drafts => {
