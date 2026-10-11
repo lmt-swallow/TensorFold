@@ -201,6 +201,8 @@ pub const Head = struct {
     streams: usize, // the most segments one head call takes
     gx: cuda.DeviceBuffer, // bf16 [streams, D]: each segment's last row, gathered for one draft-head call
     gxs: cuda.DeviceBuffer, // fp32 [streams, D / 32]: their group sums
+    /// Host nanoseconds spent in sampleDraft (its read-back and the host's top and sum), for TF_QFN_ROUND_STATS.
+    sample_ns: u64 = 0,
     /// A test's hook after each head call (its streams in the buffers it ran on; decode calls' logits in self.logits).
     probe: ?Probe = null,
 
@@ -450,6 +452,13 @@ pub const Head = struct {
     /// exp(top - logsumexp) (the chain's confidence; computed on the host, so it may differ from torch's in the last
     /// bits, which can only move a chain's cut, never a kept token).
     pub fn sampleDraft(h: *Head, row: usize) !struct { token: u32, prob: f64 } {
+        var t0: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &t0);
+        defer {
+            var t1: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &t1);
+            h.sample_ns += @intCast((@as(i128, t1.sec) - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec));
+        }
         try h.logits.download(row * h.draft_head.n * 2, std.mem.sliceAsBytes(h.host)); // qmm's rows: n apart
         var best: usize = 0;
         var top = weights.bf16ToF32(h.host[0]);

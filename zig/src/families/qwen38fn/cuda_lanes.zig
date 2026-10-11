@@ -11,6 +11,7 @@ const Config = @import("config.zig").Config;
 const fwd = @import("cuda_forward.zig");
 const prompt_mod = @import("cuda_prompt.zig");
 const mtp = @import("cuda_mtp.zig");
+const round_stats = @import("round_stats.zig");
 
 const be = lanes.backend;
 
@@ -69,6 +70,7 @@ pub const Lanes = struct {
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu)
     drawn_dev: cuda.DeviceBuffer, // int32 [shared_rows]
     rounds: u64 = 0,
+    stats: ?round_stats.Stats = null, // TF_QFN_ROUND_STATS=1
     // a lone stream's rounds from captured graphs (TF_QFN_GRAPHS=0: every round eager)
     graphs: ?fwd.Graphs = null,
     slots: [max_streams]?Slot = @splat(null),
@@ -95,6 +97,7 @@ pub const Lanes = struct {
         self.drawn_dev = try cuda.DeviceBuffer.alloc(d, shared_rows * 4);
         const off = if (std.c.getenv("TF_QFN_GRAPHS")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         if (!off) self.graphs = .{ .gpa = gpa, .most = max_graphs };
+        self.stats = round_stats.Stats.fromEnv();
         return self;
     }
 
@@ -267,7 +270,9 @@ pub const Lanes = struct {
             l = try self.startFill(s);
         }
         const f = &l.fill.?;
+        const t0 = if (self.stats) |*st| st.begin() else 0;
         var n: u32 = 0;
+        defer if (self.stats) |*st| st.prompt(t0, n);
         while (n < chunks and f.start < f.ids.len) : (n += 1) {
             if (s.isCancelled()) return error.Cancelled;
             f.start = try mtp.prefillChunk(self.head, &self.pr, l.st, &self.pb, if (self.scp) |*x| x else null, f.ids, f.start, l.last, self.stream);
@@ -318,6 +323,7 @@ pub const Lanes = struct {
     /// stream's rows after the last's, drawn greedily; committed lazily.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        const t0 = if (self.stats) |*st| st.begin() else 0;
         if (windows.len > max_streams) return error.TooManyStreams;
         var segs: [max_streams]fwd.Seg = undefined;
         var ids: [shared_rows]i32 = undefined;
@@ -351,15 +357,20 @@ pub const Lanes = struct {
             l.a0 = sg.a0;
             l.round = self.rounds;
         }
+        if (self.stats) |*st| st.verify(t0, windows.len, R);
     }
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const self = of(ptr);
+        const t0 = if (self.stats) |*st| st.begin() else 0;
+        var kept: usize = 0;
         for (windows, paths) |w, path| {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
             _ = try self.bindLane(w.stream, path.len);
+            kept += path.len;
         }
+        if (self.stats) |*st| st.keep(t0, kept);
     }
 
     /// multi.py `_draft_all`: every request's kept rows (or, after the prompt, its last row) absorbed with the token
@@ -372,6 +383,9 @@ pub const Lanes = struct {
             return;
         };
         if (requests.len > max_streams) return error.TooManyStreams;
+        const t0 = if (self.stats) |*st| st.begin() else 0;
+        const sample0 = h.sample_ns;
+        defer if (self.stats) |*st| st.draft(t0, h.sample_ns - sample0);
         const wide = self.m.cfg.wide();
         var next: [max_streams][max_rows]i32 = undefined;
         var reqs: [max_streams]mtp.Head.Request = undefined;
