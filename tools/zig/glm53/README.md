@@ -19,4 +19,5 @@ To check a fresh build against a capture's extensions:
       ~/glm53fx/kda/extensions/tensorfold_glm_kda_v2.so zig-out/fatbin/glm53_kda.fatbin
 
 The fixtures (`capture.sh <kda|dsa|moe|hc> <work-dir>`) and their digests are listed in FIXTURES.md. The
-tests that read them are `tf-cuda-test glm53-kda|glm53-moe <work-dir> <pack-dir> [isolated]`.
+tests that read them are `tf-cuda-test glm53-kda|glm53-moe <work-dir> <pack-dir> [isolated]` and
+`tf-cuda-test glm53-prompt <work-dir> <pack-dir>` (the prompt path over layers 0 and 3 and the MTP layer).
