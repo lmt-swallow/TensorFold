@@ -1,5 +1,6 @@
-//! `glm53-shared <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>`: four streams' windows in one forward
-//! (cuda_model.zig `forwardSegs`) against each stream's windows alone, on both Sparks. The streams' prompts are
+//! `glm53-shared <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir> [layers]`: four streams' windows in one
+//! forward (cuda_model.zig `forwardSegs`) against each stream's windows alone, on both Sparks (master "local": both
+//! ranks on this GPU, the first `layers` layers). The streams' prompts are
 //! prefixes of the forward fixture's (some past the dense limit, some within it); every round each stream verifies a
 //! window of its pending token and a few forced tokens (widths changing round to round, up to 32 rows in all) and
 //! keeps one row. Every row's logits and sample must be the same in the shared forward as alone, and alone as on the
@@ -8,7 +9,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm53");
 const check = @import("check.zig");
-const fixture = @import("fixture.zig");
+const pair = @import("glm53_pair.zig");
 const Gpu = check.Gpu;
 
 const Ptr = cuda.abi.DevicePtr;
@@ -16,15 +17,6 @@ const M = glm.model;
 const T = glm.mtp;
 const E = glm.engine;
 const P = glm.pool;
-
-const Link = struct {
-    comm: *const cuda.comm.Comm,
-
-    fn gather(p: *anyopaque, send: Ptr, recv: Ptr, floats: usize, stream: cuda.Stream) anyerror!void {
-        const l: *Link = @ptrCast(@alignCast(p));
-        try l.comm.allGather(send, recv, floats, .f32, stream.handle);
-    }
-};
 
 const streams = 4;
 const rounds = 6;
@@ -102,59 +94,32 @@ fn record(r: *E.Runner, run_: *Run, wins: []const E.Runner.Window, i: usize, sam
     try run_.tokens.appendSlice(r.gpa, samples);
 }
 
-pub fn run(gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, master: []const u8, port: u16, aot_dir: []const u8) !void {
+pub const Args = struct { dir: []const u8, model: []const u8, aot: []const u8, layers: ?usize };
+
+pub fn run(gpu: Gpu, args: Args, rank: usize, master: []const u8, port: u16) !void {
+    try pair.launch(gpu, rank, master, port, (E.prompt_rows + 2) * 4096, args, body);
+}
+
+fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
-    var why: glm.config.Why = .{};
-    const cfg = glm.config.read(gpa, gpu.io, model, &why) catch |e| {
-        std.debug.print("FAIL glm53 config: {t}: {s}\n", .{ e, why.text() });
-        return e;
-    };
-    const lay: glm.config.Layout = .{ .rank = rank, .world = 2, .cfg = &cfg };
-    var set = try cuda.aot.Set.load(gpa, gpu.io, d, gpu.ctx.device, aot_dir);
-    defer set.deinit();
-    const fx_dir = try std.fs.path.join(gpa, &.{ dir, "out", "fixture" });
-    defer gpa.free(fx_dir);
-    var fx = try fixture.Fixture.open(gpa, gpu.io, fx_dir);
-    defer fx.deinit();
-    var stream = try cuda.Stream.init(d, true);
-    defer stream.deinit();
-    var ip: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, master, '.');
-    for (&ip) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadAddress, 10);
-    var comm = try cuda.comm.Comm.init(@intCast(rank), 2, ip, port, 600_000);
-    defer comm.deinit();
-    var hck = try glm.glue.Hc.load(d);
-    defer hck.deinit();
-    var kk = try glm.kda.Kernels.load(d);
-    defer kk.deinit();
-    var mk = try glm.moe.Kernels.load(d);
-    defer mk.deinit();
-    var tk = try T.Kernels.load(d);
-    defer tk.deinit();
-    var pack = try glm.weights.Pack.open(gpa, gpu.io, model);
-    defer pack.close();
-    const l: glm.weights.Loader = .{ .gpa = gpa, .d = d, .pack = &pack, .lay = lay };
-    var mdl = try M.Model.load(l, cfg.layers);
-    defer mdl.deinit();
-    var mtp = try T.Mtp.load(l);
-    defer mtp.deinit();
-    pack.dropCache();
-    var link: Link = .{ .comm = &comm };
-    const k: M.Kernels = .{ .g = .{ .set = &set, .hc = &hck, .hidden = cfg.hidden, .streams = cfg.streams }, .kk = &kk, .mk = &mk };
-    var r = try E.Runner.init(gpa, d, lay, k, &tk, &mdl, &mtp, .{ .ctx = &link, .gather = Link.gather }, stream, 8192);
+    var rk: pair.Rank = undefined;
+    try rk.load(gpu, args.dir, args.model, rank, args.aot, args.layers);
+    defer rk.deinit();
+    const cfg = &rk.cfg;
+    const lay = rk.lay;
+    var r = try rk.runner(gpa, d, link, 8192);
     defer r.deinit();
-    var pool = try P.Pool.init(gpa, d, &cfg, cfg.count(.dsa) + 1, streams * 8192, .bf16);
+    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, streams * 8192, .bf16);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(8192, E.prompt_rows);
     var seqs: [streams]E.Seq = undefined;
-    for (&seqs) |*q| q.* = try E.Seq.initSlot(gpa, d, lay, cfg.layers, ring, .bf16);
+    for (&seqs) |*q| q.* = try E.Seq.initSlot(gpa, d, lay, rk.mdl.layers.len, ring, .bf16);
     defer for (&seqs) |*q| q.deinit();
 
-    var nb: [64]u8 = undefined;
-    const prompt_b = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_prompt_ids", .{rank}));
-    defer gpa.free(prompt_b);
-    const ids = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(prompt_b)));
+    const pr = try rk.prompt();
+    defer gpa.free(pr.bytes);
+    const ids = pr.ids;
     var prompts: [streams][]const u32 = undefined;
     for (&prompts, lengths) |*p, n| p.* = ids[0..@min(n, ids.len)];
     const forced = ids[100..600];
