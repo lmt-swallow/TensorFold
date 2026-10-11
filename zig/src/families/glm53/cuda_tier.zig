@@ -9,7 +9,9 @@
 //! - sparse attention: after the selection wrote tokens [R, W] and counts [R], `resolve(...)` returns the base the
 //!   remapped tokens index (the stream syncs once when some written pool of the layer is on the file only; while
 //!   the context fits, no sync);
-//! - after the round's tokens are known: `commit(s, accepted_end)`, `rewind(s, end)`.
+//! - after the round's tokens are known: `commit(s, accepted_end)`, `rewind(s, end)`;
+//! - a kept prompt continued by another stream: `alias(src, dst, rows)` (no copy past the home block; `src` stays
+//!   while `dst` reads through it).
 //!
 //! The kernels see the bytes a whole cache holds at the same positions in the same order, so the bits are those of
 //! a memory-resident cache.
@@ -34,6 +36,9 @@ pub const Tier = struct {
     at: cuda.HostBuffer, // second pieces' first positions (i32 16 bytes apart, mapped: Triton specializes pointers on 16-byte alignment), a ring
     at_dev: Ptr,
     at_next: usize = 0,
+    chains: cuda.HostBuffer, // the remap's chains (tier.cu: 10 int64 each, 128 bytes apart, mapped), a ring
+    chains_dev: Ptr,
+    chain_next: usize = 0,
     module: cuda.Module,
     remap_fn: cuda.Function,
 
@@ -58,6 +63,10 @@ pub const Tier = struct {
         t.at = try cuda.HostBuffer.allocMapped(d, ring * 16);
         errdefer t.at.free();
         t.at_dev = try t.at.device();
+        t.chain_next = 0;
+        t.chains = try cuda.HostBuffer.allocMapped(d, ring * 128);
+        errdefer t.chains.free();
+        t.chains_dev = try t.chains.device();
         t.module = try cuda.Module.load(d, cuda.kernels.glm53_tier);
         errdefer t.module.unload();
         t.remap_fn = try t.module.function("tf_glm53_tier_remap");
@@ -66,13 +75,14 @@ pub const Tier = struct {
         return t;
     }
 
-    /// Second pieces in flight at most before a slot of the position ring is written again (a window's layers
-    /// each take one; the stream syncs at least once a window).
-    const ring = 256;
+    /// Second pieces (and remap chains) in flight at most before a slot of their ring is written again: a window's
+    /// layers take one each a stream, and the stream syncs at least once a window.
+    const ring = 1024;
 
     pub fn deinit(t: *Tier, gpa: std.mem.Allocator) void {
         t.host.deinit();
         t.module.unload();
+        t.chains.free();
         t.at.free();
         t.cnts.free();
         t.toks.free();
@@ -116,25 +126,75 @@ pub const Tier = struct {
         return t.slab_dev +% @as(u64, @bitCast(t.host.denseBase(s, l)));
     }
 
+    /// One stream-layer's selection on the device: rows [R], tokens [R, w] positions, counts [R].
+    pub const Sel = struct { h: usize, layer: usize, tokens: Ptr, counts: Ptr, R: usize };
+
     /// After the selection of rows [R] (tokens [R, w] positions, counts [R]) ran on `stream`: every selected pool
     /// resident, the tokens remapped in place; returns the base the sparse kernels read the latent rows at.
     pub fn resolve(t: *Tier, s: usize, l: usize, tokens: Ptr, counts: Ptr, R: usize, w: usize, stream: cuda.Stream) !Ptr {
-        if (R * w * 4 > t.toks.bytes.len or R * 4 > t.cnts.bytes.len) return error.BadShape;
+        return t.resolveMany(&.{.{ .h = s, .layer = l, .tokens = tokens, .counts = counts, .R = R }}, w, stream);
+    }
+
+    /// `resolve` of several streams' selections at once (a round's streams on one DSA layer): their missing pools
+    /// read as one batch (the drive's latency paid once), then each remapped.
+    pub fn resolveMany(t: *Tier, sels: []const Sel, w: usize, stream: cuda.Stream) !Ptr {
+        var all_resident = true;
+        var rows: usize = 0;
+        for (sels) |x| {
+            all_resident = all_resident and t.host.resident(x.h, x.layer);
+            rows += x.R;
+        }
+        if (rows * w * 4 > t.toks.bytes.len or rows * 4 > t.cnts.bytes.len or sels.len > 64) return error.BadShape;
         // every written pool resident (the whole context fits): the device remap alone, no read-back, no sync
-        if (!t.host.resident(s, l)) {
+        if (!all_resident) {
             const api = t.d.api;
-            try t.d.check(api.cuMemcpyDtoHAsync_v2(t.cnts.bytes.ptr, counts, R * 4, stream.handle), "cuMemcpyDtoHAsync");
-            try t.d.check(api.cuMemcpyDtoHAsync_v2(t.toks.bytes.ptr, tokens, R * w * 4, stream.handle), "cuMemcpyDtoHAsync");
+            var at: usize = 0;
+            for (sels) |x| {
+                try t.d.check(api.cuMemcpyDtoHAsync_v2(t.cnts.bytes.ptr + at * 4, x.counts, x.R * 4, stream.handle), "cuMemcpyDtoHAsync");
+                try t.d.check(api.cuMemcpyDtoHAsync_v2(t.toks.bytes.ptr + at * w * 4, x.tokens, x.R * w * 4, stream.handle), "cuMemcpyDtoHAsync");
+                at += x.R;
+            }
             try stream.synchronize();
-            try t.host.fetch(s, l, t.toks.slice(i32)[0 .. R * w], t.cnts.slice(i32)[0..R], w);
+            var hs: [64]kv.Tier.Selection = undefined;
+            at = 0;
+            for (sels, 0..) |x, i| {
+                hs[i] = .{ .s = x.h, .l = x.layer, .tokens = t.toks.slice(i32)[at * w ..][0 .. x.R * w], .counts = t.cnts.slice(i32)[at..][0..x.R], .W = w };
+                at += x.R;
+            }
+            try t.host.fetchMany(hs[0..sels.len]);
+        }
+        for (sels) |x| try t.remap(x, w, stream);
+        return t.slab_dev;
+    }
+
+    fn remap(t: *Tier, x: Sel, w: usize, stream: cuda.Stream) !void {
+        var links: [kv.max_chain]kv.Tier.Link = undefined;
+        const n = t.host.chain(x.h, &links);
+        const k = t.chain_next % ring;
+        t.chain_next += 1;
+        const c = t.chains.slice(i64)[k * 16 ..][0..10];
+        c[0] = @intCast(n);
+        c[1] = kv.home_pools;
+        for (0..kv.max_chain) |i| {
+            c[2 + i] = if (i < n) @intCast(links[i].fork_pool) else 0;
+            c[6 + i] = if (i < n) @intCast(t.map_dev + t.host.mapBase(links[i].s, x.layer) * 4) else 0;
         }
         var args: cuda.Args = .{};
-        args.add(tokens);
-        args.add(counts);
-        args.add(t.map_dev + t.host.mapBase(s, l) * 4);
+        args.add(x.tokens);
+        args.add(x.counts);
+        args.add(t.chains_dev + k * 128);
         args.add(@as(i32, @intCast(w)));
-        try cuda.launch.launch(t.remap_fn, .{ .grid = .{ .x = @intCast(R) }, .block = .{ .x = 256 } }, stream, &args);
-        return t.slab_dev;
+        try cuda.launch.launch(t.remap_fn, .{ .grid = .{ .x = @intCast(x.R) }, .block = .{ .x = 256 } }, stream, &args);
+    }
+
+    /// kv_tier.Tier.alias: stream `dst` continues `src`'s first `rows` positions (a kept prompt), reading through it.
+    pub fn alias(t: *Tier, src: usize, dst: usize, rows: usize) !void {
+        try t.host.alias(src, dst, rows);
+    }
+
+    /// kv_tier.Tier.acquire: a free stream opened with `layers` layers.
+    pub fn acquire(t: *Tier, layers: usize) !usize {
+        return t.host.acquire(layers);
     }
 
     pub fn commit(t: *Tier, s: usize, pos: usize) !void {

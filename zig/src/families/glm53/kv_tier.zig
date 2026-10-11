@@ -31,8 +31,11 @@ pub const seg_positions = run_pools * pool_rows;
 /// rows) reads positions below 4,099 at one base.
 pub const home_runs = 3;
 pub const home_positions = home_runs * seg_positions;
+pub const home_pools = home_positions / pool_rows;
+/// Streams a chain of aliases reads through at most (a stream and its ancestors; cuda_tier's remap takes as many).
+pub const max_chain = 4;
 
-pub const Error = error{ TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory };
+pub const Error = error{ TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory, NoStream, ChainTooDeep };
 
 pub const Options = struct {
     streams: usize,
@@ -93,6 +96,11 @@ pub const Tier = struct {
         hi: usize = 0, // newest segment a window touched
         committed: usize = 0,
         dirty_lo: usize = 0, // pools below this are persisted wherever full and committed
+        // an alias's: pools [home_pools, fork_pool) are the parent's (read through it, never written here)
+        parent: ?u32 = null,
+        fork_pool: usize = 0,
+        refs: u32 = 0, // aliases reading through this stream
+        pending: bool = false, // closed by its owner, kept for its aliases
     };
 
     /// `slab` (run_pools * block bytes a run, whole runs) and `map` (streams * layers * capacity / 4 entries) are the
@@ -176,6 +184,33 @@ pub const Tier = struct {
         return @intCast(t.mapBase(s, l) + pool);
     }
 
+    /// The key holding stream `s`'s layer `l`'s pool `pool`: its own, or (an alias's pool below the fork, past the
+    /// home block) an ancestor's.
+    fn keyOf(t: *const Tier, s: usize, l: usize, pool: usize) u32 {
+        var h = s;
+        while (t.streams[h].parent) |par| {
+            if (pool < home_pools or pool >= t.streams[h].fork_pool) break;
+            h = par;
+        }
+        return t.key(h, l, pool);
+    }
+
+    /// A stream of a chain and its fork: below it (past the home block) the next stream's pools serve.
+    pub const Link = struct { s: usize, fork_pool: usize };
+
+    /// Stream `s`'s chain for the device remap: the streams whose pools it reads (itself first) and each one's fork
+    /// (0 for the last); returns its length.
+    pub fn chain(t: *const Tier, s: usize, out: *[max_chain]Link) usize {
+        var h = s;
+        var n: usize = 0;
+        while (true) {
+            out[n] = .{ .s = h, .fork_pool = if (t.streams[h].parent != null) t.streams[h].fork_pool else 0 };
+            n += 1;
+            h = t.streams[h].parent orelse break;
+        }
+        return n;
+    }
+
     fn fileOffset(k: u32) u64 {
         return @as(u64, k) * block;
     }
@@ -188,6 +223,7 @@ pub const Tier = struct {
     /// its home blocks, one a layer; its previous contents are dropped.
     pub fn open(t: *Tier, s: usize, layers: usize) Error!void {
         if (layers == 0 or layers > t.o.layers) return error.BadShape;
+        if (t.streams[s].pending) return error.NoStream;
         if (t.streams[s].open) t.close(s);
         t.streams[s].layers = layers;
         for (0..layers) |l| {
@@ -198,21 +234,64 @@ pub const Tier = struct {
         t.streams[s] = .{ .open = true, .layers = layers };
     }
 
-    /// Drops a stream: its runs and slots are free, its pools forgotten.
+    /// A free stream (neither open nor kept for aliases) opened with `layers` layers.
+    pub fn acquire(t: *Tier, layers: usize) Error!usize {
+        for (t.streams, 0..) |st, s| if (!st.open and !st.pending) {
+            try t.open(s, layers);
+            return s;
+        };
+        return error.NoStream;
+    }
+
+    /// Drops a stream. One that aliases read through stays (pending) until the last of them closes: only the pools
+    /// they read are kept, its home block and recent window let go.
     pub fn close(t: *Tier, s: usize) void {
         t.io.finish() catch {};
+        const st = &t.streams[s];
+        if (!st.open) return;
+        if (st.refs > 0) {
+            if (!st.pending) {
+                st.pending = true;
+                // the aliases copied the home block; the rest turns loose (written pools evictable)
+                for (0..st.layers) |l| {
+                    const k0 = t.mapBase(s, l);
+                    for (0..home_pools) |p| t.drop(k0 + p);
+                    const sr = t.seg_run[(s * t.o.layers + l) * t.segs ..][0..t.segs];
+                    for (0..home_runs) |g| {
+                        t.runs[sr[g]] = .{};
+                        sr[g] = none;
+                    }
+                    for (home_runs..t.segs) |g| if (sr[g] != none) t.demote(sr, g);
+                    t.home[s * t.o.layers + l] = none;
+                }
+            }
+            return;
+        }
+        const parent = st.parent;
+        t.free(s);
+        if (parent) |par| {
+            const ps = &t.streams[par];
+            ps.refs -= 1;
+            if (ps.refs == 0 and ps.pending) t.close(par);
+        }
+    }
+
+    /// Key `k` forgotten: its slot (if any) free, its file copy no longer counted.
+    fn drop(t: *Tier, k: usize) void {
+        const slot = t.map[k];
+        if (slot >= 0) {
+            const u: usize = @intCast(slot);
+            t.disown(u);
+            if (t.runs[u / run_pools].kind == .loose) t.free_slots.append(t.gpa, @intCast(u)) catch {};
+        } else if (t.persisted.isSet(k)) t.away[k / t.pools] -= 1;
+        t.map[k] = -1;
+        t.persisted.unset(k);
+    }
+
+    fn free(t: *Tier, s: usize) void {
         for (0..t.streams[s].layers) |l| {
             const k0 = t.mapBase(s, l);
-            for (0..t.pools) |p| {
-                const slot = t.map[k0 + p];
-                if (slot >= 0) {
-                    const u: usize = @intCast(slot);
-                    t.disown(u);
-                    if (t.runs[u / run_pools].kind == .loose) t.free_slots.append(t.gpa, @intCast(u)) catch {};
-                }
-                t.map[k0 + p] = -1;
-                t.persisted.unset(k0 + p);
-            }
+            for (0..t.pools) |p| t.drop(k0 + p);
             for (t.seg_run[(s * t.o.layers + l) * t.segs ..][0..t.segs]) |*r| {
                 if (r.* != none) t.runs[r.*] = .{};
                 r.* = none;
@@ -230,6 +309,7 @@ pub const Tier = struct {
         const st = &t.streams[s];
         if (!st.open) return error.NotOpen;
         if (R == 0 or R > seg_positions or pos + R > t.o.capacity) return error.PastCapacity;
+        if (st.parent != null and pos < st.fork_pool * pool_rows) return error.BadShape; // the parent's rows
         try t.io.finish();
         t.window +%= 1;
         const first = pos / seg_positions;
@@ -282,35 +362,45 @@ pub const Tier = struct {
         return @intCast(@as(u64, t.home[s * t.o.layers + l]) * run_pools * block);
     }
 
+    /// One stream-layer's selection: rows [counts.len], row r's first counts[r] positions at tokens[r * W ..].
+    pub const Selection = struct { s: usize, l: usize, tokens: []const i32, counts: []const i32, W: usize };
+
     /// Makes resident every pool the rows' selected positions name (`tokens [R, W]`, row r's first counts[r]);
     /// returns once their bytes are in the slab and the map names their slots. None of them is evicted before the
     /// next fetch.
     pub fn fetch(t: *Tier, s: usize, l: usize, tokens: []const i32, counts: []const i32, W: usize) Error!void {
-        if (!t.streams[s].open) return error.NotOpen;
-        if (l >= t.streams[s].layers) return error.BadShape;
+        return t.fetchMany(&.{.{ .s = s, .l = l, .tokens = tokens, .counts = counts, .W = W }});
+    }
+
+    /// `fetch` of several selections (streams' or layers') as one batch of reads: the drive's latency is paid
+    /// once. None of their pools is evicted before the next fetch.
+    pub fn fetchMany(t: *Tier, sels: []const Selection) Error!void {
         try t.io.finish();
         t.gen +%= 1;
-        const k0 = t.mapBase(s, l);
         var need: std.ArrayList(u32) = .empty;
         defer need.deinit(t.gpa);
-        for (counts, 0..) |c, r| {
-            if (c < 0 or @as(usize, @intCast(c)) > W) return error.BadToken;
-            for (tokens[r * W ..][0..@intCast(c)]) |tok| {
-                if (tok < 0 or @as(usize, @intCast(tok)) >= t.o.capacity) return error.BadToken;
-                const k: u32 = @intCast(k0 + @as(usize, @intCast(tok)) / pool_rows);
-                const slot = t.map[k];
-                if (slot >= 0) {
-                    t.touch(@intCast(slot));
-                } else if (slot == -1) {
-                    if (!t.persisted.isSet(k)) return error.NotPersisted;
-                    t.map[k] = -2; // named once
-                    try need.append(t.gpa, k);
-                }
-            }
-        }
         errdefer for (need.items) |k| if (t.map[k] == -2) {
             t.map[k] = -1;
         };
+        for (sels) |x| {
+            if (!t.streams[x.s].open) return error.NotOpen;
+            if (x.l >= t.streams[x.s].layers) return error.BadShape;
+            for (x.counts, 0..) |c, r| {
+                if (c < 0 or @as(usize, @intCast(c)) > x.W) return error.BadToken;
+                for (x.tokens[r * x.W ..][0..@intCast(c)]) |tok| {
+                    if (tok < 0 or @as(usize, @intCast(tok)) >= t.o.capacity) return error.BadToken;
+                    const k = t.keyOf(x.s, x.l, @as(usize, @intCast(tok)) / pool_rows);
+                    const slot = t.map[k];
+                    if (slot >= 0) {
+                        t.touch(@intCast(slot));
+                    } else if (slot == -1) {
+                        if (!t.persisted.isSet(k)) return error.NotPersisted;
+                        t.map[k] = -2; // named once
+                        try need.append(t.gpa, k);
+                    }
+                }
+            }
+        }
         try t.readIn(need.items);
         try t.io.finish();
     }
@@ -318,7 +408,11 @@ pub const Tier = struct {
     /// Whether every written pool of stream `s`'s layer `l` is resident: a fetch would read nothing (the device
     /// remap alone serves a selection).
     pub fn resident(t: *const Tier, s: usize, l: usize) bool {
-        return t.away[s * t.o.layers + l] == 0;
+        var h = s;
+        while (true) {
+            if (t.away[h * t.o.layers + l] != 0) return false;
+            h = t.streams[h].parent orelse return true;
+        }
     }
 
     /// Starts reading layer `l`'s pools below position `end` that are not resident (prefill's next layer); the
@@ -329,11 +423,13 @@ pub const Tier = struct {
         if (end > t.o.capacity) return error.PastCapacity;
         try t.io.finish();
         t.gen +%= 1;
-        const k0 = t.mapBase(s, l);
         var need: std.ArrayList(u32) = .empty;
         defer need.deinit(t.gpa);
+        errdefer for (need.items) |k| if (t.map[k] == -2) {
+            t.map[k] = -1;
+        };
         for (0..(end + pool_rows - 1) / pool_rows) |p| {
-            const k: u32 = @intCast(k0 + p);
+            const k = t.keyOf(s, l, p);
             const slot = t.map[k];
             if (slot >= 0) {
                 t.touch(@intCast(slot));
@@ -342,9 +438,6 @@ pub const Tier = struct {
                 try need.append(t.gpa, k);
             }
         }
-        errdefer for (need.items) |k| if (t.map[k] == -2) {
-            t.map[k] = -1;
-        };
         try t.readIn(need.items);
     }
 
@@ -355,10 +448,9 @@ pub const Tier = struct {
 
     /// Selected positions to row indices at the slab's base (the device's remap, on the host): fetch ran.
     pub fn remap(t: *const Tier, s: usize, l: usize, tokens: []i32, counts: []const i32, W: usize) void {
-        const k0 = t.mapBase(s, l);
         for (counts, 0..) |c, r| for (tokens[r * W ..][0..@intCast(c)]) |*tok| {
             const p: usize = @intCast(tok.*);
-            tok.* = t.map[k0 + p / pool_rows] * pool_rows + @as(i32, @intCast(p % pool_rows));
+            tok.* = t.map[t.keyOf(s, l, p / pool_rows)] * pool_rows + @as(i32, @intCast(p % pool_rows));
         };
     }
 
@@ -373,6 +465,10 @@ pub const Tier = struct {
                 const k0 = t.mapBase(s, l);
                 var p = st.dirty_lo;
                 while (p < hi) {
+                    if (st.parent != null and p >= home_pools and p < st.fork_pool) {
+                        p = st.fork_pool; // the parent's pools
+                        continue;
+                    }
                     const k: u32 = @intCast(k0 + p);
                     if (t.persisted.isSet(k)) {
                         p += 1;
@@ -393,6 +489,57 @@ pub const Tier = struct {
         }
         st.committed = @max(st.committed, pos);
         try t.io.finish();
+    }
+
+    /// Stream `dst` (just opened, nothing written, `src`'s layers) starts as `src`'s first `rows` positions (a kept
+    /// prompt continued): its home block and the pool at `rows` (when partial) are copied, the pools between are
+    /// read through `src`, which stays (pending once closed) while `dst` lives. `dst` writes from `rows` on. A chain
+    /// longer than max_chain is refused (error.ChainTooDeep): the caller prefills instead.
+    pub fn alias(t: *Tier, src: usize, dst: usize, rows: usize) Error!void {
+        const ss = &t.streams[src];
+        const ds = &t.streams[dst];
+        if (!ss.open or ss.pending or !ds.open or ds.hi != 0 or ds.committed != 0 or ds.layers != ss.layers) return error.BadShape;
+        if (rows == 0 or rows > t.o.capacity - 1) return error.PastCapacity;
+        try t.io.finish();
+        const full = rows / pool_rows;
+        if (full > home_pools) {
+            var depth: usize = 1;
+            var h: ?u32 = @intCast(src);
+            while (h) |x| : (h = t.streams[x].parent) depth += 1;
+            if (depth > max_chain) return error.ChainTooDeep;
+            ds.parent = @intCast(src);
+            ds.fork_pool = full;
+            ss.refs += 1;
+        }
+        // the pools dst holds itself below `rows`: the home block's, and the partial pool at `rows`
+        const own_hi = @min((rows + pool_rows - 1) / pool_rows, home_pools);
+        for (0..ds.layers) |l| {
+            for (0..own_hi) |p| try t.copyPool(src, dst, l, p);
+            if (rows % pool_rows != 0 and full >= home_pools) {
+                const g = full / run_pools;
+                if (t.seg_run[(dst * t.o.layers + l) * t.segs + g] == none) try t.placeLinear(dst, l, g, try t.takeRuns(1));
+                try t.copyPool(src, dst, l, full);
+            }
+        }
+        try t.io.finish();
+        ds.hi = (rows - 1) / seg_positions;
+        ds.committed = rows;
+        ds.dirty_lo = 0;
+    }
+
+    /// Pool `p` of `src`'s layer `l` (through its chain) into `dst`'s resident slot for it (a linear run's).
+    fn copyPool(t: *Tier, src: usize, dst: usize, l: usize, p: usize) Error!void {
+        const kd = t.key(dst, l, p);
+        const sd = t.map[kd];
+        if (sd < 0) return error.BadShape;
+        const ks = t.keyOf(src, l, p);
+        const ss = t.map[ks];
+        if (ss >= 0) {
+            @memcpy(t.slotBytes(@intCast(sd)), t.slotBytes(@intCast(ss)));
+        } else if (t.persisted.isSet(ks)) {
+            try t.io.add(.read, t.slotBytes(@intCast(sd)), fileOffset(ks));
+            t.reads += 1;
+        } else return error.NotPersisted;
     }
 
     /// Positions from `pos` on are dropped (rejected drafts, a shortened prompt): the next window rewrites them.
@@ -929,6 +1076,99 @@ test "a selection reads the bytes last written, through windows, drafts, commits
     }
 }
 
+test "fetchMany serves several streams' selections from one batch of reads" {
+    var prng = std.Random.DefaultPrng.init(0x99);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = 3, .layers = 2, .capacity = 8 * seg_positions, .recent_runs = 1, .depth = 16 };
+    const f = try Fixture.init(o, 36, 5);
+    defer f.deinit();
+    const t = &f.tier;
+    for (0..3) |s| try t.open(s, 2);
+    for (0..3) |s| {
+        var pos: usize = 0;
+        while (pos < 7 * seg_positions) : (pos += seg_positions) {
+            try f.write(rnd, s, pos, seg_positions);
+            try t.commit(s, pos + seg_positions);
+        }
+    }
+    const W = 256;
+    var toks: [6][2 * W]i32 = undefined;
+    var orig: [6][2 * W]i32 = undefined;
+    var cnts: [6][2]i32 = undefined;
+    var sels: [6]Tier.Selection = undefined;
+    for (0..6) |i| {
+        for (0..2) |r| {
+            cnts[i][r] = W;
+            for (0..W) |j| toks[i][r * W + j] = @intCast(rnd.uintLessThan(usize, f.end[i / 2]));
+        }
+        orig[i] = toks[i];
+        sels[i] = .{ .s = i / 2, .l = i % 2, .tokens = &toks[i], .counts = &cnts[i], .W = W };
+    }
+    const reads = t.reads;
+    try t.fetchMany(&sels);
+    try testing.expect(t.reads > reads);
+    for (0..6) |i| {
+        t.remap(i / 2, i % 2, &toks[i], &cnts[i], W);
+        for (0..2 * W) |j| {
+            const want = f.ref[(i / 2) * 2 + i % 2][@as(usize, @intCast(orig[i][j])) * o.row_bytes ..][0..o.row_bytes];
+            try testing.expectEqualSlices(u8, want, t.slab[@as(usize, @intCast(toks[i][j])) * o.row_bytes ..][0..o.row_bytes]);
+        }
+    }
+    try t.check();
+}
+
+test "aliases read their parents' pools: kept prompts continued, parents closed first, chains" {
+    var prng = std.Random.DefaultPrng.init(0xa11a5);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = 4, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 1, .depth = 16 };
+    const f = try Fixture.init(o, 60, 6);
+    defer f.deinit();
+    const t = &f.tier;
+    var trial: usize = 0;
+    while (trial < 12) : (trial += 1) {
+        // a: a prompt of random length, committed
+        const a = try t.acquire(2);
+        const la = home_positions / 2 + rnd.uintLessThan(usize, 10 * seg_positions);
+        var pos: usize = 0;
+        while (pos < la) {
+            const R = @min(la - pos, 1 + rnd.uintLessThan(usize, seg_positions));
+            try f.write(rnd, a, pos, R);
+            pos += R;
+            try t.commit(a, pos);
+        }
+        // b continues a's first `rows`, c continues b's
+        const b = try t.acquire(2);
+        const rows = 1 + rnd.uintLessThan(usize, la);
+        try t.alias(a, b, rows);
+        for (0..2) |l| @memcpy(f.ref[b * 2 + l][0 .. rows * o.row_bytes], f.ref[a * 2 + l][0 .. rows * o.row_bytes]);
+        f.end[b] = rows;
+        if (rnd.boolean()) t.close(a); // the kept prompt let go while b reads through it
+        pos = rows;
+        for (0..6) |_| {
+            const R = 1 + rnd.uintLessThan(usize, 16);
+            try f.write(rnd, b, pos, R);
+            try f.select(rnd, b, R, 256);
+            pos += 1 + rnd.uintLessThan(usize, R);
+            t.rewind(b, pos);
+            try t.commit(b, pos);
+            f.end[b] = pos;
+        }
+        const c = try t.acquire(2);
+        const rows_c = 1 + rnd.uintLessThan(usize, pos);
+        try t.alias(b, c, rows_c);
+        for (0..2) |l| @memcpy(f.ref[c * 2 + l][0 .. rows_c * o.row_bytes], f.ref[b * 2 + l][0 .. rows_c * o.row_bytes]);
+        f.end[c] = rows_c;
+        t.close(b);
+        try f.write(rnd, c, rows_c, 8);
+        for (0..4) |_| try f.select(rnd, c, 4, 512);
+        try t.check();
+        t.close(c);
+        t.close(a); // a no-op when closed before (then freed with its last alias)
+        try t.check();
+        for (t.streams) |st| try testing.expect(!st.open and !st.pending);
+    }
+}
+
 test "prefetchRange brings a layer's whole context back" {
     var prng = std.Random.DefaultPrng.init(0x55);
     const rnd = prng.random();
@@ -993,7 +1233,7 @@ test "writeRuns splits a window at a segment's end and keeps the home block whol
     try testing.expectEqual(t.denseBase(0, 0), (try t.writeRuns(0, 0, 0, 1))[0].?.base);
 }
 
-test "bench (TF_TIER_BENCH=positions): a 1M-position stream-layer's prompt and decode selections" {
+test "bench (TF_TIER_BENCH=positions): 4 stream-layers' prompt and decode selections, one by one and batched" {
     const arg = std.c.getenv("TF_TIER_BENCH") orelse return error.SkipZigTest;
     const N = try std.fmt.parseInt(usize, std.mem.span(arg), 10);
     const gpa = std.heap.page_allocator;
@@ -1003,11 +1243,12 @@ test "bench (TF_TIER_BENCH=positions): a 1M-position stream-layer's prompt and d
             return std.fmt.parseInt(usize, std.mem.span(e), 10) catch default;
         }
     }.get;
-    const o: Options = .{ .streams = 1, .layers = 1, .capacity = N, .recent_runs = 32, .depth = env("TF_TIER_DEPTH", 64), .lanes = env("TF_TIER_LANES", 4) };
-    const runs = home_runs + o.recent_runs + 2 + (N / seg_positions) / 2;
+    const L = 4;
+    const o: Options = .{ .streams = 1, .layers = L, .capacity = N, .recent_runs = 32, .depth = env("TF_TIER_DEPTH", 64), .lanes = env("TF_TIER_LANES", 4) };
+    const runs = L * (home_runs + o.recent_runs + 2 + (N / seg_positions) / 2);
     const slab = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * block);
     defer gpa.free(slab);
-    const map = try gpa.alloc(i32, N / pool_rows);
+    const map = try gpa.alloc(i32, L * N / pool_rows);
     defer gpa.free(map);
     var buf: [256]u8 = undefined;
     const dir = if (std.c.getenv("TF_TIER_TEST_DIR")) |e| std.mem.span(e) else "/tmp";
@@ -1016,7 +1257,7 @@ test "bench (TF_TIER_BENCH=positions): a 1M-position stream-layer's prompt and d
     defer _ = std.c.unlink(path.ptr);
     var t = try Tier.init(gpa, slab, map, path, o);
     defer t.deinit();
-    try t.open(0, 1);
+    try t.open(0, L);
     var prng = std.Random.DefaultPrng.init(9);
     const rnd = prng.random();
     var ts: std.c.timespec = undefined;
@@ -1034,31 +1275,43 @@ test "bench (TF_TIER_BENCH=positions): a 1M-position stream-layer's prompt and d
     }
     const fill_ms = @as(f64, @floatFromInt(clock(&ts) - t0)) / 1e6;
     const W = 2051;
-    var tokens: [4 * W]i32 = undefined;
-    var counts: [4]i32 = undefined;
-    var fetch_ns: i128 = 0;
-    var hit_ns: i128 = 0;
-    const reads0 = t.reads;
-    const windows = 200;
-    for (0..windows) |_| {
+    var tokens: [L][4 * W]i32 = undefined;
+    var counts: [L][4]i32 = undefined;
+    var sels: [L]Tier.Selection = undefined;
+    var one_ns: i128 = 0;
+    var many_ns: i128 = 0;
+    var reads_one: u64 = 0;
+    var reads_many: u64 = 0;
+    const windows = 100;
+    for (0..2 * windows) |w| {
         try t.beginWindow(0, pos, 4);
-        for (0..4) |r| {
-            for (0..512) |i| {
-                const full = (pos + r + 1) / 4;
-                const p = if (rnd.uintLessThan(u8, 3) == 0) full - 1 - rnd.uintLessThan(usize, 4096) else rnd.uintLessThan(usize, full);
-                for (0..4) |j| tokens[r * W + i * 4 + j] = @intCast(p * 4 + j);
+        for (0..L) |l| {
+            for (0..4) |r| {
+                for (0..512) |i| {
+                    const full = (pos + r + 1) / 4;
+                    const p = if (rnd.uintLessThan(u8, 3) == 0) full - 1 - rnd.uintLessThan(usize, 4096) else rnd.uintLessThan(usize, full);
+                    for (0..4) |j| tokens[l][r * W + i * 4 + j] = @intCast(p * 4 + j);
+                }
+                counts[l][r] = 2048;
             }
-            counts[r] = 2048;
+            sels[l] = .{ .s = 0, .l = l, .tokens = &tokens[l], .counts = &counts[l], .W = W };
         }
+        const r0 = t.reads;
         const a = clock(&ts);
-        try t.fetch(0, 0, &tokens, &counts, W);
-        fetch_ns += clock(&ts) - a;
-        // the same selection again: resident, the bookkeeping alone
-        const b = clock(&ts);
-        try t.fetch(0, 0, &tokens, &counts, W);
-        hit_ns += clock(&ts) - b;
+        if (w % 2 == 0) {
+            for (sels) |x| try t.fetch(x.s, x.l, x.tokens, x.counts, x.W);
+            one_ns += clock(&ts) - a;
+            reads_one += t.reads - r0;
+        } else {
+            try t.fetchMany(&sels);
+            many_ns += clock(&ts) - a;
+            reads_many += t.reads - r0;
+        }
         pos += 2;
         try t.commit(0, pos);
     }
-    std.debug.print("\nkv_tier bench: {d} positions, slab {d} of {d} runs; prompt bookkeeping and writes {d:.0} ms ({d:.2} ms a 2,048-row chunk); decode fetch of 4 rows x 512 pools: {d:.3} ms a window ({d:.3} ms when resident), {d:.0} pools read a window (aio {}, direct {}, {d} lanes of {d})\n", .{ N, runs, N / seg_positions, fill_ms, fill_ms / @as(f64, @floatFromInt(N / seg_positions)), @as(f64, @floatFromInt(fetch_ns)) / 1e6 / windows, @as(f64, @floatFromInt(hit_ns)) / 1e6 / windows, @as(f64, @floatFromInt(t.reads - reads0)) / windows, t.io.aio, t.io.direct, o.lanes, o.depth });
+    const f = @as(f64, windows);
+    std.debug.print("\nkv_tier bench: {d} positions x {d} layers, slab {d} runs (about half); prompt bookkeeping and writes {d:.2} ms a 2,048-row chunk; a window of 4 rows x 512 pools on each layer: one fetch a layer {d:.3} ms ({d:.0} pools read), one fetchMany {d:.3} ms ({d:.0} pools read) (aio {}, direct {}, {d} lanes of {d})\n", .{
+        N, L, runs, fill_ms / @as(f64, @floatFromInt(N / seg_positions)), @as(f64, @floatFromInt(one_ns)) / 1e6 / f, @as(f64, @floatFromInt(reads_one)) / f, @as(f64, @floatFromInt(many_ns)) / 1e6 / f, @as(f64, @floatFromInt(reads_many)) / f, t.io.aio, t.io.direct, o.lanes, o.depth,
+    });
 }
