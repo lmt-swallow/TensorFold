@@ -26,12 +26,23 @@ pub const max_streams = 4;
 /// A shared round's rows at most.
 const shared_rows = max_streams * max_rows;
 
+/// A sequence's buffers, made once and reused (state.py `reset`) by one stream after another.
+const Slot = struct {
+    st: fwd.Stream,
+    last: cuda.DeviceBuffer, // the prompt's last row's final streams (the head's first absorb)
+    busy: bool = false,
+};
+
 const Lane = struct {
     st: *fwd.Stream,
+    slot: usize,
+    last: cuda.DeviceBuffer,
+    // the prompt pass under way (prefill_part): the prompt's ids and the next chunk's first row
+    fill: ?struct { ids: []i32, start: usize } = null,
+    first: u64 = 0, // the handle of the token drawn from the prompt's last row
     pending_rows: ?usize = null,
     a0: usize = 0, // the first row of its window in the last round's buffers
     round: u64 = 0, // that round (Lanes.rounds): its final streams stay in b.streams until the next one
-    last: ?cuda.DeviceBuffer = null, // the prompt's last row's final streams (the head's first absorb)
     held: [mtp.depth]u32 = undefined, // the drafts the head holds for the next window
     probs: [mtp.depth]f64 = undefined,
     nheld: usize = 0,
@@ -55,6 +66,7 @@ pub const Lanes = struct {
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu)
     drawn_dev: cuda.DeviceBuffer, // int32 [shared_rows]
     rounds: u64 = 0,
+    slots: [max_streams]?Slot = @splat(null),
     head: ?*mtp.Head = null,
     mb: ?fwd.Buffers = null, // the head's decode buffers
     sc: ?mtp.Scratch = null,
@@ -90,6 +102,10 @@ pub const Lanes = struct {
     pub fn deinit(self: *Lanes) void {
         var it = self.lanes.valueIterator();
         while (it.next()) |l| self.drop(l);
+        for (&self.slots) |*x| if (x.*) |*sl| {
+            sl.st.deinit();
+            sl.last.free();
+        };
         if (self.mb) |*x| x.deinit();
         if (self.sc) |*x| x.deinit();
         if (self.scp) |*x| x.deinit();
@@ -107,6 +123,7 @@ pub const Lanes = struct {
     pub fn backend(self: *Lanes) be.Backend {
         return .{ .ptr = self, .vtable = &.{
             .prefill = prefillFn,
+            .prefill_part = prefillPartFn,
             .first = firstFn,
             .queue = queueFn,
             .read = readFn,
@@ -133,10 +150,30 @@ pub const Lanes = struct {
         return if (self.head != null) 1 + mtp.depth else 1;
     }
 
+    /// The lane's slot free again (its buffers kept for the next stream), its prompt pass's ids freed.
     fn drop(self: *Lanes, l: *Lane) void {
-        if (l.last) |*x| x.free();
-        l.st.deinit();
-        self.gpa.destroy(l.st);
+        if (l.fill) |f| self.gpa.free(f.ids);
+        l.fill = null;
+        self.slots[l.slot].?.busy = false;
+    }
+
+    /// A free slot reset for a new sequence; its buffers are made on its first use.
+    fn takeSlot(self: *Lanes) !usize {
+        for (&self.slots, 0..) |*x, i| {
+            if (x.*) |*sl| {
+                if (sl.busy) continue;
+                try sl.st.reset(self.m, self.stream);
+                sl.busy = true;
+                return i;
+            }
+        }
+        for (&self.slots, 0..) |*x, i| if (x.* == null) {
+            var st = try fwd.Stream.init(self.gpa, self.d, self.m, self.capacity, max_rows);
+            errdefer st.deinit();
+            x.* = .{ .st = st, .last = try cuda.DeviceBuffer.alloc(self.d, self.m.cfg.wide() * 2), .busy = true };
+            return i;
+        };
+        return error.TooManyStreams;
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -182,40 +219,58 @@ pub const Lanes = struct {
 
     // -- the vtable ---------------------------------------------------------------------------------------------
 
-    /// A new sequence for the stream, then its prompt in 2,048-row chunks; the first token drawn from the last row.
+    /// A new sequence for the stream, then its whole prompt in 2,048-row chunks (prefillPartFn's pass in one call).
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+        while (!try prefillPartFn(ptr, s, std.math.maxInt(u32))) {}
+    }
+
+    /// The next `chunks` 2,048-row chunks of the stream's prompt pass (multi_fill.py's passes between rounds), the
+    /// first call taking a slot for its sequence; true once the pass ended, its first token drawn from the last row.
+    /// Each chunk runs whole inside the call, so other streams' rounds may run between two calls.
+    fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream, chunks: u32) anyerror!bool {
         const self = of(ptr);
+        var l = self.lanes.getPtr(s) orelse try self.startFill(s);
+        if (l.fill == null) { // a stream prefilled again: a new sequence
+            self.drop(l);
+            _ = self.lanes.remove(s);
+            l = try self.startFill(s);
+        }
+        const f = &l.fill.?;
+        var n: u32 = 0;
+        while (n < chunks and f.start < f.ids.len) : (n += 1) {
+            if (s.isCancelled()) return error.Cancelled;
+            f.start = try mtp.prefillChunk(self.head, &self.pr, l.st, &self.pb, if (self.scp) |*x| x else null, f.ids, f.start, l.last, self.stream);
+        }
+        if (f.start < f.ids.len) return false;
+        var first: [1]u32 = undefined;
+        try self.argmax(self.pb.logits, 1, &first);
+        l.first = self.take(first[0]);
+        self.gpa.free(f.ids);
+        l.fill = null;
+        return true;
+    }
+
+    /// The stream's lane on a reset slot, its prompt's ids kept for the pass.
+    fn startFill(self: *Lanes, s: *lanes.Stream) !*Lane {
         if (s.sampling) |sm| if (sm.temperature > 0) return error.SamplingNotPorted;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + max_rows > self.capacity) return error.PromptTooLong;
-        const gop = try self.lanes.getOrPut(self.gpa, s);
-        if (gop.found_existing) self.drop(gop.value_ptr);
-        const st = self.gpa.create(fwd.Stream) catch |e| {
-            self.lanes.removeByPtr(gop.key_ptr);
-            return e;
-        };
-        st.* = fwd.Stream.init(self.gpa, self.d, self.m, self.capacity, max_rows) catch |e| {
-            self.gpa.destroy(st);
-            self.lanes.removeByPtr(gop.key_ptr);
-            return e;
-        };
-        gop.value_ptr.* = .{ .st = st };
-        const l = gop.value_ptr;
-        l.last = try cuda.DeviceBuffer.alloc(self.d, self.m.cfg.wide() * 2);
         const toks = try self.gpa.alloc(i32, ids.len);
-        defer self.gpa.free(toks);
+        errdefer self.gpa.free(toks);
         for (ids, toks) |t, *x| x.* = @intCast(t);
-        try mtp.prefill(self.head, &self.pr, st, &self.pb, if (self.scp) |*x| x else null, toks, l.last.?, .{ .ctx = s, .check = cancelledCtx }, self.stream);
-        try self.stream.synchronize();
-        var first: [1]u32 = undefined;
-        try self.argmax(self.pb.logits, 1, &first);
-        _ = self.take(first[0]);
+        const slot = try self.takeSlot();
+        errdefer self.slots[slot].?.busy = false;
+        const sl = &self.slots[slot].?;
+        try self.lanes.put(self.gpa, s, .{ .st = &sl.st, .slot = slot, .last = sl.last, .fill = .{ .ids = toks, .start = 0 } });
+        return self.lanes.getPtr(s).?;
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
         const self = of(ptr);
         if (position != s.prompt_len) return error.PositionMismatch;
-        return self.next - 1;
+        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
+        if (l.fill != null) return error.PromptNotDone;
+        return l.first;
     }
 
     fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
@@ -305,7 +360,7 @@ pub const Lanes = struct {
                     .value => |v| v,
                 } else if (r.follow.len == 1) r.follow[0] else return error.NoFirstToken);
                 n = 1;
-                streams = l.last.?.ptr;
+                streams = l.last.ptr;
             }
             l.nheld = 0;
             held[i] = l;

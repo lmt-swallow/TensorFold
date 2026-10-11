@@ -15,6 +15,9 @@ pub const formats: []const []const u8 = &.{"exl3"};
 pub const default_context: i64 = 16384;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = prompt_mod.chunk_rows;
+/// Rounds of the decoding streams after each 2,048-row chunk of another stream's prompt pass (LaneHost.interleave),
+/// unless TENSORFOLD_PREFILL_INTERLEAVE says otherwise (0: a pass runs whole before the next round).
+pub const prefill_interleave: u32 = 1;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 
