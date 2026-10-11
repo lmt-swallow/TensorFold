@@ -199,6 +199,8 @@ pub const Head = struct {
     logits: cuda.DeviceBuffer, // bf16 [streams, padded draft vocab]: each segment's last row's draft logits
     host: []u16,
     streams: usize, // the most segments one head call takes
+    gx: cuda.DeviceBuffer, // bf16 [streams, D]: each segment's last row, gathered for one draft-head call
+    gxs: cuda.DeviceBuffer, // fp32 [streams, D / 32]: their group sums
     /// A test's hook after each head call (its streams in the buffers it ran on; decode calls' logits in self.logits).
     probe: ?Probe = null,
 
@@ -248,6 +250,8 @@ pub const Head = struct {
         h.k = try Kernels.load(d);
         h.streams = streams;
         h.logits = try cuda.DeviceBuffer.alloc(d, streams * h.draft_head.npad * 2);
+        h.gx = try cuda.DeviceBuffer.alloc(d, streams * cfg.hidden * 2);
+        h.gxs = try cuda.DeviceBuffer.alloc(d, streams * cfg.hidden / 32 * 4);
         h.host = try gpa.alloc(u16, h.ids.len);
         m.has_mtp = true;
         return h;
@@ -263,6 +267,8 @@ pub const Head = struct {
         self.draft_head.deinit();
         self.k.deinit();
         self.logits.free();
+        self.gx.free();
+        self.gxs.free();
         self.gpa.free(self.host);
         self.gpa.free(self.ids);
         self.gpa.destroy(self);
@@ -279,10 +285,24 @@ pub const Head = struct {
         try h.inputs(f, mb.ids.ptr, &mb.w, sc, sc.in.ptr, R, stream, null, mb);
         try f.layerStep(&h.layer, segs, mb, .none, .mtp, stream);
         try f.finish(&h.mixer, mb, R, f.moePending(mb), stream);
-        for (segs, 0..) |sg, i| {
-            const last = sg.a0 + sg.n - 1;
-            try h.k.matmul(&h.draft_head, mb.w.mixed.ptr + last * cfg.hidden * 2, cfg.hidden, mb.w.xs_mixed.ptr + last * cfg.hidden / 32 * 4, 1, h.logits.ptr + i * h.draft_head.npad * 2, stream);
+        // every segment's last row through the draft head in one call (multi.py `_mtp`, last_only), the head read once
+        const D = cfg.hidden;
+        var x = mb.w.mixed.ptr;
+        var xs = mb.w.xs_mixed.ptr;
+        if (segs.len == 1) {
+            const last = segs[0].a0 + segs[0].n - 1;
+            x += last * D * 2;
+            xs += last * D / 32 * 4;
+        } else if (R != segs.len) { // a segment of several rows: its last row gathered after the others'
+            for (segs, 0..) |sg, i| {
+                const last = sg.a0 + sg.n - 1;
+                try h.gx.copyFrom(i * D * 2, mb.w.mixed.ptr + last * D * 2, D * 2, stream.handle);
+                try h.gxs.copyFrom(i * D / 32 * 4, mb.w.xs_mixed.ptr + last * D / 32 * 4, D / 32 * 4, stream.handle);
+            }
+            x = h.gx.ptr;
+            xs = h.gxs.ptr;
         }
+        try h.k.matmul(&h.draft_head, x, D, xs, segs.len, h.logits.ptr, stream);
         if (h.probe) |pr| {
             try stream.synchronize();
             try pr.call(pr.ctx, false, R, mb.streams);
