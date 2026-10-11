@@ -3026,8 +3026,15 @@ pub fn positionCostsFromEnv() bool {
 /// proposals) may take up to `max_rows` rows, priced against the drafter's by expected tokens a ms
 /// (`lanes.Model.copy_pricing`); the drafter's windows keep their width. Unset or 0: copies take the drafter's
 /// width and the core's fixed ramp. Either way the tokens are the same; only the rows a round verifies differ.
+/// With it, TF_DS_COPY_POSITION=1 prices a copy's window at its stream's position (`lanes.Model.copy_position_costs`,
+/// from the position tables timed at load) and TF_DS_COPY_SHARE=1 lets copies in a shared round take only the rows
+/// the other streams would not get (`lanes.Model.copy_share`); both off by default and the tokens the same.
 pub fn copyDraftsFromEnv() bool {
-    const v = std.mem.span(std.c.getenv("TF_DS_COPY_DRAFTS") orelse return false);
+    return envOn("TF_DS_COPY_DRAFTS");
+}
+
+fn envOn(name: [*:0]const u8) bool {
+    const v = std.mem.span(std.c.getenv(name) orelse return false);
     return std.mem.eql(u8, v, "1");
 }
 
@@ -3101,6 +3108,8 @@ pub const Lanes = struct {
     position_rows: [1 + Engine.probe_ends.len][round_rows_most]lanes.config.Cost = undefined,
     position_costs: [1 + Engine.probe_ends.len]lanes.allocate.PositionCosts.Timed = undefined,
     n_positions: usize = 0,
+    /// the tables timed, whatever TF_DS_POSITION_COSTS says (TF_DS_COPY_POSITION=1 prices copies by them)
+    n_timed: usize = 0,
     /// Keeps not yet sent (TF_DS_TAIL on): the next step carries them, and a drafts step whose absorb keeps the same
     /// rows of a stream makes its keep moot (`Streams.draft` sets the length there itself). Every other step sends
     /// them first, so each rank sees the same lengths at every step as without the deferral.
@@ -3247,6 +3256,7 @@ pub const Lanes = struct {
             self.n_positions += 1;
             std.log.info("deepseek_v41: rounds of {any} rows ending at position {d}: {any} ms", .{ counts, end, ms[0..counts.len] });
         }
+        self.n_timed = self.n_positions;
         if (!positionCostsFromEnv()) self.n_positions = 0;
     }
 
@@ -3261,6 +3271,8 @@ pub const Lanes = struct {
             m.drafts = @intCast(self.width() - 1);
             m.first_copy_rows = @intCast(self.width());
             m.copy_pricing = true;
+            if (timed and envOn("TF_DS_COPY_POSITION")) m.copy_position_costs = self.position_costs[0..self.n_timed];
+            m.copy_share = envOn("TF_DS_COPY_SHARE");
         }
         return m;
     }
