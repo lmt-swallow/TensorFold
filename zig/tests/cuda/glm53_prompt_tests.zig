@@ -212,7 +212,28 @@ fn drawn(i: u64, seed: u64) u16 {
     return @intCast(@as(u32, @bitCast(v)) >> 16);
 }
 
-fn draw(gpa: std.mem.Allocator, b: Buf, seed: u64) !void {
+/// dump_prompt.py `draw`: bf16 caches the formula's values by flat index; an FP8 cache's rows of `width` values the
+/// same values (row x width + column) quantized a row at a time (glue.Kv.quantizeRow, kv8.quantize_rows).
+fn draw(gpa: std.mem.Allocator, b: Buf, seed: u64, kv: A.Kv, width: usize) !void {
+    if (kv == .fp8) {
+        const rb = kv.rowBytes(width);
+        const rows = b.len / rb;
+        const block: usize = 4096;
+        const vals = try gpa.alloc(u16, width);
+        defer gpa.free(vals);
+        const host = try gpa.alloc(u8, block * rb);
+        defer gpa.free(host);
+        var r0: usize = 0;
+        while (r0 < rows) : (r0 += block) {
+            const m = @min(block, rows - r0);
+            for (0..m) |i| {
+                for (vals, 0..) |*x, j| x.* = drawn((r0 + i) * width + j, seed);
+                A.Kv.quantizeRow(vals, host[i * rb ..][0..rb]);
+            }
+            try b.upload(r0 * rb, host[0 .. m * rb]);
+        }
+        return;
+    }
     const n = b.len / 2;
     const step: usize = 1 << 24;
     const host = try gpa.alloc(u16, step);
@@ -353,7 +374,8 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
         for (&ranks) |*r| try r.fresh(d, &cfg, if (long) long_capacity else capacity, if (long) long_ring else ring, kv);
         if (long) for (&ranks) |*r| {
             // dump_prompt.py's draws: layer 3's latents and pooled keys, then the MTP layer's
-            for ([_]Buf{ r.cache.latent, r.cache.pk, r.mcache.latent, r.mcache.pk }, 0..) |b, seed| try draw(gpa, b, seed);
+            const widths = [_]usize{ cfg.kv_lora, cfg.index_dim, cfg.kv_lora, cfg.index_dim };
+            for ([_]Buf{ r.cache.latent, r.cache.pk, r.mcache.latent, r.mcache.pk }, widths, 0..) |b, width, seed| try draw(gpa, b, seed, kv, width);
         };
         const list = e.value_ptr.array.items;
         for (list, 0..) |sv, si| {

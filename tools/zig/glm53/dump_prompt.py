@@ -19,7 +19,8 @@ are chosen so that every prompt-form kernel variant the served engine can reach 
   s5  2,048, 1,500 (7 latent chunks)
   s6  2, 2,048, 2,048 (the third chunk at 2,050: one dense row, 9 latent chunks)
   s7  4 x 2,048, then 37 rows at 8,192 (decode-form scores over 4,096 pools: 64 programs a row)
-  l   drawn caches (layer 3's and the MTP layer's latents and pooled keys from `draw`, KDA state zero), then chunks at 40,000
+  l   drawn caches (layer 3's and the MTP layer's latents and pooled keys from `draw`, KDA state zero; quantized rows
+      with TF_GLM53_REF_KV=fp8), then chunks at 40,000
       (2,048, 549, 37) and 600,000 (549, 37): the selection over 10k-150k pools, positions past 524,288
 
 Per rank r and chunk step <s>_<i> (s0_3, l_1, ...):
@@ -73,18 +74,37 @@ LONG = [(40_000, (2_048, 549, 37)), (600_000, (549, 37))]
 LONG_CAPACITY = 602_112
 
 
+def _drawn(a: int, n: int, seed: int, device) -> torch.Tensor:
+    """Values a .. a + n of `draw`'s formula (fp32, exact in bf16)."""
+    i = torch.arange(a, a + n, dtype=torch.int64, device=device)
+    h = (i * 0x9E3779B1 + seed * 0x85EBCA6B) & 0xFFFFFFFF
+    h = h ^ (h >> 15)
+    return (((h >> 7) & 255) - 128).to(torch.float32).div_(64.0)
+
+
 def draw(t: torch.Tensor, seed: int) -> None:
     """t (bf16) <- a fixed integer formula of each element's flat index i and ``seed``, exact in bf16 (multiples of
     1/64 in [-2, 2)), so the Zig test draws the same bytes on the host (glm53_prompt_tests.zig `draw`):
-    h = (i * 0x9E3779B1 + seed * 0x85EBCA6B) mod 2^32, h ^= h >> 15, value = (((h >> 7) & 255) - 128) / 64."""
+    h = (i * 0x9E3779B1 + seed * 0x85EBCA6B) mod 2^32, h ^= h >> 15, value = (((h >> 7) & 255) - 128) / 64.
+    An FP8 cache (TF_GLM_KV=fp8): the same values over its rows of `width` (i = row x width + column), each row
+    quantized as the write kernels store it (kv8.quantize_rows; the Zig test's glue.Kv.quantizeRow)."""
+    from tensorfold.families.glm5_next.cuda import kv8
+
+    if kv8.quantized(t):
+        width = kv8.width(t)
+        rows = t.shape[0]
+        step = (1 << 24) // width
+        for a in range(0, rows, step):
+            n = min(step, rows - a)
+            vals = _drawn(a * width, n * width, seed, t.device).view(n, width).to(torch.bfloat16)
+            t[a:a + n].copy_(kv8.quantize_rows(vals))
+        return
     flat = t.view(-1)
     n = flat.numel()
     step = 1 << 24
     for a in range(0, n, step):
-        i = torch.arange(a, min(n, a + step), dtype=torch.int64, device=t.device)
-        h = (i * 0x9E3779B1 + seed * 0x85EBCA6B) & 0xFFFFFFFF
-        h = h ^ (h >> 15)
-        flat[a:a + i.numel()] = (((h >> 7) & 255) - 128).to(torch.float32).div_(64.0).to(t.dtype)
+        m = min(step, n - a)
+        flat[a:a + m] = _drawn(a, m, seed, t.device).to(t.dtype)
 
 
 def sha(t: torch.Tensor) -> list:
