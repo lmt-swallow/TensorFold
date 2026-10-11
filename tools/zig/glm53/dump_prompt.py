@@ -212,6 +212,7 @@ def main() -> int:
         n = st.mtp_len - mtp0
         if n:
             digests[p + "mtp_latent"] = sha(st.mtp_kc[mtp0:mtp0 + n])
+        print(f"rank {r} {step}: {R} rows at {start}, MTP {st.mtp_len - mtp0} rows at {mtp0}", flush=True)
         if r == 0:
             steps.setdefault(step.split("_")[0], []).append(
                 {"step": step, "pos": start, "rows": R, "mtp_len": mtp0, "absorbed": n, "end": start + R == len(prompt)})
@@ -251,7 +252,8 @@ def main() -> int:
 
     pair.run(rank_run)
     for name in [n for n in digests if n.startswith("r0_")]:
-        if name.endswith(("_x_out", "_rec", "_conv", "_latent", "_pk", "_mtp_latent")) and \
+        # the KDA state and conv window are each rank's heads; the streams and the latent caches both ranks hold alike
+        if name.endswith(("_x_out", "_latent", "_pk")) and \
                 digests[name] != digests["r1_" + name[3:]]:
             raise SystemExit(f"{name[3:]}: the ranks differ")
     params = {"layers": LAYERS, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
