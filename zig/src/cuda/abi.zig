@@ -13,6 +13,30 @@ pub const Graph = ?*opaque {};
 pub const GraphNode = ?*opaque {};
 pub const GraphExec = ?*opaque {};
 pub const Kernel = ?*opaque {};
+pub const GreenCtx = ?*opaque {};
+pub const DevResourceDesc = ?*opaque {};
+
+/// CUdevResource (RESOURCE_ABI_VERSION 1): the type, the driver's padding, then the SM fields in a 48-byte union.
+pub const DevResource = extern struct {
+    type: c_uint = 0,
+    internal: [92]u8 = @splat(0),
+    sm_count: c_uint = 0,
+    min_partition: c_uint = 0,
+    coscheduled: c_uint = 0,
+    rest: [36]u8 = @splat(0),
+};
+pub const dev_resource_sm: c_uint = 1;
+pub const green_ctx_default_stream: c_uint = 1;
+
+/// The green-context entry points (CUDA 12.4+), resolved apart from `Api`: a driver without them still opens.
+pub const GreenApi = struct {
+    cuDeviceGetDevResource: *const fn (Device, *DevResource, c_uint) callconv(.c) Result,
+    cuDevSmResourceSplitByCount: *const fn (?[*]DevResource, *c_uint, *const DevResource, ?*DevResource, c_uint, c_uint) callconv(.c) Result,
+    cuDevResourceGenerateDesc: *const fn (*DevResourceDesc, [*]DevResource, c_uint) callconv(.c) Result,
+    cuGreenCtxCreate: *const fn (*GreenCtx, DevResourceDesc, Device, c_uint) callconv(.c) Result,
+    cuGreenCtxDestroy: *const fn (GreenCtx) callconv(.c) Result,
+    cuGreenCtxStreamCreate: *const fn (*Stream, GreenCtx, c_uint, c_int) callconv(.c) Result,
+};
 
 pub const success: Result = 0;
 pub const error_not_found: Result = 500;

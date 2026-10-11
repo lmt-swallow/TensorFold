@@ -24,6 +24,7 @@ pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
 pub const segments = @import("segments.zig");
+pub const green = @import("green.zig");
 
 test {
     _ = @import("memory.zig");
@@ -31,4 +32,5 @@ test {
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = @import("green.zig");
 }

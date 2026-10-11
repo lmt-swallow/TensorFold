@@ -8,6 +8,8 @@ pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDevi
 pub const Driver = struct {
     lib: std.DynLib,
     api: abi.Api,
+    /// The green-context entry points (`green.zig`); null when the driver lacks any of them.
+    green: ?abi.GreenApi = null,
 
     pub fn open() Error!Driver {
         return openPath("libcuda.so.1");
@@ -25,7 +27,13 @@ pub const Driver = struct {
                 return error.MissingSymbol;
             };
         }
-        const d: Driver = .{ .lib = lib, .api = api };
+        var green: abi.GreenApi = undefined;
+        var have_green = true;
+        const ginfo = @typeInfo(abi.GreenApi).@"struct";
+        inline for (ginfo.field_names, ginfo.field_types) |name, T| {
+            if (lib.lookup(T, name)) |f| @field(green, name) = f else have_green = false;
+        }
+        const d: Driver = .{ .lib = lib, .api = api, .green = if (have_green) green else null };
         try d.check(api.cuInit(0), "cuInit");
         return d;
     }
