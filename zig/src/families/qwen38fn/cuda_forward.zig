@@ -137,11 +137,16 @@ pub const Model = struct {
         var lin: usize = 0;
         var att: usize = 0;
         var n: names.Name = .{};
+        // seconds each kind of weight took (the load's summary line)
+        var spent: struct { hc: f64 = 0, mixer: f64 = 0, experts: f64 = 0, other: f64 = 0 } = .{};
+        const t_start = now(io);
         for (0..layers) |i| {
             var l: Layer = undefined;
             l.index = i;
+            var t = now(io);
             l.attn_hc = try weights.Hc.load(gpa, d, &m.pack, &m.cfg, n.of(names.lm ++ "layers.{d}.attn_hyper_connection", .{i}), true, m.offset);
             l.mlp_hc = try weights.Hc.load(gpa, d, &m.pack, &m.cfg, n.of(names.lm ++ "layers.{d}.mlp_hyper_connection", .{i}), true, m.offset);
+            spent.hc += lap(io, &t);
             if (cfg.kinds[i] == .linear) {
                 const w = try weights.Gdn.load(gpa, d, &m.pack, &m.cfg, i);
                 l.mixer = .{ .gdn = .{ .w = w, .qkv = try linear(gpa, &m.xk, w.qkv), .z = try linear(gpa, &m.xk, w.z), .out = try linear(gpa, &m.xk, w.out), .li = lin } };
@@ -156,16 +161,37 @@ pub const Model = struct {
                 } };
                 att += 1;
             }
+            spent.mixer += lap(io, &t);
             l.router = try weights.router(gpa, d, &m.pack, &m.cfg, .{ .lm = i });
             l.experts = try experts.Experts.load(gpa, d, &m.pack, &m.cfg, .{ .lm = i });
+            spent.experts += lap(io, &t);
             l.ple = if (cfg.ple_layer != null and cfg.ple_layer.? == i) try weights.Ple.load(gpa, d, &m.pack, &m.cfg, &m.table.?, i, m.offset) else null;
+            spent.other += lap(io, &t);
             m.layers[i] = l;
             made += 1;
         }
+        var t = now(io);
         m.mixer = try weights.Hc.load(gpa, d, &m.pack, &m.cfg, names.mixer, false, m.offset);
         errdefer m.mixer.deinit();
         m.head = if (with_head) try linear(gpa, &m.xk, try m.pack.group(names.head)) else null;
+        spent.other += lap(io, &t);
+        std.log.info("qwen38fn: {d} layers in {d:.1} s (experts {d:.1} s, mixers {d:.1} s, hyper-connections {d:.1} s, the rest {d:.1} s)", .{ layers, secs(now(io) - t_start), spent.experts, spent.mixer, spent.hc, spent.other });
         return m;
+    }
+
+    fn now(io: std.Io) i96 {
+        return std.Io.Clock.awake.now(io).toNanoseconds();
+    }
+
+    fn secs(ns: i96) f64 {
+        return @as(f64, @floatFromInt(ns)) / 1e9;
+    }
+
+    /// Seconds since `t`, which moves to now.
+    fn lap(io: std.Io, t: *i96) f64 {
+        const x = now(io);
+        defer t.* = x;
+        return secs(x - t.*);
     }
 
     pub fn deinit(self: *Model) void {
