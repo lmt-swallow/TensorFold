@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A GLM-5.3-Flash fixture (dump_<name>.py) from the Mia fork's pinned image on ONE DGX Spark, with its Triton
 # launches packed for the Zig engine and its CUDA extensions kept for the SASS comparison. Usage:
-#   bash capture.sh <kda|dsa|moe|hc> <work-dir> [dump args...]
+#   bash capture.sh <kda|dsa|moe|hc|prompt> <work-dir> [dump args...]
 # needs the TensorFold checkout at $TF (default: this script's tree), the pack in the Hugging Face cache ($HF_REPO,
 # default ~/.cache/huggingface/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold, its one snapshot) and the
 # image $IMAGE (the recipe's v1.5 pin, present on the node: never pulled). Writes <work-dir>/out/fixture
@@ -11,7 +11,7 @@
 set -euo pipefail
 NAME=$1; shift
 WORK=$1; shift
-case "$NAME" in kda|dsa|moe|hc) ;; *) echo "capture.sh: kda, dsa, moe or hc, not $NAME" >&2; exit 2 ;; esac
+case "$NAME" in kda|dsa|moe|hc|prompt) ;; *) echo "capture.sh: kda, dsa, moe, hc or prompt, not $NAME" >&2; exit 2 ;; esac
 HERE=$(cd "$(dirname "$0")" && pwd)
 TF=${TF:-$(cd "$HERE/../../.." && pwd)}
 NEED_GIB=${NEED_GIB:-40} bash "$TF/tools/zig/dsv41/gpu_guard.sh" || exit $?   # never beside a serving model
