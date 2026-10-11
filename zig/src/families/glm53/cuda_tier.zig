@@ -7,7 +7,8 @@
 //! - the latent write: `writes(s, l, pos, R, pos_dev)`, one or two (base, pos_dev, rows) pieces;
 //! - dense attention (rows before the dense limit): `denseBase(s, l)`, positions [0, kv_tier.home_positions);
 //! - sparse attention: after the selection wrote tokens [R, W] and counts [R], `resolve(...)` returns the base the
-//!   remapped tokens index (the stream syncs once);
+//!   remapped tokens index (the stream syncs once when some written pool of the layer is on the file only; while
+//!   the context fits, no sync);
 //! - after the round's tokens are known: `commit(s, accepted_end)`, `rewind(s, end)`.
 //!
 //! The kernels see the bytes a whole cache holds at the same positions in the same order, so the bits are those of
@@ -119,11 +120,14 @@ pub const Tier = struct {
     /// resident, the tokens remapped in place; returns the base the sparse kernels read the latent rows at.
     pub fn resolve(t: *Tier, s: usize, l: usize, tokens: Ptr, counts: Ptr, R: usize, w: usize, stream: cuda.Stream) !Ptr {
         if (R * w * 4 > t.toks.bytes.len or R * 4 > t.cnts.bytes.len) return error.BadShape;
-        const api = t.d.api;
-        try t.d.check(api.cuMemcpyDtoHAsync_v2(t.cnts.bytes.ptr, counts, R * 4, stream.handle), "cuMemcpyDtoHAsync");
-        try t.d.check(api.cuMemcpyDtoHAsync_v2(t.toks.bytes.ptr, tokens, R * w * 4, stream.handle), "cuMemcpyDtoHAsync");
-        try stream.synchronize();
-        try t.host.fetch(s, l, t.toks.slice(i32)[0 .. R * w], t.cnts.slice(i32)[0..R], w);
+        // every written pool resident (the whole context fits): the device remap alone, no read-back, no sync
+        if (!t.host.resident(s, l)) {
+            const api = t.d.api;
+            try t.d.check(api.cuMemcpyDtoHAsync_v2(t.cnts.bytes.ptr, counts, R * 4, stream.handle), "cuMemcpyDtoHAsync");
+            try t.d.check(api.cuMemcpyDtoHAsync_v2(t.toks.bytes.ptr, tokens, R * w * 4, stream.handle), "cuMemcpyDtoHAsync");
+            try stream.synchronize();
+            try t.host.fetch(s, l, t.toks.slice(i32)[0 .. R * w], t.cnts.slice(i32)[0..R], w);
+        }
         var args: cuda.Args = .{};
         args.add(tokens);
         args.add(counts);

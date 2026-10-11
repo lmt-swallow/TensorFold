@@ -72,6 +72,7 @@ pub const Tier = struct {
     runs: []Run,
     seg_run: []u32, // [streams, layers, segs]: the linear run holding a segment
     home: []u32, // [streams, layers]: the home block's first run
+    away: []u32, // [streams, layers]: written pools not resident (0: every selection is resident, fetch reads nothing)
     owner: []u32, // [slots]: the key (map index) a slot holds
     pin: []u32, // [slots]: the fetch call that last named it
     used: []u32, // [slots]: the window that last named it
@@ -128,6 +129,9 @@ pub const Tier = struct {
         t.home = try gpa.alloc(u32, o.streams * o.layers);
         errdefer gpa.free(t.home);
         @memset(t.home, none);
+        t.away = try gpa.alloc(u32, o.streams * o.layers);
+        errdefer gpa.free(t.away);
+        @memset(t.away, 0);
         t.owner = try gpa.alloc(u32, nslots);
         errdefer gpa.free(t.owner);
         @memset(t.owner, none);
@@ -157,6 +161,7 @@ pub const Tier = struct {
         t.gpa.free(t.pin);
         t.gpa.free(t.owner);
         t.gpa.free(t.home);
+        t.gpa.free(t.away);
         t.gpa.free(t.seg_run);
         t.gpa.free(t.runs);
         t.free_slots.deinit(t.gpa);
@@ -213,6 +218,7 @@ pub const Tier = struct {
                 r.* = none;
             }
             t.home[s * t.o.layers + l] = none;
+            t.away[s * t.o.layers + l] = 0;
         }
         t.streams[s] = .{};
     }
@@ -307,6 +313,12 @@ pub const Tier = struct {
         };
         try t.readIn(need.items);
         try t.io.finish();
+    }
+
+    /// Whether every written pool of stream `s`'s layer `l` is resident: a fetch would read nothing (the device
+    /// remap alone serves a selection).
+    pub fn resident(t: *const Tier, s: usize, l: usize) bool {
+        return t.away[s * t.o.layers + l] == 0;
     }
 
     /// Starts reading layer `l`'s pools below position `end` that are not resident (prefill's next layer); the
@@ -411,6 +423,7 @@ pub const Tier = struct {
     fn readIn(t: *Tier, keys: []const u32) Error!void {
         for (keys) |k| {
             const slot = try t.allocLoose();
+            t.away[k / t.pools] -= 1;
             t.own(slot, k);
             t.map[k] = @intCast(slot);
             t.touch(slot);
@@ -435,6 +448,7 @@ pub const Tier = struct {
                 try t.free_slots.append(t.gpa, u);
             } else if (t.persisted.isSet(k)) {
                 try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
+                t.away[k / t.pools] -= 1;
                 t.reads += 1;
             }
             t.own(slot, k);
@@ -460,6 +474,7 @@ pub const Tier = struct {
     }
 
     fn evict(t: *Tier, slot: usize) void {
+        t.away[t.owner[slot] / t.pools] += 1;
         t.map[t.owner[slot]] = -1;
         t.disown(slot);
         t.ref.unset(slot);
@@ -560,6 +575,11 @@ pub const Tier = struct {
             if (t.map[k] != @as(i32, @intCast(slot))) return error.Inconsistent;
             if (t.runs[slot / run_pools].kind == .free) return error.Inconsistent;
         };
+        for (t.away, 0..) |a, sl| {
+            var n: u32 = 0;
+            for (t.map[sl * t.pools ..][0..t.pools], sl * t.pools..) |slot, k| n += @intFromBool(slot == -1 and t.persisted.isSet(k));
+            if (n != a) return error.Inconsistent;
+        }
         for (t.runs, 0..) |r, i| {
             var held: u32 = 0;
             for (t.owner[i * run_pools ..][0..run_pools]) |k| held += @intFromBool(k != none);
