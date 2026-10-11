@@ -38,6 +38,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_exl3_grouped", .src = "dsv41/linear_grouped", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // the same extension's linear_grouped.cu: rot_many, glinear (grouped launches, rotation / RoPE epilogues)
     .{ .name = "dsv41_l2_prefetch", .src = "dsv41/l2_prefetch", .flags = &.{"-O3"} }, // cuda/exl3/prefetch.py, tensorfold_exl3_l2_prefetch_v6: paced L2 prefetch of weight ranges
     .{ .name = "dsv41_rope", .src = "dsv41/rope", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: ops.py rope_cs's table rows (glibc's sinf / cosf) at given positions
+    .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // the DSV4.1 fork's cuda/rdma_gather.cu v7 kernel pair: the rounds' gathers over the RDMA ring
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -82,6 +83,8 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     dsv41.addImport("cuda", cuda);
     dsv41.addImport("core", core);
     dsv41.addImport("lanes", lanes);
+    // the RDMA ring's verbs (deepseek_v41/rdma.zig)
+    dsv41.addImport("fabric", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41 };
 }
 
