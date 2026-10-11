@@ -30,6 +30,7 @@ pub const Model = struct {
     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
+    draft_slack: ?u32 = null, // drafts a stream offers in a shared round past its last grant (null: the rule's)
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
     // a lone window's forward ms by rows at two or more stream positions (timed at load): allocation prices each
@@ -121,6 +122,7 @@ pub const Config = struct {
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
             .position_costs = try alloc.PositionCosts.init(gpa, m.position_costs, batch_rows),
             .mtp_step_ms = m.mtp_step_ms,
+            .k = if (m.draft_slack) |slack| .{ .draft_slack = slack } else .{},
         };
     }
 
