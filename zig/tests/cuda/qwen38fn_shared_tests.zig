@@ -1,8 +1,10 @@
 //! `qwen38fn-shared <kernel-set> <model-dir>`: Qwen3.8-Flash-Next's shared rounds (multi.py `round` and
 //! `_draft_all`) keep every stream's bits. Four streams with different prompts decode greedily with MTP drafts, first
-//! each alone (the path qwen38fn-mtp holds equal to 0.6.6's), then all four in shared rounds: one forward a round over
-//! every window, one head call a depth for every stream's drafts. Each round's logits rows, each stream's drafts and
-//! their probabilities, and the decoded tokens must be the same bytes both ways.
+//! each alone on a new sequence (the path qwen38fn-mtp holds equal to 0.6.6's), then all four in shared rounds on
+//! the same sequences reset (state.py `reset`: old attention rows left in place): one forward a round over every
+//! window, one head call a depth for every stream's drafts, and the last stream's prompt chunks run between the
+//! others' rounds. Each round's logits rows, each stream's drafts and their probabilities, and the decoded tokens must
+//! be the same bytes both ways.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -17,7 +19,9 @@ const streams = 4;
 const tokens = 40;
 const capacity = 4096;
 const rows = 16;
-const prompt_lens = [streams]usize{ 37, 58, 5, 130 };
+const prompt_lens = [streams]usize{ 37, 58, 5, 133 };
+/// Prompt chunk rows: small, so the last prompt takes five chunks.
+const chunk = 32;
 
 /// One stream's prompt: token ids spread over the vocabulary, different for each stream.
 fn promptOf(s: usize, out: []i32) void {
@@ -66,7 +70,9 @@ const Live = struct {
     keep: usize = 0,
     a0: usize = 0,
     rec: Record = .{},
-    round: usize = 0,
+    ids: [prompt_lens[streams - 1]]i32 = undefined,
+    len: usize = 0,
+    start: usize = 0, // the next prompt chunk's first row
 
     fn done(l: *const Live) bool {
         return l.rec.out.items.len >= tokens;
@@ -92,24 +98,39 @@ const Env = struct {
     vh: []u16,
     stream: cuda.Stream,
 
-    /// A fresh stream with its prompt run; its first token taken.
-    fn start(e: *Env, l: *Live, s: usize) !void {
-        const gpa = e.gpu.gpa;
-        l.* = .{ .st = try F.Stream.init(gpa, e.gpu.d, e.m, capacity, rows), .last = try cuda.DeviceBuffer.alloc(e.gpu.d, e.m.cfg.wide() * 2) };
-        const ids = try gpa.alloc(i32, prompt_lens[s]);
-        defer gpa.free(ids);
-        promptOf(s, ids);
-        try M.prefill(e.head, e.pr, &l.st, e.pb, e.scp, ids, l.last, null, e.stream);
+    /// Stream `s`'s sequence: new, or `l`'s reset; its prompt ready for its chunks.
+    fn begin(e: *Env, l: *Live, s: usize, fresh: bool) !void {
+        if (fresh) {
+            l.* = .{ .st = try F.Stream.init(e.gpu.gpa, e.gpu.d, e.m, capacity, rows), .last = try cuda.DeviceBuffer.alloc(e.gpu.d, e.m.cfg.wide() * 2) };
+        } else {
+            try l.st.reset(e.m, e.stream);
+            l.nd = 0;
+            l.keep = 0;
+        }
+        l.len = prompt_lens[s];
+        l.start = 0;
+        promptOf(s, l.ids[0..l.len]);
+    }
+
+    /// The prompt's next chunk; true once the prompt ended, its first token taken.
+    fn chunkStep(e: *Env, l: *Live) !bool {
+        l.start = try M.prefillChunk(e.head, e.pr, &l.st, e.pb, e.scp, l.ids[0..l.len], l.start, l.last, e.stream);
+        if (l.start < l.len) return false;
         try e.stream.synchronize();
         const v = e.m.cfg.vocab;
         try e.pb.logits.download(0, std.mem.sliceAsBytes(e.vh[0..v]));
-        try l.rec.out.append(gpa, argmax(e.vh[0..v]));
+        try l.rec.out.append(e.gpu.gpa, argmax(e.vh[0..v]));
+        return true;
     }
 
     fn free(l: *Live, gpa: std.mem.Allocator) void {
         l.st.deinit();
         l.last.free();
         l.rec.deinit(gpa);
+    }
+
+    fn prefillAll(e: *Env, l: *Live) !void {
+        while (!try e.chunkStep(l)) {}
     }
 
     fn noteDrafts(e: *Env, l: *Live) !void {
@@ -179,26 +200,24 @@ const Env = struct {
         }
     }
 
-    /// Rounds until every stream in `ls` has its tokens.
-    fn decode(e: *Env, ls: []const *Live) !void {
-        try e.draft(ls, true);
-        while (true) {
-            var live: [streams]*Live = undefined;
-            var n: usize = 0;
-            for (ls) |l| if (!l.done()) {
-                live[n] = l;
-                n += 1;
-            };
-            if (n == 0) return;
-            try e.round(live[0..n]);
-            var more: [streams]*Live = undefined;
-            var k: usize = 0;
-            for (live[0..n]) |l| if (!l.done()) {
-                more[k] = l;
-                k += 1;
-            };
-            if (k > 0) try e.draft(more[0..k], false);
-        }
+    /// One round over the streams of `ls` still decoding, then their drafts; false when none is.
+    fn step(e: *Env, ls: []const *Live) !bool {
+        var live: [streams]*Live = undefined;
+        var n: usize = 0;
+        for (ls) |l| if (!l.done()) {
+            live[n] = l;
+            n += 1;
+        };
+        if (n == 0) return false;
+        try e.round(live[0..n]);
+        var more: [streams]*Live = undefined;
+        var k: usize = 0;
+        for (live[0..n]) |l| if (!l.done()) {
+            more[k] = l;
+            k += 1;
+        };
+        if (k > 0) try e.draft(more[0..k], false);
+        return true;
     }
 };
 
@@ -244,11 +263,11 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
     defer b.deinit();
     var mb = try F.Buffers.init(gpa, d, m, shared_rows, capacity);
     defer mb.deinit();
-    var pb = try P.Buffers.init(gpa, d, m, P.chunk_rows, capacity);
+    var pb = try P.Buffers.init(gpa, d, m, chunk, capacity);
     defer pb.deinit();
     var sc = try M.Scratch.init(d, &m.cfg, shared_rows);
     defer sc.deinit();
-    var scp = try M.Scratch.init(d, &m.cfg, P.chunk_rows);
+    var scp = try M.Scratch.init(d, &m.cfg, chunk);
     defer scp.deinit();
     var fw = F.Forward.init(d, m, &set);
     var pr = try P.Prompt.init(&fw, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
@@ -257,34 +276,41 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
     defer gpa.free(vh);
     var e: Env = .{ .gpu = gpu, .m = m, .head = head, .fw = &fw, .pr = &pr, .b = &b, .mb = &mb, .pb = &pb, .sc = &sc, .scp = &scp, .vh = vh, .stream = stream };
 
-    // each stream alone
-    var alone: [streams]Live = undefined;
-    for (&alone, 0..) |*l, s| {
-        try e.start(l, s);
-        try e.decode(&.{l});
-        l.st.deinit();
-        l.last.free();
+    // each stream alone, on a new sequence
+    var ls: [streams]Live = undefined;
+    var made: usize = 0;
+    defer for (ls[0..made]) |*l| Env.free(l, gpa);
+    var alone: [streams]Record = @splat(.{});
+    defer for (&alone) |*r| r.deinit(gpa);
+    for (&ls, 0..) |*l, s| {
+        try e.begin(l, s, true);
+        made += 1;
+        try e.prefillAll(l);
+        try e.draft(&.{l}, true);
+        while (try e.step(&.{l})) {}
+        alone[s] = l.rec;
+        l.rec = .{};
     }
-    defer for (&alone) |*l| l.rec.deinit(gpa);
-    // all four in shared rounds
-    var together: [streams]Live = undefined;
-    var started: usize = 0;
-    defer for (together[0..started]) |*l| Env.free(l, gpa);
-    for (&together, 0..) |*l, s| {
-        try e.start(l, s);
-        started += 1;
-    }
+    // all four on the same sequences reset: three prompts, then the last one's chunks between the others' rounds
     var ptrs: [streams]*Live = undefined;
-    for (&together, &ptrs) |*l, *p| p.* = l;
-    try e.decode(&ptrs);
+    for (&ls, &ptrs, 0..) |*l, *p, s| {
+        p.* = l;
+        try e.begin(l, s, false);
+    }
+    for (ptrs[0 .. streams - 1]) |l| try e.prefillAll(l);
+    try e.draft(ptrs[0 .. streams - 1], true);
+    var interleaved: usize = 0;
+    while (!try e.chunkStep(ptrs[streams - 1])) interleaved += @intFromBool(try e.step(ptrs[0 .. streams - 1]));
+    try e.draft(ptrs[streams - 1 ..], true);
+    while (try e.step(&ptrs)) {}
 
     var failures: usize = 0;
     var equal: usize = 0;
     var rounds: usize = 0;
-    for (&alone, &together, 0..) |*x, *y, s| {
-        compare("alone vs shared", s, &x.rec, &y.rec, &failures, &equal);
-        rounds += x.rec.logits.items.len;
+    for (&alone, &ls, 0..) |*x, *y, s| {
+        compare("alone vs shared", s, x, &y.rec, &failures, &equal);
+        rounds += x.logits.items.len;
     }
     try check.expect(failures == 0, "qwen38fn-shared: {d} records differ ({d} equal)", .{ failures, equal });
-    check.pass("BITEXACT qwen38fn-shared: {d} streams x {d} tokens, {d} rounds' logits, drafts and tokens equal alone and shared ({d} records)", .{ streams, tokens, rounds, equal });
+    check.pass("BITEXACT qwen38fn-shared: {d} streams x {d} tokens, {d} rounds' logits, drafts and tokens equal alone and shared on reset sequences, {d} rounds between prompt chunks ({d} records)", .{ streams, tokens, rounds, interleaved, equal });
 }
