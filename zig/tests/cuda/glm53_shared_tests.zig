@@ -40,10 +40,11 @@ const Mode = enum { single, alone, shared };
 /// Every stream prefilled from 0 in its pool extent; then `rounds` rounds: `shared`, the streams' windows in one
 /// forward a round; `alone`, one stream's window a forward (`forwardSegs` of one); `single`, `forward`'s own path. Each
 /// stream's rows' logits and samples into its run.
-fn decode(r: *E.Runner, pool: *const P.Pool, seqs: *[streams]E.Seq, prompts: [streams][]const u32, forced: []const u32, mode: Mode, runs: *[streams]Run) !void {
+fn decode(rk: *pair.Rank, r: *E.Runner, pool: *const P.Pool, seqs: *[streams]E.Seq, prompts: [streams][]const u32, forced: []const u32, mode: Mode, runs: *[streams]Run) !void {
     const gpa = r.gpa;
     var pending: [streams]u32 = undefined;
     for (seqs, prompts, 0..) |*q, p, i| {
+        try rk.tierOpen(q, i);
         try q.bind(pool, i * 8192, 8192);
         try q.reset(r.stream);
         var at: usize = 0;
@@ -108,7 +109,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const lay = rk.lay;
     var r = try rk.runner(gpa, d, link, 8192);
     defer r.deinit();
-    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, streams * 8192, .bf16, true);
+    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, streams * 8192, .bf16, rk.tier == null);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(8192, E.prompt_rows);
     var seqs: [streams]E.Seq = undefined;
@@ -122,7 +123,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
 
     var runs: [3][streams]Run = @splat(@splat(.{}));
     defer for (&runs) |*m| for (m) |*x| x.deinit(gpa);
-    for (std.enums.values(Mode), 0..) |mode, mi| try decode(&r, &pool, &seqs, prompts, forced, mode, &runs[mi]);
+    for (std.enums.values(Mode), 0..) |mode, mi| try decode(rk, &r, &pool, &seqs, prompts, forced, mode, &runs[mi]);
     var bad: usize = 0;
     const row = r.host.len * 2;
     const single = &runs[@intFromEnum(Mode.single)];

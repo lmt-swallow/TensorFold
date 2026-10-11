@@ -151,6 +151,13 @@ fn lockstep(r: *E.Runner, qs: [2]*E.Seq, b: []const u32, starts: [2]usize, ts: [
 
 pub const Args = pair.Args;
 
+/// On a tier, sequence `q` reads A's latent rows before `rows` through A's tier streams (1's: backbone 2, head 3).
+fn aliasA(q: *E.Seq, rows: usize) !void {
+    const x = q.tier orelse return;
+    try x.t.alias(2, x.h, rows);
+    try x.t.alias(3, x.hm, rows);
+}
+
 pub fn run(gpu: Gpu, args: Args, rank: usize, master: []const u8, port: u16) !void {
     try pair.launch(gpu, rank, master, port, (E.prompt_rows + 2) * 4096, args, body);
 }
@@ -165,7 +172,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const capacity: usize = 8192;
     var r = try rk.runner(gpa, d, link, capacity);
     defer r.deinit();
-    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 4 * capacity, .bf16, true);
+    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 4 * capacity, .bf16, rk.tier == null);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(capacity, E.prompt_rows);
     var seqs: [3]E.Seq = undefined;
@@ -184,6 +191,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     for (b[cut + 1 ..], 0..) |*x, i| x.* = a[a.len - 1 - i];
 
     // A in extent 1 to its boundary, snapshotted there (as a served prompt's pass does), then on to its end
+    try rk.tierOpen(&seqs[1], 1);
     try seqs[1].bind(&pool, capacity, capacity);
     try seqs[1].reset(stream);
     var at = try r.fill(&seqs[1], a, 0);
@@ -193,11 +201,13 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
 
     // B fresh in extent 0 (slot 0); B continued in extent 2 (slot 2): A's rows before the boundary copied in, the
     // slot's state restored from the snapshot
+    try rk.tierOpen(&seqs[0], 0);
     try seqs[0].bind(&pool, 0, capacity);
     try seqs[0].reset(stream);
     // slot 2 first serves a whole other stream (B from 0, 16 steps) in extent 2, as a served slot does before it is
     // reused: nothing it leaves may reach the continued prompt
     {
+        try rk.tierOpen(&seqs[2], 2);
         try seqs[2].bind(&pool, 2 * capacity, capacity);
         try seqs[2].reset(stream);
         var at2: usize = 0;
@@ -210,9 +220,11 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
             tok = o[0];
         }
     }
+    try rk.tierOpen(&seqs[2], 2);
     try seqs[2].bind(&pool, 2 * capacity, capacity);
     try seqs[2].reset(stream);
     try K.copyRows(&pool, capacity, 2 * capacity, cut, stream);
+    try aliasA(&seqs[2], cut);
     try snaps.restore(0, &seqs[2], cut, stream);
     var fresh: Trace = .{};
     defer fresh.deinit(gpa);
@@ -228,9 +240,11 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     // taking a kept prompt's continuation after another stream): the same rows again
     var moved: Trace = .{};
     defer moved.deinit(gpa);
+    try rk.tierOpen(&seqs[0], 3);
     try seqs[0].bind(&pool, 3 * capacity, capacity);
     try seqs[0].reset(stream);
     try K.copyRows(&pool, capacity, 3 * capacity, cut, stream);
+    try aliasA(&seqs[0], cut);
     try snaps.restore(0, &seqs[0], cut, stream);
     try finishB(&r, &seqs[0], b, cut, &moved);
     if (!std.mem.eql(u32, fresh.tokens.items, moved.tokens.items)) {

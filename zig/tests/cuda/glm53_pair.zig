@@ -29,6 +29,9 @@ pub const Rank = struct {
     fx: fixture.Fixture,
     prompt_bytes: []u8, // the fixture's prompt ids (both ranks' prompt is the same: rank 0's copy)
     gpa: std.mem.Allocator,
+    /// TF_GLM_TIER=<dir> (bf16): the latent rows on a tier of `tier_streams` streams whose slab holds the home
+    /// blocks and a few runs more, the rest on <dir>/glm53-pair-r<rank>.bin.
+    tier: ?*glm.tier.Tier = null,
 
     pub fn load(self: *Rank, gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, aot_dir: []const u8, layers: ?usize) !void {
         const gpa = gpu.gpa;
@@ -56,9 +59,35 @@ pub const Rank = struct {
         self.mdl = try M.Model.load(l, layers orelse self.cfg.layers);
         self.mtp = try T.Mtp.load(l);
         pack.dropCache();
+        self.tier = null;
+        if (std.c.getenv("TF_GLM_TIER")) |e| {
+            const kvt = glm.tier.kv;
+            var dsa_layers: usize = 0;
+            for (self.mdl.layers) |x| dsa_layers += @intFromBool(x.dsa != null);
+            const tl = @max(dsa_layers, 1);
+            const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-pair-r{d}.bin", .{ std.mem.span(e), rank }, 0);
+            defer gpa.free(path);
+            const cap = @max(std.mem.alignForward(usize, tier_capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
+            const runs = tier_streams * tl * kvt.home_runs + 8;
+            self.tier = try glm.tier.Tier.init(gpa, d, .{ .streams = tier_streams, .layers = tl, .capacity = cap, .row_bytes = self.cfg.kv_lora * 2, .recent_runs = 2 }, runs * kvt.run_pools * kvt.block, E.prompt_rows, glm.glue.sparse_tokens, path);
+        }
+    }
+
+    /// Tier streams a test may open, and the positions each holds.
+    pub const tier_streams = 8;
+    pub const tier_capacity = 8192;
+
+    /// Sequence `i`'s tier streams (backbone 2i, head 2i + 1), opened afresh (nothing without a tier).
+    pub fn tierOpen(self: *Rank, q: *E.Seq, i: usize) !void {
+        const t = self.tier orelse return;
+        const nd = q.st.caches.len;
+        try t.open(2 * i, @max(nd, 1));
+        try t.open(2 * i + 1, 1);
+        q.tier = .{ .t = t, .h = 2 * i, .hm = 2 * i + 1 };
     }
 
     pub fn deinit(self: *Rank) void {
+        if (self.tier) |t| t.deinit(self.gpa);
         self.mtp.deinit();
         self.mdl.deinit();
         self.tk.deinit();
