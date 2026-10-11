@@ -69,11 +69,13 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
     defer po.deinit();
     var st = try F.KdaState.init(d, lay, nk, 16);
     defer st.deinit();
+    // TF_GLM_KV: the DSA caches' format (bf16 unless fp8)
+    const kv = try A.Kv.parse(if (std.c.getenv("TF_GLM_KV")) |v| std.mem.span(v) else "");
     const caches = try gpa.alloc(A.Cache, nd);
     defer gpa.free(caches);
-    for (caches) |*c| c.* = try A.Cache.init(d, &cfg, capacity, A.indexRing(capacity, P.chunk_rows));
+    for (caches) |*c| c.* = try A.Cache.init(d, &cfg, capacity, A.indexRing(capacity, P.chunk_rows), kv);
     defer for (caches) |*c| c.deinit();
-    var mcache = try A.Cache.init(d, &cfg, capacity, A.indexRing(capacity, P.chunk_rows));
+    var mcache = try A.Cache.init(d, &cfg, capacity, A.indexRing(capacity, P.chunk_rows), kv);
     defer mcache.deinit();
     var pos_dev = try Buf.alloc(d, 16);
     defer pos_dev.free();
