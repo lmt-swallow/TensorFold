@@ -188,8 +188,10 @@ pub const Work = struct {
         w.pms = try M.Scratch.init(d, lay, prompt_rows, true);
         w.temp = try kda.Temp.init(d, @max(rows, prompt_rows), lay.size(.lin));
         w.pscratch = try kda.Scratch.init(d, 1, prompt_rows, lay.size(.lin));
-        w.fnormed = try Buf.alloc(d, prompt_rows * c.hidden * 2);
-        w.fxs = try Buf.alloc(d, prompt_rows * c.hidden / 64 * 4);
+        // the final norm's rows: a prompt chunk's or a decode window's, whichever is wider
+        const fr = @max(rows, prompt_rows);
+        w.fnormed = try Buf.alloc(d, fr * c.hidden * 2);
+        w.fxs = try Buf.alloc(d, fr * c.hidden / 64 * 4);
         w.logits = try Buf.alloc(d, rows * lay.size(.vocab) * 2);
         return w;
     }
