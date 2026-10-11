@@ -469,3 +469,67 @@ pub const Ple = struct {
         self.head_bias.free();
     }
 };
+
+/// A sparse-attention layer's own tensors (exl3.py `attention`): the projection [q (with its gate) | k | v | index qk]
+/// as four EXL3 groups, the centred q, k, index-q and index-k norms (fp32), and o_proj.
+pub const Attn = struct {
+    q: Group,
+    k: Group,
+    v: Group,
+    iqk: Group,
+    o: Group,
+    q_scale: cuda.DeviceBuffer,
+    k_scale: cuda.DeviceBuffer,
+    iq_scale: cuda.DeviceBuffer,
+    ik_scale: cuda.DeviceBuffer,
+
+    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, i: usize, offset: f32) !Attn {
+        var n: names.Name = .{};
+        var a: Attn = undefined;
+        a.q = try pack.group(names.layer(&n, i, "self_attn.q_proj"));
+        a.k = try pack.group(names.layer(&n, i, "self_attn.k_proj"));
+        a.v = try pack.group(names.layer(&n, i, "self_attn.v_proj"));
+        a.iqk = try pack.group(names.layer(&n, i, "self_attn.indexer.index_qk_proj"));
+        a.o = try pack.group(names.layer(&n, i, "self_attn.o_proj"));
+        const parts = [_][]const u8{ "self_attn.q_norm.weight", "self_attn.k_norm.weight", "self_attn.indexer.q_layernorm.weight", "self_attn.indexer.k_layernorm.weight" };
+        var bufs: [4]cuda.DeviceBuffer = undefined;
+        var made: usize = 0;
+        errdefer for (bufs[0..made]) |*b| b.free();
+        for (parts, &bufs) |p, *b| {
+            const t = try pack.get(n.of(names.lm ++ "layers.{d}.{s}", .{ i, p }));
+            const v = try widen(gpa, t);
+            defer gpa.free(v);
+            for (v) |*x| x.* += offset;
+            b.* = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(v));
+            made += 1;
+        }
+        a.q_scale, a.k_scale, a.iq_scale, a.ik_scale = bufs;
+        return a;
+    }
+
+    pub fn deinit(self: *Attn) void {
+        self.q_scale.free();
+        self.k_scale.free();
+        self.iq_scale.free();
+        self.ik_scale.free();
+    }
+
+    /// The projection row's width: q (heads * head_dim * 2, the gate interleaved as 0.6.6 stores it) + k + v + index.
+    pub fn projWidth(self: *const Attn) usize {
+        return self.q.n() + self.k.n() + self.v.n() + self.iqk.n();
+    }
+};
+
+/// The rotary inverse frequencies (exl3.py `load`): theta ** (-j / half) in fp64, j < half, then rounded to fp32.
+pub fn invFreq(out: []f32, theta: f64) void {
+    const half: f64 = @floatFromInt(out.len);
+    for (out, 0..) |*v, j| v.* = @floatCast(std.math.pow(f64, theta, -@as(f64, @floatFromInt(j)) / half));
+}
+
+test "inverse frequencies round as fp64 pow then fp32" {
+    var got: [32]f32 = undefined;
+    invFreq(&got, 10_000_000);
+    // numpy float64 ** then astype(float32), the same arithmetic as the loader's torch float64 pow
+    const want = [_]u32{ 0x3f800000, 0x3f1ab32b, 0x3ebaf81a, 0x3e61f836, 0x3e088d77, 0x3da50957, 0x3d47763f, 0x3cf11176, 0x3c91ad39, 0x3c301052, 0x3bd4ca14, 0x3b80967d, 0x3b1b690d, 0x3abbd3ec, 0x3a6301e2, 0x3a092e02, 0x39a5cb5f, 0x394860c1, 0x38f22ce3, 0x3892587f, 0x3830df51, 0x37d5c442, 0x37812dac, 0x371c1fc4, 0x36bcb0c1, 0x36640cc6, 0x3609cf4b, 0x35a68e4c, 0x35494c56, 0x34f3499c, 0x3493048e, 0x3431af44 };
+    for (got, want) |g, w| try std.testing.expectEqual(w, @as(u32, @bitCast(g)));
+}
