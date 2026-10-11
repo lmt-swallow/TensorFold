@@ -159,12 +159,25 @@ pub const Kernels = struct {
             aot.ptr("IQ", "*bf16", iq), aot.ptr("POOLED", "*bf16", c.pooled.ptr), aot.ptr("POS0", "*i32", pos0),
             aot.ptr("SC", "*fp32", s.scores.ptr), aot.int("NB", n32(s.nb)),
         }, &.{ aot.ci("HI", @intCast(cfg.index_heads)), aot.ci("DI", @intCast(cfg.index_dim)), aot.ci("RATIO", @intCast(s.ratio)), aot.ci("TOP", @intCast(top)), aot.ci("BB", @intCast(bb)) });
+        try k.select(pos0, s, rows, blocks, false, stream);
+    }
+
+    /// attention.py `_launch_select`: each row's selected blocks from s.scores (`blocks` of them bound the launch):
+    /// `_select` while they fit its registers, else `_select_tiles` (the same lists, read in tiles: 4,096 blocks a
+    /// tile for a prompt's row blocks, 8,192 for a decode window). `tiles` takes `_select_tiles` at any width (tests).
+    pub fn select(k: Kernels, pos0: Ptr, s: *const Scratch, rows: usize, blocks: usize, tiles: bool, stream: cuda.Stream) !void {
+        const top = s.budget / s.ratio;
         const width = std.math.ceilPowerOfTwoAssert(usize, blocks);
-        if (width > select_regs) return error.SelectTilesNotPorted; // _select_tiles: past 131,072 keys
-        try k.set.run(stream, "_select", .{ @intCast(rows), 1, 1 }, &.{
+        const args = [_]aot.Arg{
             aot.ptr("SC", "*fp32", s.scores.ptr), aot.ptr("POS0", "*i32", pos0), aot.ptr("IDS", "*i32", s.ids.ptr),
             aot.ptr("NKR", "*i32", s.nk.ptr),     aot.ptr("SPR", "*i32", s.sparse.ptr), aot.int("NB", n32(s.nb)),
-        }, &.{ aot.ci("RATIO", @intCast(s.ratio)), aot.ci("TOP", @intCast(top)), aot.ci("IDW", @intCast(s.idw)), aot.ci("BLOCK", @intCast(width)) });
+        };
+        if (width <= select_regs and !tiles) {
+            try k.set.run(stream, "_select", .{ @intCast(rows), 1, 1 }, &args, &.{ aot.ci("RATIO", @intCast(s.ratio)), aot.ci("TOP", @intCast(top)), aot.ci("IDW", @intCast(s.idw)), aot.ci("BLOCK", @intCast(width)) });
+            return;
+        }
+        const tb: i64 = if (rows >= 64) 4096 else 8192;
+        try k.set.run(stream, "_select_tiles", .{ @intCast(rows), 1, 1 }, &args, &.{ aot.ci("RATIO", @intCast(s.ratio)), aot.ci("TOP", @intCast(top)), aot.ci("IDW", @intCast(s.idw)), aot.ci("TB", tb) });
     }
 
     /// attention.py `attention` (bf16 caches): q [rows, heads, head_dim] against each row's keys -> s.out bf16.

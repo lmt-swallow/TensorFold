@@ -92,7 +92,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.SamplingNotPorted => "this engine decodes greedily for now: send temperature 0",
-        error.SelectTilesNotPorted => "past 131,072 positions the indexer's tiled block selection is not ported yet: lower the context",
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
         else => null,
     };
