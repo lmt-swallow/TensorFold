@@ -57,7 +57,7 @@ say "starting $NAME on $NODE: --parallel $PARALLEL --context $CONTEXT"
 on "mkdir -p \$HOME/.cache/tensorfold-qwen38fn-0.6.6/torch_extensions \$HOME/.cache/tensorfold-qwen38fn-0.6.6/triton && \
   docker run -d --name $NAME --gpus all --ipc=host --net=host --user \$(id -u):\$(id -g) -e HOME=/tmp \
   -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton \
-  -v \$HOME/.cache/tensorfold-qwen38fn-0.6.6:/cache -v \$HOME/models/$MODEL:/model:ro ${capture[*]} $IMAGE \
+  -v \$HOME/.cache/tensorfold-qwen38fn-0.6.6:/cache -v \$HOME/models/$MODEL:/model:ro ${capture[*]:-} $IMAGE \
   serve /model --name qwen38fn --host 0.0.0.0 --port $HTTP_PORT --parallel $PARALLEL --context $CONTEXT ${EXTRA_ARGS:-}" >/dev/null
 on "docker logs -f $NAME" >"$LOG_DIR/$NAME.log" 2>&1 &
 LOG_PID=$!
