@@ -2,9 +2,9 @@
 //! forward (cuda_model.zig `forwardSegs`) against each stream's windows alone, on both Sparks (master "local": both
 //! ranks on this GPU, the first `layers` layers). The streams' prompts are prefixes of the forward fixture's (some
 //! past the dense limit, some within it); every round each stream verifies a window of its pending token and a few
-//! forced tokens (widths changing round to round, up to `E.batch_rows` rows in all) and keeps one row. Every row's
-//! logits and sample must be the same in the shared forward as alone, and alone as on the single-stream path the
-//! fixtures check (cuda_model.zig `forward`).
+//! forced tokens (widths changing round to round, up to `E.batch_rows` rows in all) and keeps `keeps` of them. Every
+//! row's logits and sample must be the same in the shared forward as alone, and alone as on the single-stream path
+//! the fixtures check (cuda_model.zig `forward`).
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm53");
@@ -22,6 +22,8 @@ const streams = 4;
 const rounds = 6;
 /// Each stream's window rows by round (the pending token and forced tokens), at most `E.batch_rows` (16) rows a round in all.
 const widths = [rounds][streams]usize{ .{ 1, 1, 1, 1 }, .{ 1, 3, 8, 4 }, .{ 8, 4, 2, 2 }, .{ 2, 11, 1, 2 }, .{ 4, 4, 4, 4 }, .{ 1, 13, 1, 1 } };
+/// Each window's kept rows by round (fewer than its rows: the KDA states replay, the rest is rewritten next round).
+const keeps = [rounds][streams]usize{ .{ 1, 1, 1, 1 }, .{ 1, 2, 5, 4 }, .{ 3, 1, 2, 1 }, .{ 2, 6, 1, 1 }, .{ 4, 1, 3, 2 }, .{ 1, 5, 1, 1 } };
 /// The prompts' lengths: past the dense limit (2,051) and within it.
 const lengths = [streams]usize{ 3000, 2100, 1200, 333 };
 
@@ -75,8 +77,9 @@ fn decode(rk: *pair.Rank, r: *E.Runner, pool: *const P.Pool, seqs: *[streams]E.S
             },
         }
         for (0..streams) |i| {
-            try r.commit(&seqs[i], ws[i], 1);
-            pending[i] = outs[i][0];
+            const k = keeps[round][i];
+            try r.commit(&seqs[i], ws[i], k);
+            pending[i] = outs[i][k - 1];
         }
     }
     _ = gpa;
