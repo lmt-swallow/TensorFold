@@ -221,6 +221,23 @@ pub const Lanes = struct {
         t.prefetch(ids[0..n]);
     }
 
+    /// The n-gram table rows of the prompt chunk starting at row `start` (its history: the prompt's n - 1 tokens
+    /// before it), asked of the page cache ahead of its stage. The first chunk's history is the initial one: not asked.
+    fn prefetchPrompt(self: *Lanes, ids: []const i32, start: usize) void {
+        const g = &(self.m.ng orelse return);
+        const t = &(self.m.table orelse return);
+        const ctx = g.n - 1;
+        if (start < ctx or start >= ids.len) return;
+        const end = @min(start + self.pb.rows, ids.len);
+        const seq = self.gpa.alloc(i64, ctx + end - start) catch return;
+        defer self.gpa.free(seq);
+        for (ids[start - ctx .. end], seq) |x, *y| y.* = x;
+        const rows = self.gpa.alloc(i64, (end - start) * g.heads()) catch return;
+        defer self.gpa.free(rows);
+        g.idsAny(self.gpa, seq[0..ctx], seq[ctx..], rows) catch return;
+        t.prefetch(rows);
+    }
+
     /// The lane's stream, its pending window committed first (`kept` rows, else all of them).
     fn bindLane(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
         const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
@@ -276,6 +293,8 @@ pub const Lanes = struct {
         while (n < chunks and f.start < f.ids.len) : (n += 1) {
             if (s.isCancelled()) return error.Cancelled;
             f.start = try mtp.prefillChunk(self.head, &self.pr, l.st, &self.pb, if (self.scp) |*x| x else null, f.ids, f.start, l.last, self.stream);
+            // the chunk computes on the device: meanwhile the next chunk's n-gram rows are asked of the page cache
+            self.prefetchPrompt(f.ids, f.start);
         }
         if (f.start < f.ids.len) return false;
         var first: [1]u32 = undefined;
