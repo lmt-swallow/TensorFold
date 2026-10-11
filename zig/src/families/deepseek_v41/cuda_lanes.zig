@@ -1708,20 +1708,37 @@ pub const Streams = struct {
         return @min(@min(self.most, rope_rows), self.runner.bucket) -| rows;
     }
 
-    /// `probeRound` with its rows at `position` .. `position + rows - 1`: the round scans their bucket.
+    /// `probeRound` with its rows at `position` .. `position + rows - 1`: the round scans their bucket. Its rows
+    /// carry `probeIds`.
     pub fn probeRoundAt(self: *Streams, gather: forward.Gather, rows: usize, position: usize) !void {
         const noise: i32 = @intCast(self.cfg.dspark_noise);
         if (rows < 1 or rows > self.rows) return error.WindowTooWide;
-        var ids: [round_rows_most]i64 = @splat(noise);
+        var ids: [round_rows_most]i64 = undefined;
+        probeIds(self.cfg.vocab, &ids);
         const w = [1]rounds.Window{.{ .slot = 0, .base = 0, .size = self.most, .position = position, .ids = ids[0..rows] }};
         if (self.engram != null) {
-            // the rows' n-grams reach before them: noise there too (the history is otherwise unset)
-            @memset(self.lanes[0].hist[position -| 64 .. position + rows], noise);
+            // the rows' n-grams reach before them: noise there (the history is otherwise unset), the rows' own ids
+            @memset(self.lanes[0].hist[position -| 64 .. position], noise);
+            for (self.lanes[0].hist[position..][0..rows], ids[0..rows]) |*h, id| h.* = @intCast(id);
             var hw = w;
             hw[0].host = self.lanes[0].hist[0 .. position + rows];
             self.logits = try self.runner.forward(&hw, gather, self.stream);
         } else self.logits = try self.runner.forward(&w, gather, self.stream);
     }
+
+    /// The timing step's row ids: distinct ids of the vocabulary's ordinary range (below `probe_id_top`) from a
+    /// fixed seed, the same on every rank and in every probe. A reply's rows are distinct tokens that route to
+    /// different experts; identical ids would share theirs and price a round's extra rows too low.
+    pub fn probeIds(vocab: usize, out: []i64) void {
+        var prng: std.Random.DefaultPrng = .init(probe_seed);
+        const r = prng.random();
+        const top = @min(vocab, probe_id_top);
+        for (out) |*id| id.* = @intCast(r.intRangeLessThan(usize, probe_id_least, top));
+    }
+
+    pub const probe_seed: u64 = 0x5eed_c057;
+    pub const probe_id_least: usize = 1000;
+    pub const probe_id_top: usize = 100_000;
 
     /// Records the round graphs of 1 .. min(`rows`, `warm_rows_max`) rows at the buckets bucket_min ..
     /// `warm_bucket_max` the runner scans (the others are recorded on first use) and the batched drafts' of 1 .. `passStreams` streams, ahead of the rounds and drafts
@@ -1792,8 +1809,10 @@ pub const Engine = struct {
     /// A round's ms by rows (index rows - 1) at the least bucket and a batched draft's by streams (index streams -
     /// 1), timed at load by the `measure` step (rank 0's clock).
     round_ms: [round_rows_most]f64,
-    /// A round's ms of 1 and `streams.rows` rows at the widest bucket (the context's), the same step's.
-    round_deep_ms: [2]f64,
+    /// A round's ms by `probe_rows` (index: the row count's) with its rows ending at `deep_end[i]` (0: not timed),
+    /// the same step's: rounds deeper in a stream's extent read more keys a row.
+    deep_ms: [probe_ends.len][probe_rows_most]f64,
+    deep_end: [probe_ends.len]usize,
     draft_ms: [max_slots]f64,
     streams: Streams,
     /// Prompt rows a chunk (the settings' chunk, at most the context).
@@ -1880,7 +1899,8 @@ pub const Engine = struct {
         e.stages = &.{};
         e.drafter = null;
         e.round_ms = @splat(0);
-        e.round_deep_ms = @splat(0);
+        e.deep_ms = @splat(@splat(0));
+        e.deep_end = @splat(0);
         e.draft_ms = @splat(0);
         errdefer e.freeDrafter();
         if (s.drafts) {
@@ -2104,7 +2124,8 @@ pub const Engine = struct {
     }
 
     /// The measure step (every rank): rounds of 1 .. `streams.rows` rows at position 0 of slot 0 (the least bucket),
-    /// of 1 and `streams.rows` rows at the widest bucket (`probeDeep`), then batched drafts of 1 .. passStreams streams, each
+    /// of `probeRows` rows ending at each of `probe_ends` (at most a stream's deepest, `probeDeep(0)`; an end not
+    /// past the one before is skipped), then batched drafts of 1 .. passStreams streams, each
     /// timed after a warm-up run. Rank 0 keeps the times. The positions follow from the record's window alone, so
     /// every rank runs the same buckets. With the record's `at`, rank 0 also logs rounds of 1 .. `streams.rows` rows at
     /// that position (at most `probeDeep`'s): the costs the facts leave out, for the record.
@@ -2112,7 +2133,16 @@ pub const Engine = struct {
         const reps: usize = @max(m.reps, 1);
         const st = &e.streams;
         for (1..st.rows + 1) |n| e.round_ms[n - 1] = try e.timeRound(reps, n, 0);
-        for ([_]usize{ 1, st.rows }, &e.round_deep_ms) |n, *ms| ms.* = try e.timeRound(reps, n, st.probeDeep(n));
+        var row_counts: [probe_rows_most]usize = undefined;
+        const counts = probeRows(st.rows, &row_counts);
+        var last: usize = rounds.bucket_min;
+        for (probe_ends, &e.deep_ms, &e.deep_end) |want, *ms, *end| {
+            const at = @min(want, st.probeDeep(0));
+            if (at <= last or at < st.rows) continue;
+            last = at;
+            end.* = at;
+            for (counts, ms[0..counts.len]) |n, *t| t.* = try e.timeRound(reps, n, at - n);
+        }
         if (m.at > 0) {
             var at_ms: [round_rows_most]f64 = undefined;
             for (at_ms[0..st.rows], 1..) |*ms, n| ms.* = try e.timeRound(reps, n, @min(m.at, st.probeDeep(n)));
@@ -2213,6 +2243,22 @@ pub const Engine = struct {
             if (e.link.profile) e.link.note(e.settings.rank, .{ t1 - t0, nowNs() - t1 });
             try e.step(Engine.run, .{ e, op });
         }
+    }
+
+    /// The positions the measure step times rounds ending at (past `rounds.bucket_min`; the last: a stream's deepest).
+    pub const probe_ends = [_]usize{ 1 << 16, 1 << 18, std.math.maxInt(usize) };
+    pub const probe_rows_most = 7;
+
+    /// The row counts timed at `probe_ends`: the powers of two below `rows`, then `rows`. Returns a prefix of `out`.
+    pub fn probeRows(rows: usize, out: *[probe_rows_most]usize) []const usize {
+        var n: usize = 0;
+        var r: usize = 1;
+        while (r < rows and n + 1 < out.len) : (r *= 2) {
+            out[n] = r;
+            n += 1;
+        }
+        out[n] = rows;
+        return out[0 .. n + 1];
     }
 
     /// Rank 0: time the rounds and drafts on every rank (the `measure` step); `round_ms` and `draft_ms` hold rank
@@ -2387,6 +2433,14 @@ fn loadRopeTable(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir:
     return .{ .cos = cos, .sin = sin, .rows = rows };
 }
 
+/// TF_DS_POSITION_COSTS=1: the facts carry the forwards' costs by position (each stream's rows priced at its
+/// position); unset or 0, every stream's rows are priced as at the least bucket. Either way the tokens are the same;
+/// only the rows a round verifies differ.
+pub fn positionCostsFromEnv() bool {
+    const v = std.mem.span(std.c.getenv("TF_DS_POSITION_COSTS") orelse return false);
+    return std.mem.eql(u8, v, "1");
+}
+
 /// The round loop's facts: shared rounds of up to `slots` streams and `rounds.rows_default` rows (`hidden_rows`;
 /// `factsWith`: `rows`), windows of
 /// up to `draft_width` rows (`factsWith`: `width`); with the drafter, every drafting stream's drafts in one batch (`draft_streams`) and
@@ -2449,6 +2503,11 @@ pub const Lanes = struct {
     next: u64 = 0,
     window_costs: [max_rows]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
     shared_costs: [round_rows_most]lanes.config.Cost = @splat(.{ .width = 0, .ms = 0 }),
+    /// A window's forward ms by rows at the least bucket and at each timed `Engine.probe_ends` (`position_costs`
+    /// the first `n_positions`), for the facts' position costs (TF_DS_POSITION_COSTS=1).
+    position_rows: [1 + Engine.probe_ends.len][round_rows_most]lanes.config.Cost = undefined,
+    position_costs: [1 + Engine.probe_ends.len]lanes.allocate.PositionCosts.Timed = undefined,
+    n_positions: usize = 0,
     /// Keeps not yet sent (TF_DS_TAIL on): the next step carries them, and a drafts step whose absorb keeps the same
     /// rows of a stream makes its keep moot (`Streams.draft` sets the length there itself). Every other step sends
     /// them first, so each rank sees the same lengths at every step as without the deferral.
@@ -2456,11 +2515,13 @@ pub const Lanes = struct {
     keeps: [max_slots]KeepAsk = undefined,
     n_keeps: usize = 0,
     /// TF_DS_DRAFT_STATS=1: each slot's stream's draft tallies, logged as it leaves, the served streams' summed,
-    /// and the rounds by their rows (index: rows)
+    /// and the rounds by their rows (index: rows) with their forwards' summed ms (the round step to its draw read
+    /// back, rank 0's clock: what the facts' costs predict)
     stats_on: bool = false,
     stats: [max_slots]draft_stats.Stats = @splat(.{}),
     stats_all: draft_stats.Stats = .{},
     round_rows: [round_rows_most + 1]u64 = @splat(0),
+    round_rows_ms: [round_rows_most + 1]f64 = @splat(0),
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine) Lanes {
         return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv(), .stats_on = draft_stats.enabled() };
@@ -2497,6 +2558,12 @@ pub const Lanes = struct {
         var first = true;
         for (self.round_rows, 0..) |c, r| if (c > 0) {
             aw.print("{s}{d}:{d}", .{ if (first) "" else ",", r, c }) catch {};
+            first = false;
+        };
+        aw.writeAll(" ms=") catch {};
+        first = true;
+        for (self.round_rows, self.round_rows_ms, 0..) |c, ms, r| if (c > 0) {
+            aw.print("{s}{d}:{d:.2}", .{ if (first) "" else ",", r, ms / @as(f64, @floatFromInt(c)) }) catch {};
             first = false;
         };
         std.log.info("deepseek_v41: draft stats, every stream so far: {s}", .{aw.buffered()});
@@ -2558,13 +2625,30 @@ pub const Lanes = struct {
             c.* = .{ .width = @intCast(rows), .ms = ms };
         }
         for (self.window_costs[0..self.width()], 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
-        std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket ({d} and {d} rows {any} ms at the {d}-position bucket), batched drafts of 1..{d} streams {any} ms", .{ e.streams.rows, e.round_ms[0..e.streams.rows], rounds.bucket_min, 1, e.streams.rows, e.round_deep_ms, e.streams.runner.bucket, max_slots, e.draft_ms });
+        std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket, batched drafts of 1..{d} streams {any} ms", .{ e.streams.rows, e.round_ms[0..e.streams.rows], rounds.bucket_min, max_slots, e.draft_ms });
+        // the forwards by position: the least bucket's rows, then each timed end's
+        var row_counts: [Engine.probe_rows_most]usize = undefined;
+        const counts = Engine.probeRows(e.streams.rows, &row_counts);
+        for (self.position_rows[0][0..e.streams.rows], e.round_ms[0..e.streams.rows], 1..) |*c, ms, n| c.* = .{ .width = @intCast(n), .ms = ms };
+        self.position_costs[0] = .{ .position = rounds.bucket_min, .costs = self.position_rows[0][0..e.streams.rows] };
+        self.n_positions = 1;
+        for (e.deep_end, &e.deep_ms) |end, ms| {
+            if (end == 0) continue;
+            const row = &self.position_rows[self.n_positions];
+            for (row[0..counts.len], counts, ms[0..counts.len]) |*c, n, t| c.* = .{ .width = @intCast(n), .ms = t };
+            self.position_costs[self.n_positions] = .{ .position = end, .costs = row[0..counts.len] };
+            self.n_positions += 1;
+            std.log.info("deepseek_v41: rounds of {any} rows ending at position {d}: {any} ms", .{ counts, end, ms[0..counts.len] });
+        }
+        if (!positionCostsFromEnv()) self.n_positions = 0;
     }
 
     pub fn facts(self: *const Lanes) lanes.Model {
         const timed = self.shared_costs[0].ms > 0;
         const rows = self.e.streams.rows;
-        return factsWith(self.e.drafter != null, self.width(), self.e.streams.lanes.len, rows, if (timed) self.window_costs[0..self.width()] else &.{}, if (timed) self.shared_costs[0..rows] else &.{});
+        var m = factsWith(self.e.drafter != null, self.width(), self.e.streams.lanes.len, rows, if (timed) self.window_costs[0..self.width()] else &.{}, if (timed) self.shared_costs[0..rows] else &.{});
+        if (timed) m.position_costs = self.position_costs[0..self.n_positions];
+        return m;
     }
 
     /// The window rows the host sizes the round loop for (`Loaded.rows`): a window's drafts at most and the pending
@@ -2712,10 +2796,12 @@ pub const Lanes = struct {
             if (self.stats_on) self.offerStats(slot, w);
         }
         if (self.stats_on) self.round_rows[r] += 1;
+        const t0 = nowNs();
         try e.both(Round.encode(e.op_buf, rws[0..windows.len]));
         // every window's rows in one draw (one read back), then each window's share
         var sampled: [round_rows_most]u32 = undefined;
         try st.argmaxRows(0, sampled[0..r]);
+        if (self.stats_on) self.round_rows_ms[r] += msSince(t0);
         r = 0;
         for (windows, out) |w, o| {
             @memcpy(o.sampled[0..w.rows()], sampled[r..][0..w.rows()]);
@@ -3129,4 +3215,21 @@ test "admission, free, fill, round, drafts, keeps and measure records parse back
     wide[3] = round_rows_most + 1;
     var rr: Round = undefined;
     try std.testing.expectError(error.BadRecord, Round.parse(&wide, &rr));
+}
+
+test "the measure step's rows: powers of two below the round's rows, then its rows; its ids distinct, fixed and ordinary" {
+    var out: [Engine.probe_rows_most]usize = undefined;
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 4, 8, 16 }, Engine.probeRows(16, &out));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 4, 8, 12 }, Engine.probeRows(12, &out));
+    try std.testing.expectEqualSlices(usize, &.{1}, Engine.probeRows(1, &out));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 4, 8, 16, 32 }, Engine.probeRows(round_rows_most, &out));
+    var a: [round_rows_most]i64 = undefined;
+    var b: [round_rows_most]i64 = undefined;
+    Streams.probeIds(129280, &a);
+    Streams.probeIds(129280, &b);
+    try std.testing.expectEqualSlices(i64, &a, &b);
+    for (a, 0..) |x, i| {
+        try std.testing.expect(x >= Streams.probe_id_least and x < Streams.probe_id_top);
+        for (a[0..i]) |y| try std.testing.expect(x != y);
+    }
 }
