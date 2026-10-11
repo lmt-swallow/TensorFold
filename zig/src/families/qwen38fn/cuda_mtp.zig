@@ -72,7 +72,8 @@ pub fn pack(gpa: std.mem.Allocator, d: *const cuda.Driver, rows: []const f32, n:
             lo = @min(lo, x);
             hi = @max(hi, x);
         }
-        const sbits = weights.f32ToBf16(@max((hi - lo) / 15.0, 1e-8));
+        // torch's CUDA division by a Python scalar multiplies by its fp32 reciprocal
+        const sbits = weights.f32ToBf16(@max((hi - lo) * @as(f32, 1.0 / 15.0), 1e-8));
         const bbits = weights.f32ToBf16(lo);
         scales[g * npad + c] = sbits;
         biases[g * npad + c] = bbits;
