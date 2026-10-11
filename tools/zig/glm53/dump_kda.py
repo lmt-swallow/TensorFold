@@ -56,7 +56,7 @@ def main() -> int:
     from tensorfold.families.glm5_next.cuda import kda as kda_mod
 
     pair = ref.Pair(rec)
-    ws = [ref.load_rank(a.model, r, [0], mtp=False, long_context=False) for r in (0, 1)]
+    ws = [ref.load_rank(a.model, r, [0], mtp=False, long_context=True) for r in (0, 1)]  # past 2,051 tokens (no index caches: no DSA layer)
     if ws[0].layers[0].kind != "kda" or ws[0].layers[0].mlp is None:
         raise SystemExit("layer 0 must be a KDA layer with a dense MLP")
     for r, w in enumerate(ws):
