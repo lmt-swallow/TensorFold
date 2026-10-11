@@ -404,8 +404,7 @@ pub const Lanes = struct {
         };
         if (requests.len > max_streams) return error.TooManyStreams;
         const t0 = if (self.stats) |*st| st.begin() else 0;
-        const sample0 = h.sample_ns;
-        defer if (self.stats) |*st| st.draft(t0, h.sample_ns - sample0);
+        defer if (self.stats) |*st| st.draft(t0);
         const wide = self.m.cfg.wide();
         var next: [max_streams][max_rows]i32 = undefined;
         var reqs: [max_streams]mtp.Head.Request = undefined;

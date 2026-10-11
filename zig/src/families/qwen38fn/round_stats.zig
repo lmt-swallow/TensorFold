@@ -1,6 +1,6 @@
 //! TF_QFN_ROUND_STATS=1: where the serving time goes, logged every ten seconds the backend is busy. Rounds by
 //! stream count; verify forwards by total rows (count and wall ms, the device's work and the draws' read-back
-//! included); the head's drafting (wall ms, of it the host's draft sampling); commits; prompt chunks; and the time
+//! included); the head's drafting (wall ms); commits; prompt chunks; and the time
 //! between backend calls (the round loop, the HTTP side, an idle server). A window also ends when the last stream
 //! leaves. It only observes: no choice reads it.
 const std = @import("std");
@@ -27,7 +27,6 @@ pub const Stats = struct {
     verify_ms: f64 = 0,
     draft_ms: f64 = 0,
     draft_calls: u64 = 0,
-    sample_ms: f64 = 0,
     keep_ms: f64 = 0,
     kept: u64 = 0,
     prompt_ms: f64 = 0,
@@ -69,10 +68,9 @@ pub const Stats = struct {
         s.maybeLog();
     }
 
-    pub fn draft(s: *Stats, t0: i128, sample_ns: u64) void {
+    pub fn draft(s: *Stats, t0: i128) void {
         s.draft_ms += s.end(t0);
         s.draft_calls += 1;
-        s.sample_ms += @as(f64, @floatFromInt(sample_ns)) / 1e6;
     }
 
     pub fn keep(s: *Stats, t0: i128, tokens: usize) void {
@@ -107,8 +105,8 @@ pub const Stats = struct {
         for (s.rounds[1..], 1..) |n, k| if (n > 0) w.print(" {d}:{d}", .{ k, n }) catch {};
         w.print("; verify by rows", .{}) catch {};
         for (s.rows_n, s.rows_ms, 0..) |n, t_ms, r| if (n > 0) w.print(" {d}:{d}x{d:.1}ms", .{ r, n, t_ms / @as(f64, @floatFromInt(n)) }) catch {};
-        w.print("; verify {d:.0} ms ({d:.0}%), draft {d:.0} ms in {d} calls ({d:.0}%, host sampling {d:.0} ms), keep {d:.0} ms, prompt {d:.0} ms in {d} chunks ({d:.0}%), between calls {d:.0} ms ({d:.0}%); {d} tokens kept", .{
-            s.verify_ms, 100 * s.verify_ms / wall, s.draft_ms, s.draft_calls, 100 * s.draft_ms / wall, s.sample_ms, s.keep_ms, s.prompt_ms, s.prompt_chunks, 100 * s.prompt_ms / wall, s.between_ms, 100 * s.between_ms / wall, s.kept,
+        w.print("; verify {d:.0} ms ({d:.0}%), draft {d:.0} ms in {d} calls ({d:.0}%), keep {d:.0} ms, prompt {d:.0} ms in {d} chunks ({d:.0}%), between calls {d:.0} ms ({d:.0}%); {d} tokens kept", .{
+            s.verify_ms, 100 * s.verify_ms / wall, s.draft_ms, s.draft_calls, 100 * s.draft_ms / wall, s.keep_ms, s.prompt_ms, s.prompt_chunks, 100 * s.prompt_ms / wall, s.between_ms, 100 * s.between_ms / wall, s.kept,
         }) catch {};
         std.log.info("{s}", .{w.buffered()});
         s.* = .{ .since = t, .last_end = s.last_end };

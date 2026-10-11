@@ -48,6 +48,7 @@ pub const qwen38fn_experts: []const u8 = if (available) &Blob("fatbin_qwen38fn_e
 pub const qwen38fn_gdn_io: []const u8 = if (available) &Blob("fatbin_qwen38fn_gdn_io").bytes else &.{};
 pub const qwen38fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_qwen38fn_gdn_prefill").bytes else &.{};
 pub const qwen38fn_qmm: []const u8 = if (available) &Blob("fatbin_qwen38fn_qmm").bytes else &.{};
+pub const qwen38fn_draft_pick: []const u8 = if (available) &Blob("fatbin_qwen38fn_draft_pick").bytes else &.{};
 pub const qwen38fn_prompt_glue: []const u8 = if (available) &Blob("fatbin_qwen38fn_prompt_glue").bytes else &.{};
 pub const glm53_kda: []const u8 = if (available) &Blob("fatbin_glm53_kda").bytes else &.{};
 pub const glm53_hc: []const u8 = if (available) &Blob("fatbin_glm53_hc").bytes else &.{};

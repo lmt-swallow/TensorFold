@@ -110,12 +110,16 @@ pub fn splitK(n: usize, k: usize) usize {
 pub const Kernels = struct {
     module: cuda.Module,
     qmm: [3]cuda.Function, // BM 16, 32, 64; no K slices
+    pick_module: cuda.Module,
+    pick: cuda.Function, // tf_qfn_draft_pick (draft_pick.cu)
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var module = try cuda.Module.load(d, cuda.kernels.qwen38fn_qmm);
         errdefer module.unload();
-        return .{ .module = module, .qmm = .{
+        var pick_module = try cuda.Module.load(d, cuda.kernels.qwen38fn_draft_pick);
+        errdefer pick_module.unload();
+        return .{ .module = module, .pick_module = pick_module, .pick = try pick_module.function("tf_qfn_draft_pick"), .qmm = .{
             try module.function("_ZN10tf_qfn_qmm10qmm_kernelILi32ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii"),
             try module.function("_ZN10tf_qfn_qmm10qmm_kernelILi32ELi32ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii"),
             try module.function("_ZN10tf_qfn_qmm10qmm_kernelILi32ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii"),
@@ -123,6 +127,7 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(self: *Kernels) void {
+        self.pick_module.unload();
         self.module.unload();
     }
 
@@ -197,12 +202,12 @@ pub const Head = struct {
     ids: []u32, // the draft head's rows' token ids
     k: Kernels,
     logits: cuda.DeviceBuffer, // bf16 [streams, draft vocab]: each segment's last row's draft logits
-    host: []u16,
+    picks: cuda.DeviceBuffer, // per logits row: int32 token index, then (after `streams` of them) fp64 probability
+    pick_tok: [16]i32 = undefined, // the last head call's picks, read back
+    pick_prob: [16]f64 = undefined,
     streams: usize, // the most segments one head call takes
     gx: cuda.DeviceBuffer, // bf16 [streams, D]: each segment's last row, gathered for one draft-head call
     gxs: cuda.DeviceBuffer, // fp32 [streams, D / 32]: their group sums
-    /// Host nanoseconds spent in sampleDraft (its read-back and the host's top and sum), for TF_QFN_ROUND_STATS.
-    sample_ns: u64 = 0,
     /// A test's hook after each head call (its streams in the buffers it ran on; decode calls' logits in self.logits).
     probe: ?Probe = null,
 
@@ -252,9 +257,9 @@ pub const Head = struct {
         h.k = try Kernels.load(d);
         h.streams = streams;
         h.logits = try cuda.DeviceBuffer.alloc(d, streams * h.draft_head.npad * 2);
+        h.picks = try cuda.DeviceBuffer.alloc(d, streams * 16);
         h.gx = try cuda.DeviceBuffer.alloc(d, streams * cfg.hidden * 2);
         h.gxs = try cuda.DeviceBuffer.alloc(d, streams * cfg.hidden / 32 * 4);
-        h.host = try gpa.alloc(u16, h.ids.len);
         m.has_mtp = true;
         return h;
     }
@@ -269,9 +274,9 @@ pub const Head = struct {
         self.draft_head.deinit();
         self.k.deinit();
         self.logits.free();
+        self.picks.free();
         self.gx.free();
         self.gxs.free();
-        self.gpa.free(self.host);
         self.gpa.free(self.ids);
         self.gpa.destroy(self);
     }
@@ -305,6 +310,19 @@ pub const Head = struct {
             xs = h.gxs.ptr;
         }
         try h.k.matmul(&h.draft_head, x, D, xs, segs.len, h.logits.ptr, stream);
+        // each row's greedy pick and its probability on the device, read back (decode.py `sample_draft`)
+        {
+            const n = segs.len;
+            var a: cuda.Args = .{};
+            a.add(h.logits.ptr);
+            a.add(@as(c_int, @intCast(h.draft_head.n)));
+            a.add(@as(c_int, @intCast(h.draft_head.n))); // qmm's rows: n apart
+            a.add(h.picks.ptr);
+            a.add(h.picks.ptr + h.streams * 8);
+            try cuda.launch.launch(h.k.pick, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, stream, &a);
+            try h.picks.downloadAsync(0, std.mem.sliceAsBytes(h.pick_tok[0..n]), stream.handle);
+            try h.picks.downloadAsync(h.streams * 8, std.mem.sliceAsBytes(h.pick_prob[0..n]), stream.handle);
+        }
         if (h.probe) |pr| {
             try stream.synchronize();
             try pr.call(pr.ctx, false, R, mb.streams);
@@ -448,30 +466,14 @@ pub const Head = struct {
         try g.addStreams(sc.eo.ptr, sc.hs.ptr, w.h.ptr, n, stream);
     }
 
-    /// decode.py `Engine.sample_draft`, greedy: the draft head's first largest logit, its token, and its probability
-    /// exp(top - logsumexp) (the chain's confidence; computed on the host, so it may differ from torch's in the last
-    /// bits, which can only move a chain's cut, never a kept token).
+    /// decode.py `Engine.sample_draft`, greedy, for logits row `row` of the last head call (read once the stream has
+    /// run it): the draft head's first largest logit, its token, and its probability 1 / sum(exp(x - top)) in fp64
+    /// (the chain's confidence; it may differ from torch's fp32 logsumexp in the last bits, which can only move a
+    /// chain's cut, never a kept token).
     pub fn sampleDraft(h: *Head, row: usize) !struct { token: u32, prob: f64 } {
-        var t0: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.MONOTONIC, &t0);
-        defer {
-            var t1: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(.MONOTONIC, &t1);
-            h.sample_ns += @intCast((@as(i128, t1.sec) - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec));
-        }
-        try h.logits.download(row * h.draft_head.n * 2, std.mem.sliceAsBytes(h.host)); // qmm's rows: n apart
-        var best: usize = 0;
-        var top = weights.bf16ToF32(h.host[0]);
-        for (h.host[1..], 1..) |x, i| {
-            const v = weights.bf16ToF32(x);
-            if (v > top) {
-                top = v;
-                best = i;
-            }
-        }
-        var sum: f64 = 0;
-        for (h.host) |x| sum += @exp(@as(f64, weights.bf16ToF32(x)) - top);
-        return .{ .token = h.ids[best], .prob = 1.0 / sum };
+        const i: usize = @intCast(h.pick_tok[row]);
+        if (i >= h.ids.len) return error.BadPick;
+        return .{ .token = h.ids[i], .prob = h.pick_prob[row] };
     }
 };
 

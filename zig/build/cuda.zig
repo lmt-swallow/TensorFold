@@ -51,6 +51,7 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_gdn_io", .src = "qwen38fn/gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
     .{ .name = "qwen38fn_gdn_prefill", .src = "qwen38fn/gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 cuda/kernels/gdn.py's gdn_prefill.cu, tensorfold_gdn_v2
     .{ .name = "qwen38fn_qmm", .src = "qwen38fn/qmm", .flags = &.{"-O3"} }, // 0.6.6 cuda/kernels/qmm.py's qmm.cu, tensorfold_qmm_v5: the MTP draft head
+    .{ .name = "qwen38fn_draft_pick", .src = "qwen38fn/draft_pick", .flags = &.{"-O3"} }, // the draft head's greedy pick and its probability on the device
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
     .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
     .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
