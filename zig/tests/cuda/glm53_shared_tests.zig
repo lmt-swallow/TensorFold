@@ -94,18 +94,16 @@ fn record(r: *E.Runner, run_: *Run, wins: []const E.Runner.Window, i: usize, sam
     try run_.tokens.appendSlice(r.gpa, samples);
 }
 
-pub const Args = struct { dir: []const u8, model: []const u8, aot: []const u8, layers: ?usize };
+pub const Args = pair.Args;
 
 pub fn run(gpu: Gpu, args: Args, rank: usize, master: []const u8, port: u16) !void {
     try pair.launch(gpu, rank, master, port, (E.prompt_rows + 2) * 4096, args, body);
 }
 
-fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
+fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
-    var rk: pair.Rank = undefined;
-    try rk.load(gpu, args.dir, args.model, rank, args.aot, args.layers);
-    defer rk.deinit();
+    const rank = rk.lay.rank;
     const cfg = &rk.cfg;
     const lay = rk.lay;
     var r = try rk.runner(gpa, d, link, 8192);
@@ -117,9 +115,7 @@ fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
     for (&seqs) |*q| q.* = try E.Seq.initSlot(gpa, d, lay, rk.mdl.layers.len, ring, .bf16);
     defer for (&seqs) |*q| q.deinit();
 
-    const pr = try rk.prompt();
-    defer gpa.free(pr.bytes);
-    const ids = pr.ids;
+    const ids = rk.prompt();
     var prompts: [streams][]const u32 = undefined;
     for (&prompts, lengths) |*p, n| p.* = ids[0..@min(n, ids.len)];
     const forced = ids[100..600];

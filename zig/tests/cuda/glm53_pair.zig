@@ -27,6 +27,8 @@ pub const Rank = struct {
     mtp: T.Mtp,
     stream: cuda.Stream,
     fx: fixture.Fixture,
+    prompt_bytes: []u8, // the fixture's prompt ids (both ranks' prompt is the same: rank 0's copy)
+    gpa: std.mem.Allocator,
 
     pub fn load(self: *Rank, gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, aot_dir: []const u8, layers: ?usize) !void {
         const gpa = gpu.gpa;
@@ -41,6 +43,8 @@ pub const Rank = struct {
         const fx_dir = try std.fs.path.join(gpa, &.{ dir, "out", "fixture" });
         defer gpa.free(fx_dir);
         self.fx = try fixture.Fixture.open(gpa, gpu.io, fx_dir);
+        self.gpa = gpa;
+        self.prompt_bytes = try self.fx.bytes("r0_prompt_ids");
         self.stream = try cuda.Stream.init(d, true);
         self.hck = try glm.glue.Hc.load(d);
         self.kk = try glm.kda.Kernels.load(d);
@@ -62,6 +66,7 @@ pub const Rank = struct {
         self.kk.deinit();
         self.hck.deinit();
         self.stream.deinit();
+        self.gpa.free(self.prompt_bytes);
         self.fx.deinit();
         self.set.deinit();
     }
@@ -74,11 +79,9 @@ pub const Rank = struct {
         return E.Runner.init(gpa, d, self.lay, self.kernels(), &self.tk, &self.mdl, &self.mtp, link, self.stream, capacity);
     }
 
-    /// The fixture's prompt ids (both ranks' prompt is the same: rank 0's copy, which a local run's one fixture
-    /// holds), the fixture allocator's bytes (the test's gpa) and their u32 view.
-    pub fn prompt(self: *Rank) !struct { bytes: []u8, ids: []const u32 } {
-        const b = try self.fx.bytes("r0_prompt_ids");
-        return .{ .bytes = b, .ids = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(b))) };
+    /// The fixture's prompt ids, read at `load` (a local run's ranks are threads that read no files).
+    pub fn prompt(self: *const Rank) []const u32 {
+        return std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(self.prompt_bytes)));
     }
 };
 
@@ -132,37 +135,50 @@ const HostLink = struct {
     }
 };
 
-/// Runs `body(ctx, gpu, rank, link)` for this process's rank over NCCL, or with master "local" for both ranks as
-/// threads on this GPU (each gather at most `most_floats`).
-pub fn launch(gpu: Gpu, rank: usize, master: []const u8, port: u16, most_floats: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), Gpu, usize, E.Link) anyerror!void) !void {
+/// What a pair test loads: the fixture's directory, the model's, the kernel set's, and the layers (null: all).
+pub const Args = struct { dir: []const u8, model: []const u8, aot: []const u8, layers: ?usize };
+
+/// Runs `body(args, gpu, rank, link)` for this process's rank over NCCL, or with master "local" for both ranks as
+/// threads on this GPU (each gather at most `most_floats`), each rank loaded first on the calling thread (a rank's
+/// files are read there).
+pub fn launch(gpu: Gpu, rank: usize, master: []const u8, port: u16, most_floats: usize, args: Args, comptime body: fn (Args, Gpu, *Rank, E.Link) anyerror!void) !void {
     if (!std.mem.eql(u8, master, "local")) {
+        var rk: Rank = undefined;
+        try rk.load(gpu, args.dir, args.model, rank, args.aot, args.layers);
+        defer rk.deinit();
         var ip: [4]u8 = undefined;
         var it = std.mem.splitScalar(u8, master, '.');
         for (&ip) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadAddress, 10);
         var comm = try cuda.comm.Comm.init(@intCast(rank), 2, ip, port, 600_000);
         defer comm.deinit();
         var link: Nccl = .{ .comm = &comm };
-        return body(ctx, gpu, rank, .{ .ctx = &link, .gather = Nccl.gather });
+        return body(args, gpu, &rk, .{ .ctx = &link, .gather = Nccl.gather });
     }
+    var rks: [2]Rank = undefined;
+    try rks[0].load(gpu, args.dir, args.model, 0, args.aot, args.layers);
+    defer rks[0].deinit();
+    try rks[1].load(gpu, args.dir, args.model, 1, args.aot, args.layers);
+    defer rks[1].deinit();
     var host: Host = .{ .slots = .{ try gpu.gpa.alloc(u8, most_floats * 4), try gpu.gpa.alloc(u8, most_floats * 4) } };
     defer for (host.slots) |s| gpu.gpa.free(s);
     var links: [2]HostLink = .{ .{ .h = &host, .rank = 0, .d = gpu.d }, .{ .h = &host, .rank = 1, .d = gpu.d } };
     var errs: [2]?anyerror = .{ null, null };
     const Thread = struct {
-        fn run(c: @TypeOf(ctx), g: Gpu, r: usize, l: *HostLink, h: *Host, err: *?anyerror) void {
+        fn run(a: Args, g: Gpu, rk: *Rank, l: *HostLink, h: *Host, err: *?anyerror) void {
             g.ctx.makeCurrent() catch |e| {
                 err.* = e;
                 h.failed.store(true, .release);
                 return;
             };
-            body(c, g, r, .{ .ctx = l, .gather = HostLink.gather }) catch |e| {
+            body(a, g, rk, .{ .ctx = l, .gather = HostLink.gather }) catch |e| {
+                std.debug.print("glm53 local rank {d}: {t}\n", .{ rk.lay.rank, e });
                 err.* = e;
                 h.failed.store(true, .release);
             };
         }
     };
     var threads: [2]std.Thread = undefined;
-    for (&threads, 0..) |*t, r| t.* = try std.Thread.spawn(.{}, Thread.run, .{ ctx, gpu, r, &links[r], &host, &errs[r] });
+    for (&threads, 0..) |*t, r| t.* = try std.Thread.spawn(.{}, Thread.run, .{ args, gpu, &rks[r], &links[r], &host, &errs[r] });
     for (threads) |t| t.join();
     for (errs) |e| if (e) |x| return x;
 }

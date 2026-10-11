@@ -40,35 +40,94 @@ fn logitsRow(r: *E.Runner, t: *Trace) !void {
     try r.w.logits.download(0, t.logits.items[at..][0..n]);
 }
 
-/// B from `start` (the sequence holds the rows before it) to its end, then `steps` one-row windows.
-fn finishB(r: *E.Runner, q: *E.Seq, b: []const u32, start: usize, t: *Trace) !void {
-    var at = start;
-    while (at < b.len) at = try r.fill(q, b, at);
-    try logitsRow(r, t);
-    var tok = try r.first(q);
-    try t.tokens.append(r.gpa, tok);
-    var out: [1]u32 = undefined;
-    for (0..steps) |_| {
-        try r.window(q, &.{tok}, &out);
-        try logitsRow(r, t);
-        try r.commit(q, 1, 1);
-        tok = out[0];
-        try t.tokens.append(r.gpa, tok);
+/// A sequence's state as named digests: the KDA states (the current parity) and conv windows, every DSA cache's
+/// index rings, latent rows and pooled keys before `len` (and the head's), so a mismatch names its part.
+const Parts = struct {
+    names: [64][]const u8 = undefined,
+    sums: [64][32]u8 = undefined,
+    n: usize = 0,
+
+    fn add(p: *Parts, gpa: std.mem.Allocator, name: []const u8, ptr: Ptr, len: usize, d: *const cuda.Driver) !void {
+        const host = try gpa.alloc(u8, len);
+        defer gpa.free(host);
+        const buf: cuda.DeviceBuffer = .{ .d = d, .ptr = ptr, .len = len };
+        try buf.download(0, host);
+        std.crypto.hash.sha2.Sha256.hash(host, &p.sums[p.n], .{});
+        p.names[p.n] = name;
+        p.n += 1;
     }
+};
+
+fn parts(r: *E.Runner, q: *const E.Seq, len: usize) !Parts {
+    try r.stream.synchronize();
+    var p: Parts = .{};
+    const k = &q.st.kda;
+    const g = r.gpa;
+    const d = r.d;
+    try p.add(g, "kda states", k.state(k.cur, 0), k.layers * k.stateBytes(), d);
+    try p.add(g, "conv windows", k.conv.ptr, k.conv.len, d);
+    const names = [_][]const u8{ "dsa 0", "dsa 1", "dsa 2", "dsa 3", "dsa 4", "dsa 5", "dsa 6", "dsa 7", "dsa 8", "dsa 9", "dsa 10", "dsa 11" };
+    for (q.st.caches, 0..) |c, i| {
+        try p.add(g, names[i], c.ik.ptr, c.ik.len, d);
+        try p.add(g, names[i], c.ig.ptr, c.ig.len, d);
+        try p.add(g, names[i], c.latent.ptr, len * (c.latent.len / c.capacity), d);
+        try p.add(g, names[i], c.pk.ptr, len / 4 * (c.pk.len / (c.capacity / 4 + 2)), d);
+    }
+    return p;
 }
 
-pub const Args = struct { dir: []const u8, model: []const u8, aot: []const u8, layers: ?usize };
+fn compare(rank: usize, step: usize, x: *const Parts, y: *const Parts) usize {
+    for (0..x.n) |i| if (!std.mem.eql(u8, &x.sums[i], &y.sums[i])) {
+        std.debug.print("FAIL glm53-keep rank {d}: step {d}: {s} (part {d}) differs\n", .{ rank, step, x.names[i], i });
+        return 1;
+    };
+    return 0;
+}
+
+/// Both B runs from their starts to B's end, then `steps` one-row windows each, in lockstep: their logits and
+/// tokens into the traces, their states compared after the prompt and after every step (the first differing part
+/// named). Returns the mismatches.
+fn lockstep(r: *E.Runner, qs: [2]*E.Seq, b: []const u32, starts: [2]usize, ts: [2]*Trace, rank: usize) !usize {
+    var toks: [2]u32 = undefined;
+    for (qs, starts, ts, &toks) |q, start, t, *tok| {
+        var at = start;
+        while (at < b.len) at = try r.fill(q, b, at);
+        try logitsRow(r, t);
+        tok.* = try r.first(q);
+        try t.tokens.append(r.gpa, tok.*);
+    }
+    var bad: usize = 0;
+    var p0 = try parts(r, qs[0], qs[0].len());
+    var p1 = try parts(r, qs[1], qs[1].len());
+    bad += compare(rank, 0, &p0, &p1);
+    var out: [1]u32 = undefined;
+    for (0..steps) |step| {
+        for (qs, ts, &toks) |q, t, *tok| {
+            try r.window(q, &.{tok.*}, &out);
+            try logitsRow(r, t);
+            try r.commit(q, 1, 1);
+            tok.* = out[0];
+            try t.tokens.append(r.gpa, tok.*);
+        }
+        if (bad == 0) {
+            p0 = try parts(r, qs[0], qs[0].len());
+            p1 = try parts(r, qs[1], qs[1].len());
+            bad += compare(rank, step + 1, &p0, &p1);
+        }
+    }
+    return bad;
+}
+
+pub const Args = pair.Args;
 
 pub fn run(gpu: Gpu, args: Args, rank: usize, master: []const u8, port: u16) !void {
     try pair.launch(gpu, rank, master, port, (E.prompt_rows + 2) * 4096, args, body);
 }
 
-fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
+fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
-    var rk: pair.Rank = undefined;
-    try rk.load(gpu, args.dir, args.model, rank, args.aot, args.layers);
-    defer rk.deinit();
+    const rank = rk.lay.rank;
     const cfg = &rk.cfg;
     const lay = rk.lay;
     const stream = rk.stream;
@@ -78,15 +137,13 @@ fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
     var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 3 * capacity, .bf16);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(capacity, E.prompt_rows);
-    var seqs: [2]E.Seq = undefined;
+    var seqs: [3]E.Seq = undefined;
     for (&seqs) |*q| q.* = try E.Seq.initSlot(gpa, d, lay, rk.mdl.layers.len, ring, .bf16);
     defer for (&seqs) |*q| q.deinit();
     var snaps = try K.Snaps.init(gpa, d, 1, K.snapBytes(&seqs[0]));
     defer snaps.deinit();
 
-    const pr = try rk.prompt();
-    defer gpa.free(pr.bytes);
-    const a = pr.ids;
+    const a = rk.prompt();
     const cut = K.chunk;
     if (a.len < cut + 64) return error.PromptTooShort;
     // B: A's first 2,049 tokens, then A's tail reversed
@@ -94,13 +151,6 @@ fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
     defer gpa.free(b);
     @memcpy(b[0 .. cut + 1], a[0 .. cut + 1]);
     for (b[cut + 1 ..], 0..) |*x, i| x.* = a[a.len - 1 - i];
-
-    // B fresh, in extent 0
-    var fresh: Trace = .{};
-    defer fresh.deinit(gpa);
-    try seqs[0].bind(&pool, 0, capacity);
-    try seqs[0].reset(stream);
-    try finishB(&r, &seqs[0], b, 0, &fresh);
 
     // A in extent 1 to its boundary, snapshotted there (as a served prompt's pass does), then on to its end
     try seqs[1].bind(&pool, capacity, capacity);
@@ -110,16 +160,19 @@ fn body(args: Args, gpu: Gpu, rank: usize, link: E.Link) !void {
     try snaps.save(0, &seqs[1], stream);
     while (at < a.len) at = try r.fill(&seqs[1], a, at);
 
-    // B continued: A's rows before the boundary copied to extent 2, slot 0's state restored from the snapshot
+    // B fresh in extent 0 (slot 0); B continued in extent 2 (slot 2): A's rows before the boundary copied in, the
+    // slot's state restored from the snapshot
+    try seqs[0].bind(&pool, 0, capacity);
+    try seqs[0].reset(stream);
+    try seqs[2].bind(&pool, 2 * capacity, capacity);
+    try seqs[2].reset(stream);
+    try K.copyRows(&pool, capacity, 2 * capacity, cut, stream);
+    try snaps.restore(0, &seqs[2], cut, stream);
+    var fresh: Trace = .{};
+    defer fresh.deinit(gpa);
     var cont: Trace = .{};
     defer cont.deinit(gpa);
-    try seqs[0].bind(&pool, 2 * capacity, capacity);
-    try seqs[0].reset(stream);
-    try K.copyRows(&pool, capacity, 2 * capacity, cut, stream);
-    try snaps.restore(0, &seqs[0], cut, stream);
-    try finishB(&r, &seqs[0], b, cut, &cont);
-
-    var bad: usize = 0;
+    var bad = try lockstep(&r, .{ &seqs[0], &seqs[2] }, b, .{ 0, cut }, .{ &fresh, &cont }, rank);
     if (!std.mem.eql(u32, fresh.tokens.items, cont.tokens.items)) {
         std.debug.print("FAIL glm53-keep rank {d}: tokens {any}, fresh {any}\n", .{ rank, cont.tokens.items, fresh.tokens.items });
         bad += 1;
