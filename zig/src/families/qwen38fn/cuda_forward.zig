@@ -707,3 +707,62 @@ pub const Forward = struct {
         try st.pos_dev.uploadAsync(0, std.mem.asBytes(&p), stream.handle);
     }
 };
+
+/// graphs.py `Graphs.forward` for one stream's decode windows: each key's launches (the stream's sequence, the
+/// window's rows, its DeltaNet state parity, the context bucket) recorded once as a CUDA graph and replayed. A key's
+/// first window runs eagerly and is then recorded; a replay runs the same launches with the same arguments as the
+/// eager path at that bucket, so it writes the same bytes. Inputs (ids, n-gram rows, positions) are device buffers
+/// staged before each run.
+pub const Graphs = struct {
+    gpa: std.mem.Allocator,
+    map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
+    captures: usize = 0,
+
+    const Key = struct { st: usize, rows: usize, parity: u1, bucket: usize };
+
+    pub fn deinit(g: *Graphs) void {
+        var it = g.map.valueIterator();
+        while (it.next()) |e| e.deinit();
+        g.map.deinit(g.gpa);
+    }
+
+    /// Forget every graph of `st` (its buffers freed or about to be).
+    pub fn drop(g: *Graphs, st: *const Stream) void {
+        var it = g.map.iterator();
+        while (it.next()) |kv| if (kv.key_ptr.st == @intFromPtr(st)) {
+            kv.value_ptr.deinit();
+            g.map.removeByPtr(kv.key_ptr);
+            it = g.map.iterator();
+        };
+    }
+
+    /// computeSegs of `st`'s window of R rows (staged in `b`), at its context bucket.
+    pub fn compute(g: *Graphs, f: *Forward, st: *Stream, b: *Buffers, R: usize, stream: cuda.Stream) !void {
+        const was = f.buckets;
+        f.buckets = true;
+        defer f.buckets = was;
+        const seg = [_]Seg{.{ .st = st, .a0 = 0, .n = R }};
+        for (st.cur[1..]) |c| if (c != st.cur[0]) return f.computeSegs(&seg, b, .{}, stream); // parities apart: eager
+        const ai = for (f.m.layers) |*l| switch (l.mixer) {
+            .attn => |*al| break al.ai,
+            .gdn => {},
+        } else 0;
+        const key: Key = .{ .st = @intFromPtr(st), .rows = R, .parity = if (st.cur.len > 0) st.cur[0] else 0, .bucket = attn.bucket(st.pos + R, st.caches[ai].capacity) };
+        if (g.map.get(key)) |e| return e.launchOn(stream);
+        try f.computeSegs(&seg, b, .{}, stream);
+        try cuda.graph.beginCapture(stream, .thread_local);
+        f.computeSegs(&seg, b, .{}, stream) catch |err| {
+            if (cuda.graph.endCapture(stream)) |gr| {
+                var x = gr;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        var gr = try cuda.graph.endCapture(stream);
+        defer gr.deinit();
+        const e = try gr.instantiate();
+        try g.map.put(g.gpa, key, e);
+        g.captures += 1;
+    }
+};
+

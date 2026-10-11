@@ -97,6 +97,7 @@ const Env = struct {
     scp: *M.Scratch,
     vh: []u16,
     stream: cuda.Stream,
+    graphs: ?*F.Graphs = null, // one stream's rounds replayed from captured graphs
 
     /// Stream `s`'s sequence: new, or `l`'s reset; its prompt ready for its chunks.
     fn begin(e: *Env, l: *Live, s: usize, fresh: bool) !void {
@@ -156,7 +157,9 @@ const Env = struct {
             R += n;
         }
         try e.fw.stageSegs(segs[0..ls.len], e.b, ids[0..R], e.stream);
-        try e.fw.computeSegs(segs[0..ls.len], e.b, .{}, e.stream);
+        if (e.graphs != null and ls.len == 1) {
+            try e.graphs.?.compute(e.fw, &ls[0].st, e.b, R, e.stream);
+        } else try e.fw.computeSegs(segs[0..ls.len], e.b, .{}, e.stream);
         try e.stream.synchronize();
         try e.b.logits.download(0, std.mem.sliceAsBytes(e.vh[0 .. R * v]));
         for (ls, segs[0..ls.len]) |l, sg| {
@@ -321,6 +324,22 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
         compare("alone at context buckets", s, &alone[s], &l.rec, &failures, &equal);
     }
     fw.buckets = false;
+    // each alone again, its rounds from captured graphs (the first of each key eager, then recorded)
+    var graphs: F.Graphs = .{ .gpa = gpa };
+    defer graphs.deinit();
+    e.graphs = &graphs;
+    for (0..streams) |s| {
+        var l: Live = undefined;
+        try e.begin(&l, s, true);
+        defer Env.free(&l, gpa);
+        try e.prefillAll(&l);
+        try e.draft(&.{&l}, true);
+        while (try e.step(&.{&l})) {}
+        compare("alone from graphs", s, &alone[s], &l.rec, &failures, &equal);
+        graphs.drop(&l.st);
+    }
+    std.debug.print("qwen38fn-shared: {d} graphs captured\n", .{graphs.captures});
+    e.graphs = null;
     // new sequences, the last prompt's chunks between the others' rounds
     {
         var fresh: [streams]Live = undefined;

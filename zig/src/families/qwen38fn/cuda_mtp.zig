@@ -196,7 +196,7 @@ pub const Head = struct {
     draft_head: Q4,
     ids: []u32, // the draft head's rows' token ids
     k: Kernels,
-    logits: cuda.DeviceBuffer, // bf16 [streams, padded draft vocab]: each segment's last row's draft logits
+    logits: cuda.DeviceBuffer, // bf16 [streams, draft vocab]: each segment's last row's draft logits
     host: []u16,
     streams: usize, // the most segments one head call takes
     gx: cuda.DeviceBuffer, // bf16 [streams, D]: each segment's last row, gathered for one draft-head call
@@ -450,7 +450,7 @@ pub const Head = struct {
     /// exp(top - logsumexp) (the chain's confidence; computed on the host, so it may differ from torch's in the last
     /// bits, which can only move a chain's cut, never a kept token).
     pub fn sampleDraft(h: *Head, row: usize) !struct { token: u32, prob: f64 } {
-        try h.logits.download(row * h.draft_head.npad * 2, std.mem.sliceAsBytes(h.host));
+        try h.logits.download(row * h.draft_head.n * 2, std.mem.sliceAsBytes(h.host)); // qmm's rows: n apart
         var best: usize = 0;
         var top = weights.bf16ToF32(h.host[0]);
         for (h.host[1..], 1..) |x, i| {
