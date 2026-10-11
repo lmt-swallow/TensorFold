@@ -29,6 +29,19 @@ pub const Pack = struct {
         self.head.close();
     }
 
+    /// Drops the shards' pages from the page cache (madvise on the maps, then fadvise on the files): on a Spark the
+    /// page cache and the GPU share one memory, so a whole rank's load must not leave 82 GiB of cached checkpoint
+    /// behind it. Linux only; a no-op elsewhere.
+    pub fn dropCache(self: *Pack) void {
+        if (@import("builtin").os.tag != .linux) return;
+        const linux = std.os.linux;
+        for ([_]*Checkpoint{ &self.text, &self.head }) |ck| for (ck.files.items) |*f| {
+            const mem = f.map.memory;
+            _ = std.c.madvise(@ptrCast(@alignCast(mem.ptr)), mem.len, linux.MADV.DONTNEED);
+            _ = linux.fadvise(f.file.handle, 0, 0, linux.POSIX_FADV.DONTNEED);
+        };
+    }
+
     pub fn get(self: *Pack, name: []const u8) !Tensor {
         return if (std.mem.startsWith(u8, name, "lm_head.")) self.head.get(name) else self.text.get(name);
     }
