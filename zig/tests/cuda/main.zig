@@ -23,6 +23,7 @@ const dsv41_topk_tests = @import("dsv41_topk_tests.zig");
 const dsv41_rope_tests = @import("dsv41_rope_tests.zig");
 const dsv41_prompt_time = @import("dsv41_prompt_time.zig");
 const dsv41_rdma_tests = @import("dsv41_rdma_tests.zig");
+const qwen38fn_layer0 = @import("qwen38fn_layer0_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -56,6 +57,7 @@ const usage =
     \\  sample                    sample.cu's keyed draws against the Metal rule's host references (synthetic rows)
     \\  exl3-linear <dir>         DSV4.1 EXL3 linear layers against the Python fork's fixture (dsv41/dump_linear.py)
     \\  exl3-experts <dir>        DSV4.1 EXL3 routed experts (decode windows) against the fork's fixture (dsv41/dump_experts.py)
+    \\  qwen38fn-layer0 <work-dir> <model-dir> [isolated]  Qwen3.8-Flash-Next embeddings + DeltaNet layer 0 (decode windows) against TensorFold 0.6.6's fixture (qwen38fn/capture_layer0.sh)
     \\
 ;
 
@@ -130,6 +132,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "exl3-linear")) return dsv41_tests.exl3Linear(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "exl3-experts")) return dsv41_tests.exl3Experts(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "qwen38fn-layer0")) return qwen38fn_layer0.layer0(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
 }
