@@ -31,6 +31,11 @@ pub const Error = error{ NotEngramLayer, NoTable, TooManyRows, HistoryShort, Bad
 /// most (cuda_rounds.max_rows).
 pub const decode_rows: usize = rounds.max_rows;
 
+/// Rows a call projects, gathers and gates at a time (its device buffers hold this many): the prompt's base chunk
+/// (cuda_prompt.base_chunk). A wider chunk's rows are read and decoded at once and run in pieces of this many, each a
+/// whole base chunk of the prompt (lanes.chunkEnd), so every row gets the bits a base-chunk call gives it.
+pub const device_rows: usize = 2048;
+
 pub const Engram = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -54,9 +59,10 @@ pub const Engram = struct {
     e: cuda.DeviceBuffer, // bf16 [max_rows, cols_r * 256]
     xh: cuda.DeviceBuffer, // the decode linear's rotated input, fp16 [decode_rows, K]
     z: cuda.DeviceBuffer, // its split-K scratch
-    partial: cuda.DeviceBuffer, // fp32 [max_rows, 5 d]
-    gathered: cuda.DeviceBuffer, // fp32 [world, max_rows * 5 d]
-    kv: cuda.DeviceBuffer, // bf16 [max_rows, 5 d]
+    partial: cuda.DeviceBuffer, // fp32 [piece, 5 d]
+    gathered: cuda.DeviceBuffer, // fp32 [world, piece * 5 d]
+    kv: cuda.DeviceBuffer, // bf16 [piece, 5 d]
+    piece: usize, // min(max_rows, device_rows): the rows a projection, gather and gate take at a time
     /// The sequence's ids from position 0 (set by the caller before each run; covers every row it runs).
     history: []const i32 = &.{},
     probe: ?forward.Probe = null,
@@ -160,11 +166,12 @@ pub const Engram = struct {
         errdefer self.xh.free();
         self.z = try cuda.DeviceBuffer.alloc(d, zw * 4);
         errdefer self.z.free();
-        self.partial = try cuda.DeviceBuffer.alloc(d, max_rows * kvw * 4);
+        self.piece = @min(max_rows, device_rows);
+        self.partial = try cuda.DeviceBuffer.alloc(d, self.piece * kvw * 4);
         errdefer self.partial.free();
-        self.gathered = try cuda.DeviceBuffer.alloc(d, w.world * max_rows * kvw * 4);
+        self.gathered = try cuda.DeviceBuffer.alloc(d, w.world * self.piece * kvw * 4);
         errdefer self.gathered.free();
-        self.kv = try cuda.DeviceBuffer.alloc(d, max_rows * kvw * 2);
+        self.kv = try cuda.DeviceBuffer.alloc(d, self.piece * kvw * 2);
         errdefer self.kv.free();
         var present: std.ArrayList(usize) = .empty;
         defer present.deinit(gpa);
@@ -308,19 +315,28 @@ pub const Engram = struct {
         };
         const b: Bufs = if (side) |x| x.bufs else .{ .e = self.e, .xh = self.xh, .z = self.z, .partial = self.partial, .gathered = self.gathered, .kv = self.kv };
         try self.kernels.decode(stream, st.dev_w.ptr, st.dev_s.ptr, b.e.ptr, n * per);
-        // this rank's partial, every rank's in rank order, their sum to bf16, the gate
-        if (mm) |f| {
-            try f.call(f.ctx, wkv, b.e.ptr, n, b.partial.ptr, stream);
-        } else {
-            try wkv.run(b.e.ptr, .bf16, n, b.xh.ptr, b.z.ptr, b.partial.ptr, .f32, stream);
+        // in pieces of `piece` rows (the rounds' side buffers: one piece of at most decode_rows): this rank's
+        // partial, every rank's in rank order, their sum to bf16, the gate
+        const piece = if (side != null) n else self.piece;
+        const e_row = per * rows_mod.row_w * 2; // bytes of a row of e
+        const h_row = hcmod.hc_streams * self.cfg.dim * 2; // bytes of a row of h
+        var off: usize = 0;
+        while (off < n) : (off += piece) {
+            const m = @min(piece, n - off);
+            const e_at = b.e.ptr + off * e_row;
+            if (mm) |f| {
+                try f.call(f.ctx, wkv, e_at, m, b.partial.ptr, stream);
+            } else {
+                try wkv.run(e_at, .bf16, m, b.xh.ptr, b.z.ptr, b.partial.ptr, .f32, stream);
+            }
+            if (self.probe) |p| {
+                var nb: [32]u8 = undefined;
+                try p.call(p.ctx, try std.fmt.bufPrint(&nb, "L{d}.p_engram.r0", .{layer}), b.partial.ptr, m * kvw * 4, stream);
+            }
+            try gather.run(b.partial.ptr, m * kvw, b.gathered.ptr, stream);
+            try self.kernels.sumToBf16(stream, b.gathered.ptr, @intCast(self.w.world), m * kvw, b.kv.ptr);
+            try self.hc.engramGate(stream, h + off * h_row, b.kv.ptr, qk.ptr(), h + off * h_row, @intCast(m));
         }
-        if (self.probe) |p| {
-            var nb: [32]u8 = undefined;
-            try p.call(p.ctx, try std.fmt.bufPrint(&nb, "L{d}.p_engram.r0", .{layer}), b.partial.ptr, n * kvw * 4, stream);
-        }
-        try gather.run(b.partial.ptr, n * kvw, b.gathered.ptr, stream);
-        try self.kernels.sumToBf16(stream, b.gathered.ptr, @intCast(self.w.world), n * kvw, b.kv.ptr);
-        try self.hc.engramGate(stream, h, b.kv.ptr, qk.ptr(), h, @intCast(n));
     }
 
     // -- read-ahead ------------------------------------------------------------------------------------------------

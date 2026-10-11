@@ -95,6 +95,11 @@ pub const default_chunk: usize = prompt.base_chunk;
 /// The widest prompt chunk TF_DS_PREFILL_CHUNK may name.
 pub const max_chunk: usize = prompt.max_chunk;
 
+comptime {
+    // Engram runs a wider chunk's rows in whole base chunks (engram_apply.device_rows)
+    std.debug.assert(engram_apply.device_rows == prompt.base_chunk);
+}
+
 /// Step opcodes. The served engine sends `measure` and `admit` .. `join`; the others are `Sequence`'s records.
 pub const Op = enum(u8) { prefill = 1, round = 2, release = 3, stop = 4, verify = 5, keep = 6, draft = 7, measure = 8, admit = 9, rounds = 10, drafts = 11, keeps = 12, free = 13, fill = 14, join = 15 };
 
