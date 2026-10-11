@@ -5,7 +5,8 @@
 //! slot's index rings, layer 0's KDA states and conv windows) goes into a pool and four stream slots bound to the
 //! fixture's extents; then each window runs with its segments' rows, commits each segment's keep, and must leave the
 //! bytes the fork's window left: the window's logits (this rank's vocabulary half), each segment's latent rows, the
-//! pooled-key plane, the rings, each segment's stream's KDA state and conv window. The fork's batched window equals its
+//! pooled-key plane, the rings, each segment's stream's KDA state and conv window; and before the commits layer 0's
+//! KDA projections, low-rank products and chain output against the fork's traced calls. The fork's batched window equals its
 //! segments run alone (the dump checks it), so this also holds the engine's per-stream attention to the fork's
 //! segmented kernels.
 const std = @import("std");
@@ -172,6 +173,50 @@ fn same(r: *Rank, fx: *const fixture.Fixture, rank: usize, k: usize, what: []con
     } else r.passes += 1;
 }
 
+/// The fork's digest of argument `arg` of the `nth` traced call to a function named `name` (the module path's last
+/// part) in rank `rank`'s window `k` (dump_prompt.py's DigestTracer entries in the manifest's "trace").
+fn traced(fx: *const fixture.Fixture, rank: usize, k: usize, name: []const u8, nth: usize, arg: []const u8) ?Json {
+    var nb: [16]u8 = undefined;
+    const step = std.fmt.bufPrint(&nb, "w{d}", .{k}) catch return null;
+    var seen: usize = 0;
+    for (fx.parsed.value.object.get("trace").?.array.items) |call| {
+        const o = call.object;
+        if (int(o.get("rank").?) != rank or !std.mem.eql(u8, o.get("step").?.string, step)) continue;
+        const f = o.get("fn").?.string;
+        if (!std.mem.endsWith(f, name) or f[f.len - name.len - 1] != '.') continue;
+        if (seen == nth) return o.get("digests").?.object.get(arg);
+        seen += 1;
+    }
+    return null;
+}
+
+/// Layer 0's KDA buffers after a window (no later layer writes them) against the fork's traced calls: the
+/// projections, the two low-rank products and the chains' output, to place a difference before or after the chain.
+fn sameKda(r: *Rank, gpa: std.mem.Allocator, fx: *const fixture.Fixture, rank: usize, k: usize, R: usize, d: *const cuda.Driver) !void {
+    const b = &r.work.b;
+    const lw = r.layers[0].kda.?.heads * glm.kda.dk;
+    const width = r.sts[0].kda.width;
+    const checks = [_]struct { []const u8, []const u8, usize, []const u8, cuda.abi.DevicePtr, usize }{
+        .{ "kda_proj", "mm", 0, "out", b.kproj.ptr, R * width * 2 },
+        .{ "kda_a", "mm", 1, "out", b.ka.ptr, R * lw * 2 },
+        .{ "kda_g", "mm", 2, "out", b.kg.ptr, R * lw * 2 },
+        .{ "kda_out", "chain_segments", 0, "ret", b.kout.ptr, R * lw * 2 },
+    };
+    for (checks) |c| {
+        const want = traced(fx, rank, k, c[1], c[2], c[3]) orelse return error.MissingTrace;
+        const x = try host(gpa, .{ .d = d, .ptr = c[4], .len = c[5] });
+        defer gpa.free(x);
+        var out: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(x, &out, .{});
+        const hex = std.fmt.bytesToHex(out, .lower);
+        const w = want.array.items;
+        if (x.len != @as(usize, @intCast(w[1].integer)) or !std.mem.eql(u8, &hex, w[0].string)) {
+            std.debug.print("FAIL glm53-seg rank {d} window {d} {s}: {d} bytes sha256 {s}, the fork's {d} bytes {s}\n", .{ rank, k, c[0], x.len, hex[0..16], w[1].integer, w[0].string[0..16] });
+            r.failures += 1;
+        } else r.passes += 1;
+    }
+}
+
 fn host(gpa: std.mem.Allocator, b: Buf) ![]u8 {
     const x = try gpa.alloc(u8, b.len);
     try b.download(0, x);
@@ -224,6 +269,8 @@ fn windows(j: *Job) !void {
         if (j.ids[wi].len != R * 4) return error.FixtureShape;
         try r.work.b.ids.upload(0, j.ids[wi]);
         try M.forwardSegs(k, r.lay, &r.mdl, segs[0..n], &r.work, R, gather, r.stream);
+        try r.stream.synchronize();
+        try sameKda(r, gpa, fx, j.rank, wi, R, d);
         for (segs[0..n], keeps[0..n]) |sg, keep| try M.commit(k, r.lay, sg.st, sg.n, keep, false, &r.work, r.stream);
         try r.stream.synchronize();
         // the window's logits (the fork's array, and each segment's rows by digest), then what each segment and the
