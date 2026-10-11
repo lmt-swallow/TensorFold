@@ -76,7 +76,7 @@ const Run = struct {
     }
 };
 
-fn weightsOk(gpa: std.mem.Allocator, io: std.Io, work: []const u8, ranks: []Rank) !void {
+fn weightsOk(gpa: std.mem.Allocator, io: std.Io, work: []const u8, ranks: []Rank, cfg: *const glm.config.Config, pack: *glm.weights.Pack) !void {
     const path = try std.fs.path.join(gpa, &.{ work, "out", "weights.json" });
     defer gpa.free(path);
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
@@ -106,8 +106,33 @@ fn weightsOk(gpa: std.mem.Allocator, io: std.Io, work: []const u8, ranks: []Rank
             }
         }
     }
+    // the MTP drafts' 4-bit head, quantized and packed on the host from each rank's head rows
+    for (0..ranks.len) |ri| {
+        var kb: [16]u8 = undefined;
+        const want = parsed.value.object.get(try std.fmt.bufPrint(&kb, "rank{d}", .{ri})).?.object;
+        const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
+        const l: glm.weights.Loader = .{ .gpa = gpa, .d = undefined, .pack = pack, .lay = lay };
+        const rows = try l.headRows();
+        defer gpa.free(rows);
+        var p = try glm.draft_head.quantizePack(gpa, std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(rows))), rows.len / 2 / cfg.hidden, cfg.hidden);
+        defer p.deinit(gpa);
+        const parts = [_]struct { []const u8, []const u8 }{
+            .{ "head.weight", rows }, .{ "draft_head.weight", std.mem.sliceAsBytes(p.words) },
+            .{ "draft_head.scales", std.mem.sliceAsBytes(p.scales) }, .{ "draft_head.biases", std.mem.sliceAsBytes(p.biases) },
+        };
+        for (parts) |q| {
+            var out: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(q[1], &out, .{});
+            const got = std.fmt.bytesToHex(out, .lower);
+            n += 1;
+            if (!std.mem.eql(u8, &got, want.get(q[0]).?.string)) {
+                std.debug.print("FAIL glm53 rank {d} {s}: sha256 {s}, the reference's {s}\n", .{ ri, q[0], got[0..16], want.get(q[0]).?.string[0..16] });
+                bad += 1;
+            }
+        }
+    }
     try check.expect(bad == 0, "glm53-dsa: {d} of {d} loaded tensors differ from the reference loader's", .{ bad, n });
-    check.pass("glm53-dsa: every rank's layer-3 DSA tensors equal the reference loader's ({d} sha256)", .{n});
+    check.pass("glm53-dsa: every rank's layer-3 DSA tensors, head rows and 4-bit draft head equal the reference loader's ({d} sha256)", .{n});
 }
 
 pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void {
@@ -158,7 +183,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
         r.pos_dev = try Buf.alloc(d, 16);
         loaded += 1;
     }
-    try weightsOk(gpa, gpu.io, work, &ranks);
+    try weightsOk(gpa, gpu.io, work, &ranks, &cfg, &pack);
     const g: glm.glue.Glue = .{ .set = &set, .hc = &hck, .hidden = cfg.hidden, .streams = cfg.streams };
     const steps = h.fx.parsed.value.object.get("params").?.object.get("steps").?.object;
 

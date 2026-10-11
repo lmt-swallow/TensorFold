@@ -88,6 +88,14 @@ pub const Loader = struct {
         return buf;
     }
 
+    /// The rank's rows of the head (weights.py: `lm_head.weight[v0:v1]`, its vocabulary share) in host memory.
+    pub fn headRows(self: Loader) ![]u8 {
+        const t = try self.pack.get(map.head);
+        const v = self.lay.share(.vocab);
+        const row = t.shape[1] * t.dtype.size();
+        return self.gpa.dupe(u8, t.bytes[v[0] * row .. v[1] * row]);
+    }
+
     /// A BF16 matrix: the rank's share of `name` (or the stack of `names`) with `k` columns.
     pub fn matrix(self: Loader, names: []const []const u8, k: usize) !Matrix {
         const buf = try self.stack(names);
