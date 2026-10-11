@@ -1,0 +1,188 @@
+{
+ "schema": 1,
+ "started": "2026-10-12T03:58:48+0900",
+ "binary_sha": "5fbd82c8bfdd",
+ "config": "model 107.46 GiB; 4 streams at once, each at most a 1048576-token window, in a pool of 4194304 positions (3.53 GiB, in the model's), of 2.7 GiB left after a 2.0 GiB reserve; prompts in 2048-row chunks",
+ "full": false,
+ "label": "5a96414f ov1 chunk4096",
+ "base": "http://127.0.0.1:8000",
+ "scenarios": {
+  "long": {
+   "seconds": 170.2,
+   "rank0": {
+    "admissions": [
+     {
+      "slot": 0,
+      "base": 0,
+      "size": 65536,
+      "how": "fresh",
+      "prompt": 65211,
+      "streams": 1,
+      "kept": 0,
+      "free": 4128768,
+      "pool": 4194304
+     },
+     {
+      "slot": 0,
+      "base": 61440,
+      "size": 65536,
+      "how": "copy",
+      "prompt": 65221,
+      "streams": 1,
+      "kept": 1,
+      "free": 4067328,
+      "pool": 4194304
+     },
+     {
+      "slot": 0,
+      "base": 122880,
+      "size": 264192,
+      "how": "fresh",
+      "prompt": 262757,
+      "streams": 1,
+      "kept": 1,
+      "free": 3868672,
+      "pool": 4194304
+     },
+     {
+      "slot": 0,
+      "base": 385024,
+      "size": 264192,
+      "how": "copy",
+      "prompt": 262767,
+      "streams": 1,
+      "kept": 2,
+      "free": 3606528,
+      "pool": 4194304
+     }
+    ],
+    "prefills": [
+     {
+      "rows": 65211,
+      "from": 0,
+      "ms": 32084,
+      "tps": 2032
+     },
+     {
+      "rows": 65221,
+      "from": 61440,
+      "ms": 1944,
+      "tps": 1945
+     },
+     {
+      "rows": 262757,
+      "from": 0,
+      "ms": 123936,
+      "tps": 2120
+     },
+     {
+      "rows": 262767,
+      "from": 262144,
+      "ms": 1160,
+      "tps": 537
+     }
+    ],
+    "continued": [
+     {
+      "kept": 0,
+      "at": 61440,
+      "of": 65221,
+      "how": "copy"
+     },
+     {
+      "kept": 2,
+      "at": 262144,
+      "of": 262767,
+      "how": "copy"
+     }
+    ],
+    "max_streams": 1,
+    "min_free": 3606528
+   }
+  }
+ },
+ "rows": [
+  {
+   "id": "long/64k",
+   "scenario": "long",
+   "sha": "3a36a6102a01",
+   "text_sha": "0a3c6652a5f3",
+   "prompt_tokens": 65211,
+   "cached_tokens": 0,
+   "tokens": 9,
+   "ttft_s": 32.198,
+   "decode_tps": 79.612,
+   "server_ttft_s": 32.196,
+   "server_prefill_s": 32.099,
+   "server_decode_tps": 54.821,
+   "rounds": 3,
+   "drafted": 12,
+   "accepted": 5,
+   "finish": "stop",
+   "prefill_tps": 2031.5,
+   "correct": true,
+   "answer": "7391-ALPHA-KITE"
+  },
+  {
+   "id": "long/64k-depth",
+   "scenario": "long",
+   "sha": "0181dc85796e",
+   "text_sha": "265f90e64482",
+   "prompt_tokens": 65221,
+   "cached_tokens": 61440,
+   "tokens": 256,
+   "ttft_s": 2.05,
+   "decode_tps": 57.475,
+   "server_ttft_s": 2.048,
+   "server_prefill_s": 1.949,
+   "server_decode_tps": 57.474,
+   "rounds": 119,
+   "drafted": 220,
+   "accepted": 137,
+   "finish": "length",
+   "prefill_tps": 1939.9
+  },
+  {
+   "id": "long/256k",
+   "scenario": "long",
+   "sha": "3a36a6102a01",
+   "text_sha": "0a3c6652a5f3",
+   "prompt_tokens": 262757,
+   "cached_tokens": 0,
+   "tokens": 9,
+   "ttft_s": 124.31,
+   "decode_tps": 56.683,
+   "server_ttft_s": 124.303,
+   "server_prefill_s": 123.943,
+   "server_decode_tps": 41.992,
+   "rounds": 3,
+   "drafted": 12,
+   "accepted": 5,
+   "finish": "stop",
+   "prefill_tps": 2120.0,
+   "correct": true,
+   "answer": "7391-ALPHA-KITE"
+  },
+  {
+   "id": "long/256k-depth",
+   "scenario": "long",
+   "sha": "1f4685f192b8",
+   "text_sha": "d1cd2d39f3c6",
+   "prompt_tokens": 262767,
+   "cached_tokens": 262144,
+   "tokens": 256,
+   "ttft_s": 1.529,
+   "decode_tps": 50.929,
+   "server_ttft_s": 1.524,
+   "server_prefill_s": 1.168,
+   "server_decode_tps": 50.929,
+   "rounds": 127,
+   "drafted": 214,
+   "accepted": 128,
+   "finish": "length",
+   "prefill_tps": 533.5
+  }
+ ],
+ "rank_errors": [],
+ "seconds": 171.8
+}
