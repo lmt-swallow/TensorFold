@@ -48,6 +48,7 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
     .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" } }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
     .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"} }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
+    .{ .name = "glm53_exl3", .src = "glm53/exl3", .flags = &.{"-O3"} }, // the Mia fork's exl3_mm.py, tensorfold_glm_exl3_v20
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

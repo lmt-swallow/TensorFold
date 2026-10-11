@@ -3,7 +3,8 @@
 (an .so from a capture's extensions/) against the Zig build's fatbin of the vendored source. Each kernel's SASS is
 matched by its name with the namespace removed (the extension's anonymous namespace, ours tf_glm53_*). Instruction
 addresses, comments and the function's own symbol inside relocations are ignored; every other byte of the text must
-be equal. Exit 1 when a kernel of the extension differs or is missing from the fatbin.
+be equal. Every kernel of the fatbin must be in the extension and equal to it (the extension may hold more: the
+launch variants a setting other than the strict one picks). Exit 1 otherwise.
 
   python3 sass_check.py --cuobjdump /usr/local/cuda/bin/cuobjdump <extension.so> <kernels.fatbin>
 """
@@ -61,12 +62,10 @@ def main() -> int:
     ref = kernels(a.cuobjdump, a.extension)
     ours = kernels(a.cuobjdump, a.fatbin)
     bad = 0
-    for name, sass in sorted(ref.items()):
-        if "EmptyKernel" in name:                       # cub's, from the torch headers
-            continue
-        got = ours.get(name)
-        if got is None:
-            print(f"MISSING {name}")
+    for name, got in sorted(ours.items()):
+        sass = ref.get(name)
+        if sass is None:
+            print(f"MISSING {name} (not in the extension)")
             bad += 1
         elif got != sass:
             at = next((i for i, (x, y) in enumerate(zip(got, sass)) if x != y), min(len(got), len(sass)))
@@ -75,6 +74,8 @@ def main() -> int:
             bad += 1
         else:
             print(f"SAME {name}: {len(sass)} instructions")
+    left = len([n for n in ref if n not in ours and "EmptyKernel" not in n])
+    print(f"{len(ours) - bad} of {len(ours)} kernels identical; {left} of the extension's not built here")
     return 1 if bad else 0
 
 
