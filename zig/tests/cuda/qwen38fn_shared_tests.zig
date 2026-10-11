@@ -309,6 +309,18 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
         while (try e.step(&.{&l})) {}
         compare("alone again", s, &alone[s], &l.rec, &failures, &equal);
     }
+    // each alone again with the decode attention at its context bucket (the caches' capacity here): the same bytes
+    fw.buckets = true;
+    for (0..streams) |s| {
+        var l: Live = undefined;
+        try e.begin(&l, s, true);
+        defer Env.free(&l, gpa);
+        try e.prefillAll(&l);
+        try e.draft(&.{&l}, true);
+        while (try e.step(&.{&l})) {}
+        compare("alone at context buckets", s, &alone[s], &l.rec, &failures, &equal);
+    }
+    fw.buckets = false;
     // new sequences, the last prompt's chunks between the others' rounds
     {
         var fresh: [streams]Live = undefined;
