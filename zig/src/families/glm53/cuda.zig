@@ -7,6 +7,10 @@
 pub const config = @import("config.zig");
 pub const weights_map = @import("weights_map.zig");
 pub const plan = @import("plan.zig");
+pub const glue = @import("cuda_glue.zig");
+pub const kda = @import("cuda_kda.zig");
+pub const weights = @import("cuda_weights.zig");
+pub const forward = @import("cuda_forward.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
