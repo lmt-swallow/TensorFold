@@ -3022,6 +3022,15 @@ pub fn positionCostsFromEnv() bool {
     return std.mem.eql(u8, v, "1");
 }
 
+/// TF_DS_COPY_DRAFTS=1: windows of host tokens copied from a stream's prompt and reply (the lane core's copy
+/// proposals) may take up to `max_rows` rows, priced against the drafter's by expected tokens a ms
+/// (`lanes.Model.copy_pricing`); the drafter's windows keep their width. Unset or 0: copies take the drafter's
+/// width and the core's fixed ramp. Either way the tokens are the same; only the rows a round verifies differ.
+pub fn copyDraftsFromEnv() bool {
+    const v = std.mem.span(std.c.getenv("TF_DS_COPY_DRAFTS") orelse return false);
+    return std.mem.eql(u8, v, "1");
+}
+
 /// The round loop's facts: shared rounds of up to `slots` streams and `rounds.rows_default` rows (`hidden_rows`;
 /// `factsWith`: `rows`), windows of
 /// up to `draft_width` rows (`factsWith`: `width`); with the drafter, every drafting stream's drafts in one batch (`draft_streams`) and
@@ -3110,20 +3119,18 @@ pub const Lanes = struct {
     /// token's included), and the rows of the last round verified, which the landings that follow it count under
     round_rows_tok: [round_rows_most + 1]u64 = @splat(0),
     last_rows: usize = 0,
+    /// TF_DS_COPY_DRAFTS=1 (`copyDraftsFromEnv`): host-token windows up to `copyWidth` rows, priced by the core
+    copies: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine) Lanes {
-        return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv(), .stats_on = draft_stats.enabled() };
+        return .{ .gpa = gpa, .e = e, .defer_keeps = rounds.tailFromEnv(), .stats_on = draft_stats.enabled(), .copies = copyDraftsFromEnv() };
     }
 
     /// The window verified for `slot`: host tokens, or `w.held` of the drafter's held drafts with their predicted
     /// survivals.
     fn offerStats(self: *Lanes, slot: usize, w: be.Window) void {
         const st = &self.stats[slot];
-        if (w.tokens.len > 0) {
-            st.host_rounds += 1;
-            st.pending = null;
-            return;
-        }
+        if (w.tokens.len > 0) return st.offerHost(w.tokens.len);
         const l = &self.e.streams.lanes[slot];
         var p: [draft_stats.max_drafts]f64 = undefined;
         const n = @min(w.held, l.drafts.len, p.len);
@@ -3224,7 +3231,7 @@ pub const Lanes = struct {
             }
             c.* = .{ .width = @intCast(rows), .ms = ms };
         }
-        for (self.window_costs[0..self.width()], 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
+        for (self.window_costs[0..self.windowRows()], 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
         std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket, batched drafts of 1..{d} streams {any} ms", .{ e.streams.rows, e.round_ms[0..e.streams.rows], rounds.bucket_min, per, e.draft_ms[0..per] });
         // the forwards by position: the least bucket's rows, then each timed end's
         var row_counts: [Engine.probe_rows_most]usize = undefined;
@@ -3246,15 +3253,28 @@ pub const Lanes = struct {
     pub fn facts(self: *const Lanes) lanes.Model {
         const timed = self.shared_costs[0].ms > 0;
         const rows = self.e.streams.rows;
-        var m = factsWith(self.e.drafter != null, self.width(), self.e.streams.lanes.len, rows, if (timed) self.window_costs[0..self.width()] else &.{}, if (timed) self.shared_costs[0..rows] else &.{});
+        const wide = self.windowRows();
+        var m = factsWith(self.e.drafter != null, wide, self.e.streams.lanes.len, rows, if (timed) self.window_costs[0..wide] else &.{}, if (timed) self.shared_costs[0..rows] else &.{});
         if (timed) m.position_costs = self.position_costs[0..self.n_positions];
+        if (wide != self.width()) {
+            // copies up to `wide` rows; the drafter's windows, forced ones and the first copy keep the drafter's width
+            m.drafts = @intCast(self.width() - 1);
+            m.first_copy_rows = @intCast(self.width());
+            m.copy_pricing = true;
+        }
         return m;
     }
 
     /// The window rows the host sizes the round loop for (`Loaded.rows`): a window's drafts at most and the pending
-    /// token (without the drafter, `rowsOf`'s).
+    /// token (without the drafter, `rowsOf`'s); with copies (TF_DS_COPY_DRAFTS=1, the drafter loaded), `copyWidth`.
     pub fn windowRows(self: *const Lanes) u32 {
-        return @intCast(self.width());
+        return @intCast(if (self.copies and self.e.drafter != null) self.copyWidth() else self.width());
+    }
+
+    /// A host-token window's rows at most: a stream's window (`max_rows`) within a round's rows, never under the
+    /// drafter's width.
+    pub fn copyWidth(self: *const Lanes) usize {
+        return @max(self.width(), @min(max_rows, self.e.streams.rows));
     }
 
     /// A window's rows at most: the drafts (TF_DS_DRAFTS, else the drafter's block) and the pending token.
@@ -3404,7 +3424,8 @@ pub const Lanes = struct {
             const l = &st.lanes[slot];
             if (w.parents != null) return error.TreesNotBuilt;
             const rows = w.rows();
-            if (rows > self.width() or r + rows > st.rows) return error.WindowTooWide;
+            const most = if (w.held > 0) self.width() else self.windowRows();
+            if (rows > most or r + rows > st.rows) return error.WindowTooWide;
             for (w.positions, 0..) |p, i| if (p != l.pos + 1 + i) return error.PositionMismatch;
             if (w.held > l.held) return error.NoHeldDrafts;
             const win = ids[r..][0..rows];
@@ -3449,7 +3470,7 @@ pub const Lanes = struct {
             for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
             const slot = try self.slotOf(w.stream);
             if (self.stats_on) {
-                if (self.stats[slot].pending != null) self.round_rows_tok[self.last_rows] += path.len;
+                if (self.stats[slot].waiting()) self.round_rows_tok[self.last_rows] += path.len;
                 self.stats[slot].land(path.len - 1);
             }
             const l = &st.lanes[slot];
@@ -3490,7 +3511,7 @@ pub const Lanes = struct {
                 if (rows.len == 0 or r.follow.len < rows.len) return error.EmptyPath;
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                 if (self.stats_on) {
-                    if (self.stats[slot].pending != null) self.round_rows_tok[self.last_rows] += rows.len;
+                    if (self.stats[slot].waiting()) self.round_rows_tok[self.last_rows] += rows.len;
                     self.stats[slot].land(rows.len - 1);
                 }
                 if (r.start != l.verify_start) return error.PositionMismatch;

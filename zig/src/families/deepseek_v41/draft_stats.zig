@@ -16,8 +16,13 @@ pub fn enabled() bool {
 /// known; a round never landed (the stream left) is not counted.
 pub const Stats = struct {
     rounds: u64 = 0,
-    /// rounds whose window carried host tokens (forced or copied), not the drafter's: not in the tallies below
+    /// rounds whose window carried host tokens (copied, or forced), not the drafter's: not in the tallies below
     host_rounds: u64 = 0,
+    /// those rounds once landed, by host tokens offered (index: the span's length), and the host tokens they landed
+    host_by_offered: [max_drafts + 1]u64 = @splat(0),
+    host_landed: u64 = 0,
+    /// the host-token round waiting for its kept rows: its tokens offered
+    pending_host: ?usize = null,
     /// rounds by drafts offered (index: drafts in the window)
     by_offered: [max_drafts + 1]u64 = @splat(0),
     /// drafts landed in the rounds that offered that many (index: drafts offered)
@@ -38,6 +43,7 @@ pub const Stats = struct {
     /// A verified window: `offered` drafts out of `held`, `survival[j]` the predicted chance that drafts 0 .. j
     /// land (survival.len >= offered, or empty when the drafts carry no prediction).
     pub fn offer(self: *Stats, offered: usize, held: usize, survival: []const f64) void {
+        self.pending_host = null;
         const n = @min(offered, max_drafts);
         self.by_held[@min(held, max_drafts)] += 1;
         var p: [max_drafts]f64 = @splat(-1);
@@ -45,8 +51,27 @@ pub const Stats = struct {
         self.pending = .{ .offered = n, .survival = p };
     }
 
-    /// The pending round kept `kept` drafts (its path's rows less the pending token's); a no-op without one.
+    /// A verified window of `offered` host tokens (copied, or forced).
+    pub fn offerHost(self: *Stats, offered: usize) void {
+        self.host_rounds += 1;
+        self.pending = null;
+        self.pending_host = @min(offered, max_drafts);
+    }
+
+    /// Whether a verified round waits for its kept rows.
+    pub fn waiting(self: *const Stats) bool {
+        return self.pending != null or self.pending_host != null;
+    }
+
+    /// The pending round kept `kept` drafts or host tokens (its path's rows less the pending token's); a no-op
+    /// without one.
     pub fn land(self: *Stats, kept: usize) void {
+        if (self.pending_host) |offered| {
+            self.pending_host = null;
+            self.host_by_offered[offered] += 1;
+            self.host_landed += @min(kept, offered);
+            return;
+        }
         const p = self.pending orelse return;
         self.pending = null;
         const k = @min(kept, p.offered);
@@ -66,6 +91,8 @@ pub const Stats = struct {
     pub fn add(self: *Stats, o: Stats) void {
         self.rounds += o.rounds;
         self.host_rounds += o.host_rounds;
+        for (&self.host_by_offered, o.host_by_offered) |*a, b| a.* += b;
+        self.host_landed += o.host_landed;
         for (&self.by_offered, o.by_offered) |*a, b| a.* += b;
         for (&self.kept_by_offered, o.kept_by_offered) |*a, b| a.* += b;
         for (&self.by_held, o.by_held) |*a, b| a.* += b;
@@ -100,6 +127,10 @@ pub const Stats = struct {
             const pm: f64 = if (pn == 0) -1 else p / @as(f64, @floatFromInt(pn));
             try w.print("{d}:{d}/{d}({d:.3}|{d:.3})", .{ d, l, t, @as(f64, @floatFromInt(l)) / tf, pm });
         }
+        var offered: u64 = 0;
+        for (self.host_by_offered, 0..) |c, k| offered += c * k;
+        try w.print(" host_landed={d}/{d} host_span=", .{ self.host_landed, offered });
+        try hist(w, &self.host_by_offered);
     }
 
     fn hist(w: *std.Io.Writer, h: []const u64) !void {
@@ -132,7 +163,32 @@ test "a round counts once its kept rows land, its drafts tried in order and land
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try s.write(&w);
-    try std.testing.expectEqualStrings("2 rounds (0 of host tokens), 3.000 tokens a drafted round, offered=2:1,4:1 held=5:2 depth=1:2/2(1.000|0.900),2:2/2(1.000|0.700),3:0/1(0.000|0.500),4:0/1(0.000|0.300)", w.buffered());
+    try std.testing.expectEqualStrings("2 rounds (0 of host tokens), 3.000 tokens a drafted round, offered=2:1,4:1 held=5:2 depth=1:2/2(1.000|0.900),2:2/2(1.000|0.700),3:0/1(0.000|0.500),4:0/1(0.000|0.300) host_landed=0/0 host_span=-", w.buffered());
+}
+
+test "host-token rounds count apart from the drafted ones, by span and landed tokens" {
+    var s: Stats = .{};
+    s.offerHost(12);
+    try std.testing.expect(s.waiting());
+    s.land(12);
+    s.offerHost(15);
+    s.land(4);
+    s.offer(3, 5, &.{});
+    s.land(1);
+    s.offerHost(9);
+    s.offer(2, 5, &.{}); // a drafted window replaces an unlanded host one
+    s.land(20);
+    try std.testing.expect(!s.waiting());
+    try std.testing.expectEqual(@as(u64, 3), s.host_rounds);
+    try std.testing.expectEqual(@as(u64, 16), s.host_landed);
+    try std.testing.expectEqual(@as(u64, 1), s.host_by_offered[12]);
+    try std.testing.expectEqual(@as(u64, 1), s.host_by_offered[15]);
+    try std.testing.expectEqual(@as(u64, 0), s.host_by_offered[9]);
+    try std.testing.expectEqual(@as(u64, 2), s.rounds);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try s.write(&w);
+    try std.testing.expect(std.mem.endsWith(u8, w.buffered(), " host_landed=16/27 host_span=12:1,15:1"));
 }
 
 test "landed drafts never exceed the tried ones, and tried ones never increase with depth" {
