@@ -119,7 +119,7 @@ fn depthCase(a: std.mem.Allocator, case: fx.Value) !void {
             try rule.budgets(whos, probe, out);
             try t.expectEqualSlices(i64, try fx.i64s(a, fx.get(op, "result")), out);
         } else if (std.mem.eql(u8, kind, "observe_overhead")) {
-            try rule.observeOverhead(@intCast(fx.int(fx.get(op, "streams"))), @intCast(fx.int(fx.get(op, "rows"))), fx.float(fx.get(op, "ms")));
+            try rule.observeOverhead(@intCast(fx.int(fx.get(op, "streams"))), @intCast(fx.int(fx.get(op, "rows"))), 0.0, fx.float(fx.get(op, "ms")));
         } else if (std.mem.eql(u8, kind, "overhead")) {
             try expectBits(fx.float(fx.get(op, "result")), rule.overheadMs(@intCast(fx.int(fx.get(op, "streams")))));
         } else unreachable;
@@ -140,7 +140,7 @@ fn allocateCase(a: std.mem.Allocator, case: fx.Value) !void {
     const probs_v = fx.get(case, "probs").array.items;
     const probs = try a.alloc([]const f64, probs_v.len);
     for (probs, probs_v) |*p, v| p.* = try fx.floats(a, v);
-    const counts = try lanes.allocate.allocate(gpa, try fx.u32s(a, fx.get(case, "fixed")), probs, &costs, fx.float(fx.get(case, "overhead")), @intCast(fx.int(fx.get(case, "max_rows"))));
+    const counts = try lanes.allocate.allocate(gpa, try fx.u32s(a, fx.get(case, "fixed")), probs, &costs, &.{}, fx.float(fx.get(case, "overhead")), @intCast(fx.int(fx.get(case, "max_rows"))));
     defer gpa.free(counts);
     try t.expectEqualSlices(u32, try fx.u32s(a, fx.get(case, "result")), counts);
 }

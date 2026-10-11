@@ -152,7 +152,7 @@ pub fn probe(e: *Engine) depth.Probe {
 }
 
 pub fn who(s: *Stream) depth.Who {
-    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s };
+    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s, .position = s.cache_len };
 }
 
 /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.
@@ -173,7 +173,17 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = try nodeChances(e, p.stream, n);
         }
     }
-    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
+    // each stream's rows priced at its position (none without position costs)
+    var row_ms: []const []const f64 = &.{};
+    if (!e.cfg.position_costs.empty()) {
+        const prices = try a.alloc([]f64, plans.len);
+        for (prices, plans, fixed, probs) |*m, p, fx, pr| {
+            m.* = try a.alloc(f64, fx + pr.len + 1);
+            e.cfg.position_costs.rowsAt(p.position, m.*);
+        }
+        row_ms = prices;
+    }
+    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, row_ms, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
     for (plans, probs, counts) |*p, chances, c| {
         if (p.kind == .head) p.stream.granted = c;
         if (chances.len == 0 or c == chances.len) continue;

@@ -32,6 +32,9 @@ pub const Model = struct {
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+    // a lone window's forward ms by rows at two or more stream positions (timed at load): allocation prices each
+    // stream's rows at its position by what they add over the shallowest table (allocate.PositionCosts)
+    position_costs: []const alloc.PositionCosts.Timed = &.{},
 };
 
 pub const Config = struct {
@@ -60,6 +63,7 @@ pub const Config = struct {
     family_costs: Table,
     shared_costs: Table,
     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
+    position_costs: alloc.PositionCosts, // a stream's rows' ms over the shallowest table by its position, to batch_rows
     mtp_step_ms: f64,
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
@@ -115,6 +119,7 @@ pub const Config = struct {
             .family_costs = family_costs,
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+            .position_costs = try alloc.PositionCosts.init(gpa, m.position_costs, batch_rows),
             .mtp_step_ms = m.mtp_step_ms,
         };
     }
@@ -124,6 +129,7 @@ pub const Config = struct {
         c.family_costs.deinit(gpa);
         c.shared_costs.deinit(gpa);
         c.lane_costs.deinit(gpa);
+        c.position_costs.deinit(gpa);
     }
 };
 
@@ -135,4 +141,16 @@ test "setup derives widths like Python" {
     try std.testing.expectEqual(@as(u32, 16), c.base_width);
     try std.testing.expectEqual(@as(u32, 4), c.most_drafts);
     try std.testing.expect(c.family_mtp and c.family_streams);
+}
+
+test "position costs reach the config from two or more timed positions" {
+    const gpa = std.testing.allocator;
+    const near = [_]Cost{ .{ .width = 1, .ms = 10.0 }, .{ .width = 2, .ms = 11.0 } };
+    const far = [_]Cost{ .{ .width = 1, .ms = 12.0 }, .{ .width = 2, .ms = 14.0 } };
+    var c = try Config.init(gpa, .{ .exact_width = 2, .mtp = true, .speculate = true, .hidden_rows = true, .batch_rows = 4, .position_costs = &.{ .{ .position = 1024, .costs = &near }, .{ .position = 9216, .costs = &far } } }, 2, 1);
+    defer c.deinit(gpa);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), c.position_costs.extraMs(9216, 2), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), c.position_costs.extraMs(5120, 2), 1e-9);
+    // rows past the timed widths extend to batch_rows: 4 rows cost 22 ms (= 4/2 * 11) and 28 ms
+    try std.testing.expectApproxEqAbs(@as(f64, 6.0), c.position_costs.extraMs(9216, 4), 1e-9);
 }

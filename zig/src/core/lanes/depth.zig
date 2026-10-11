@@ -35,6 +35,7 @@ pub const Who = struct {
     forced: bool,
     granted: ?u32 = null,
     stream: ?*anyopaque = null,
+    position: u64 = 0, // the stream's cache length (its next round's rows follow it)
 };
 
 /// Whether a copied continuation is ahead of a stream (the round loop proposes; Python `_copy_proposal`).
@@ -52,6 +53,7 @@ pub const Rule = struct {
     most_drafts: u32,
     family_costs: *const Table,
     shared_costs: *const Table,
+    position_costs: ?*const alloc.PositionCosts = null, // a stream's rows' ms at its position, over shared_costs
     mtp_step_ms: f64,
     plain_guard: bool,
     node_probabilities: bool,
@@ -210,7 +212,9 @@ pub const Rule = struct {
         const ones = try r.gpa.alloc(u32, whos.len);
         defer r.gpa.free(ones);
         @memset(ones, 1);
-        const counts = try alloc.allocate(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len), @max(whos.len, r.batch_rows));
+        const row_ms = try r.rowPrices(whos, most);
+        defer r.freeRowPrices(row_ms);
+        const counts = try alloc.allocate(r.gpa, ones, probs, r.shared_costs, row_ms, r.overheadMs(whos.len), @max(whos.len, r.batch_rows));
         defer r.gpa.free(counts);
         if (r.plain_guard) {
             // no draft where none pays; a probe after a growing run of plain rounds
@@ -228,6 +232,39 @@ pub const Rule = struct {
         for (whos, most, counts, out) |*w, m, c, *o| o.* = try r.headDepth(w, @min(m, @max(1, @as(i64, c))), probe);
     }
 
+    /// Each stream's row prices at its position for `allocate` (its pending row and up to `most` drafts); empty
+    /// without position costs.
+    fn rowPrices(r: *Rule, whos: []const Who, most: []const i64) ![]const []const f64 {
+        const pc = r.position_costs orelse return &.{};
+        if (pc.empty()) return &.{};
+        const out = try r.gpa.alloc([]f64, whos.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |o| r.gpa.free(o);
+            r.gpa.free(out);
+        }
+        for (whos, most, out) |w, m, *o| {
+            o.* = try r.gpa.alloc(f64, @as(usize, @intCast(m)) + 2);
+            made += 1;
+            pc.rowsAt(w.position, o.*);
+        }
+        return out;
+    }
+
+    fn freeRowPrices(r: *Rule, row_ms: []const []const f64) void {
+        if (row_ms.len == 0) return;
+        for (row_ms) |o| r.gpa.free(o);
+        r.gpa.free(row_ms);
+    }
+
+    /// The ms a round's windows add at their streams' positions (`rows[i]` rows at `positions[i]`) over shared_costs.
+    pub fn positionMs(r: *const Rule, positions: []const u64, rows: []const u32) f64 {
+        const pc = r.position_costs orelse return 0.0;
+        var ms: f64 = 0.0;
+        for (positions, rows) |p, n| ms += pc.extraMs(p, n);
+        return ms;
+    }
+
     /// A shared round's ms beyond its forward at this many streams (the nearest measured count, first seen on ties).
     pub fn overheadMs(r: *const Rule, streams: usize) f64 {
         if (r.overhead.items.len == 0) return 8.0;
@@ -238,8 +275,10 @@ pub const Rule = struct {
         return best.ms;
     }
 
-    pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64) !void {
-        const forward = r.shared_costs.get(@intCast(rows)) orelse return;
+    /// A round of `streams` streams and `rows` rows in all took `ms`; `position_ms` of its forward is its streams'
+    /// positions' share (`positionMs`), the rest is shared_costs' at `rows`.
+    pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, position_ms: f64, ms: f64) !void {
+        const forward = (r.shared_costs.get(@intCast(rows)) orelse return) + position_ms;
         const extra = if (ms - forward > 0.0) ms - forward else 0.0;
         for (r.overhead.items) |*o| {
             if (o.streams == streams) {

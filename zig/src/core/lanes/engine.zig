@@ -53,6 +53,7 @@ pub const Engine = struct {
                 .most_drafts = cfg.most_drafts,
                 .family_costs = &cfg.family_costs,
                 .shared_costs = &cfg.shared_costs,
+                .position_costs = &cfg.position_costs,
                 .mtp_step_ms = cfg.mtp_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
@@ -302,7 +303,7 @@ pub const Engine = struct {
         if (plan.kind == .head) {
             const ms = e.clock.elapsedMs(.overhead);
             try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
-            try e.rule.observeOverhead(1, rows, ms);
+            try e.rule.observeOverhead(1, rows, e.rule.positionMs(&.{plan.position}, &.{@intCast(rows)}), ms);
         }
         return .{ .rows = @intCast(rows), .keep = @intCast(o.path.len), .got = o.got };
     }
@@ -316,11 +317,15 @@ pub const Engine = struct {
         try win.allocate(e, plans);
         const windows = try a.alloc(be.Window, plans.len);
         const out = try a.alloc(be.Verified, plans.len);
+        const positions = try a.alloc(u64, plans.len);
+        const window_rows = try a.alloc(u32, plans.len);
         var total: u64 = 0;
-        for (plans, windows, out) |p, *w, *o| {
+        for (plans, windows, out, positions, window_rows) |p, *w, *o, *at, *n| {
             w.* = try win.build(e, p, false);
             o.* = .{ .sampled = try a.alloc(u32, w.rows()), .drafts = try a.alloc(u32, w.rows() - 1) };
             total += w.rows();
+            at.* = p.position;
+            n.* = @intCast(w.rows());
         }
         try e.backend.verify(windows, out);
         const outcomes = try a.alloc(Outcome, plans.len);
@@ -357,7 +362,7 @@ pub const Engine = struct {
         try e.backend.keep(windows, paths);
         const ms = e.clock.elapsedMs(.overhead);
         try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
-        try e.rule.observeOverhead(@intCast(plans.len), total, ms);
+        try e.rule.observeOverhead(@intCast(plans.len), total, e.rule.positionMs(positions, window_rows), ms);
     }
 
     /// Commit the target-sampled path (after the thinking budget's cut); the kept rows and their following tokens.
