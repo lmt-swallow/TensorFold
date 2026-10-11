@@ -317,7 +317,7 @@ fn runMtp(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, tk: *const T.Kern
             try h.feed("hidden_in", b.hin);
             try T.front(g, cfg, &r.mtp, b, r.embed.ptr, n, mtp_len == 0, stream);
             try h.call("mm", "out_out", b.mx.ptr);
-            _ = try h.next("rmsnorm"); // (enorm and hnorm write strided halves; eh_proj's input checks them)
+            // (enorm and hnorm, traced before eh_proj, write strided halves: eh_proj's output checks them)
             try h.call("rmsnorm", "out_out", b.normed.ptr);
             try A.dsaBlock(g, lay, &r.mtp.dsa, cache, ds, .{ .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = r.pos_dev.ptr, .host_pos = mtp_len, .nch = (mtp_len + n + 511) / 512, .R = n }, stream);
             try compareDsa(h, ds, cache, false, prefill, mtp_len, n, cfg.denseLimit(), b.part.ptr);

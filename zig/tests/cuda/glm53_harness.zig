@@ -76,8 +76,16 @@ pub const Harness = struct {
 
     /// The device bytes at `ptr` against the fixture array `name` (its length): a PASS, or a FAIL counted with the
     /// first differing byte; isolated runs then put the reference's bytes there.
-    pub fn same(h: *Harness, name: []const u8, ptr: cuda.abi.DevicePtr) !void {
+    pub fn same(h: *Harness, name_: []const u8, ptr: cuda.abi.DevicePtr) !void {
         try h.stream.synchronize();
+        // an argument the call left as it was has no "<arg>_out" (ref.Tracer saves only what changed): its "_in"
+        // holds what the call left there
+        var alt: [160]u8 = undefined;
+        const arrays = h.fx.parsed.value.object.get("arrays").?.object;
+        const name = if (arrays.get(name_) == null and std.mem.endsWith(u8, name_, "_out"))
+            try std.fmt.bufPrint(&alt, "{s}_in", .{name_[0 .. name_.len - 4]})
+        else
+            name_;
         const want = h.fx.bytes(name) catch |e| {
             std.debug.print("FAIL glm53 {s}: not in the fixture ({t})\n", .{ name, e });
             h.failures += 1;

@@ -206,7 +206,7 @@ pub const Scratch = struct {
     tokens: Buf, // [rows, 2051] i32
     counts: Buf, // [rows] i32
     split: Buf, // select_split's scratch
-    at: Buf, // [rows / 512 + 1] i32: a prompt chunk's blocks' first positions
+    at: Buf, // a prompt chunk's blocks' first positions (i32): the dense blocks' packed, the selection's 16 bytes apart
 
     pub fn init(d: *const cuda.Driver, lay: config.Layout, rows: usize, capacity: usize, prefill: bool) !Scratch {
         const c = lay.cfg;
@@ -249,7 +249,7 @@ pub const Scratch = struct {
         s.tokens = try a(d, rows * glue_mod.sparse_tokens * 4);
         s.counts = try a(d, rows * 4);
         s.split = try a(d, if (prefill) 16 else glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
-        s.at = try a(d, (rows / prompt_att_rows + 2) * 4);
+        s.at = try a(d, at_select + (rows / select_rows + 2) * 16);
         return s;
     }
 
@@ -271,13 +271,22 @@ pub const Call = struct {
     R: usize,
 };
 
-/// `at` + `pos`: a device int32 holding host position `pos` (a prompt chunk's block start, forward.py's
-/// pos_dev + starts[i]; the host knows the chunk's position).
-fn devicePos(s: *const Scratch, slot: usize, pos: usize, stream: cuda.Stream) !Ptr {
+/// Where Scratch.at's selection positions start: past the dense blocks' packed ones.
+const at_select = 256;
+
+/// A device int32 holding host position `pos` (a prompt chunk's block start; the host knows the chunk's
+/// position). The pointer's alignment is the reference's, which Triton specializes on: forward.py's dense blocks
+/// read element i of one tensor `pos_dev + starts` (4 bytes apart); sparse.py's selection blocks a tensor of their own
+/// (`pos_dev + a`, an allocation: 16-byte aligned).
+fn devicePos(s: *const Scratch, comptime kind: enum { dense, select }, slot: usize, pos: usize, stream: cuda.Stream) !Ptr {
+    const off = switch (kind) {
+        .dense => slot * 4,
+        .select => at_select + slot * 16,
+    };
     const v: i32 = @intCast(pos);
-    try s.at.uploadAsync(slot * 4, std.mem.asBytes(&v), stream.handle);
+    try s.at.uploadAsync(off, std.mem.asBytes(&v), stream.handle);
     try stream.synchronize();
-    return s.at.ptr + slot * 4;
+    return s.at.ptr + off;
 }
 
 /// forward.py `dsa_front` and `dsa_rows` up to o_proj, then o_proj into call.part (forward.py `_dsa_latent`).
@@ -318,7 +327,7 @@ pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache,
                 i += 1;
             }) {
                 const r1 = @min(dense, r0 + s.part_rows);
-                const at = try devicePos(s, i, call.host_pos + r0, stream);
+                const at = try devicePos(s, .dense, i, call.host_pos + r0, stream);
                 try g.denseAttention(s.qa.ptr + r0 * H * lw * 2, cache.latent.ptr, at, s.dense, s.ol.ptr + r0 * H * lw * 2, r1 - r0, H, lw, nch, hb, scale, stream);
             }
         }
@@ -355,7 +364,7 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, wts
             // top_pools splits a block of fewer than 64 rows over 8,192 pools or more across chunk programs
             // (select_split's pool form), which this port does not run yet: refused rather than selected otherwise
             if (n < split_rows and NP >= split_from) return error.UnportedPromptSplitSelection;
-            const at = if (a == 0) call.pos_dev else try devicePos(s, i, call.host_pos + a, stream);
+            const at = if (a == 0) call.pos_dev else try devicePos(s, .select, i, call.host_pos + a, stream);
             try g.scores(s.qi.ptr + a * qrow, wts + a * w_stride * 2, w_stride, cache.pk.ptr, s.scores.ptr, at, n, NP, stream);
             try g.selectRows(s.scores.ptr, s.pools.ptr, NP, 0, n, stream);
             try g.tokens(s.pools.ptr, at, s.tokens.ptr + a * glue_mod.sparse_tokens * 4, s.counts.ptr + a * 4, n, stream);
