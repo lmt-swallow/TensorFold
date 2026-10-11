@@ -330,6 +330,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "{s}{d}: whole prompt chunks a call, 1 to {d}", .{ named, segments, F.max_segments });
         return null;
     }
+    // two streams that both issue collectives (a pass's parts beside the rounds, each on a communicator of its own)
+    // must be able to run a collective each at once on every rank: NCCL's kernels spin until their peer's arrive, so
+    // a rank whose SMs one collective's blocks fill cannot start the other's, which the peer may be spinning on (both
+    // ranks hang: NCCL picks 64 channels, one block each, on a GB10 pair of 48 SMs). Two channels leave room for both;
+    // own hardware queues keep one stream's spinning kernel from holding the other's next one. NCCL reads its
+    // variables at a communicator's creation, the driver at its context's; values already set are kept.
+    if (overlap) {
+        _ = setenv("NCCL_MAX_NCHANNELS", "2", 0);
+        _ = setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32", 0);
+    }
     const g = try gpa.create(Gpu);
     var opened = false;
     defer if (!opened) gpa.destroy(g);
@@ -409,6 +419,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn toGib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / gib;
