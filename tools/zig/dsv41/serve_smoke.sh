@@ -43,6 +43,10 @@ RAILS=${RAILS:-auto}
 RAIL_HCAS=${RAIL_HCAS:-rocep1s0f0 roceP2p1s0f0}   # a Spark's QSFP cable reaches the peer over two PCIe Gen5 x4 functions
 RAIL_GID=${RAIL_GID:-3}
 RDMA=${RDMA:-1}                # 1: with two or more rails, the rounds' gathers over the RDMA ring (TF_DS_RDMA); 0: NCCL only
+# TF_DS_LINK_POLL: 0 makes rank 1 block on the control link instead of spinning. The spinning CPU slows rank 1's
+# latency-bound kernels by about 10% (the nodes share one memory), and rank 0 then waits for it at every gather. With
+# 0, the ranks' kernel times match within 4%, and a lone code stream gains 3-11%. 1: the engine's own busy poll and spin.
+LINK_POLL=${LINK_POLL:-0}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -171,6 +175,7 @@ case "$RAILS" in *,*)
 esac
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
+[ "$LINK_POLL" = 0 ] && ENVS="$ENVS -e TF_DS_LINK_POLL=0"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
 [ "$DRAFTS" = 0 ] && SERVE="$SERVE --no-drafts"
