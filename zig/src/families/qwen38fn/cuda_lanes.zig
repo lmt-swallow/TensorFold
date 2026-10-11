@@ -1,5 +1,6 @@
 //! Qwen3.8-Flash-Next streams behind the lane core (core/lanes): each stream owns its sequence (caches, DeltaNet
-//! states, n-gram tail), shares the model and the window buffers, and runs its windows one forward at a time.
+//! states, n-gram tail) and shares the model and the window buffers; a round's windows of up to `max_streams`
+//! streams run as one forward (multi.py `round`), each row with the bits of its stream's own window.
 //! Greedy decoding only for now: a row's token is the first index of its largest logit (torch.argmax), read on the
 //! host. With the MTP head, a stream's drafts come from its greedy confidence chain (decode.py `draft`: up to 6, the
 //! chain ending below 0.70) and are verified in its next window; the tokens kept are always the main model's.
@@ -19,9 +20,17 @@ const ring = 1024;
 /// The rows a decode window takes at most (forward.py windows keep each row's bits up to this many).
 pub const max_rows = 16;
 
+/// The streams a round runs at most (multi.py `MultiDecoder` slots): the shared buffers hold this many windows.
+pub const max_streams = 4;
+
+/// A shared round's rows at most.
+const shared_rows = max_streams * max_rows;
+
 const Lane = struct {
     st: *fwd.Stream,
     pending_rows: ?usize = null,
+    a0: usize = 0, // the first row of its window in the last round's buffers
+    round: u64 = 0, // that round (Lanes.rounds): its final streams stay in b.streams until the next one
     last: ?cuda.DeviceBuffer = null, // the prompt's last row's final streams (the head's first absorb)
     held: [mtp.depth]u32 = undefined, // the drafts the head holds for the next window
     probs: [mtp.depth]f64 = undefined,
@@ -43,6 +52,7 @@ pub const Lanes = struct {
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     host_logits: []u16,
+    rounds: u64 = 0,
     head: ?*mtp.Head = null,
     mb: ?fwd.Buffers = null, // the head's decode buffers
     sc: ?mtp.Scratch = null,
@@ -54,21 +64,21 @@ pub const Lanes = struct {
         self.* = .{ .gpa = gpa, .d = d, .m = m, .set = set, .f = fwd.Forward.init(d, m, set), .pr = undefined, .b = undefined, .pb = undefined, .stream = undefined, .capacity = capacity, .host_logits = undefined };
         self.pr = try prompt_mod.Prompt.init(&self.f, sms);
         errdefer self.pr.deinit();
-        self.b = try fwd.Buffers.init(gpa, d, m, max_rows, capacity);
+        self.b = try fwd.Buffers.init(gpa, d, m, shared_rows, capacity);
         errdefer self.b.deinit();
         self.pb = try prompt_mod.Buffers.init(gpa, d, m, prompt_mod.chunk_rows, capacity);
         errdefer self.pb.deinit();
         self.stream = try cuda.Stream.init(d, true);
         errdefer self.stream.deinit();
-        self.host_logits = try gpa.alloc(u16, max_rows * m.cfg.vocab);
+        self.host_logits = try gpa.alloc(u16, shared_rows * m.cfg.vocab);
         return self;
     }
 
     /// Load the pack's MTP head and draft with it (before any stream exists: each stream then keeps a head cache).
     pub fn withHead(self: *Lanes) !void {
-        self.head = try mtp.Head.load(self.gpa, self.d, self.m, self.stream);
-        self.mb = try fwd.Buffers.init(self.gpa, self.d, self.m, max_rows, self.capacity);
-        self.sc = try mtp.Scratch.init(self.d, &self.m.cfg, max_rows);
+        self.head = try mtp.Head.load(self.gpa, self.d, self.m, max_streams, self.stream);
+        self.mb = try fwd.Buffers.init(self.gpa, self.d, self.m, shared_rows, self.capacity);
+        self.sc = try mtp.Scratch.init(self.d, &self.m.cfg, shared_rows);
         self.scp = try mtp.Scratch.init(self.d, &self.m.cfg, prompt_mod.chunk_rows);
     }
 
@@ -103,12 +113,13 @@ pub const Lanes = struct {
         } };
     }
 
-    /// The facts the round loop reads: one-row rounds, one stream a forward, greedy draws on the host.
-    /// With the head: windows of the pending token and up to 6 drafts, the head's own chain deciding how many (its
-    /// probabilities given, no cost table: the round loop keeps every draft it holds).
+    /// The facts the round loop reads: up to `max_streams` streams a round, greedy draws on the host. Without the
+    /// head, one-row windows; with it, windows of the pending token and up to 6 drafts, the head's own chain deciding
+    /// how many (its probabilities given, no cost table: the round loop keeps every draft it holds).
     pub fn facts(self: *Lanes) lanes.Model {
-        if (self.head == null) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = false, .max_streams = 1, .batch_rows = 1 };
-        return .{ .exact_width = self.windowRows(), .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = mtp.depth, .draft_probabilities = true, .hidden_rows = false, .max_streams = 1, .batch_rows = self.windowRows() };
+        const rows = max_streams * self.windowRows();
+        if (self.head == null) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = false, .max_streams = max_streams, .batch_rows = rows };
+        return .{ .exact_width = self.windowRows(), .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = mtp.depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = false, .max_streams = max_streams, .batch_rows = rows };
     }
 
     /// A window's rows at most: the pending token and, with the head, its drafts.
@@ -218,25 +229,41 @@ pub const Lanes = struct {
         return self.drawn[handle % ring];
     }
 
-    /// Each window on its own forward (pending row, then host drafts), drawn greedily; committed lazily.
+    /// multi.py `round` without a prompt pass: every window (pending row, then host drafts) in one forward, each
+    /// stream's rows after the last's, drawn greedily; committed lazily.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
-        for (windows, out) |w, o| {
+        if (windows.len > max_streams) return error.TooManyStreams;
+        var segs: [max_streams]fwd.Seg = undefined;
+        var ids: [shared_rows]i32 = undefined;
+        var R: usize = 0;
+        for (windows, 0..) |w, i| {
             if (w.parents != null) return error.TreesNotBuilt;
             if (w.held > 0) return error.NoDraftHead;
             const l = try self.bindLane(w.stream, null);
             const rows = w.rows();
             if (rows > max_rows) return error.WindowTooWide;
             for (w.positions, 0..) |p, r| if (p != l.st.pos + 1 + r) return error.PositionMismatch;
-            var ids: [max_rows]i32 = undefined;
-            ids[0] = @intCast(w.pending);
-            for (w.tokens, 1..) |t, i| ids[i] = @intCast(t);
-            try self.f.stage(l.st, &self.b, ids[0..rows], self.stream);
-            try self.f.compute(l.st, &self.b, rows, .{}, self.stream);
-            try self.stream.synchronize();
-            try self.argmax(self.b.logits, rows, o.sampled);
+            for (windows[0..i]) |o| if (o.stream == w.stream) return error.StreamTwice;
+            ids[R] = @intCast(w.pending);
+            for (w.tokens, 1..) |t, k| ids[R + k] = @intCast(t);
+            segs[i] = .{ .st = l.st, .a0 = R, .n = rows };
+            R += rows;
+        }
+        if (R == 0) return;
+        try self.f.stageSegs(segs[0..windows.len], &self.b, ids[0..R], self.stream);
+        try self.f.computeSegs(segs[0..windows.len], &self.b, .{}, self.stream);
+        try self.stream.synchronize();
+        var drawn: [shared_rows]u32 = undefined;
+        try self.argmax(self.b.logits, R, drawn[0..R]);
+        self.rounds += 1;
+        for (windows, out, segs[0..windows.len]) |w, o, sg| {
+            @memcpy(o.sampled[0..sg.n], drawn[sg.a0..][0..sg.n]);
             @memcpy(o.drafts, w.tokens);
-            l.pending_rows = rows;
+            const l = self.lanes.getPtr(w.stream).?;
+            l.pending_rows = sg.n;
+            l.a0 = sg.a0;
+            l.round = self.rounds;
         }
     }
 
@@ -249,27 +276,33 @@ pub const Lanes = struct {
         }
     }
 
-    /// decode.py `draft` for each request: the kept rows (or, after the prompt, its last row) absorbed with the token
-    /// after each, then the chain; its drafts held for the stream's next window.
+    /// multi.py `_draft_all`: every request's kept rows (or, after the prompt, its last row) absorbed with the token
+    /// after each in one head call, then the chains, one head call a depth; each stream's drafts held for its next
+    /// window.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
         const h = self.head orelse {
             for (requests) |r| if (r.depth > 0) return error.NoDraftHead;
             return;
         };
-        for (requests) |r| {
+        if (requests.len > max_streams) return error.TooManyStreams;
+        const wide = self.m.cfg.wide();
+        var next: [max_streams][max_rows]i32 = undefined;
+        var reqs: [max_streams]mtp.Head.Request = undefined;
+        var held: [max_streams]*Lane = undefined;
+        for (requests, 0..) |r, i| {
             const l = try self.bindLane(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != l.st.pos + 1) return error.PositionMismatch;
-            var next: [max_rows]i32 = undefined;
             var n: usize = 0;
             var streams: cuda.abi.DevicePtr = undefined;
             if (r.rows) |rows| {
-                for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
-                for (r.follow[0..rows.len], 0..) |t, i| next[i] = @intCast(t);
+                if (l.round != self.rounds) return error.StaleRows; // another round overwrote its final streams
+                for (rows, 0..) |row, k| if (row != k) return error.TreesNotBuilt;
+                for (r.follow[0..rows.len], 0..) |t, k| next[i][k] = @intCast(t);
                 n = rows.len;
-                streams = self.b.streams.ptr;
+                streams = self.b.streams.ptr + l.a0 * wide * 2;
             } else {
-                next[0] = @intCast(if (r.first) |first| switch (first) {
+                next[i][0] = @intCast(if (r.first) |first| switch (first) {
                     .handle => |hd| self.drawn[hd % ring],
                     .value => |v| v,
                 } else if (r.follow.len == 1) r.follow[0] else return error.NoFirstToken);
@@ -277,12 +310,11 @@ pub const Lanes = struct {
                 streams = l.last.?.ptr;
             }
             l.nheld = 0;
-            if (r.depth == 0) {
-                try h.absorb(&self.f, l.st, &self.mb.?, &self.sc.?, streams, next[0..n], self.stream);
-            } else {
-                l.nheld = try h.draft(&self.f, l.st, &self.mb.?, &self.sc.?, streams, next[0..n], @min(r.depth, mtp.depth), &l.held, &l.probs, self.stream);
-            }
+            held[i] = l;
+            reqs[i] = .{ .st = l.st, .streams = streams, .next = next[i][0..n], .count = @min(r.depth, mtp.depth), .out = &l.held, .probs = &l.probs };
         }
+        try h.draftAll(&self.f, reqs[0..requests.len], &self.mb.?, &self.sc.?, self.stream);
+        for (reqs[0..requests.len], held[0..requests.len]) |q, l| l.nheld = q.n;
     }
 
     /// The held drafts as host tokens (a chain: no parents), read where the round loop plans the next window.
