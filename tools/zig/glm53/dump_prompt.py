@@ -259,7 +259,7 @@ def main() -> int:
     params = {"layers": LAYERS, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
               "rows": MAX_ROWS, "prompt_rows": PREFILL_ROWS, "world": 2, "steps": steps, "digests": digests,
               "dense_limit": ws[0].cfg.dense_limit, "ring": F.index_ring(CAPACITY, max(MAX_ROWS, PREFILL_ROWS)),
-              "long_ring": F.index_ring(LONG_CAPACITY, max(MAX_ROWS, PREFILL_ROWS))}
+              "long_ring": F.index_ring(LONG_CAPACITY, max(MAX_ROWS, PREFILL_ROWS)), "kv": ref.KV}
     ck.save(out / "fixture", params, arrays, extra={"trace": tr.calls})
     rec.dump(out / "launches.json")
     (out / "jit.json").write_text(json.dumps(ck.specialization(), indent=1, sort_keys=True) + "\n")

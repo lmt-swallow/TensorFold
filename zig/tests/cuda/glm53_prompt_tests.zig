@@ -182,10 +182,10 @@ const Rank = struct {
     }
 
     /// A fresh stream over `capacity` tokens: zero caches, KDA state and conv windows, position 0.
-    fn fresh(r: *Rank, d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, ring: usize) !void {
+    fn fresh(r: *Rank, d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, ring: usize, kv: A.Kv) !void {
         r.dropCaches();
-        r.cache = try A.Cache.init(d, cfg, capacity, ring);
-        r.mcache = try A.Cache.init(d, cfg, capacity, ring);
+        r.cache = try A.Cache.init(d, cfg, capacity, ring, kv);
+        r.mcache = try A.Cache.init(d, cfg, capacity, ring, kv);
         r.caches = true;
         try r.st.rec.fill8(0, null);
         try r.st.conv.fill8(0, null);
@@ -262,7 +262,16 @@ fn weightsOk(gpa: std.mem.Allocator, io: std.Io, work: []const u8, ranks: []Rank
     check.pass("glm53-prompt: the cut-down model's tensors equal the reference loader's ({d} sha256)", .{n});
 }
 
-pub fn run(gpu: Gpu, work: []const u8, model: []const u8) !void {
+/// The fixture's DSA cache format (params "kv": dump_*.py with TF_GLM53_REF_KV; absent: bf16), required to be `want`
+/// when given (the -fp8 subcommands).
+fn fixtureKv(params: std.json.ObjectMap, want: ?A.Kv) !A.Kv {
+    const kv = try A.Kv.parse(if (params.get("kv")) |v| v.string else "");
+    if (want) |w| try check.expect(kv == w, "glm53: the fixture's DSA caches are {t}, not {t} (capture it with KV={t})", .{ kv, w, w });
+    return kv;
+}
+
+/// `want`: the cache format the fixture must hold (glm53-prompt-fp8), or any (glm53-prompt).
+pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
     var why: glm.config.Why = .{};
@@ -289,6 +298,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8) !void {
     const prompt_rows: usize = @intCast(params.get("prompt_rows").?.integer);
     const ring: usize = @intCast(params.get("ring").?.integer);
     const long_ring: usize = @intCast(params.get("long_ring").?.integer);
+    const kv = try fixtureKv(params, want);
     var stream = try cuda.Stream.init(d, true);
     defer stream.deinit();
     var h: Digests = .{ .gpa = gpa, .d = d, .stream = stream, .trace = fx.parsed.value.object.get("trace").?.array.items, .steps = params.get("digests").?.object };
@@ -340,7 +350,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8) !void {
     while (it.next()) |e| {
         const name = e.key_ptr.*;
         const long = std.mem.eql(u8, name, "l");
-        for (&ranks) |*r| try r.fresh(d, &cfg, if (long) long_capacity else capacity, if (long) long_ring else ring);
+        for (&ranks) |*r| try r.fresh(d, &cfg, if (long) long_capacity else capacity, if (long) long_ring else ring, kv);
         if (long) for (&ranks) |*r| {
             // dump_prompt.py's draws: layer 3's latents and pooled keys, then the MTP layer's
             for ([_]Buf{ r.cache.latent, r.cache.pk, r.mcache.latent, r.mcache.pk }, 0..) |b, seed| try draw(gpa, b, seed);
@@ -419,9 +429,9 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
         try h.state("x_out", r.p.b.x.ptr);
         try h.state("rec", r.st.state(r.st.cur, 0));
         try h.state("conv", r.st.convOf(0));
-        try h.state("latent", r.cache.latent.ptr + pos * cfg.kv_lora * 2);
+        try h.state("latent", r.cache.latent.ptr + r.cache.latentAt(cfg, pos));
         try h.state("pk", r.cache.pk.ptr);
-        if (absorbed > 0) try h.state("mtp_latent", r.mcache.latent.ptr + mtp0 * cfg.kv_lora * 2);
+        if (absorbed > 0) try h.state("mtp_latent", r.mcache.latent.ptr + r.mcache.latentAt(cfg, mtp0));
         var nb: [64]u8 = undefined;
         const want = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_head", .{ ri, step }));
         defer gpa.free(want);

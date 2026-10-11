@@ -28,6 +28,61 @@ const index_wscale: f32 = @floatCast(1.0 / 5.656854249492381);
 /// sparse.py TOKENS: a sparse row's attended tokens (512 pools of 4, then its incomplete pool's 3).
 pub const sparse_tokens = 512 * 4 + 3;
 
+/// The DSA caches' format (the Mia fork's TF_GLM_KV, glm5_next/cuda/kv8.py): the latent rows and the indexer's
+/// pooled keys, bf16 (the default), or fp8: a row of `width` values is `width` e4m3 codes, its fp32 power-of-two
+/// scale and 12 zero bytes (`rowBytes`), as `_lat_write` and `_pool_keys` store it. The indexer's per-token key and
+/// gate ring is bf16 in both. Every kernel that reads or writes these caches takes the format as its FP8 constexpr,
+/// its row stride RS (elements of the value pointer) and the value and scale pointers' types.
+pub const Kv = enum {
+    bf16,
+    fp8,
+
+    /// kv8.py PAD: the bytes after an FP8 row's codes (its scale, then zeros).
+    pub const pad = 16;
+
+    /// kv8.py `kv_kind`: TF_GLM_KV's value ("" is bf16).
+    pub fn parse(text: []const u8) !Kv {
+        if (text.len == 0) return .bf16;
+        return std.meta.stringToEnum(Kv, text) orelse error.BadKvFormat;
+    }
+
+    /// kv8.py `row_bytes`: a cache row of `width` values.
+    pub fn rowBytes(k: Kv, width: usize) usize {
+        return switch (k) {
+            .bf16 => 2 * width,
+            .fp8 => width + pad,
+        };
+    }
+
+    /// kv8.py `parts`: a row's stride in elements of the kernel's value pointer.
+    fn stride(k: Kv, width: usize) usize {
+        return switch (k) {
+            .bf16 => width,
+            .fp8 => width + pad,
+        };
+    }
+
+    /// The value pointer's Triton type: bf16 values, or the e4m3 codes (a torch.float8_e4m3fn view).
+    fn values(k: Kv) []const u8 {
+        return switch (k) {
+            .bf16 => "*bf16",
+            .fp8 => "*fp8e4nv",
+        };
+    }
+
+    /// The scale pointer's Triton type: an FP8 cache's fp32 view; a bf16 cache passes itself, unread.
+    fn scales(k: Kv) []const u8 {
+        return switch (k) {
+            .bf16 => "*bf16",
+            .fp8 => "*fp32",
+        };
+    }
+
+    fn flag(k: Kv) i64 {
+        return @intFromBool(k == .fp8);
+    }
+};
+
 /// sparse.py `split_scratch`: select_split's int32s for R rows of np scores.
 pub fn splitScratchBytes(R: usize, np: usize) usize {
     const chs: usize = if (np <= 16384) 2048 else 4096;
@@ -256,26 +311,28 @@ pub const Glue = struct {
 
     // -- DSA: the latent cache, the indexer and the attention (latent.py, sparse.py) ------------------------------
 
-    /// latent.py `latent_write`: lat rows [R, 512] (row stride lat_stride) into cache rows pos .. pos + R - 1.
-    pub fn latWrite(g: Glue, lat: Ptr, lat_stride: usize, cache: Ptr, pos: Ptr, R: usize, lw: usize, stream: cuda.Stream) !void {
+    /// latent.py `latent_write`: lat rows [R, 512] (row stride lat_stride) into cache rows pos .. pos + R - 1 (an FP8
+    /// cache: each row's codes and scale, a function of the row alone).
+    pub fn latWrite(g: Glue, lat: Ptr, lat_stride: usize, cache: Ptr, kv: Kv, pos: Ptr, R: usize, lw: usize, stream: cuda.Stream) !void {
         try g.set.run(stream, "_lat_write", .{ @intCast(R), 1, 1 }, &.{
-            aot.ptr("LAT", "*bf16", lat), aot.int("lat_stride", n32(lat_stride)), aot.ptr("LC", "*bf16", cache),
-            aot.ptr("LS", "*bf16", cache), aot.ptr("POS", "*i32", pos),
-        }, &.{ aot.ci("LW", @intCast(lw)), aot.ci("RS", @intCast(lw)), aot.ci("FP8", 0) });
+            aot.ptr("LAT", "*bf16", lat), aot.int("lat_stride", n32(lat_stride)), aot.ptr("LC", kv.values(), cache),
+            aot.ptr("LS", kv.scales(), cache), aot.ptr("POS", "*i32", pos),
+        }, &.{ aot.ci("LW", @intCast(lw)), aot.ci("RS", @intCast(kv.stride(lw))), aot.ci("FP8", kv.flag()) });
     }
 
     /// sparse.py `index_update`: the rows' LayerNormed index keys and their gates into the ring (row t at t % ring),
     /// then every pool of 4 the window completes into the pooled keys.
-    pub fn indexUpdate(g: Glue, kr: Ptr, k_stride: usize, gr: Ptr, ln_w: Ptr, ln_b: Ptr, ape: Ptr, ik: Ptr, ig: Ptr, ring: usize, pk: Ptr, pos: Ptr, R: usize, stream: cuda.Stream) !void {
+    /// `kv`: the pooled keys' format (the ring is bf16 either way).
+    pub fn indexUpdate(g: Glue, kr: Ptr, k_stride: usize, gr: Ptr, ln_w: Ptr, ln_b: Ptr, ape: Ptr, ik: Ptr, ig: Ptr, ring: usize, pk: Ptr, kv: Kv, pos: Ptr, R: usize, stream: cuda.Stream) !void {
         try g.set.run(stream, "_index_write", .{ @intCast(R), 1, 1 }, &.{
             aot.ptr("KR", "*bf16", kr), aot.int("k_stride", n32(k_stride)), aot.ptr("GR", "*fp32", gr), aot.ptr("LNW", "*bf16", ln_w),
             aot.ptr("LNB", "*bf16", ln_b), aot.ptr("IK", "*bf16", ik), aot.ptr("IG", "*bf16", ig), aot.ptr("POS", "*i32", pos),
             aot.int("RING", n32(ring)), aot.float("eps", 1e-6),
         }, &.{aot.ci("D", 128)});
         try g.set.run(stream, "_pool_keys", .{ @intCast(R / 4 + 2), 1, 1 }, &.{
-            aot.ptr("IK", "*bf16", ik), aot.ptr("IG", "*bf16", ig),   aot.ptr("APE", "*bf16", ape), aot.ptr("PK", "*bf16", pk),
-            aot.ptr("PKS", "*bf16", pk), aot.ptr("POS", "*i32", pos), aot.int("R", n32(R)),       aot.int("RING", n32(ring)),
-        }, &.{ aot.ci("D", 128), aot.ci("RS", 128), aot.ci("FP8", 0) });
+            aot.ptr("IK", "*bf16", ik),     aot.ptr("IG", "*bf16", ig),   aot.ptr("APE", "*bf16", ape), aot.ptr("PK", kv.values(), pk),
+            aot.ptr("PKS", kv.scales(), pk), aot.ptr("POS", "*i32", pos), aot.int("R", n32(R)),       aot.int("RING", n32(ring)),
+        }, &.{ aot.ci("D", 128), aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()) });
     }
 
     /// latent.py `absorb_q` (bf16 kv_b): qa [R, H, LW] = q [R, H, D] @ wk [H, D, LW]; prompt rows on the tensor cores.
@@ -302,13 +359,13 @@ pub const Glue = struct {
 
     /// latent.py `attention`: rows 0 .. R at device position pos (keys 0 .. pos + r visible to row r) over `nch`
     /// 512-key chunks into fp32 partials, then their merge in chunk order into out [R, H, LW].
-    pub fn denseAttention(g: Glue, qa: Ptr, cache: Ptr, pos: Ptr, p: Partials, out: Ptr, R: usize, H: usize, lw: usize, nch: usize, hb: usize, scale: f32, stream: cuda.Stream) !void {
+    pub fn denseAttention(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, pos: Ptr, p: Partials, out: Ptr, R: usize, H: usize, lw: usize, nch: usize, hb: usize, scale: f32, stream: cuda.Stream) !void {
         try g.set.run(stream, "_dense_chunks", .{ @intCast(R), @intCast(cdiv(H, hb)), @intCast(nch) }, &.{
-            aot.ptr("QA", "*bf16", qa), aot.ptr("LC", "*bf16", cache), aot.ptr("LS", "*bf16", cache), aot.ptr("POS", "*i32", pos),
+            aot.ptr("QA", "*bf16", qa), aot.ptr("LC", kv.values(), cache), aot.ptr("LS", kv.scales(), cache), aot.ptr("POS", "*i32", pos),
             aot.ptr("PO", "*fp32", p.po), aot.ptr("PM", "*fp32", p.pm), aot.ptr("PL", "*fp32", p.pl), aot.int("R", n32(R)),
         }, &.{
             aot.ci("H", @intCast(H)),   aot.ci("LW", @intCast(lw)), aot.ci("CH", 512), aot.cf("SCALE", scale),
-            aot.ci("HBT", @intCast(hb)), aot.ci("KTT", 32),          aot.ci("RS", @intCast(lw)), aot.ci("FP8", 0),
+            aot.ci("HBT", @intCast(hb)), aot.ci("KTT", 32),          aot.ci("RS", @intCast(kv.stride(lw))), aot.ci("FP8", kv.flag()),
         });
         try g.merge(p, out, 0, R, H, lw, nch, false, stream);
     }
@@ -324,53 +381,53 @@ pub const Glue = struct {
 
     /// latent.py `sparse_attention`: rows with a count over their selected tokens (W a row), chunks of 512 tokens
     /// in list order, then the merge; other rows left alone.
-    pub fn sparseAttention(g: Glue, qa: Ptr, cache: Ptr, tok: Ptr, counts: Ptr, p: Partials, out: Ptr, R: usize, H: usize, lw: usize, w: usize, hb: usize, scale: f32, stream: cuda.Stream) !void {
+    pub fn sparseAttention(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, p: Partials, out: Ptr, R: usize, H: usize, lw: usize, w: usize, hb: usize, scale: f32, stream: cuda.Stream) !void {
         const nch = cdiv(w, 512);
         try g.set.run(stream, "_sparse_chunks", .{ @intCast(R), @intCast(cdiv(H, hb)), @intCast(nch) }, &.{
-            aot.ptr("QA", "*bf16", qa), aot.ptr("LC", "*bf16", cache), aot.ptr("LS", "*bf16", cache), aot.ptr("TOK", "*i32", tok),
+            aot.ptr("QA", "*bf16", qa), aot.ptr("LC", kv.values(), cache), aot.ptr("LS", kv.scales(), cache), aot.ptr("TOK", "*i32", tok),
             aot.ptr("CNT", "*i32", counts), aot.ptr("PO", "*fp32", p.po), aot.ptr("PM", "*fp32", p.pm), aot.ptr("PL", "*fp32", p.pl),
             aot.int("R", n32(R)),
         }, &.{
             aot.ci("W", @intCast(w)),   aot.ci("H", @intCast(H)), aot.ci("LW", @intCast(lw)), aot.ci("CH", 512), aot.cf("SCALE", scale),
-            aot.ci("HBT", @intCast(hb)), aot.ci("KTT", 32),        aot.ci("RS", @intCast(lw)), aot.ci("FP8", 0),
+            aot.ci("HBT", @intCast(hb)), aot.ci("KTT", 32),        aot.ci("RS", @intCast(kv.stride(lw))), aot.ci("FP8", kv.flag()),
         });
         try g.merge(p, out, counts, R, H, lw, nch, true, stream);
     }
 
     /// latent.py `sparse_onepass` (prompt rows): one online softmax a row over its selected tokens, straight to out.
-    pub fn sparseOnepass(g: Glue, qa: Ptr, cache: Ptr, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
+    pub fn sparseOnepass(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
         try g.set.run(stream, "_sparse_onepass", .{ @intCast(R), @intCast(cdiv(H, 32)), 1 }, &.{
-            aot.ptr("QA", "*bf16", qa),      aot.ptr("LC", "*bf16", cache), aot.ptr("LS", "*bf16", cache), aot.ptr("TOK", "*i32", tok),
+            aot.ptr("QA", "*bf16", qa),      aot.ptr("LC", kv.values(), cache), aot.ptr("LS", kv.scales(), cache), aot.ptr("TOK", "*i32", tok),
             aot.ptr("CNT", "*i32", counts), aot.ptr("OUT", "*bf16", out),
         }, &.{
             aot.ci("W", @intCast(w)), aot.ci("H", @intCast(H)), aot.ci("LW", @intCast(lw)), aot.cf("SCALE", scale), aot.ci("HBT", 32),
-            aot.ci("KTT", 32),        aot.ci("SPLIT", 1),        aot.ci("STAGES", 1),          aot.ci("PREFETCH", 1),   aot.ci("RS", @intCast(lw)),
-            aot.ci("FP8", 0),
+            aot.ci("KTT", 32),        aot.ci("SPLIT", 1),        aot.ci("STAGES", 1),          aot.ci("PREFETCH", 1),   aot.ci("RS", @intCast(kv.stride(lw))),
+            aot.ci("FP8", kv.flag()),
         });
     }
 
     /// sparse.py `_scores_rows` (decode rows from device position pos): row r's scores over its visible pools,
     /// `grid` programs a row, into out [R, np] (row stride np).
-    pub fn scoresRows(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, out: Ptr, pos: Ptr, R: usize, np: usize, grid: usize, stream: cuda.Stream) !void {
+    pub fn scoresRows(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, grid: usize, stream: cuda.Stream) !void {
         try g.set.run(stream, "_scores_rows", .{ @intCast(R), @intCast(grid), 1 }, &.{
-            aot.ptr("QI", "*bf16", qi), aot.ptr("W", "*bf16", w),       aot.int("w_stride", n32(w_stride)), aot.ptr("PK", "*bf16", pk),
-            aot.ptr("PKS", "*bf16", pk), aot.ptr("OUT", "*fp32", out),  aot.int("o_stride", n32(np)),       aot.ptr("POS", "*i32", pos),
+            aot.ptr("QI", "*bf16", qi), aot.ptr("W", "*bf16", w),       aot.int("w_stride", n32(w_stride)), aot.ptr("PK", kv.values(), pk),
+            aot.ptr("PKS", kv.scales(), pk), aot.ptr("OUT", "*fp32", out),  aot.int("o_stride", n32(np)),       aot.ptr("POS", "*i32", pos),
             aot.ptr("SPR", "*i32", pos), aot.ptr("BASE", "*i32", pos), aot.int("R", n32(R)),              aot.int("NP", n32(np)),
             aot.float("scale", index_scale), aot.float("wscale", index_wscale),
         }, &.{
             aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("G", @intCast(grid)), aot.ci("SEG", 0),
-            aot.ci("RS", 128), aot.ci("FP8", 0), aot.ci("K", 512),
+            aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()), aot.ci("K", 512),
         });
     }
 
     /// sparse.py `_scores` (a prompt chunk's rows from device position pos, RB rows a program) into out [R, np].
-    pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
+    pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
         const rb = 4;
         try g.set.run(stream, "_scores", .{ @intCast(cdiv(R, rb)), @intCast(cdiv(np, 64)), 1 }, &.{
-            aot.ptr("QI", "*bf16", qi),  aot.ptr("W", "*bf16", w),     aot.int("w_stride", n32(w_stride)), aot.ptr("PK", "*bf16", pk),
-            aot.ptr("PKS", "*bf16", pk), aot.ptr("OUT", "*fp32", out), aot.ptr("POS", "*i32", pos),        aot.int("R", n32(R)),
+            aot.ptr("QI", "*bf16", qi),  aot.ptr("W", "*bf16", w),     aot.int("w_stride", n32(w_stride)), aot.ptr("PK", kv.values(), pk),
+            aot.ptr("PKS", kv.scales(), pk), aot.ptr("OUT", "*fp32", out), aot.ptr("POS", "*i32", pos),        aot.int("R", n32(R)),
             aot.int("NP", n32(np)),      aot.float("scale", index_scale), aot.float("wscale", index_wscale),
-        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", rb), aot.ci("RS", 128), aot.ci("FP8", 0) });
+        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", rb), aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()) });
     }
 
     /// sparse.py `_select_rows`: each row's 512 best pools ascending (ties to the lower pool) into out int64 [R, 512];
@@ -447,4 +504,20 @@ test "qmm.py's BF16 K slices for the rank's shapes" {
     // the dense MLP's down [4096, 6144]: 4 slices; its gate | up [12288, 4096]: one
     try std.testing.expectEqual(@as(usize, 4), b16SplitK(4096, 6144));
     try std.testing.expectEqual(@as(usize, 1), b16SplitK(12288, 4096));
+}
+
+test "kv8.py's cache rows" {
+    try std.testing.expectEqual(Kv.bf16, try Kv.parse(""));
+    try std.testing.expectEqual(Kv.fp8, try Kv.parse("fp8"));
+    try std.testing.expectError(error.BadKvFormat, Kv.parse("fp4"));
+    // a latent row of 512 and a pooled key of 128 (a pool of 4 tokens): 12 indexed layers hold 13,056 bytes a
+    // position in bf16, 6,768 in fp8
+    try std.testing.expectEqual(@as(usize, 1024), Kv.bf16.rowBytes(512));
+    try std.testing.expectEqual(@as(usize, 528), Kv.fp8.rowBytes(512));
+    try std.testing.expectEqual(@as(usize, 144), Kv.fp8.rowBytes(128));
+    try std.testing.expectEqual(@as(usize, 13_056), 12 * (Kv.bf16.rowBytes(512) + Kv.bf16.rowBytes(128) / 4));
+    try std.testing.expectEqual(@as(usize, 6_768), 12 * (Kv.fp8.rowBytes(512) + Kv.fp8.rowBytes(128) / 4));
+    // rows stay 16-byte aligned (kv8.parts)
+    try std.testing.expectEqual(@as(usize, 0), Kv.fp8.rowBytes(512) % 16);
+    try std.testing.expectEqual(@as(usize, 0), Kv.fp8.rowBytes(128) % 16);
 }
