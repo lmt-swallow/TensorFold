@@ -18,7 +18,8 @@ pub const kv = @import("kv_tier.zig");
 
 const Ptr = cuda.abi.DevicePtr;
 
-pub const Piece = struct { base: Ptr, pos_dev: Ptr, rows: usize };
+/// A latent write: rows pos .. pos + rows - 1 at `base` (row p at base + p * row bytes), the first at `pos_dev`.
+pub const Piece = struct { base: Ptr, pos_dev: Ptr, pos: usize, rows: usize };
 
 pub const Tier = struct {
     d: *const cuda.Driver,
@@ -29,7 +30,7 @@ pub const Tier = struct {
     map_dev: Ptr,
     toks: cuda.HostBuffer, // the selection read back: tokens [rows, W] i32
     cnts: cuda.HostBuffer, // counts [rows] i32
-    at: cuda.HostBuffer, // second pieces' first positions (i32, mapped), a ring
+    at: cuda.HostBuffer, // second pieces' first positions (i32 16 bytes apart, mapped: Triton specializes pointers on 16-byte alignment), a ring
     at_dev: Ptr,
     at_next: usize = 0,
     module: cuda.Module,
@@ -53,7 +54,7 @@ pub const Tier = struct {
         errdefer t.toks.free();
         t.cnts = try cuda.HostBuffer.alloc(d, rows * 4);
         errdefer t.cnts.free();
-        t.at = try cuda.HostBuffer.allocMapped(d, ring * 4);
+        t.at = try cuda.HostBuffer.allocMapped(d, ring * 16);
         errdefer t.at.free();
         t.at_dev = try t.at.device();
         t.module = try cuda.Module.load(d, cuda.kernels.glm53_tier);
@@ -101,10 +102,10 @@ pub const Tier = struct {
             if (i > 0) {
                 const k = t.at_next % ring;
                 t.at_next += 1;
-                t.at.slice(i32)[k] = @intCast(q.pos);
-                at = t.at_dev + k * 4;
+                t.at.slice(i32)[k * 4] = @intCast(q.pos);
+                at = t.at_dev + k * 16;
             }
-            out[i] = .{ .base = t.slab_dev +% @as(u64, @bitCast(q.base)), .pos_dev = at, .rows = q.rows };
+            out[i] = .{ .base = t.slab_dev +% @as(u64, @bitCast(q.base)), .pos_dev = at, .pos = q.pos, .rows = q.rows };
         };
         return out;
     }

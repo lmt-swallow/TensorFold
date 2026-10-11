@@ -40,6 +40,7 @@ const glm53_generate = @import("glm53_generate_tests.zig");
 const glm53_prompt_time = @import("glm53_prompt_time.zig");
 const glm53_keep = @import("glm53_keep_tests.zig");
 const glm53_shared = @import("glm53_shared_tests.zig");
+const glm53_tier = @import("glm53_tier_tests.zig");
 const dsv41_ptx_lift_tests = @import("dsv41_ptx_lift_tests.zig");
 
 const usage =
@@ -82,6 +83,7 @@ const usage =
     \\  qwen38fn-select <kernel-set> <model-dir>  Qwen3.8-Flash-Next indexer block selection (_select, _select_tiles past 131,072 keys) against a host oracle up to the capacity
     \\  qwen38fn-mtp <work-dir> <model-dir>  Qwen3.8-Flash-Next MTP drafting (draft head, head calls, rounds) against 0.6.6's serial drafted decoder (qwen38fn/capture_mtp.sh)
     \\  qwen38fn-shared <kernel-set> <model-dir>  Qwen3.8-Flash-Next shared rounds: four streams' logits, drafts and tokens the same alone and in one forward a round
+    \\  glm53-tier <aot-dir> <model-dir> <file-dir> [positions]  GLM-5.3-Flash tiered latent cache (slab + NVMe file) against a whole cache: the sparse kernels' outputs byte for byte, decode windows and a prompt block
     \\  glm53-prompt <work-dir> <model-dir>  GLM-5.3-Flash prompt path (chunks, head, MTP absorb, commit) over layers 0 and 3 and the MTP layer on both ranks against the Mia fork's fixture (glm53/capture.sh prompt)
     \\  glm53-prompt-fp8 <work-dir> <model-dir>  glm53-prompt on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture
     \\  glm53-dsa-fp8 <work-dir> <model-dir> [isolated]  glm53-dsa on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture (glm53/capture.sh dsa with KV=fp8)
@@ -199,6 +201,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         const default = [_]usize{ 0, 30720 };
         return glm53_prompt_time.run(gpu, try arg(rest, 0), try arg(rest, 1), if (n == 0) &default else pos[0..n]);
     }
+    if (std.mem.eql(u8, cmd, "glm53-tier")) return glm53_tier.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), if (rest.len > 3) rest[3] else null);
     if (std.mem.eql(u8, cmd, "glm53-moe")) return glm53_moe.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "glm53-kda")) return glm53_kda.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "qwen38fn-layer0")) return qwen38fn_layer0.layer0(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
