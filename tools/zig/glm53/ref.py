@@ -35,8 +35,14 @@ STRICT = {
     "TF_GLM_MULTI_PREFILL": "1", "TF_GLM_L2PF": "1", "TF_GLM_EXL3_LOADS": "nc", "TF_GLM_SHARED_PREFIX": "1",
     "TF_GLM_MTP": "auto",
 }
+# the strict four are forced; the rest give way to the caller's environment (a pair capture may gather over NCCL,
+# TF_GLM_COMM=nccl, the same bits by the recipe's account)
+FORCED = ("TF_GLM_DENSE", "TF_GLM_KV", "TF_GLM_KDA_CHUNKED", "TF_GLM_LATENT")
 for _k, _v in STRICT.items():
-    os.environ[_k] = _v
+    if _k in FORCED:
+        os.environ[_k] = _v
+    else:
+        os.environ.setdefault(_k, _v)
 
 import torch  # noqa: E402
 
