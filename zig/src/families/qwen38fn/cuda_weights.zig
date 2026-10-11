@@ -191,7 +191,7 @@ pub const Hc = struct {
         var parts: [2]Tensor = undefined;
         parts[0] = try pack.expect(n.of("{s}.input_mix_weight_down.weight", .{prefix}), .f16, &.{ cfg.low, wide });
         if (inject) parts[1] = try pack.expect(n.of("{s}.block_inject_weight.weight", .{prefix}), .f16, &.{ cfg.streams, wide });
-        const down_bytes = try stackF16(gpa, parts[0 .. 1 + @intFromBool(inject)], wide);
+        const down_bytes = try stackF16(gpa, parts[0 .. @as(usize, 1) + @intFromBool(inject)], wide);
         defer gpa.free(down_bytes);
         var down = try F16.init(d, down_bytes, cfg.low + if (inject) cfg.streams else 0, wide);
         errdefer down.deinit();

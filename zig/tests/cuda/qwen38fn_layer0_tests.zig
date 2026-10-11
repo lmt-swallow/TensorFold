@@ -64,7 +64,11 @@ const Harness = struct {
 /// One EXL3 group as the DSV4.1 port's EXL3 linear (the same kernels as 0.6.6's `cuda/exl3/linear.cu`; this test
 /// is what checks that its bits are 0.6.6's).
 fn linear(gpa: std.mem.Allocator, k: *const dsv41.exl3.Kernels, g: qfn.weights.Group) !dsv41.exl3.Linear {
-    return dsv41.exl3.Linear.init(gpa, k, g.trellis, g.kt, g.nt, g.w16, g.suh, g.svh, @enumFromInt(@intFromEnum(g.codebook)));
+    // the mapped trellis may sit at any even offset of its shard; Linear.init reads it as 32-bit words
+    const words = try gpa.alignedAlloc(u8, .@"4", g.trellis.len);
+    defer gpa.free(words);
+    @memcpy(words, g.trellis);
+    return dsv41.exl3.Linear.init(gpa, k, words, g.kt, g.nt, g.w16, g.suh, g.svh, @enumFromInt(@intFromEnum(g.codebook)));
 }
 
 pub fn layer0(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void {
