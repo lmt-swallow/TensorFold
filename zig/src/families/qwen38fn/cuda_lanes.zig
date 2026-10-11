@@ -157,6 +157,16 @@ pub const Lanes = struct {
         self.slots[l.slot].?.busy = false;
     }
 
+    /// The first `n` slots' sequences made now (caches allocated and zeroed), so no request waits for them.
+    pub fn makeSlots(self: *Lanes, n: u32) !void {
+        for (self.slots[0..@min(n, max_streams)]) |*x| if (x.* == null) {
+            var st = try fwd.Stream.init(self.gpa, self.d, self.m, self.capacity, max_rows);
+            errdefer st.deinit();
+            x.* = .{ .st = st, .last = try cuda.DeviceBuffer.alloc(self.d, self.m.cfg.wide() * 2) };
+        };
+        try self.stream.synchronize();
+    }
+
     /// A free slot reset for a new sequence; its buffers are made on its first use.
     fn takeSlot(self: *Lanes) !usize {
         for (&self.slots, 0..) |*x, i| {

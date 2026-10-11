@@ -31,6 +31,8 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
+    /// Make the sequences of `streams` slots (their caches allocated and zeroed) before serving.
+    prepare: ?*const fn (ctx: *anyopaque, streams: u32) anyerror!void = null,
 };
 
 const Owned = struct { gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, set: *cuda.aot.Set, lanes: *Lanes };
@@ -81,6 +83,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .stream_bytes = streamBytes(&m.cfg, capacity, o.drafts),
         .ctx = own,
         .deinit = release,
+        .prepare = prepare,
     };
 }
 
@@ -93,6 +96,11 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
         else => null,
     };
+}
+
+fn prepare(p: *anyopaque, streams: u32) anyerror!void {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    try own.lanes.makeSlots(streams);
 }
 
 fn release(p: *anyopaque) void {
