@@ -34,7 +34,8 @@ def load_module(name: str, path: Path):
 
 
 def const(v):
-    """A constexpr as Zig compares it (aot_pack.py's rule): ints and bools as integers, floats by their fp32 bits."""
+    """A constexpr as Zig compares it (aot_pack.py's rule): ints and bools as integers, floats by their fp32 bits,
+    None as none, dtypes by name."""
 
     if isinstance(v, bool):
         return {"int": int(v)}
@@ -42,6 +43,10 @@ def const(v):
         return {"int": v}
     if isinstance(v, dict) and "fp32_bits" in v:
         return {"f32": int(v["fp32_bits"], 16)}
+    if v is None:                       # an optional pointer left out: Triton compiles the None branch
+        return {"none": True}
+    if isinstance(v, str):              # a tl.dtype passed as a constexpr ("bf16", "fp16", ...)
+        return {"str": v}
     raise ValueError(f"constexpr {v!r} has no Zig form")
 
 

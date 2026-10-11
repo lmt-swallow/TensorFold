@@ -8,7 +8,7 @@ const launch = @import("launch.zig");
 const triton = @import("triton.zig");
 
 const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
-const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
+const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null, str: ?[]const u8 = null, none: bool = false };
 const KernelJson = struct {
     @"fn": []const u8,
     hash: []const u8,
@@ -33,8 +33,9 @@ pub const Arg = struct {
     pub const Value = union(enum) { ptr: struct { addr: u64, ty: []const u8 }, i32: i32, f32: f32, u64: u64 };
 };
 
-/// A constexpr the call site compiled the kernel with (Python's keyword arguments): ints, bools, fp32 bits.
-pub const Const = struct { name: []const u8, int: ?i64 = null, f32: ?f32 = null };
+/// A constexpr the call site compiled the kernel with (Python's keyword arguments): ints, bools, fp32 bits, a dtype
+/// by name ("bf16"), or None (an optional argument left out).
+pub const Const = struct { name: []const u8, int: ?i64 = null, f32: ?f32 = null, str: ?[]const u8 = null, none: bool = false };
 
 pub fn ptr(name: []const u8, ty: []const u8, addr: u64) Arg {
     return .{ .name = name, .value = .{ .ptr = .{ .addr = addr, .ty = ty } } };
@@ -53,6 +54,12 @@ pub fn ci(name: []const u8, v: i64) Const {
 }
 pub fn cf(name: []const u8, v: f32) Const {
     return .{ .name = name, .f32 = v };
+}
+pub fn cs(name: []const u8, v: []const u8) Const {
+    return .{ .name = name, .str = v };
+}
+pub fn cnone(name: []const u8) Const {
+    return .{ .name = name, .none = true };
 }
 
 const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
@@ -168,6 +175,8 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, loose: bool)
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
         if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return false;
+        if (c.str) |x| if (got.str == null or !std.mem.eql(u8, got.str.?, x)) return false;
+        if (c.none and !got.none) return false;
     }
     var runtime: usize = 0;
     for (args) |a| {
@@ -208,4 +217,23 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, loose: bool)
         runtime += 1;
     }
     return runtime == k.params.len;
+}
+
+test "a dtype constexpr and a None constexpr pick their own variant" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\{"kernels":[
+        \\ {"fn":"_k","hash":"a","name":"_k","num_warps":4,"params":[{"name":"X","type":"*bf16","div16":true,"nospec":false}],
+        \\  "consts":{"DT":{"str":"bf16"},"ROPE":{"none":true}}},
+        \\ {"fn":"_k","hash":"b","name":"_k","num_warps":4,"params":[{"name":"X","type":"*bf16","div16":true,"nospec":false}],
+        \\  "consts":{"DT":{"str":"fp16"},"ROPE":{"none":true}}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer parsed.deinit();
+    const ks = parsed.value.kernels;
+    const args = [_]Arg{ptr("X", "*bf16", 4096)};
+    try std.testing.expect(matches(ks[0], &args, &.{ cs("DT", "bf16"), cnone("ROPE") }, false));
+    try std.testing.expect(!matches(ks[1], &args, &.{ cs("DT", "bf16"), cnone("ROPE") }, false));
+    try std.testing.expect(matches(ks[1], &args, &.{cs("DT", "fp16")}, false));
+    try std.testing.expect(!matches(ks[0], &args, &.{cs("DT", "fp16")}, false));
 }
