@@ -157,9 +157,12 @@ const HostLink = struct {
         const src: cuda.DeviceBuffer = .{ .d = l.d, .ptr = send, .len = n };
         try src.download(0, l.h.slots[l.rank][0..n]);
         try l.h.barrier();
+        // on the stream (a synchronous upload from pageable memory may return before its copy lands, unordered with
+        // the stream's next kernels), done before the slots are written again
         const dst: cuda.DeviceBuffer = .{ .d = l.d, .ptr = recv, .len = 2 * n };
-        try dst.upload(0, l.h.slots[0][0..n]);
-        try dst.upload(n, l.h.slots[1][0..n]);
+        try dst.uploadAsync(0, l.h.slots[0][0..n], stream.handle);
+        try dst.uploadAsync(n, l.h.slots[1][0..n], stream.handle);
+        try stream.synchronize();
         try l.h.barrier();
     }
 };

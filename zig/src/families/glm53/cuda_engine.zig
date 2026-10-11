@@ -261,7 +261,7 @@ pub const Runner = struct {
             mine[i] = b.v;
             mine[k + i] = @bitCast(b.id);
         }
-        try r.cand.upload(0, std.mem.sliceAsBytes(mine[0 .. 2 * k]));
+        try r.cand.uploadAsync(0, std.mem.sliceAsBytes(mine[0 .. 2 * k]), r.stream.handle);
         try r.link.gather(r.link.ctx, r.cand.ptr, r.cand.ptr + 2 * draft_k * 4, 2 * k, r.stream);
         try r.stream.synchronize();
         var both: [4 * draft_k]f32 = undefined;
@@ -307,7 +307,7 @@ pub const Runner = struct {
         }
         const send = batch_rows * 4;
         const recv = send + 2 * batch_rows * 4;
-        try r.picks.upload(send, std.mem.sliceAsBytes(mine[0 .. 2 * n]));
+        try r.picks.uploadAsync(send, std.mem.sliceAsBytes(mine[0 .. 2 * n]), r.stream.handle);
         try r.link.gather(r.link.ctx, r.picks.ptr + send, r.picks.ptr + recv, 2 * n, r.stream);
         try r.stream.synchronize();
         var every: [config.world * 2 * batch_rows]f32 = undefined;
@@ -398,7 +398,7 @@ pub const Runner = struct {
         if (R == 0 or R > rows) return error.WindowTooWide;
         if (q.st.pos + R >= q.st.caches[0].capacity) return error.PromptTooLong;
         try r.tierBegin(q, false, q.st.pos, R);
-        try r.w.b.ids.upload(0, std.mem.sliceAsBytes(ids));
+        try r.w.b.ids.uploadAsync(0, std.mem.sliceAsBytes(ids), r.stream.handle);
         try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, false, r.gather(), null, r.stream);
         try q.last.copyFrom(0, r.w.fnormed.ptr, R * D * 2, r.stream.handle);
         for (0..R) |row| out[row] = try r.sample(r.w.logits, row, 1, null);
