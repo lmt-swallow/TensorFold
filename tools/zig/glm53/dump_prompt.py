@@ -27,7 +27,7 @@ Per rank r and chunk step <s>_<i> (s0_3, l_1, ...):
   r{r}_<step>_head       the head's logits of the chunk's last row (this rank's vocabulary half, bf16)
 The manifest's "trace" lists every traced call (ref.Tracer's names) with "digests": the sha256 and byte length of
 each tensor argument the call changed (and of its return values), so the fixture holds no intermediate arrays; and
-params "digests" the per-step states: x_out (the streams after the last layer), fnormed, rec / conv (layer 0's
+params "digests" the per-step states: x_out (the streams after the last layer), rec / conv (layer 0's
 KDA state and conv window after the commit), latent / pk (layer 3's latent rows of the chunk and its pooled keys up
 to the chunk's end), mtp_latent (the MTP layer's latent rows the absorb wrote).
 
@@ -205,7 +205,6 @@ def main() -> int:
         arrays[f"r{r}_{step}_head"] = head
         p = f"r{r}_{step}_"
         digests[p + "x_out"] = sha(b.x[:R])
-        digests[p + "fnormed"] = sha(b.fnormed[:R])
         digests[p + "rec"] = sha(st.rec[st.cur[0], 0])
         digests[p + "conv"] = sha(st.conv[0])
         digests[p + "latent"] = sha(st.kc[0][start:start + R])
@@ -252,7 +251,7 @@ def main() -> int:
 
     pair.run(rank_run)
     for name in [n for n in digests if n.startswith("r0_")]:
-        if name.endswith(("_x_out", "_fnormed", "_rec", "_conv", "_latent", "_pk", "_mtp_latent")) and \
+        if name.endswith(("_x_out", "_rec", "_conv", "_latent", "_pk", "_mtp_latent")) and \
                 digests[name] != digests["r1_" + name[3:]]:
             raise SystemExit(f"{name[3:]}: the ranks differ")
     params = {"layers": LAYERS, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,

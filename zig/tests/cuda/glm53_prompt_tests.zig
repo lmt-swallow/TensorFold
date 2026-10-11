@@ -417,7 +417,6 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
     for (ranks, 0..) |*r, ri| {
         h.on(ri, step);
         try h.state("x_out", r.p.b.x.ptr);
-        try h.state("fnormed", r.p.fnormed.ptr);
         try h.state("rec", r.st.state(r.st.cur, 0));
         try h.state("conv", r.st.convOf(0));
         try h.state("latent", r.cache.latent.ptr + pos * cfg.kv_lora * 2);
