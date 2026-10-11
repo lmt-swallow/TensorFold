@@ -117,6 +117,9 @@ fn f16Mode() !F16Mode {
     return modeOf(F16Mode, "TF_QFN_PROMPT_F16");
 }
 
+/// The widest selection (power-of-two block count) select.cu takes; past it 0.6.6's `_select` is faster.
+const fused_select_blocks = 16384;
+
 /// scores.cu SMEM: a scores program's dynamic shared bytes (32 rows' queries as fp32, 64 keys).
 const scores_shared: u32 = 32 * 4 * 128 * 4 + 64 * (128 + 8) * 2;
 
@@ -187,7 +190,7 @@ pub const Buffers = struct {
     logits: cuda.DeviceBuffer, // bf16 [1, vocab]: the chunk's last row
     f16_mode: F16Mode = .fused,
     scores_mode: F16Mode = .fused,
-    select_mode: F16Mode = .captured,
+    select_mode: F16Mode = .fused,
     select_check: ?cuda.DeviceBuffer = null, // check: the fused lists (int32 ids [att_rows, idw], nk, sparse)
     scores_check: ?cuda.DeviceBuffer = null, // check: the fused scores (fp32 [att_rows, nb])
     f16_check: ?cuda.DeviceBuffer = null, // check: the fused call's rows (bf16 [rows, widest N])
@@ -265,10 +268,10 @@ pub const Buffers = struct {
         try b.moe.setMode(d, &m.layers[0].experts, try expertsMode(), rows);
         b.f16_mode = try f16Mode();
         b.scores_mode = try scoresMode();
-        // TF_QFN_PROMPT_SELECT: the indexer's block lists of a prompt block while they fit `_select`'s registers
-        // (131,072 keys): `captured` (default) 0.6.6's `_select`, `fused` select.cu (the same lists, one program a
-        // row), `check` both, compared. Past them `_select_tiles` runs in every mode.
-        b.select_mode = try modeOr(F16Mode, "TF_QFN_PROMPT_SELECT", .captured);
+        // TF_QFN_PROMPT_SELECT: the indexer's block lists of a prompt block of up to fused_select_blocks blocks:
+        // `fused` (default) select.cu (the same lists, one program a row), `captured` 0.6.6's `_select`, `check`
+        // both, compared. Past them 0.6.6's kernels run in every mode.
+        b.select_mode = try modeOr(F16Mode, "TF_QFN_PROMPT_SELECT", .fused);
         b.select_check = null;
         b.f16_check = null;
         b.f16_part = null;
@@ -615,8 +618,8 @@ pub const Prompt = struct {
                 try countDiffs(p.k.sc_diff, b, &a, .{ .x = 1024 }, "scores", n * blocks, stream);
             }
         }
-        // select.cu below `_select`'s register width only: past it 0.6.6's `_select_tiles` is the faster one
-        const tiles = std.math.ceilPowerOfTwoAssert(usize, blocks) > attn.select_regs;
+        // select.cu up to 16,384 blocks (65,536 keys); from there 0.6.6's `_select` and `_select_tiles` are faster
+        const tiles = std.math.ceilPowerOfTwoAssert(usize, blocks) > fused_select_blocks;
         if (b.select_mode == .captured or tiles) return ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
         const check = b.select_mode == .check;
         if (check) try ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);

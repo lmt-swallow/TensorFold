@@ -3,7 +3,7 @@
 // rows, one 256-thread program a row. The lists are integers fixed by the scores, so any exact method gives
 // `_select`'s bytes; this one finds the cut as `_select_tiles` does (the TOP-th largest order-preserving key, a byte a
 // pass from the top) with shared-memory histograms instead of `_select`'s 33 full-row reductions. cuda_prompt.zig uses
-// it where 0.6.6 runs `_select` (past 131,072 keys `_select_tiles`, which is faster than this kernel there).
+// it up to 16,384 blocks (65,536 keys); wider, 0.6.6's `_select` and `_select_tiles` are faster.
 
 #include <stdint.h>
 
