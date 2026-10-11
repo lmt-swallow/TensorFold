@@ -615,6 +615,7 @@ fn timeRounds(gpu: Gpu, runner: *Rounds.RoundRunner, cap: usize, reps: usize, st
     var echo: Echo = .{ .d = gpu.d };
     const gather: F.Gather = .{ .ctx = &echo, .call = Echo.gather };
     const ids: [Rounds.max_rows]i64 = @splat(1);
+    if (getenv("TF_DS_ROUNDS_TIME_AT")) |at| return timeRoundsAt(runner, gather, cap, reps, at, getenv("TF_DS_ROUNDS_TIME_ROWS") orelse "1", stream);
     const rope_rows = @min(runner.rope_c.rows, runner.rope_w.rows);
     const least = runner.least;
     defer runner.least = least;
@@ -638,6 +639,38 @@ fn timeRounds(gpu: Gpu, runner: *Rounds.RoundRunner, cap: usize, reps: usize, st
                 }
                 std.debug.print("dsv41-rounds time: cap {d}, least bucket {d}: {d} row(s) at position {d} scan bucket {d}: {d:.3} ms\n", .{ cap, lb, rows, p, runner.round_bucket, best });
             }
+        }
+    }
+}
+
+/// TF_DS_ROUNDS_TIME_AT=<ends> (comma-separated) with TF_DS_ROUNDS_TIME_ROWS=<row counts> (default 1): for each end e
+/// and row count n, rounds of n noise rows on slot 0 at positions e - n .. e - 1 (the round scans bucketFor(e)), the
+/// best of `reps` after a warm-up, each configuration followed by a 300 ms idle gap (a profiler's trace splits there).
+fn timeRoundsAt(runner: *Rounds.RoundRunner, gather: F.Gather, cap: usize, reps: usize, ends: []const u8, rows_list: []const u8, stream: cuda.Stream) !void {
+    const ids: [Rounds.max_rows]i64 = @splat(1);
+    var ei = std.mem.tokenizeScalar(u8, ends, ',');
+    while (ei.next()) |es| {
+        const e = try std.fmt.parseInt(usize, es, 10);
+        var ri = std.mem.tokenizeScalar(u8, rows_list, ',');
+        while (ri.next()) |rs| {
+            const rows = try std.fmt.parseInt(usize, rs, 10);
+            if (rows < 1 or rows > runner.rows or e < rows or e > cap) return error.BadShape;
+            const w = [1]Rounds.Window{.{ .slot = 0, .base = 0, .size = cap, .position = e - rows, .ids = ids[0..rows] }};
+            var best: f64 = std.math.inf(f64);
+            for (0..reps + 1) |rep| {
+                try stream.synchronize();
+                var t0: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &t0);
+                _ = try runner.forward(&w, gather, stream);
+                try stream.synchronize();
+                var t1: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &t1);
+                const ms = @as(f64, @floatFromInt((t1.sec - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec))) / 1e6;
+                if (rep > 0) best = @min(best, ms);
+            }
+            std.debug.print("dsv41-rounds time-at: {d} row(s) ending at position {d} scan bucket {d}: {d:.3} ms\n", .{ rows, e, runner.round_bucket, best });
+            var gap: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&gap, null);
         }
     }
 }
