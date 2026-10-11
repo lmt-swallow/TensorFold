@@ -93,6 +93,11 @@ pub const Scratch = struct {
     pub fn deinit(self: *Scratch) void {
         for ([_]*cuda.DeviceBuffer{ &self.po, &self.pm, &self.pl, &self.out, &self.ids, &self.nk, &self.sparse, &self.scores }) |b| b.free();
     }
+
+    /// The blocks a launch for keys up to `context` covers (qsa_rows' `blocks`).
+    pub fn blocks(self: *const Scratch, context: usize) usize {
+        return @min(self.nb, @max(1, (context + self.ratio - 1) / self.ratio));
+    }
 };
 
 /// graphs.py `_bucket`: the context a window ending at `end` scans with buckets on, a power of two of at least 8,192
@@ -151,15 +156,21 @@ pub const Kernels = struct {
     /// attention.py `qsa_rows`: score each sparse row's complete blocks and list its selected blocks (scratch.ids,
     /// nk, sparse); `context` bounds the launches to the keys in use.
     pub fn rowsSelect(k: Kernels, iq: Ptr, c: *const Caches, pos0: Ptr, s: *const Scratch, rows: usize, context: usize, stream: cuda.Stream) !void {
+        const blocks = s.blocks(context);
+        try k.scores(iq, c, pos0, s, s.scores.ptr, rows, blocks, stream);
+        try k.select(pos0, s, rows, blocks, false, stream);
+    }
+
+    /// attention.py `qsa_rows`' `_scores` launch: each sparse row's complete blocks scored into sc fp32 [rows, nb]
+    /// (`blocks` of them bound the launch).
+    pub fn scores(k: Kernels, iq: Ptr, c: *const Caches, pos0: Ptr, s: *const Scratch, sc: Ptr, rows: usize, blocks: usize, stream: cuda.Stream) !void {
         const cfg = k.cfg;
         const top = s.budget / s.ratio;
         const bb: usize = 64;
-        const blocks = @min(s.nb, @max(1, (context + s.ratio - 1) / s.ratio));
         try k.set.run(stream, "_scores", .{ @intCast(rows), @intCast((blocks + bb - 1) / bb), 1 }, &.{
             aot.ptr("IQ", "*bf16", iq), aot.ptr("POOLED", "*bf16", c.pooled.ptr), aot.ptr("POS0", "*i32", pos0),
-            aot.ptr("SC", "*fp32", s.scores.ptr), aot.int("NB", n32(s.nb)),
+            aot.ptr("SC", "*fp32", sc), aot.int("NB", n32(s.nb)),
         }, &.{ aot.ci("HI", @intCast(cfg.index_heads)), aot.ci("DI", @intCast(cfg.index_dim)), aot.ci("RATIO", @intCast(s.ratio)), aot.ci("TOP", @intCast(top)), aot.ci("BB", @intCast(bb)) });
-        try k.select(pos0, s, rows, blocks, false, stream);
     }
 
     /// attention.py `_launch_select`: each row's selected blocks from s.scores (`blocks` of them bound the launch):

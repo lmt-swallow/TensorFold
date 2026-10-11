@@ -40,6 +40,10 @@ fn range(lo: u32, hi: u32) [2]u32 {
 
 pub const Kernels = struct {
     module: cuda.Module,
+    prompt: cuda.Module, // experts_prompt.cu: a prompt window's experts with the reference pipeline's bytes
+    list: cuda.Function,
+    plan: cuda.Function,
+    diff: cuda.Function,
     group: cuda.Function,
     rot_in_bf16: cuda.Function,
     gateup: cuda.Function,
@@ -49,8 +53,14 @@ pub const Kernels = struct {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var module = try cuda.Module.load(d, cuda.kernels.qwen38fn_experts);
         errdefer module.unload();
+        var prompt = try cuda.Module.load(d, cuda.kernels.qwen38fn_experts_prompt);
+        errdefer prompt.unload();
         return .{
             .module = module,
+            .prompt = prompt,
+            .list = try prompt.function("tf_qfn_xp_list"),
+            .plan = try prompt.function("tf_qfn_xp_plan"),
+            .diff = try prompt.function("tf_qfn_xp_count_diff"),
             .group = try module.function("_ZN8tf_qfn_x12group_kernelEPKiPiS2_S2_iiii"),
             .rot_in_bf16 = try module.function("_ZN8tf_qfn_x13rot_in_kernelI13__nv_bfloat16EEvPKT_iPKiPK6__halfS9_PS7_SA_iii"),
             .gateup = try module.function("_ZN8tf_qfn_x22gateup_epilogue_kernelEPKfPKiPK6__halfS6_S6_PS4_iiiifi"),
@@ -60,6 +70,15 @@ pub const Kernels = struct {
 
     pub fn deinit(self: *Kernels) void {
         self.module.unload();
+        self.prompt.unload();
+    }
+
+    /// experts_prompt.cu tf_qfn_xp_{gateup,down}_<cb>_<lo>_<hi>.
+    fn promptFn(self: *const Kernels, comptime which: []const u8, cb: weights.Codebook, r: [2]u32) !cuda.Function {
+        var buf: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "tf_qfn_xp_" ++ which ++ "_{d}_{d}_{d}", .{ @intFromEnum(cb), r[0], r[1] });
+        buf[text.len] = 0;
+        return self.prompt.function(buf[0..text.len :0]);
     }
 
     /// grouped_kernel<CB, NT, W, PF, LO, HI> as cuobjdump lists it.
@@ -194,6 +213,17 @@ pub const Experts = struct {
     }
 };
 
+/// The kernels of a prompt window's experts. `captured`: 0.6.6's pipeline (`routed`, then the bf16 copy). `fused`:
+/// experts_prompt.cu (`promptWindow`), the same bytes in four launches. `check`: both, the fused slots compared with
+/// the captured ones byte for byte after every window (error.ExpertsDiffer); the captured ones are kept.
+pub const Mode = enum { captured, fused, check };
+
+/// experts_prompt.cu: members a gate/up program and a down program, and their dynamic shared bytes.
+const gu_members = 32;
+const down_members = 64;
+const gu_shared: u32 = gu_members * (640 + 8) * 2;
+const down_shared: u32 = down_members * (640 + 8) * 2;
+
 /// experts.py `Scratch` for windows of up to `rows` rows of `slots` slots.
 pub const Scratch = struct {
     xg: cuda.DeviceBuffer, // fp16 [P, D]
@@ -208,6 +238,43 @@ pub const Scratch = struct {
     slots: usize,
     gu: Tiles,
     dn: Tiles,
+    mode: Mode = .captured,
+    // fused and check: the rows a fused window takes, each expert's slots, their counts, the work items and their
+    // count, the SwiGLU outputs
+    frows: usize = 0,
+    lists: ?cuda.DeviceBuffer = null, // int32 [E, frows]
+    counts: ?cuda.DeviceBuffer = null, // int32 [E]
+    items: ?cuda.DeviceBuffer = null, // gate/up's, then down's (each maxItems(gu_members) long)
+    nitems: ?cuda.DeviceBuffer = null, // int32 [2]
+    fxd: ?cuda.DeviceBuffer = null, // fp16 [frows * slots, I]
+    // check: the fused slots (bf16 [frows * slots, D]) and the differing words (u64)
+    ycheck: ?cuda.DeviceBuffer = null,
+    diffs: ?cuda.DeviceBuffer = null,
+
+    fn maxItems(self: *const Scratch, E: usize, members: usize) usize {
+        const P = self.frows * self.slots;
+        return P / members + @min(P, E) + 1;
+    }
+
+    /// Runs prompt windows in `mode` from now on, a fused window taking up to `frows` rows (its buffers allocated
+    /// here, once). The fused kernels take Flash Next's shapes: every split of 640 K values (gate/up 4 splits of the
+    /// model width, down 1 of the expert width), 4 warps, and at most 1,024 experts.
+    pub fn setMode(self: *Scratch, d: *const cuda.Driver, ex: *const Experts, mode: Mode, frows: usize) !void {
+        if (mode != .captured and self.lists == null) {
+            if (ex.count > 1024 or self.gu.w != 4 or self.dn.w != 4 or ex.dims / self.gu.sk != 640 or ex.width / self.dn.sk != 640 or self.dn.sk != 1 or ex.width % 128 != 0 or ex.dims % 256 != 0) return error.UnsupportedShape;
+            self.frows = frows;
+            self.lists = try cuda.DeviceBuffer.alloc(d, ex.count * frows * 4);
+            self.counts = try cuda.DeviceBuffer.alloc(d, ex.count * 4);
+            self.items = try cuda.DeviceBuffer.alloc(d, 2 * self.maxItems(ex.count, gu_members) * 4);
+            self.nitems = try cuda.DeviceBuffer.alloc(d, 16);
+            self.fxd = try cuda.DeviceBuffer.alloc(d, frows * self.slots * ex.width * 2);
+        }
+        if (mode == .check and self.ycheck == null) {
+            self.ycheck = try cuda.DeviceBuffer.alloc(d, self.frows * self.slots * ex.dims * 2);
+            self.diffs = try cuda.DeviceBuffer.alloc(d, 8);
+        }
+        self.mode = mode;
+    }
 
     pub fn init(d: *const cuda.Driver, ex: *const Experts, rows: usize, slots: usize) !Scratch {
         const D = ex.dims;
@@ -216,11 +283,7 @@ pub const Scratch = struct {
         const gu = try defaultTiles(D, I, true);
         const dn = try defaultTiles(I, D, false);
         const maxu = @min(P, ex.count);
-        var s: Scratch = undefined;
-        s.rows = rows;
-        s.slots = slots;
-        s.gu = gu;
-        s.dn = dn;
+        var s: Scratch = .{ .xg = undefined, .xu = undefined, .xd = undefined, .z = undefined, .y = undefined, .ids = undefined, .count = undefined, .members = undefined, .rows = rows, .slots = slots, .gu = gu, .dn = dn };
         const sizes = [_]struct { *cuda.DeviceBuffer, usize }{
             .{ &s.xg, P * D * 2 }, .{ &s.xu, P * D * 2 }, .{ &s.xd, P * I * 2 },
             .{ &s.z, @max(2 * gu.sk * I, dn.sk * D) * P * 4 }, .{ &s.y, P * D * 4 }, .{ &s.ids, maxu * 4 },
@@ -239,6 +302,7 @@ pub const Scratch = struct {
 
     pub fn deinit(self: *Scratch) void {
         for ([_]*cuda.DeviceBuffer{ &self.xg, &self.xu, &self.xd, &self.z, &self.y, &self.ids, &self.count, &self.members }) |b| b.free();
+        for ([_]*?cuda.DeviceBuffer{ &self.lists, &self.counts, &self.items, &self.nitems, &self.fxd, &self.ycheck, &self.diffs }) |b| if (b.*) |*x| x.free();
     }
 };
 
@@ -316,6 +380,107 @@ pub fn routed(k: *const Kernels, ex: *const Experts, s: *const Scratch, x: Ptr, 
         try cuda.launch.launch(k.down, .{ .grid = .{ .x = @intCast(P), .y = @intCast(D / 128) }, .block = .{ .x = 32 } }, stream, &a);
     }
     return s.y.ptr;
+}
+
+/// `routed` for a prompt window (up to s.frows rows; rows are independent, so one window may take what `routed` takes
+/// in several) followed by its bf16 copy: each slot's expert output, rounded to bf16, into out bf16
+/// [R * slots, D] (row stride D) for the bf16 rows x (row stride x_stride) and their picks int32 [R, slots], on
+/// experts_prompt.cu (the bytes `routed` and tf_qfn_f32_to_bf16 write; slots whose pick is not an expert are left).
+pub fn promptWindow(k: *const Kernels, ex: *const Experts, s: *const Scratch, x: Ptr, x_stride: usize, pick: Ptr, R: usize, out: Ptr, stream: cuda.Stream) !void {
+    if (R > s.frows) return error.WindowTooLarge;
+    const D = ex.dims;
+    const I = ex.width;
+    const E = ex.count;
+    const P = R * s.slots;
+    const lists = s.lists orelse return error.PromptModeUnset;
+    const counts = s.counts.?;
+    const items = s.items.?;
+    const nitems = s.nitems.?;
+    const xd = s.fxd.?;
+    {
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(@as(c_int, @intCast(P)));
+        a.add(lists.ptr);
+        a.add(@as(c_int, @intCast(s.frows)));
+        a.add(counts.ptr);
+        try cuda.launch.launch(k.list, .{ .grid = .{ .x = @intCast(E) }, .block = .{ .x = 256 } }, stream, &a);
+    }
+    const stride = s.maxItems(E, gu_members) * 4;
+    for ([_]usize{ gu_members, down_members }, 0..) |mg, i| {
+        var a: cuda.Args = .{};
+        a.add(counts.ptr);
+        a.add(@as(c_int, @intCast(E)));
+        a.add(items.ptr + i * stride);
+        a.add(nitems.ptr + i * 4);
+        a.add(@as(c_int, @intCast(mg)));
+        try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
+    }
+    {
+        const f = try k.promptFn("gateup", ex.cb, range(ex.k2_gu[0], ex.k2_gu[1]));
+        try f.allowDynamicShared(gu_shared);
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(c_int, @intCast(x_stride)));
+        a.add(@as(c_int, @intCast(s.slots)));
+        a.add(items.ptr);
+        a.add(nitems.ptr);
+        a.add(lists.ptr);
+        a.add(@as(c_int, @intCast(s.frows)));
+        a.add(counts.ptr);
+        for ([_]Ptr{ ex.gate_ptr.ptr, ex.up_ptr.ptr, ex.gate_k2.ptr, ex.up_k2.ptr, ex.suh_g.ptr, ex.suh_u.ptr, ex.svh_g.ptr, ex.svh_u.ptr, ex.suh_d.ptr, xd.ptr }) |v| a.add(v);
+        a.add(@as(c_int, @intCast(D)));
+        a.add(@as(c_int, @intCast(I)));
+        a.add(std.math.inf(f32)); // routed's limit: math.inf
+        a.add(act_f32);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(s.maxItems(E, gu_members)), .y = @intCast(I / 128) }, .block = .{ .x = 256 }, .shared = gu_shared }, stream, &a);
+    }
+    {
+        const f = try k.promptFn("down", ex.cb, range(ex.k2_d[0], ex.k2_d[1]));
+        try f.allowDynamicShared(down_shared);
+        var a: cuda.Args = .{};
+        a.add(xd.ptr);
+        a.add(items.ptr + stride);
+        a.add(nitems.ptr + 4);
+        a.add(lists.ptr);
+        a.add(@as(c_int, @intCast(s.frows)));
+        a.add(counts.ptr);
+        a.add(ex.down_ptr.ptr);
+        a.add(ex.down_k2.ptr);
+        a.add(ex.svh_d.ptr);
+        a.add(out);
+        a.add(@as(c_int, @intCast(I)));
+        a.add(@as(c_int, @intCast(D)));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(s.maxItems(E, down_members)), .y = @intCast(D / 256) }, .block = .{ .x = 512 }, .shared = down_shared }, stream, &a);
+    }
+}
+
+/// Check mode: the fused slots (s.ycheck) against the captured ones at `want`, `bytes` long.
+pub fn checkWindow(k: *const Kernels, s: *const Scratch, want: Ptr, bytes: usize, stream: cuda.Stream) !void {
+    return checkBytes(k, s, s.ycheck.?.ptr, want, bytes, "slots", stream);
+}
+
+/// Check mode: the fused SwiGLU outputs of a captured window's rows (from slot `p0`) against the captured ones.
+pub fn checkSwiglu(k: *const Kernels, s: *const Scratch, p0: usize, slots_n: usize, stream: cuda.Stream) !void {
+    return checkBytes(k, s, s.fxd.?.ptr + p0 * s.xd.len / (s.rows * s.slots), s.xd.ptr, slots_n * s.xd.len / (s.rows * s.slots), "SwiGLU outputs", stream);
+}
+
+fn checkBytes(k: *const Kernels, s: *const Scratch, got: Ptr, want: Ptr, bytes: usize, what: []const u8, stream: cuda.Stream) !void {
+    const diffs = s.diffs.?;
+    try diffs.fill8(0, stream.handle);
+    var a: cuda.Args = .{};
+    a.add(got);
+    a.add(want);
+    a.add(@as(c_ulonglong, bytes / 4));
+    a.add(diffs.ptr);
+    try cuda.launch.launch(k.diff, .{ .grid = .{ .x = 1024 }, .block = .{ .x = 256 } }, stream, &a);
+    var n: u64 = 0;
+    try diffs.downloadAsync(0, std.mem.asBytes(&n), stream.handle);
+    try stream.synchronize();
+    if (n != 0) {
+        std.debug.print("qwen38fn experts check: the fused {s} differ from the captured ones in {d} of {d} words\n", .{ what, n, bytes / 4 });
+        return error.ExpertsDiffer;
+    }
 }
 
 test "tile settings follow the shapes" {

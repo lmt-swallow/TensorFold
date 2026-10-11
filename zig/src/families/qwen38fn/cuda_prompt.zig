@@ -1,7 +1,8 @@
 //! Flash Next's prompt path for one stream (TensorFold 0.6.6 `forward.forward` on the prompt buffers, `decode.py:
 //! prefill_chunk` without the MTP head): a chunk of up to `rows` prompt rows through every layer with the prompt
 //! arithmetic (EXL3 matrices decoded once a chunk into a fixed-tile GEMM, the DeltaNet chunk chain, attention in
-//! 256-row blocks, routed experts in 1,024-row windows whose slots are kept as bf16), the head on the chunk's last
+//! 256-row blocks, routed experts in 1,024-row windows whose slots are kept as bf16; the switches TF_QFN_PROMPT_*
+//! put three parts on our kernels with the same bytes), the head on the chunk's last
 //! row only, and the commit (the DeltaNet states and conv windows are committed during the chunk). A row's bits do not
 //! depend on where a chunk starts or ends.
 const std = @import("std");
@@ -35,6 +36,14 @@ pub const Kernels = struct {
     chain64: cuda.Function,
     pglue: cuda.Module,
     to_bf16: cuda.Function,
+    f16_mod: cuda.Module, // f16_rows.cu: F16 matrices over a chunk's rows in one launch
+    f16_bf16: cuda.Function,
+    f16_fp16: cuda.Function,
+    f16_diff: cuda.Function,
+    f16_reduce: cuda.Function,
+    sc: cuda.Module, // scores.cu: the indexer's block scores for many rows a program
+    sc_rows: cuda.Function,
+    sc_diff: cuda.Function,
     sms: u32,
 
     pub fn load(d: *const cuda.Driver, sms: u32) !Kernels {
@@ -45,6 +54,10 @@ pub const Kernels = struct {
         errdefer pre.unload();
         var pglue = try cuda.Module.load(d, cuda.kernels.qwen38fn_prompt_glue);
         errdefer pglue.unload();
+        var f16_mod = try cuda.Module.load(d, cuda.kernels.qwen38fn_f16_rows);
+        errdefer f16_mod.unload();
+        var sc = try cuda.Module.load(d, cuda.kernels.qwen38fn_scores);
+        errdefer sc.unload();
         return .{
             .io = io,
             .front = try io.function("_ZN13tf_qfn_gdn_io12front_kernelILi16ELi48EEEvPK13__nv_bfloat16PKxPKiS7_S3_PKfS9_PfSA_PS1_SA_SA_"),
@@ -54,6 +67,14 @@ pub const Kernels = struct {
             .chain64 = try pre.function("_ZN18tf_qfn_gdn_prefill12chain_kernelIfLi64ELi32EEEvPKT_S3_PK13__nv_bfloat16PKfS8_S8_PfPS4_iii"),
             .pglue = pglue,
             .to_bf16 = try pglue.function("tf_qfn_f32_to_bf16"),
+            .f16_mod = f16_mod,
+            .f16_bf16 = try f16_mod.function("tf_qfn_f16_rows_bf16"),
+            .f16_fp16 = try f16_mod.function("tf_qfn_f16_rows_fp16"),
+            .f16_diff = try f16_mod.function("tf_qfn_f16_count_diff"),
+            .f16_reduce = try f16_mod.function("tf_qfn_f16_reduce"),
+            .sc = sc,
+            .sc_rows = try sc.function("tf_qfn_scores_rows"),
+            .sc_diff = try sc.function("tf_qfn_scores_diff"),
             .sms = sms,
         };
     }
@@ -62,8 +83,41 @@ pub const Kernels = struct {
         self.io.unload();
         self.pre.unload();
         self.pglue.unload();
+        self.f16_mod.unload();
+        self.sc.unload();
     }
 };
+
+/// The kernels of a prompt chunk's F16 matrices (exl3_mm.py `F16.__call__`): `captured` 0.6.6's `_f16_mm` in
+/// 128-row calls and `_reduce`, `fused` f16_rows.cu (the same bytes, one launch), `check` both, compared after
+/// every call (error.F16Differ).
+pub const F16Mode = enum { captured, fused, check };
+
+/// TF_QFN_PROMPT_F16: `captured` (default), `fused` or `check` (F16Mode).
+fn f16Mode() !F16Mode {
+    return modeOf(F16Mode, "TF_QFN_PROMPT_F16");
+}
+
+/// scores.cu SMEM: a scores program's dynamic shared bytes (32 rows' queries as fp32, 64 keys).
+const scores_shared: u32 = 32 * 4 * 128 * 4 + 64 * (128 + 8) * 2;
+
+/// TF_QFN_PROMPT_SCORES: the indexer's block scores of a prompt block: `captured` (default) 0.6.6's `_scores`,
+/// `fused` scores.cu (the same bytes, the keys read once for 32 rows), `check` both, compared after every call.
+fn scoresMode() !F16Mode {
+    return modeOf(F16Mode, "TF_QFN_PROMPT_SCORES");
+}
+
+fn modeOf(comptime M: type, comptime name: [:0]const u8) !M {
+    const v = std.mem.span(std.c.getenv(name) orelse return .captured);
+    if (v.len == 0) return .captured;
+    return std.meta.stringToEnum(M, v) orelse error.BadPromptMode;
+}
+
+/// TF_QFN_PROMPT_EXPERTS: the kernels of a prompt window's routed experts (cuda_experts.zig `Mode`): `captured`
+/// (default) 0.6.6's, `fused` experts_prompt.cu (the same bytes), `check` both, compared after every window.
+fn expertsMode() !experts.Mode {
+    return modeOf(experts.Mode, "TF_QFN_PROMPT_EXPERTS");
+}
 
 /// The prompt buffers (state.py `Buffers(prefill=True)`) and the EXL3 prompt workspace (exl3/prefill.py).
 pub const Buffers = struct {
@@ -108,6 +162,12 @@ pub const Buffers = struct {
     ple_nrow: cuda.DeviceBuffer,
     streams: cuda.DeviceBuffer,
     logits: cuda.DeviceBuffer, // bf16 [1, vocab]: the chunk's last row
+    f16_mode: F16Mode = .captured,
+    scores_mode: F16Mode = .captured,
+    scores_check: ?cuda.DeviceBuffer = null, // check: the fused scores (fp32 [att_rows, nb])
+    f16_check: ?cuda.DeviceBuffer = null, // check: the fused call's rows (bf16 [rows, widest N])
+    f16_part: ?cuda.DeviceBuffer = null, // fused: K slices' sums (fp32 [sk, rows, n], the largest matrix's)
+    f16_diffs: ?cuda.DeviceBuffer = null,
     gpa: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const fwd.Model, rows: usize, capacity: usize) !Buffers {
@@ -177,6 +237,29 @@ pub const Buffers = struct {
         try b.hadamard.upload(0, std.mem.sliceAsBytes(&h));
         b.attn = try attn.Scratch.init(d, cfg, @min(rows, att_rows), capacity);
         b.moe = try experts.Scratch.init(d, &m.layers[0].experts, @min(rows, moe_window), slots);
+        try b.moe.setMode(d, &m.layers[0].experts, try expertsMode(), rows);
+        b.f16_mode = try f16Mode();
+        b.scores_mode = try scoresMode();
+        if (b.f16_mode == .check or b.scores_mode == .check) b.f16_diffs = try cuda.DeviceBuffer.alloc(d, 8);
+        if (b.f16_mode == .check) b.f16_check = try cuda.DeviceBuffer.alloc(d, rows * wide * 2);
+        if (b.f16_mode != .captured) {
+            var most: usize = 0;
+            for (m.layers) |*l| {
+                for ([_]*const weights.F16{ &l.attn_hc.down, &l.attn_hc.up, &l.mlp_hc.down, &l.mlp_hc.up }) |x| most = @max(most, x.sk * x.n);
+                if (l.ple) |*pl| {
+                    for ([_]*const weights.F16{ &pl.key, &pl.value }) |x| most = @max(most, x.sk * x.n);
+                }
+                switch (l.mixer) {
+                    .gdn => |*gl| {
+                        most = @max(most, gl.w.ba.sk * gl.w.ba.n);
+                    },
+                    .attn => {},
+                }
+            }
+            most = @max(most, @max(m.mixer.down.sk * m.mixer.down.n, m.mixer.up.sk * m.mixer.up.n));
+            b.f16_part = try cuda.DeviceBuffer.alloc(d, rows * most * 4);
+        }
+        if (b.scores_mode == .check) b.scores_check = try cuda.DeviceBuffer.alloc(d, b.attn.scores.len);
         b.ple_host = try gpa.alloc(u8, rows * ple_heads * ple_words * 2);
         return b;
     }
@@ -184,6 +267,10 @@ pub const Buffers = struct {
     pub fn deinit(self: *Buffers) void {
         self.w.deinit();
         for ([_]*cuda.DeviceBuffer{ &self.dn, &self.ids, &self.proj, &self.windows, &self.sid, &self.conv_ptr, &self.gq, &self.gk, &self.gv, &self.gg, &self.gb, &self.gy, &self.pa, &self.q, &self.iq, &self.attn_o, &self.gated, &self.xs_gated, &self.pos_blk, &self.xh, &self.wq, &self.hadamard, &self.z, &self.logits_router, &self.pick, &self.wts, &self.y, &self.ple_dev, &self.ple_emb, &self.ple_keys, &self.ple_vals, &self.ple_gated, &self.ple_pss, &self.ple_nrow, &self.streams, &self.logits }) |x| x.free();
+        if (self.f16_check) |*x| x.free();
+        if (self.f16_part) |*x| x.free();
+        if (self.scores_check) |*x| x.free();
+        if (self.f16_diffs) |*x| x.free();
         self.attn.deinit();
         self.moe.deinit();
         self.gpa.free(self.ple_host);
@@ -237,6 +324,56 @@ pub const Prompt = struct {
         try p.f.g.gemm(b.xh.ptr, b.wq.ptr, b.hadamard.ptr, l.svh.ptr, out, o_stride, m, l.k, l.n, stream);
     }
 
+    /// exl3_mm.py `F16.__call__` on a chunk's rows (cuda_glue.zig `f16Rows`): out [m, w.n] bf16 (row stride o_stride)
+    /// = x [m, w.k] (bf16 or fp16, row stride x_stride) @ w^T, on the kernels b.f16_mode names.
+    pub fn f16Rows(p: *Prompt, w: *const weights.F16, x: Ptr, x_ty: []const u8, x_stride: usize, m: usize, out: Ptr, o_stride: usize, b: *Buffers, stream: cuda.Stream) !void {
+        const fp16 = std.mem.eql(u8, x_ty, "*fp16");
+        if (b.f16_mode == .captured or (!fp16 and !std.mem.eql(u8, x_ty, "*bf16")) or (w.k / w.sk) % 64 != 0) return p.f.g.f16Rows(w, x, x_ty, x_stride, m, out, o_stride, b.w.part.ptr, stream);
+        const fused_out = if (b.f16_mode == .check) b.f16_check.?.ptr else out;
+        const fused_stride = if (b.f16_mode == .check) w.n else o_stride;
+        const part = b.f16_part.?;
+        if (w.sk > 1 and w.sk * m * w.n * 4 > part.len) return error.F16PartTooSmall;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(c_int, @intCast(x_stride)));
+        a.add(w.w.ptr);
+        a.add(fused_out);
+        a.add(@as(c_int, @intCast(fused_stride)));
+        a.add(part.ptr);
+        for ([_]usize{ m, w.n, w.k, w.k / w.sk }) |v| a.add(@as(c_int, @intCast(v)));
+        try cuda.launch.launch(if (fp16) p.k.f16_fp16 else p.k.f16_bf16, .{ .grid = .{ .x = @intCast((m + 127) / 128), .y = @intCast((w.n + 127) / 128), .z = @intCast(w.sk) }, .block = .{ .x = 256 } }, stream, &a);
+        if (w.sk > 1) {
+            var r: cuda.Args = .{};
+            r.add(part.ptr);
+            r.add(@as(c_int, @intCast(w.sk)));
+            r.add(@as(c_int, @intCast(m)));
+            r.add(@as(c_int, @intCast(w.n)));
+            r.add(fused_out);
+            r.add(@as(c_int, @intCast(fused_stride)));
+            try cuda.launch.launch(p.k.f16_reduce, .{ .grid = .{ .x = @intCast((m * w.n + 255) / 256) }, .block = .{ .x = 256 } }, stream, &r);
+        }
+        if (b.f16_mode != .check) return;
+        try p.f.g.f16Rows(w, x, x_ty, x_stride, m, out, o_stride, b.w.part.ptr, stream);
+        const diffs = b.f16_diffs.?;
+        try diffs.fill8(0, stream.handle);
+        var c: cuda.Args = .{};
+        c.add(out);
+        c.add(@as(c_int, @intCast(o_stride)));
+        c.add(fused_out);
+        c.add(@as(c_int, @intCast(fused_stride)));
+        c.add(@as(c_int, @intCast(m)));
+        c.add(@as(c_int, @intCast(w.n)));
+        c.add(diffs.ptr);
+        try cuda.launch.launch(p.k.f16_diff, .{ .grid = .{ .x = 1024 }, .block = .{ .x = 256 } }, stream, &c);
+        var n: u64 = 0;
+        try diffs.downloadAsync(0, std.mem.asBytes(&n), stream.handle);
+        try stream.synchronize();
+        if (n != 0) {
+            std.debug.print("qwen38fn F16 check: {d} of {d} values differ (k {d}, n {d}, {d} slices, {d} rows)\n", .{ n, m * w.n, w.k, w.n, w.sk, m });
+            return error.F16Differ;
+        }
+    }
+
     /// forward.py `_readout_plain` on the prompt path: the down projection summed (F16 call), `hc_act`, up, mix.
     fn readout(p: *Prompt, b: *Buffers, h: Ptr, hc: *const weights.Hc, R: usize, inject: Ptr, stream: cuda.Stream) !void {
         const g = p.f.g;
@@ -244,9 +381,9 @@ pub const Prompt = struct {
         const w = &b.w;
         const wide = cfg.wide();
         try g.hcNormed(h, w.pss.ptr, hc.scale.ptr, w.normed.ptr, w.xs_normed.ptr, cfg.eps, R, stream);
-        try g.f16Rows(&hc.down, w.normed.ptr, "*bf16", wide, R, b.dn.ptr, hc.down.n, w.part.ptr, stream);
+        try p.f16Rows(&hc.down, w.normed.ptr, "*bf16", wide, R, b.dn.ptr, hc.down.n, b, stream);
         try g.hcAct(b.dn.ptr, hc.down.n, w.act.ptr, w.xs_act.ptr, inject, R, stream);
-        try g.f16Rows(&hc.up, w.act.ptr, "*bf16", cfg.low, R, w.up.ptr, wide, w.part.ptr, stream);
+        try p.f16Rows(&hc.up, w.act.ptr, "*bf16", cfg.low, R, w.up.ptr, wide, b, stream);
         try g.hcMix(w.up.ptr, w.normed.ptr, w.mixed.ptr, w.xs_mixed.ptr, R, stream);
     }
 
@@ -352,7 +489,7 @@ pub const Prompt = struct {
                 // Stack.prefill: each part straight into its columns
                 try p.matmul(&gl.qkv, w.mixed.ptr, R, b.proj.ptr, pw, b, stream);
                 try p.matmul(&gl.z, w.mixed.ptr, R, b.proj.ptr + gl.qkv.n * 2, pw, b, stream);
-                try g.f16Rows(&gl.w.ba, w.mixed.ptr, "*bf16", cfg.hidden, R, b.proj.ptr + (gl.qkv.n + gl.z.n) * 2, pw, w.part.ptr, stream);
+                try p.f16Rows(&gl.w.ba, w.mixed.ptr, "*bf16", cfg.hidden, R, b.proj.ptr + (gl.qkv.n + gl.z.n) * 2, pw, b, stream);
                 try p.chain(st, b, gl, lin, R, stream);
                 try p.matmul(&gl.out, w.gout.ptr, R, w.branch.ptr, cfg.hidden, b, stream);
             },
@@ -406,6 +543,52 @@ pub const Prompt = struct {
         try p.f.g.shiftWindows(conv, taps * cfg.convDim(), b.proj.ptr, b.rows * cfg.projWidth(), cfg.projWidth(), R, 1, cfg.convDim(), taps, stream);
     }
 
+    /// attention.py `qsa_rows` for a prompt block of n rows at b.pos_blk (keys up to `context`): the scores on the
+    /// kernels b.scores_mode names, then the selection.
+    fn rowsSelect(p: *Prompt, iq: Ptr, c: *const attn.Caches, b: *Buffers, n: usize, context: usize, stream: cuda.Stream) !void {
+        const ak = p.f.ak;
+        const s = &b.attn;
+        const blocks = s.blocks(context);
+        if (b.scores_mode == .captured) return ak.rowsSelect(iq, c, b.pos_blk.ptr, s, n, context, stream);
+        const check = b.scores_mode == .check;
+        const sc = if (check) b.scores_check.? else s.scores;
+        if (check) {
+            try sc.copyFrom(0, s.scores.ptr, s.scores.len, stream.handle);
+            try ak.scores(iq, c, b.pos_blk.ptr, s, s.scores.ptr, n, blocks, stream);
+        }
+        {
+            var a: cuda.Args = .{};
+            a.add(iq);
+            a.add(c.pooled.ptr);
+            a.add(b.pos_blk.ptr);
+            a.add(sc.ptr);
+            a.add(@as(c_int, @intCast(s.nb)));
+            a.add(@as(c_int, @intCast(n)));
+            try p.k.sc_rows.allowDynamicShared(scores_shared);
+            try cuda.launch.launch(p.k.sc_rows, .{ .grid = .{ .x = @intCast((n + 31) / 32), .y = @intCast((blocks + 63) / 64) }, .block = .{ .x = 256 }, .shared = scores_shared }, stream, &a);
+        }
+        if (check) {
+            const diffs = b.f16_diffs.?;
+            try diffs.fill8(0, stream.handle);
+            var a: cuda.Args = .{};
+            a.add(s.scores.ptr);
+            a.add(sc.ptr);
+            a.add(@as(c_int, @intCast(s.nb)));
+            a.add(@as(c_int, @intCast(n)));
+            a.add(@as(c_int, @intCast(blocks)));
+            a.add(diffs.ptr);
+            try cuda.launch.launch(p.k.sc_diff, .{ .grid = .{ .x = 1024 }, .block = .{ .x = 256 } }, stream, &a);
+            var nd: u64 = 0;
+            try diffs.downloadAsync(0, std.mem.asBytes(&nd), stream.handle);
+            try stream.synchronize();
+            if (nd != 0) {
+                std.debug.print("qwen38fn scores check: {d} of {d} scores differ ({d} rows, {d} blocks)\n", .{ nd, n * blocks, n, blocks });
+                return error.ScoresDiffer;
+            }
+        }
+        try ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
+    }
+
     /// forward.py `attn_block` on the prompt path for one stream.
     fn attention(p: *Prompt, a: fwd.AttnAt, b: *Buffers, al: *const fwd.AttnLayer, pw: usize, R: usize, stream: cuda.Stream) !void {
         const m = p.f.m;
@@ -422,7 +605,7 @@ pub const Prompt = struct {
             const ends = a.pos + r0 + n;
             const iq = b.iq.ptr + r0 * cfg.index_heads * cfg.index_dim * 2;
             const q = b.q.ptr + r0 * cfg.heads * cfg.head_dim * 2;
-            if (b.attn.qsa) try ak.rowsSelect(iq, c, b.pos_blk.ptr, &b.attn, n, ends, stream);
+            if (b.attn.qsa) try p.rowsSelect(iq, c, b, n, ends, stream);
             try ak.attendInto(q, c, b.pos_blk.ptr, &b.attn, n, ends, b.attn_o.ptr + r0 * cfg.heads * cfg.head_dim * 2, stream);
         }
         try ak.gate(b.attn_o.ptr, b.pa.ptr, pw, b.gated.ptr, b.xs_gated.ptr, R, stream);
@@ -438,10 +621,17 @@ pub const Prompt = struct {
         try g.router(w.mixed.ptr, cfg.hidden, layer.router.ptr, cfg.experts + 1, b.logits_router.ptr, R, stream);
         try g.selectRows(b.logits_router.ptr, cfg.experts, cfg.topk, b.pick.ptr, b.wts.ptr, R, stream);
         const slots = cfg.slots();
+        // fused: the chunk in one window; check: that, then the captured windows, compared
+        switch (b.moe.mode) {
+            .captured => {},
+            .fused => return experts.promptWindow(&m.ek, &layer.experts, &b.moe, w.mixed.ptr, cfg.hidden, b.pick.ptr, R, b.y.ptr, stream),
+            .check => try experts.promptWindow(&m.ek, &layer.experts, &b.moe, w.mixed.ptr, cfg.hidden, b.pick.ptr, R, b.moe.ycheck.?.ptr, stream),
+        }
         var r0: usize = 0;
         while (r0 < R) : (r0 += moe_window) {
             const n = @min(moe_window, R - r0);
             const y = try experts.routed(&m.ek, &layer.experts, &b.moe, w.mixed.ptr + r0 * cfg.hidden * 2, cfg.hidden, b.pick.ptr + r0 * slots * 4, n, stream);
+            if (b.moe.mode == .check) try experts.checkSwiglu(&m.ek, &b.moe, r0 * slots, n * slots, stream);
             const count: i64 = @intCast(n * slots * cfg.hidden);
             var a: cuda.Args = .{};
             a.add(y);
@@ -449,6 +639,7 @@ pub const Prompt = struct {
             a.add(@as(c_longlong, count));
             try cuda.launch.launch(p.k.to_bf16, .{ .grid = .{ .x = @intCast((@as(usize, @intCast(count)) + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
         }
+        if (b.moe.mode == .check) try experts.checkWindow(&m.ek, &b.moe, b.y.ptr, R * slots * cfg.hidden * 2, stream);
     }
 
     fn pleBlock(p: *Prompt, pl: *const weights.Ple, st: *fwd.Stream, b: *Buffers, R: usize, stream: cuda.Stream) !void {
@@ -458,8 +649,8 @@ pub const Prompt = struct {
         const t = &m.table.?;
         const ng = m.ng.?;
         try g.pleRows(b.ple_dev.ptr, t.words, pl.head_bias.ptr, ng.heads(), t.dh, t.bits, b.ple_emb.ptr, R, stream);
-        try g.f16Rows(&pl.key, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_keys.ptr, cfg.wide(), b.w.part.ptr, stream);
-        try g.f16Rows(&pl.value, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_vals.ptr, cfg.hidden, b.w.part.ptr, stream);
+        try p.f16Rows(&pl.key, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_keys.ptr, cfg.wide(), b, stream);
+        try p.f16Rows(&pl.value, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_vals.ptr, cfg.hidden, b, stream);
         try g.pleGate(b.ple_keys.ptr, b.ple_vals.ptr, b.w.h.ptr, pl.norm_key.ptr, pl.norm_query.ptr, b.ple_gated.ptr, b.ple_pss.ptr, cfg.eps, R, stream);
         try g.pleConv(b.ple_gated.ptr, b.ple_pss.ptr, pl.norm_conv.ptr, st.ple_tail.ptr, pl.conv.ptr, pl.taps, cfg.ngram, b.w.h.ptr, b.ple_nrow.ptr, cfg.eps, R, stream);
     }

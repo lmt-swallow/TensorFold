@@ -48,10 +48,13 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // the DSV4.1 fork's cuda/rdma_gather.cu v7 kernel pair: the rounds' gathers over the RDMA ring
     .{ .name = "qwen38fn_gdn", .src = "qwen38fn/gdn", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
     .{ .name = "qwen38fn_experts", .src = "qwen38fn/experts", .flags = &.{ "-O3", "-lineinfo" } }, // 0.6.6 cuda/exl3/experts.py, tensorfold_exl3_experts_v1
+    .{ .name = "qwen38fn_experts_prompt", .src = "qwen38fn/experts_prompt", .flags = &.{ "-O3", "-lineinfo" } }, // ours: a prompt window's experts with experts.py's bytes (qwen38fn_experts' flags)
     .{ .name = "qwen38fn_gdn_io", .src = "qwen38fn/gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
     .{ .name = "qwen38fn_gdn_prefill", .src = "qwen38fn/gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 cuda/kernels/gdn.py's gdn_prefill.cu, tensorfold_gdn_v2
     .{ .name = "qwen38fn_qmm", .src = "qwen38fn/qmm", .flags = &.{"-O3"} }, // 0.6.6 cuda/kernels/qmm.py's qmm.cu, tensorfold_qmm_v5: the MTP draft head
     .{ .name = "qwen38fn_draft_pick", .src = "qwen38fn/draft_pick", .flags = &.{"-O3"} }, // the draft head's greedy pick and its probability on the device
+    .{ .name = "qwen38fn_f16_rows", .src = "qwen38fn/f16_rows", .flags = &.{"-O3"} }, // ours: exl3_mm.py F16 matrices over a prompt chunk's rows with _f16_mm's and _reduce's bytes
+    .{ .name = "qwen38fn_scores", .src = "qwen38fn/scores", .flags = &.{"-O3"} }, // ours: attention.py _scores for 32 rows a program with the captured kernel's bytes
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
     .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
     .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
