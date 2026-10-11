@@ -136,6 +136,10 @@ pub const Engine = struct {
             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
             s.dropHeld(e.gpa);
             s.next = .{ .count = d };
+            // a head that keeps its drafts on the host hands them over as after any later draft (askDrafts)
+            if (e.backend.vtable.tree) |tree| {
+                if (try tree(e.backend.ptr, s, e.gpa)) |held| s.next = held;
+            }
         } else if (e.cfg.pipelined) {
             try e.queueNext(s, feed);
         }
