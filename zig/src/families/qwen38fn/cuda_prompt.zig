@@ -240,6 +240,10 @@ pub const Buffers = struct {
         try b.moe.setMode(d, &m.layers[0].experts, try expertsMode(), rows);
         b.f16_mode = try f16Mode();
         b.scores_mode = try scoresMode();
+        b.f16_check = null;
+        b.f16_part = null;
+        b.f16_diffs = null;
+        b.scores_check = null;
         if (b.f16_mode == .check or b.scores_mode == .check) b.f16_diffs = try cuda.DeviceBuffer.alloc(d, 8);
         if (b.f16_mode == .check) b.f16_check = try cuda.DeviceBuffer.alloc(d, rows * wide * 2);
         if (b.f16_mode != .captured) {
