@@ -17,6 +17,7 @@ const M = @import("cuda_model.zig");
 const T = @import("cuda_mtp.zig");
 const copy_drafts = @import("copy_drafts.zig");
 const P = @import("cuda_pool.zig");
+const Pm = @import("cuda_prompt.zig");
 
 const Ptr = cuda.abi.DevicePtr;
 const Buf = cuda.DeviceBuffer;
@@ -125,9 +126,11 @@ pub const Runner = struct {
     pmb: T.Buffers,
     host: []u16, // a logits row
     cand: Buf,
+    players: []Pm.Layer, // the prompt path's view of the model (`pmodel`)
+    pmodel: Pm.Model,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined };
         r.w = try M.Work.init(d, lay, rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -137,6 +140,9 @@ pub const Runner = struct {
         r.host = try gpa.alloc(u16, lay.size(.vocab));
         errdefer gpa.free(r.host);
         r.cand = try Buf.alloc(d, 6 * draft_k * 4);
+        errdefer r.cand.free();
+        r.players = try gpa.alloc(Pm.Layer, model.layers.len);
+        r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
         return r;
     }
 
@@ -146,6 +152,7 @@ pub const Runner = struct {
         r.pmb.deinit();
         r.gpa.free(r.host);
         r.cand.free();
+        r.gpa.free(r.players);
     }
 
     fn gatherFn(p: *anyopaque, part: Ptr, gath: Ptr, floats: usize, stream: cuda.Stream) anyerror!void {
@@ -155,6 +162,11 @@ pub const Runner = struct {
 
     fn gather(r: *Runner) M.Gather {
         return .{ .ctx = r, .run = gatherFn };
+    }
+
+    fn promptGatherFn(p: *anyopaque, x: Pm.Exchange, stream: cuda.Stream) anyerror!void {
+        const r: *Runner = @ptrCast(@alignCast(p));
+        try r.link.gather(r.link.ctx, x.part, x.gath, x.bytes / 4, stream);
     }
 
     fn mtpGather(r: *Runner) T.Gather {
@@ -223,15 +235,28 @@ pub const Runner = struct {
         const D = r.lay.cfg.hidden;
         if (start != q.st.pos) return error.PositionMismatch;
         const R = @min(prompt_rows, prompt.len - start);
-        try r.w.pb.ids.upload(0, std.mem.sliceAsBytes(prompt[start .. start + R]));
-        try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, true, r.gather(), null, r.stream);
-        try q.last.copyFrom(0, r.w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
-        const nxt = prompt[start + 1 .. @min(start + R + 1, prompt.len)];
-        if (nxt.len > 0) {
-            try r.mtpStep(q, &r.pmb, nxt, r.w.fnormed.ptr);
-            q.mtp_len += nxt.len;
-        }
-        try M.commit(r.k, r.lay, &q.st, R, R, true, &r.w, r.stream);
+        var ps: Pm.Stream = .{
+            .kda = &q.st.kda,           .caches = q.st.caches,      .mtp_cache = &q.mcache,  .pos = q.st.pos,
+            .mtp_len = q.mtp_len,       .capacity = q.st.caches[0].capacity,
+            .pos_dev = q.st.pos_dev.ptr, .mtp_pos_dev = q.mpos.ptr,
+        };
+        const w = &r.w;
+        const c: Pm.Chunk = .{
+            .p = .{
+                .rows = prompt_rows, .b = &w.pb,  .temp = &w.temp,         .kscratch = &w.pscratch, .ds = &w.pds,
+                .ms = &w.pms,        .mb = &r.pmb, .fnormed = w.fnormed.ptr, .fxs = w.fxs.ptr,         .logits = w.logits.ptr,
+            },
+            .m = &r.pmodel,
+            .k = .{ .g = r.k.g, .kda = r.k.kk, .moe = r.k.mk, .mtp = r.tk },
+            .lay = r.lay,
+            .st = &ps,
+            .ids = prompt[start .. start + R],
+            .next = prompt[start + 1 .. @min(start + R + 1, prompt.len)],
+        };
+        try Pm.prefillChunk(&c, .{ .ctx = r, .run = promptGatherFn }, r.stream);
+        try q.last.copyFrom(0, w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
+        q.st.pos = ps.pos;
+        q.mtp_len = ps.mtp_len;
         return start + R;
     }
 

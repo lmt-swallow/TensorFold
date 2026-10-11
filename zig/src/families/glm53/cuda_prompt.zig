@@ -18,6 +18,7 @@ const forward = @import("cuda_forward.zig");
 const dsa = @import("cuda_dsa.zig");
 const moe = @import("cuda_moe.zig");
 const mtp = @import("cuda_mtp.zig");
+const model = @import("cuda_model.zig");
 
 const Glue = glue_mod.Glue;
 const Ptr = cuda.abi.DevicePtr;
@@ -53,6 +54,17 @@ pub const Model = struct {
     head: glue_mod.B16,
     mtp: *const mtp.Mtp,
 };
+
+/// The prompt path's view of one rank's whole model (cuda_model.zig): `out` [m.layers.len] takes its layers, each
+/// mixer's index among the stream's KDA states or DSA caches (config.zig `kindIndex`, as model.State keeps them).
+pub fn of(m: *const model.Model, cfg: *const config.Config, mtp_w: *const mtp.Mtp, out: []Layer) Model {
+    for (m.layers, out) |*x, *y| y.* = .{
+        .frame = &x.frame,
+        .mixer = if (x.kda) |*w| .{ .kda = .{ .w = w, .li = cfg.kindIndex(x.index) } } else .{ .dsa = .{ .w = &x.dsa.?, .di = cfg.kindIndex(x.index) } },
+        .ffn = if (x.mlp) |*w| .{ .mlp = w } else .{ .moe = &x.moe.? },
+    };
+    return .{ .layers = out, .embed = m.embed.ptr, .norm = m.norm.ptr, .head = m.head.b16(), .mtp = mtp_w };
+}
 
 pub const Kernels = struct {
     g: Glue,
