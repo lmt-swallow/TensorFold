@@ -99,6 +99,7 @@ pub const Lanes = struct {
         const off = if (std.c.getenv("TF_QFN_GRAPHS")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         if (!off) self.graphs = .{ .gpa = gpa, .most = max_graphs };
         self.stats = round_stats.Stats.fromEnv();
+        self.f.count_experts = self.stats != null;
         return self;
     }
 
@@ -379,7 +380,15 @@ pub const Lanes = struct {
             l.a0 = sg.a0;
             l.round = self.rounds;
         }
-        if (self.stats) |*st| st.verify(t0, windows.len, R);
+        if (self.stats) |*st| {
+            var counts: [round_stats.max_layers]i32 = undefined;
+            const n = @min(self.m.layers.len, counts.len);
+            try self.b.expert_counts.download(0, std.mem.sliceAsBytes(counts[0..n]));
+            var sum: u64 = 0;
+            for (counts[0..n]) |c| sum += @intCast(c);
+            st.experts(R, sum, n);
+            st.verify(t0, windows.len, R);
+        }
     }
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {

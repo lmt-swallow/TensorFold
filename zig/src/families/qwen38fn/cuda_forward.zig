@@ -407,6 +407,7 @@ pub const Buffers = struct {
     ple_pss: cuda.DeviceBuffer, // fp32 [rows, S]
     streams: cuda.DeviceBuffer, // bf16 [rows, S * D]: the head's copy of the streams
     logits: cuda.DeviceBuffer, // bf16 [rows, vocab]
+    expert_counts: cuda.DeviceBuffer, // int32 [layers]: each layer's distinct experts in the last window (count_experts)
     gpa: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *const Model, rows: usize, capacity: usize) !Buffers {
@@ -457,6 +458,7 @@ pub const Buffers = struct {
             s[0].* = try cuda.DeviceBuffer.alloc(d, s[1]);
             try s[0].fill8(0, null);
         }
+        b.expert_counts = try cuda.DeviceBuffer.alloc(d, @max(16, m.layers.len * 4));
         b.attn = try attn.Scratch.init(d, cfg, rows, capacity);
         b.moe = try experts.Scratch.init(d, &m.layers[0].experts, rows, slots);
         b.ple_host = try gpa.alloc(u8, rows * ple_heads * ple_words * 2);
@@ -466,6 +468,7 @@ pub const Buffers = struct {
     pub fn deinit(self: *Buffers) void {
         self.w.deinit();
         for ([_]*cuda.DeviceBuffer{ &self.ids, &self.pa, &self.q, &self.iq, &self.gated, &self.xs_gated, &self.xh, &self.z, &self.logits_router, &self.pick, &self.wts, &self.ple_dev, &self.ple_emb, &self.ple_keys, &self.ple_vals, &self.ple_gated, &self.ple_pss, &self.streams, &self.logits }) |x| x.free();
+        self.expert_counts.free();
         self.attn.deinit();
         self.moe.deinit();
         self.gpa.free(self.ple_host);
@@ -489,6 +492,8 @@ pub const Forward = struct {
     /// Decode attention scans a context bucket (attn.bucket) instead of the window's end: the same bits, launches
     /// that depend on the position only through its bucket (what a captured round needs).
     buckets: bool = false,
+    /// Each main layer's distinct experts of a window copied into b.expert_counts (round statistics).
+    count_experts: bool = false,
 
     pub fn init(d: *const cuda.Driver, m: *Model, set: *const cuda.aot.Set) Forward {
         return .{ .m = m, .d = d, .g = .{ .set = set, .hidden = m.cfg.hidden, .streams = m.cfg.streams, .low = m.cfg.low }, .ak = .{ .set = set, .cfg = &m.cfg } };
@@ -661,6 +666,7 @@ pub const Forward = struct {
         try g.router(w.mixed.ptr, cfg.hidden, layer.router.ptr, cfg.experts + 1, b.logits_router.ptr, R, stream);
         try g.selectRows(b.logits_router.ptr, cfg.experts, cfg.topk, b.pick.ptr, b.wts.ptr, R, stream);
         _ = try experts.routed(&m.ek, &layer.experts, &b.moe, w.mixed.ptr, cfg.hidden, b.pick.ptr, R, stream);
+        if (f.count_experts and cache == .main) try b.expert_counts.copyFrom(layer.index * 4, b.moe.count.ptr, 4, stream.handle);
     }
 
     /// forward.py `ple_block`: the table rows, keys, values and gate on all rows, each stream's conv on its own.

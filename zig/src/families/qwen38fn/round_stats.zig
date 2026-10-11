@@ -1,12 +1,13 @@
 //! TF_QFN_ROUND_STATS=1: where the serving time goes, logged every ten seconds the backend is busy. Rounds by
-//! stream count; verify forwards by total rows (count and wall ms, the device's work and the draws' read-back
-//! included); the head's drafting (wall ms); commits; prompt chunks; and the time
+//! stream count; verify forwards by total rows (count, wall ms with the device's work and the draws' read-back, and
+//! the distinct experts a main layer used on average, "e"); the head's drafting (wall ms); commits; prompt chunks; and the time
 //! between backend calls (the round loop, the HTTP side, an idle server). A window also ends when the last stream
 //! leaves. It only observes: no choice reads it.
 const std = @import("std");
 
 pub const max_streams = 4;
 pub const max_rows = 64;
+pub const max_layers = 64;
 
 fn nowNs() i128 {
     var ts: std.c.timespec = undefined;
@@ -81,6 +82,8 @@ pub const Stats = struct {
     rounds: [max_streams + 1]u64 = @splat(0),
     rows_n: [max_rows + 1]u64 = @splat(0),
     rows_ms: [max_rows + 1]f64 = @splat(0),
+    rows_experts: [max_rows + 1]u64 = @splat(0), // distinct experts summed over the main layers, by rows
+    layers: usize = 0,
     verify_ms: f64 = 0,
     draft_ms: f64 = 0,
     draft_calls: u64 = 0,
@@ -127,6 +130,12 @@ pub const Stats = struct {
         s.maybeLog();
     }
 
+    /// A verify window of `rows` rows used `sum` distinct experts over its `layers` main layers.
+    pub fn experts(s: *Stats, rows: usize, sum: u64, layers: usize) void {
+        s.rows_experts[@min(rows, max_rows)] += sum;
+        s.layers = layers;
+    }
+
     pub fn draft(s: *Stats, t0: i128) void {
         s.draft_ms += s.end(t0);
         s.draft_calls += 1;
@@ -163,7 +172,11 @@ pub const Stats = struct {
         w.print("qwen38fn round stats over {d:.1} s: rounds by streams", .{wall / 1000}) catch {};
         for (s.rounds[1..], 1..) |n, k| if (n > 0) w.print(" {d}:{d}", .{ k, n }) catch {};
         w.print("; verify by rows", .{}) catch {};
-        for (s.rows_n, s.rows_ms, 0..) |n, t_ms, r| if (n > 0) w.print(" {d}:{d}x{d:.1}ms", .{ r, n, t_ms / @as(f64, @floatFromInt(n)) }) catch {};
+        for (s.rows_n, s.rows_ms, s.rows_experts, 0..) |n, t_ms, e, r| if (n > 0) {
+            const nf: f64 = @floatFromInt(n);
+            const per_layer = if (s.layers > 0) @as(f64, @floatFromInt(e)) / nf / @as(f64, @floatFromInt(s.layers)) else 0;
+            w.print(" {d}:{d}x{d:.1}ms/{d:.1}e", .{ r, n, t_ms / nf, per_layer }) catch {};
+        };
         w.print("; verify {d:.0} ms ({d:.0}%), draft {d:.0} ms in {d} calls ({d:.0}%), keep {d:.0} ms, prompt {d:.0} ms in {d} chunks ({d:.0}%), between calls {d:.0} ms ({d:.0}%); {d} tokens kept", .{
             s.verify_ms, 100 * s.verify_ms / wall, s.draft_ms, s.draft_calls, 100 * s.draft_ms / wall, s.keep_ms, s.prompt_ms, s.prompt_chunks, 100 * s.prompt_ms / wall, s.between_ms, 100 * s.between_ms / wall, s.kept,
         }) catch {};
