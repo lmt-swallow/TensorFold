@@ -1038,8 +1038,8 @@ pub const Streams = struct {
     /// TF_DS_PROMPT_PIECES: beside the rounds, a part issues this many pieces of a chunk's layers
     /// (`Prompt.piece`) instead of whole chunks; 1: whole chunks.
     pieces: usize = 1,
-    /// TF_DS_FILL_AHEAD=1: beside the rounds, the next part may be issued once the one before the last has run
-    /// (`partDone`), so one part waits queued behind the running one.
+    /// TF_DS_FILL_AHEAD=1 (default off): beside the rounds, the next part may be issued once the one before the last
+    /// has run (`partDone`), so one part waits queued behind the running one.
     ahead: bool = false,
 
     /// What a prompt pass beside the rounds owns: its stream (its chunks, absorbs and snapshots), the event after its
@@ -2285,7 +2285,12 @@ pub const Engine = struct {
             try e.streams.enableOverlap(threads, narrow);
             e.streams.graphs_beside = std.mem.eql(u8, getenv("TF_DS_OVERLAP_GRAPHS") orelse "0", "1");
             e.streams.pieces = if (getenv("TF_DS_PROMPT_PIECES")) |v| @max(1, std.fmt.parseInt(usize, v, 10) catch 1) else 1;
-            e.streams.ahead = if (getenv("TF_DS_FILL_AHEAD")) |v| std.mem.eql(u8, v, "1") else e.streams.pieces > 1;
+            // TF_DS_FILL_AHEAD keeps the next part queued behind the running one, so the prompt's partition never
+            // drains and the rounds keep only the other SMs (decoders at ~7% of their rate during a 64k prefill): off
+            // unless asked for, whatever the pieces
+            e.streams.ahead = std.mem.eql(u8, getenv("TF_DS_FILL_AHEAD") orelse "0", "1");
+            if (e.streams.pieces > 1 and s.replay and s.rank == 0)
+                std.log.warn("deepseek_v41: TF_DS_PROMPT_PIECES={d} has no effect with bounded replay (TF_DS_REPLAY=1): a chunk under replay runs whole (Prompt.piecesFor)", .{e.streams.pieces});
             e.with_round = std.mem.eql(u8, getenv("TF_DS_FILL_WITH_ROUND") orelse "0", "1");
             if (s.rank == 0) std.log.info("deepseek_v41: beside the rounds: graphs {}, pieces {d}, ahead {}, parts with rounds {}, urgent rounds {}", .{ e.streams.graphs_beside, e.streams.pieces, e.streams.ahead, e.with_round, urgent });
             if (urgent) try e.streams.runner.urgentSides();
