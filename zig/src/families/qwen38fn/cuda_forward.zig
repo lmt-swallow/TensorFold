@@ -302,6 +302,34 @@ pub const Stream = struct {
 /// Where an attention layer reads and writes: its caches and the stream's position for it (forward.py `_caches`).
 pub const AttnAt = struct { caches: *const attn.Caches, pos_dev: Ptr, pos: usize };
 
+/// One stream's rows in a shared window (forward.py `stage`'s segments): buffer rows a0 .. a0 + n. A shared window's
+/// segments follow each other from row 0; every per-stream step (n-gram conv, DeltaNet, attention, commit) runs on
+/// its segment alone and every other step on all rows, so each row has the bits of its stream's own window.
+pub const Seg = struct { st: *Stream, a0: usize, n: usize };
+
+/// Which caches a layer's attention uses: the main model's at the stream's position, or the MTP head's own.
+pub const Cache = enum {
+    main,
+    mtp,
+
+    fn at(c: Cache, st: *const Stream, ai: usize) AttnAt {
+        return switch (c) {
+            .main => st.mainAt(ai),
+            .mtp => st.mtpAt(),
+        };
+    }
+};
+
+/// The rows the segments cover, checked to follow each other from row 0.
+pub fn segRows(segs: []const Seg) !usize {
+    var r: usize = 0;
+    for (segs) |sg| {
+        if (sg.a0 != r or sg.n == 0 or sg.n > sg.st.rows) return error.BadSegments;
+        r += sg.n;
+    }
+    return r;
+}
+
 /// A decode window's buffers (state.py `Buffers`, decode).
 pub const Buffers = struct {
     rows: usize,
@@ -412,22 +440,32 @@ pub const Forward = struct {
         return .{ .m = m, .d = d, .g = .{ .set = set, .hidden = m.cfg.hidden, .streams = m.cfg.streams, .low = m.cfg.low }, .ak = .{ .set = set, .cfg = &m.cfg } };
     }
 
-    /// forward.py `stage`: the token ids and the n-gram rows of the window, copied to the device.
+    /// forward.py `stage` for one stream.
     pub fn stage(f: *Forward, st: *Stream, b: *Buffers, tokens: []const i32, stream: cuda.Stream) !void {
-        const R = tokens.len;
+        try f.stageSegs(&.{.{ .st = st, .a0 = 0, .n = tokens.len }}, b, tokens, stream);
+    }
+
+    /// forward.py `stage`: the token ids of every segment's rows (`tokens`, in row order) and each stream's n-gram
+    /// rows from its own history, copied to the device.
+    pub fn stageSegs(f: *Forward, segs: []const Seg, b: *Buffers, tokens: []const i32, stream: cuda.Stream) !void {
+        const R = try segRows(segs);
+        if (R != tokens.len) return error.BadSegments;
         if (R > b.rows) return error.WindowTooLarge;
         try b.ids.upload(0, std.mem.sliceAsBytes(tokens));
         if (f.m.ng) |*g| {
-            var toks: [64]i64 = undefined;
-            for (tokens, 0..) |t, i| toks[i] = t;
             const heads = g.heads();
-            var row_ids: [64 * ngram.max_heads]i64 = undefined;
-            try g.ids(st.history[0 .. g.n - 1], toks[0..R], row_ids[0 .. R * heads]);
             const t = &f.m.table.?;
-            const bytes = b.ple_host[0 .. R * heads * t.words * 2];
-            try t.gather(row_ids[0 .. R * heads], bytes);
-            try b.ple_dev.uploadAsync(0, bytes, stream.handle);
-            st.last = .{ .history = st.history, .tokens = toks, .n = R };
+            const row_bytes = heads * t.words * 2;
+            for (segs) |sg| {
+                if (sg.n > 64) return error.WindowTooLarge;
+                var toks: [64]i64 = undefined;
+                for (tokens[sg.a0..][0..sg.n], 0..) |x, i| toks[i] = x;
+                var row_ids: [64 * ngram.max_heads]i64 = undefined;
+                try g.ids(sg.st.history[0 .. g.n - 1], toks[0..sg.n], row_ids[0 .. sg.n * heads]);
+                try t.gather(row_ids[0 .. sg.n * heads], b.ple_host[sg.a0 * row_bytes ..][0 .. sg.n * row_bytes]);
+                sg.st.last = .{ .history = sg.st.history, .tokens = toks, .n = sg.n };
+            }
+            try b.ple_dev.uploadAsync(0, b.ple_host[0 .. R * row_bytes], stream.handle);
         }
     }
 
@@ -465,9 +503,15 @@ pub const Forward = struct {
 
     /// forward.py `compute` for one stream: logits of the window's rows into b.logits (with the head loaded).
     pub fn compute(f: *Forward, st: *Stream, b: *Buffers, R: usize, probe: Probe, stream: cuda.Stream) !void {
+        try f.computeSegs(&.{.{ .st = st, .a0 = 0, .n = R }}, b, probe, stream);
+    }
+
+    /// forward.py `compute` over a shared window: logits of every segment's rows into b.logits.
+    pub fn computeSegs(f: *Forward, segs: []const Seg, b: *Buffers, probe: Probe, stream: cuda.Stream) !void {
         const m = f.m;
         const g = f.g;
         const w = &b.w;
+        const R = try segRows(segs);
         try g.embed(b.ids.ptr, m.embed.ptr, w.h.ptr, R, stream);
         var pending: Glue.Pending = .none;
         for (m.layers) |*layer| {
@@ -475,11 +519,7 @@ pub const Forward = struct {
                 try stream.synchronize();
                 try cb(probe.ctx, layer.index, b, R);
             }
-            const at: ?AttnAt = switch (layer.mixer) {
-                .attn => |*al| st.mainAt(al.ai),
-                .gdn => null,
-            };
-            try f.layerStep(layer, st, b, R, pending, at, stream);
+            try f.layerStep(layer, segs, b, pending, .main, stream);
             if (probe.layer_out) |cb| {
                 try stream.synchronize();
                 try cb(probe.ctx, layer.index, b, R);
@@ -506,43 +546,58 @@ pub const Forward = struct {
         try hc_mod.readoutOf(f.g, &b.w, b.streams.ptr, mixer, cfg, R, 0, stream);
     }
 
-    /// forward.py `layer_forward` up to its experts for one stream: the n-gram branch, both hyper-connections,
-    /// DeltaNet or attention (at `at`), router and experts; the layer's write-back is left pending in `b`.
-    pub fn layerStep(f: *Forward, layer: *const Layer, st: *Stream, b: *Buffers, R: usize, pending_in: Glue.Pending, at: ?AttnAt, stream: cuda.Stream) !void {
+    /// forward.py `layer_forward` up to its experts over a shared window: the n-gram branch, both hyper-connections,
+    /// DeltaNet or attention (each segment's at its `cache`), router and experts; the layer's write-back is left
+    /// pending in `b`.
+    pub fn layerStep(f: *Forward, layer: *const Layer, segs: []const Seg, b: *Buffers, pending_in: Glue.Pending, cache: Cache, stream: cuda.Stream) !void {
         const m = f.m;
         const cfg = &m.cfg;
         const g = f.g;
         const w = &b.w;
         const lin = m.linearLayers();
+        const R = try segRows(segs);
         var pending = pending_in;
         if (layer.ple) |*p| {
             if (pending != .none) {
                 try g.hcWriteback(w.h.ptr, w.pss.ptr, R, pending, stream);
                 pending = .none;
             }
-            try f.pleBlock(p, st, b, R, stream);
+            try f.pleBlock(p, segs, b, R, stream);
         }
         // the attention hyper-connection
         try hc_mod.block(g, w, &layer.attn_hc, cfg, R, pending, w.inj_a.ptr, stream);
         switch (layer.mixer) {
             .gdn => |*gl| {
-                const proj = st.proj.ptr + gl.li * st.rows * cfg.projWidth() * 2;
-                try f.stack(&.{ &gl.qkv, &gl.z }, &gl.w.ba, w.mixed.ptr, R, proj, cfg.projWidth(), b, stream);
-                const cur = st.cur[gl.li];
-                try gdn.chain(&m.gk, .{
-                    .p = proj,                .conv_state = st.convPtr(cfg, gl.li), .conv_w = gl.w.conv.ptr,
-                    .state_in = st.recPtr(cfg, lin, gl.li, cur), .a_log = gl.w.a_log.ptr, .dt_bias = gl.w.dt_bias.ptr,
-                    .norm_w = gl.w.norm.ptr,  .eps = cfg.eps,                         .rows = R,
-                    .out = w.gout.ptr,        .xs = w.gxs.ptr,                        .state_out = st.recPtr(cfg, lin, gl.li, 1 - cur),
-                    .scratch = &st.scratch[gl.li],
-                }, stream);
+                const pw = cfg.projWidth();
+                const vw = cfg.nv * cfg.dv;
+                // one stream: its projection rows straight into its own; more: all rows, then each stream's copied
+                const one = segs.len == 1;
+                const at = if (one) segs[0].st.proj.ptr + gl.li * segs[0].st.rows * pw * 2 else w.proj.ptr;
+                try f.stack(&.{ &gl.qkv, &gl.z }, &gl.w.ba, w.mixed.ptr, R, at, pw, b, stream);
+                for (segs) |sg| {
+                    const st = sg.st;
+                    const proj: cuda.DeviceBuffer = .{ .d = st.proj.d, .ptr = st.proj.ptr + gl.li * st.rows * pw * 2, .len = st.rows * pw * 2 };
+                    if (!one) try proj.copyFrom(0, w.proj.ptr + sg.a0 * pw * 2, sg.n * pw * 2, stream.handle);
+                    const cur = st.cur[gl.li];
+                    try gdn.chain(&m.gk, .{
+                        .p = proj.ptr,                     .conv_state = st.convPtr(cfg, gl.li), .conv_w = gl.w.conv.ptr,
+                        .state_in = st.recPtr(cfg, lin, gl.li, cur), .a_log = gl.w.a_log.ptr, .dt_bias = gl.w.dt_bias.ptr,
+                        .norm_w = gl.w.norm.ptr,           .eps = cfg.eps,                         .rows = sg.n,
+                        .out = w.gout.ptr + sg.a0 * vw * 2, .xs = w.gxs.ptr + sg.a0 * vw / 32 * 4, .state_out = st.recPtr(cfg, lin, gl.li, 1 - cur),
+                        .scratch = &st.scratch[gl.li],
+                    }, stream);
+                }
                 try f.mm(&gl.out, w.gout.ptr, R, w.branch.ptr, b, stream);
             },
             .attn => |*al| {
-                const a = at orelse return error.NoAttentionCache;
                 const pw = al.w.projWidth();
+                const qw = cfg.heads * cfg.head_dim;
+                const iw = cfg.index_heads * cfg.index_dim;
                 try f.stack(&.{ &al.parts[0], &al.parts[1], &al.parts[2], &al.parts[3] }, null, w.mixed.ptr, R, b.pa.ptr, pw, b, stream);
-                try f.ak.block(b.pa.ptr, pw, a.pos_dev, a.pos, .{ al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, al.w.ik_scale.ptr }, m.inv.ptr, b.q.ptr, b.iq.ptr, a.caches, &b.attn, b.gated.ptr, b.xs_gated.ptr, R, stream);
+                for (segs) |sg| {
+                    const a = cache.at(sg.st, al.ai);
+                    try f.ak.block(b.pa.ptr + sg.a0 * pw * 2, pw, a.pos_dev, a.pos, .{ al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, al.w.ik_scale.ptr }, m.inv.ptr, b.q.ptr + sg.a0 * qw * 2, b.iq.ptr + sg.a0 * iw * 2, a.caches, &b.attn, b.gated.ptr + sg.a0 * qw * 2, b.xs_gated.ptr + sg.a0 * qw / 32 * 4, sg.n, stream);
+                }
                 try f.mm(&al.o, b.gated.ptr, R, w.branch.ptr, b, stream);
             },
         }
@@ -553,18 +608,19 @@ pub const Forward = struct {
         _ = try experts.routed(&m.ek, &layer.experts, &b.moe, w.mixed.ptr, cfg.hidden, b.pick.ptr, R, stream);
     }
 
-    /// forward.py `ple_block` for one stream.
-    fn pleBlock(f: *Forward, p: *const weights.Ple, st: *Stream, b: *Buffers, R: usize, stream: cuda.Stream) !void {
+    /// forward.py `ple_block`: the table rows, keys, values and gate on all rows, each stream's conv on its own.
+    fn pleBlock(f: *Forward, p: *const weights.Ple, segs: []const Seg, b: *Buffers, R: usize, stream: cuda.Stream) !void {
         const m = f.m;
         const cfg = &m.cfg;
         const g = f.g;
         const t = &m.table.?;
         const ng = m.ng.?;
+        const wide = cfg.wide();
         try g.pleRows(b.ple_dev.ptr, t.words, p.head_bias.ptr, ng.heads(), t.dh, t.bits, b.ple_emb.ptr, R, stream);
-        try g.f16CallOf(&p.key, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_keys.ptr, cfg.wide(), b.w.part.ptr, stream);
+        try g.f16CallOf(&p.key, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_keys.ptr, wide, b.w.part.ptr, stream);
         try g.f16CallOf(&p.value, b.ple_emb.ptr, "*fp16", cfg.hidden, R, b.ple_vals.ptr, cfg.hidden, b.w.part.ptr, stream);
         try g.pleGate(b.ple_keys.ptr, b.ple_vals.ptr, b.w.h.ptr, p.norm_key.ptr, p.norm_query.ptr, b.ple_gated.ptr, b.ple_pss.ptr, cfg.eps, R, stream);
-        try g.pleConv(b.ple_gated.ptr, b.ple_pss.ptr, p.norm_conv.ptr, st.ple_tail.ptr, p.conv.ptr, p.taps, cfg.ngram, b.w.h.ptr, st.ple_nrow.ptr, cfg.eps, R, stream);
+        for (segs) |sg| try g.pleConv(b.ple_gated.ptr + sg.a0 * wide * 2, b.ple_pss.ptr + sg.a0 * cfg.streams * 4, p.norm_conv.ptr, sg.st.ple_tail.ptr, p.conv.ptr, p.taps, cfg.ngram, b.w.h.ptr + sg.a0 * wide * 2, sg.st.ple_nrow.ptr, cfg.eps, sg.n, stream);
     }
 
     /// forward.py `commit(keep)`: the first `keep` of the window's R rows become the stream's (a rejected tail

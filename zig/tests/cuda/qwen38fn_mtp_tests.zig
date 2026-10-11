@@ -94,7 +94,7 @@ pub fn mtp(gpu: Gpu, work: []const u8, model: []const u8) !void {
     const t0 = check.now(gpu.io);
     const m = try F.Model.load(gpa, gpu.io, d, model, cfg, cfg.layers, true);
     defer m.deinit();
-    const head = try M.Head.load(gpa, d, m, stream);
+    const head = try M.Head.load(gpa, d, m, 1, stream);
     defer head.deinit();
     check.pass("qwen38fn: {d} layers and the MTP head loaded in {d:.1} s ({d} draft ids)", .{ cfg.layers, @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e9, head.ids.len });
     var ctx: Ctx = .{ .gpu = gpu, .fx = &fx, .head = head, .calls = root.get("calls").?.array.items, .wide = cfg.wide() };

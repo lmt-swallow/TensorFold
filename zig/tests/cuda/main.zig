@@ -27,6 +27,7 @@ const qwen38fn_layer0 = @import("qwen38fn_layer0_tests.zig");
 const qwen38fn_layers = @import("qwen38fn_layers_tests.zig");
 const qwen38fn_prompt = @import("qwen38fn_prompt_tests.zig");
 const qwen38fn_mtp = @import("qwen38fn_mtp_tests.zig");
+const qwen38fn_shared = @import("qwen38fn_shared_tests.zig");
 const dsv41_ptx_lift_tests = @import("dsv41_ptx_lift_tests.zig");
 
 const usage =
@@ -65,6 +66,7 @@ const usage =
     \\  qwen38fn-layer0 <work-dir> <model-dir> [isolated]  Qwen3.8-Flash-Next embeddings + DeltaNet layer 0 (decode windows) against TensorFold 0.6.6's fixture (qwen38fn/capture_layer0.sh)
     \\  qwen38fn-prompt <work-dir> <model-dir>  Qwen3.8-Flash-Next prompt path (2,048-row chunks, then decode windows) against 0.6.6's fixture (qwen38fn/capture_prompt.sh)
     \\  qwen38fn-mtp <work-dir> <model-dir>  Qwen3.8-Flash-Next MTP drafting (draft head, head calls, rounds) against 0.6.6's serial drafted decoder (qwen38fn/capture_mtp.sh)
+    \\  qwen38fn-shared <kernel-set> <model-dir>  Qwen3.8-Flash-Next shared rounds: four streams' logits, drafts and tokens the same alone and in one forward a round
     \\  qwen38fn-layers <work-dir> <model-dir> [layers] [isolated]  Qwen3.8-Flash-Next decode forward (every layer's boundaries, the logits) against 0.6.6's fixture (qwen38fn/capture_layers.sh)
     \\
 ;
@@ -141,6 +143,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "exl3-linear")) return dsv41_tests.exl3Linear(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "exl3-experts")) return dsv41_tests.exl3Experts(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "qwen38fn-shared")) return qwen38fn_shared.shared(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "qwen38fn-mtp")) return qwen38fn_mtp.mtp(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "qwen38fn-prompt")) return qwen38fn_prompt.prompt(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "qwen38fn-layers")) return qwen38fn_layers.layers(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2 and !std.mem.eql(u8, rest[2], "isolated") and !std.mem.eql(u8, rest[2], "all")) try std.fmt.parseInt(usize, rest[2], 10) else null, for (rest) |r| {
