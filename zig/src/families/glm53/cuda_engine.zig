@@ -135,6 +135,8 @@ pub const Runner = struct {
     argmax_mod: cuda.Module,
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu): each row's first largest
     picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
+    split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
+    overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
         var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined };
@@ -156,7 +158,9 @@ pub const Runner = struct {
         r.picks = try Buf.alloc(d, batch_rows * 4 + (1 + lay.world) * 2 * batch_rows * 4);
         errdefer r.picks.free();
         r.players = try gpa.alloc(Pm.Layer, model.layers.len);
+        errdefer gpa.free(r.players);
         r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
+        try r.splitSettings(gpa, d);
         return r;
     }
 
@@ -170,6 +174,35 @@ pub const Runner = struct {
         r.cand.free();
         r.gpa.free(r.players);
         r.stage_rows.free();
+        if (r.overlap) |o| {
+            o.deinit();
+            r.gpa.destroy(o);
+        }
+    }
+
+    /// hcsplit.py `SplitSettings.from_env` of two ranks (send/receive exchanges as all-gathers): TF_GLM_HC_SPLIT=1
+    /// splits prompt chunks of TF_GLM_HC_SPLIT_MIN_ROWS rows (default 64) or more; TF_GLM_PREFILL_OVERLAP=1 runs their
+    /// gathers on a second stream in TF_GLM_OVERLAP_PIECES row pieces (default 2), =2 also the next block's front on
+    /// this rank's rows meanwhile. Every rank must be started alike (the bits do not depend on these; the calls do).
+    fn splitSettings(r: *Runner, gpa: std.mem.Allocator, d: *const cuda.Driver) !void {
+        const env = struct {
+            fn get(name: [:0]const u8, default: usize) !usize {
+                const v = std.mem.span(std.c.getenv(name) orelse return default);
+                return if (v.len == 0) default else std.fmt.parseInt(usize, v, 10);
+            }
+        };
+        if (try env.get("TF_GLM_HC_SPLIT", 0) != 1) return;
+        const level = try env.get("TF_GLM_PREFILL_OVERLAP", 0);
+        if (level > 2) return error.BadPrefillOverlap;
+        const pieces = try env.get("TF_GLM_OVERLAP_PIECES", 2);
+        if (pieces < 1 or pieces > 8) return error.BadOverlapPieces;
+        r.split = .{ .pieces = if (level > 0) pieces else 1, .min_rows = try env.get("TF_GLM_HC_SPLIT_MIN_ROWS", 64), .fronts = level == 2 };
+        if (level > 0) {
+            const o = try gpa.create(Pm.Overlap);
+            errdefer gpa.destroy(o);
+            o.* = try Pm.Overlap.init(d);
+            r.overlap = o;
+        }
     }
 
     fn gatherFn(p: *anyopaque, part: Ptr, gath: Ptr, floats: usize, stream: cuda.Stream) anyerror!void {
@@ -313,8 +346,9 @@ pub const Runner = struct {
             .st = &ps,
             .ids = prompt[start .. start + R],
             .next = prompt[start + 1 .. @min(start + R + 1, prompt.len)],
+            .split = r.split,
         };
-        try Pm.prefillChunk(&c, r.gpa, .{ .ctx = r, .gather = promptGatherFn }, null, r.stream);
+        try Pm.prefillChunk(&c, r.gpa, .{ .ctx = r, .gather = promptGatherFn }, r.overlap, r.stream);
         try q.last.copyFrom(0, w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
         q.st.pos = ps.pos;
         q.mtp_len = ps.mtp_len;
