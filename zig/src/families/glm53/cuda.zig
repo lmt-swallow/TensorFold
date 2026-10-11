@@ -19,6 +19,8 @@ pub const prompt = @import("cuda_prompt.zig");
 pub const model = @import("cuda_model.zig");
 pub const copy_drafts = @import("copy_drafts.zig");
 pub const engine = @import("cuda_engine.zig");
+pub const serve_lanes = @import("cuda_lanes.zig");
+pub const native = @import("cuda_native.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
