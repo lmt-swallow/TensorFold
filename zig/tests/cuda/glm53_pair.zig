@@ -74,10 +74,10 @@ pub const Rank = struct {
         return E.Runner.init(gpa, d, self.lay, self.kernels(), &self.tk, &self.mdl, &self.mtp, link, self.stream, capacity);
     }
 
-    /// The fixture's prompt ids (rank `lay.rank`'s copy), gpa-owned bytes and their u32 view.
+    /// The fixture's prompt ids (both ranks' prompt is the same: rank 0's copy, which a local run's one fixture
+    /// holds), the fixture allocator's bytes (the test's gpa) and their u32 view.
     pub fn prompt(self: *Rank) !struct { bytes: []u8, ids: []const u32 } {
-        var nb: [64]u8 = undefined;
-        const b = try self.fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_prompt_ids", .{self.lay.rank}));
+        const b = try self.fx.bytes("r0_prompt_ids");
         return .{ .bytes = b, .ids = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(b))) };
     }
 };
