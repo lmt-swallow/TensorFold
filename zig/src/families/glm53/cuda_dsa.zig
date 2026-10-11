@@ -239,7 +239,8 @@ pub const Scratch = struct {
         const n = s.nch * s.part_rows * H;
         s.dense_bufs = .{ try a(d, n * lw * 4), try a(d, n * 4), try a(d, n * 4) };
         s.dense = .{ .po = s.dense_bufs[0].ptr, .pm = s.dense_bufs[1].ptr, .pl = s.dense_bufs[2].ptr };
-        const ns = cdiv(glue_mod.sparse_tokens, chunk) * rows * H;
+        // decode windows' sparse chunks and merge; a prompt chunk's sparse rows take the one-pass kernel instead
+        const ns = if (prefill) 1 else cdiv(glue_mod.sparse_tokens, chunk) * rows * H;
         s.sparse_bufs = .{ try a(d, ns * lw * 4), try a(d, ns * 4), try a(d, ns * 4) };
         s.sparse = .{ .po = s.sparse_bufs[0].ptr, .pm = s.sparse_bufs[1].ptr, .pl = s.sparse_bufs[2].ptr };
         const np_max = capacity / 4;

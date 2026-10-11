@@ -14,6 +14,7 @@ pub const forward = @import("cuda_forward.zig");
 pub const moe = @import("cuda_moe.zig");
 pub const dsa = @import("cuda_dsa.zig");
 pub const draft_head = @import("draft_head.zig");
+pub const mtp = @import("cuda_mtp.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

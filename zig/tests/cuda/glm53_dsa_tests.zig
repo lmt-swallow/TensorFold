@@ -16,6 +16,7 @@ const Harness = hs.Harness;
 const F = glm.forward;
 const M = glm.moe;
 const A = glm.dsa;
+const T = glm.mtp;
 const Buf = cuda.DeviceBuffer;
 const Ptr = cuda.abi.DevicePtr;
 
@@ -35,8 +36,14 @@ const Rank = struct {
     fnormed: Buf,
     fxs: Buf,
     pos_dev: Buf,
+    mtp: T.Mtp,
+    mb: T.Buffers,
+    pmb: T.Buffers,
 
     fn deinit(r: *Rank) void {
+        r.mtp.deinit();
+        r.mb.deinit();
+        r.pmb.deinit();
         r.frame.deinit();
         r.dsa.deinit();
         r.moe.deinit();
@@ -181,6 +188,9 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
         r.fnormed = try Buf.alloc(d, prompt_rows * cfg.hidden * 2);
         r.fxs = try Buf.alloc(d, prompt_rows * cfg.hidden / 64 * 4);
         r.pos_dev = try Buf.alloc(d, 16);
+        r.mtp = try T.Mtp.load(l);
+        r.mb = try T.Buffers.init(d, lay, max_rows, false);
+        r.pmb = try T.Buffers.init(d, lay, prompt_rows, true);
         loaded += 1;
     }
     try weightsOk(gpa, gpu.io, work, &ranks, &cfg, &pack);
@@ -191,6 +201,14 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
         var run_a = try Run.init(d, &cfg, capacity);
         defer run_a.deinit();
         try runSteps(&h, g, &mk, &cfg, &ranks, &run_a, steps.get("a").?.array.items, "a", false);
+    }
+
+    {
+        var tk = try T.Kernels.load(d);
+        defer tk.deinit();
+        var run_m = try Run.init(d, &cfg, capacity);
+        defer run_m.deinit();
+        try runMtp(&h, g, &mk, &tk, &cfg, &ranks, &run_m, steps.get("m").?.array.items);
     }
 
     var run_l = try Run.init(d, &cfg, long_capacity);
@@ -205,7 +223,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
     }
     try runSteps(&h, g, &mk, &cfg, &ranks, &run_l, steps.get("l").?.array.items, "l", true);
     try check.expect(h.failures == 0, "glm53-dsa: {d} comparisons differ ({d} equal)", .{ h.failures, h.passes });
-    check.pass("glm53-dsa: runs a and l, {d} comparisons bit-exact{s}", .{ h.passes, if (isolated) " (isolated)" else "" });
+    check.pass("glm53-dsa: runs a, m and l, {d} comparisons bit-exact{s}", .{ h.passes, if (isolated) " (isolated)" else "" });
 }
 
 fn runSteps(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, cfg: *const glm.config.Config, ranks: *[2]Rank, run_: *Run, steps: []const std.json.Value, comptime tag: []const u8, long: bool) !void {
@@ -237,28 +255,7 @@ fn runSteps(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, cfg: *const glm
             try F.hcPre(cx, &r.frame, false, b, R, stream);
             try h.call("hc_pre", "out_out", b.normed.ptr);
             try A.dsaBlock(g, lay, &r.dsa, cache, ds, .{ .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = r.pos_dev.ptr, .host_pos = pos, .nch = (pos + R + 511) / 512, .R = R }, stream);
-            try h.call("mm", "out_out", ds.dp.ptr);
-            try h.call("rmsnorm", "out_out", ds.qr.ptr);
-            try h.call("rmsnorm", "out_out", ds.lat.ptr);
-            try h.call("mm", "out_out", ds.q.ptr);
-            if (!long) try h.call("latent_write", "cache_out", cache.latent.ptr) else _ = try h.next("latent_write");
-            try h.call("mm", "out_out", ds.ikr.ptr);
-            try h.call("router", "out_out", ds.igr.ptr);
-            _ = try h.next("index_update");
-            try h.alsoIf("index_update", "ik_out", cache.ik.ptr);
-            try h.alsoIf("index_update", "ig_out", cache.ig.ptr);
-            if (!long) try h.alsoIf("index_update", "pk_out", cache.pk.ptr);
-            try h.call("absorb_q", "out_out", ds.qa.ptr);
-            const limit = cfg.denseLimit();
-            if (pos < limit) try h.call("dense_attention", "out_out", ds.ol.ptr);
-            if (pos + R - 1 >= limit) {
-                try h.call("mm", "out_out", ds.qi.ptr);
-                try h.call("select_tokens", "ret0", ds.tokens.ptr);
-                try h.also("select_tokens", "ret1", ds.counts.ptr);
-                try h.call(if (prefill) "sparse_onepass" else "sparse_attention", "out_out", ds.ol.ptr);
-            }
-            try h.call("expand_v", "out_out", ds.vn.ptr);
-            try h.call("mm", "out_out", b.part.ptr);
+            try compareDsa(h, ds, cache, long, prefill, pos, R, cfg.denseLimit(), b.part.ptr);
         }
         try gatherRanks(ranks, prefill, R * D * 4, d, stream);
         // the FFN site: hc_post, hc_pre, the MoE
@@ -292,6 +289,128 @@ fn runSteps(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, cfg: *const glm
         _ = keep; // the DSA caches commit by position: the next step's pos (the fixture's) is where it writes
         if (h.failures == before) check.pass("BITEXACT glm53 layer 3 step {s} ({s} {d} rows at {d}): both ranks equal to the reference", .{ step, kind, R, pos });
     }
+}
+
+/// Run m: the MTP layer on the fixture's rows (each step's next tokens and input rows fed from the reference), its
+/// own caches from position 0, decode absorbs, chained drafts and their rewind, a prompt absorb past the dense limit.
+fn runMtp(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, tk: *const T.Kernels, cfg: *const glm.config.Config, ranks: *[2]Rank, run_: *Run, steps: []const std.json.Value) !void {
+    const stream = h.stream;
+    const D = cfg.hidden;
+    const d = h.gpu.d;
+    for (steps, 0..) |sv, s| {
+        const kind = sv.object.get("kind").?.string;
+        const n: usize = @intCast(sv.object.get("rows").?.integer);
+        const mtp_len: usize = @intCast(sv.object.get("mtp_len").?.integer);
+        const prefill = n > max_rows;
+        const before = h.failures;
+        var nb: [16]u8 = undefined;
+        const step = try std.fmt.bufPrint(&nb, "m{d}", .{s});
+        for (ranks, 0..) |*r, ri| {
+            const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
+            const b = if (prefill) &r.pmb else &r.mb;
+            const ds = if (prefill) &run_.pds[ri] else &run_.ds[ri];
+            const cache = &run_.cache[ri];
+            try h.beginStep(ri, step);
+            const p32: i32 = @intCast(mtp_len);
+            try r.pos_dev.upload(0, std.mem.asBytes(&p32));
+            try h.feed("next", b.ids);
+            try h.feed("hidden_in", b.hin);
+            try T.front(g, cfg, &r.mtp, b, r.embed.ptr, n, mtp_len == 0, stream);
+            try h.call("mm", "out_out", b.mx.ptr);
+            _ = try h.next("rmsnorm"); // (enorm and hnorm write strided halves; eh_proj's input checks them)
+            try h.call("rmsnorm", "out_out", b.normed.ptr);
+            try A.dsaBlock(g, lay, &r.mtp.dsa, cache, ds, .{ .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = r.pos_dev.ptr, .host_pos = mtp_len, .nch = (mtp_len + n + 511) / 512, .R = n }, stream);
+            try compareDsa(h, ds, cache, false, prefill, mtp_len, n, cfg.denseLimit(), b.part.ptr);
+        }
+        try gatherMtp(ranks, prefill, n * D * 4, d, stream);
+        for (ranks, 0..) |*r, ri| {
+            const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
+            const b = if (prefill) &r.pmb else &r.mb;
+            const sc = if (prefill) &r.pms else &r.ms;
+            try h.beginStep(ri, step);
+            try h.call("gather", "ret", b.gath.ptr);
+            try T.afterAttention(g, cfg, &r.mtp, b, 2, n, stream);
+            try h.call("residual_add", "xout_out", b.mx.ptr);
+            try M.moeBlock(g, mk, lay, &r.mtp.moe, sc, b.normed.ptr, b.part.ptr, b.sk.ptr, n, stream);
+            try h.call("combine_shared", "out_out", b.part.ptr);
+        }
+        try gatherMtp(ranks, prefill, n * D * 4, d, stream);
+        var best: [2]struct { v: f32, id: usize } = undefined;
+        for (ranks, 0..) |*r, ri| {
+            const b = if (prefill) &r.pmb else &r.mb;
+            try h.beginStep(ri, step);
+            try T.head(g, tk, cfg, &r.mtp, b, 2, n, stream);
+            _ = try h.next("residual_add");
+            _ = try h.next("residual_add");
+            try h.also("residual_add", "xout_out", b.mx.ptr);
+            try h.stepArray("fnormed", b.fnormed.ptr);
+            try h.stepArray("logits", b.logits.ptr);
+            // the rank's best draft candidate (decode.sample_rows, greedy: top-1 of its vocabulary share)
+            try stream.synchronize();
+            const nv = r.mtp.head.n;
+            const host = try h.gpu.gpa.alloc(u16, nv);
+            defer h.gpu.gpa.free(host);
+            try b.logits.download(0, std.mem.sliceAsBytes(host));
+            var bv: f32 = -std.math.inf(f32);
+            var bi: usize = 0;
+            for (host, 0..) |x, i| {
+                const v: f32 = @bitCast(@as(u32, x) << 16);
+                if (v > bv) {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            best[ri] = .{ .v = bv, .id = ri * nv + bi };
+        }
+        // both ranks' candidates gathered, the larger value, the lower id on a tie
+        const draft: i32 = @intCast(if (best[1].v > best[0].v) best[1].id else best[0].id);
+        for (0..2) |ri| {
+            var ab: [48]u8 = undefined;
+            const want = try h.fx.bytes(try std.fmt.bufPrint(&ab, "r{d}_{s}_draft", .{ ri, step }));
+            defer h.gpu.gpa.free(want);
+            if (!std.mem.eql(u8, want, std.mem.asBytes(&draft))) {
+                std.debug.print("FAIL glm53 {s} rank {d}: draft {d}, the reference's {d}\n", .{ step, ri, draft, std.mem.bytesToValue(i32, want[0..4]) });
+                h.failures += 1;
+            } else h.passes += 1;
+        }
+        if (h.failures == before) check.pass("BITEXACT glm53 MTP step {s} ({s} {d} rows at {d}): both ranks equal to the reference, draft {d}", .{ step, kind, n, mtp_len, draft });
+    }
+}
+
+fn gatherMtp(ranks: *[2]Rank, prefill: bool, n: usize, d: *const cuda.Driver, stream: cuda.Stream) !void {
+    var parts: [2]Ptr = undefined;
+    var gaths: [2]Ptr = undefined;
+    for (ranks, 0..) |*r, i| {
+        const b = if (prefill) &r.pmb else &r.mb;
+        parts[i] = b.part.ptr;
+        gaths[i] = b.gath.ptr;
+    }
+    try hs.gather(&parts, &gaths, n, d, stream);
+}
+
+/// One DSA block's traced calls in order (cuda_dsa.zig `dsaBlock`), then its partial `part`.
+fn compareDsa(h: *Harness, ds: *const A.Scratch, cache: *const A.Cache, long: bool, prefill: bool, pos: usize, R: usize, limit: usize, part: Ptr) !void {
+    try h.call("mm", "out_out", ds.dp.ptr);
+    try h.call("rmsnorm", "out_out", ds.qr.ptr);
+    try h.call("rmsnorm", "out_out", ds.lat.ptr);
+    try h.call("mm", "out_out", ds.q.ptr);
+    if (!long) try h.call("latent_write", "cache_out", cache.latent.ptr) else _ = try h.next("latent_write");
+    try h.call("mm", "out_out", ds.ikr.ptr);
+    try h.call("router", "out_out", ds.igr.ptr);
+    _ = try h.next("index_update");
+    try h.alsoIf("index_update", "ik_out", cache.ik.ptr);
+    try h.alsoIf("index_update", "ig_out", cache.ig.ptr);
+    if (!long) try h.alsoIf("index_update", "pk_out", cache.pk.ptr);
+    try h.call("absorb_q", "out_out", ds.qa.ptr);
+    if (pos < limit) try h.call("dense_attention", "out_out", ds.ol.ptr);
+    if (pos + R - 1 >= limit) {
+        try h.call("mm", "out_out", ds.qi.ptr);
+        try h.call("select_tokens", "ret0", ds.tokens.ptr);
+        try h.also("select_tokens", "ret1", ds.counts.ptr);
+        try h.call(if (prefill) "sparse_onepass" else "sparse_attention", "out_out", ds.ol.ptr);
+    }
+    try h.call("expand_v", "out_out", ds.vn.ptr);
+    try h.call("mm", "out_out", part);
 }
 
 fn gatherRanks(ranks: *[2]Rank, prefill: bool, n: usize, d: *const cuda.Driver, stream: cuda.Stream) !void {
