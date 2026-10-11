@@ -59,6 +59,7 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_qmm", .src = "glm53/qmm", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's cuda/kernels/qmm.py, tensorfold_qmm_v4: the draft head
     .{ .name = "glm53_qmm_prefill", .src = "glm53/qmm_prefill", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the same extension's qmm_prefill.cu
     .{ .name = "glm53_tier", .src = "glm53/tier", .flags = &.{"-O3"} }, // ours: the tiered latent cache's remap (kv_tier.zig)
+    .{ .name = "glm53_bmm", .src = "glm53/bmm", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // ours: qmm.py _bmm and _reduce's bits (prompt rows) at the mma rate
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

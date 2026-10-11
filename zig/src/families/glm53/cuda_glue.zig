@@ -112,21 +112,126 @@ fn bucket(m: usize) usize {
     unreachable;
 }
 
+/// The glue's own CUDA kernels: hc.cu's mixing dots (decode rows) and bmm.cu's BF16 matmul (`Bmm`).
 pub const Hc = struct {
     module: cuda.Module,
     partial: cuda.Function,
+    bmm: Bmm,
 
     pub fn load(d: *const cuda.Driver) !Hc {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var module = try cuda.Module.load(d, cuda.kernels.glm53_hc);
         errdefer module.unload();
-        return .{ .module = module, .partial = try module.function("_ZN11tf_glm53_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi") };
+        const partial = try module.function("_ZN11tf_glm53_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi");
+        return .{ .module = module, .partial = partial, .bmm = try Bmm.load(d) };
     }
 
     pub fn deinit(self: *Hc) void {
+        self.bmm.deinit();
         self.module.unload();
     }
 };
+
+/// bmm.cu: `_bmm` (and `_reduce` after the split grid) with their bits at the mma rate, for prompt rows (seq_rows or
+/// more) of the shapes in `table`; other calls take the captured kernels. TF_GLM_BMM=0 keeps the captured kernels
+/// for every call; TF_GLM_PROMPT_CHECK=1 runs the captured kernels beside bmm.cu on every call it takes and fails
+/// unless the outputs are byte-equal.
+pub const Bmm = struct {
+    d: *const cuda.Driver,
+    module: cuda.Module,
+    fns: [kernels.len]cuda.Function,
+    use: bool,
+    check: bool,
+
+    const Kernel = struct { name: [:0]const u8, bm: u32, bn: u32, bk: u32, threads: u32, stages: u32, swizzled: bool, split: bool, f32: bool };
+    const kernels = [_]Kernel{
+        .{ .name = "tf_glm53_bmm_128x256_1b", .bm = 128, .bn = 256, .bk = 32, .threads = 256, .stages = 3, .swizzled = false, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x256k64z_1b", .bm = 128, .bn = 256, .bk = 64, .threads = 256, .stages = 2, .swizzled = true, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64_1b", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 2, .swizzled = false, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64z_1b", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 3, .swizzled = true, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64_sb", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 2, .swizzled = false, .split = true, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64_sf", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 2, .swizzled = false, .split = true, .f32 = true },
+        .{ .name = "tf_glm53_bmm_128x128k64z_sb", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 3, .swizzled = true, .split = true, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64z_sf", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 3, .swizzled = true, .split = true, .f32 = true },
+        .{ .name = "tf_glm53_bmm_128x64_sb", .bm = 128, .bn = 64, .bk = 32, .threads = 256, .stages = 4, .swizzled = false, .split = true, .f32 = false },
+    };
+    /// Per-rank shapes (n, k, fp32 out) bmm.cu takes, and the kernel each runs (measured on GB10 at 2,048 rows); the
+    /// rest stay on the captured kernels (bmm.cu was slower there).
+    const Shape = struct { n: usize, k: usize, f32: bool, kernel: []const u8 };
+    const table = [_]Shape{
+        .{ .n = 12576, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256_1b" },
+        .{ .n = 12288, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256_1b" },
+        .{ .n = 2048, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64_sb" },
+        .{ .n = 4096, .k = 1024, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64_sf" },
+        .{ .n = 4096, .k = 1536, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64_sb" },
+        .{ .n = 4096, .k = 4096, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64_sf" },
+        .{ .n = 4096, .k = 6144, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64_sf" },
+        .{ .n = 4096, .k = 8192, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64_sb" },
+    };
+
+    pub fn load(d: *const cuda.Driver) !Bmm {
+        var module = try cuda.Module.load(d, cuda.kernels.glm53_bmm);
+        errdefer module.unload();
+        var fns: [kernels.len]cuda.Function = undefined;
+        for (kernels, &fns) |k, *f| {
+            f.* = try module.function(k.name);
+            try f.allowDynamicShared(smem(k));
+        }
+        return .{
+            .d = d,
+            .module = module,
+            .fns = fns,
+            .use = !std.mem.eql(u8, envOr("TF_GLM_BMM", "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+        };
+    }
+
+    pub fn deinit(self: *Bmm) void {
+        self.module.unload();
+    }
+
+    fn smem(k: Kernel) u32 {
+        return k.stages * (k.bm + k.bn) * (if (k.swizzled) k.bk else k.bk + 8) * 2;
+    }
+
+    /// The kernel for a call, or null (the captured kernels): prompt rows, a shape in `table`, and bmm.cu's operand
+    /// requirements (16-byte aligned rows, k a multiple of the kernel's K step times sk, n even).
+    fn pick(self: *const Bmm, x: Ptr, x_stride: usize, w: B16, m: usize, fp32: bool, sk: usize) ?usize {
+        if (!self.use or m < seq_rows) return null;
+        if (x % 16 != 0 or w.ptr % 16 != 0 or x_stride % 8 != 0 or w.n % 2 != 0) return null;
+        const name = for (table) |e| {
+            if (e.n == w.n and e.k == w.k and e.f32 == fp32) break e.kernel;
+        } else return null;
+        for (kernels, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) {
+            if (k.split != (sk > 1) or k.f32 != fp32 or w.k % (k.bk * sk) != 0) return null;
+            return i;
+        };
+        return null;
+    }
+
+    fn run(self: *const Bmm, i: usize, x: Ptr, x_stride: usize, w: B16, m: usize, out: Ptr, sk: usize, stream: cuda.Stream) !void {
+        const k = kernels[i];
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(c_int, @intCast(x_stride)));
+        a.add(w.ptr);
+        a.add(out);
+        a.add(@as(c_int, @intCast(m)));
+        a.add(@as(c_int, @intCast(w.n)));
+        a.add(@as(c_int, @intCast(w.k)));
+        a.add(@as(c_int, @intCast(sk)));
+        try cuda.launch.launch(self.fns[i], .{
+            .grid = .{ .x = @intCast(cdiv(m, k.bm)), .y = @intCast(cdiv(w.n, k.bn)) },
+            .block = .{ .x = k.threads },
+            .shared = smem(k),
+        }, stream, &a);
+    }
+};
+
+fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
+    const v = std.mem.span(std.c.getenv(name) orelse return default);
+    return if (v.len == 0) default else v;
+}
 
 /// A BF16 matrix [n, k] on the device (qmm.py `B16`), row-major.
 pub const B16 = struct { ptr: Ptr, n: usize, k: usize };
@@ -261,6 +366,36 @@ pub const Glue = struct {
     /// x_stride) times w^T, K in the shape's fixed slices summed in slice order (one program for prompt rows, else
     /// fp32 partials in `part`, at least sk m n floats, and _reduce).
     pub fn bmm(g: Glue, x: Ptr, x_stride: usize, w: B16, m: usize, out: Ptr, fp32: bool, part: Ptr, stream: cuda.Stream) !void {
+        const b = &g.hc.bmm;
+        const sk = b16SplitK(w.n, w.k);
+        const i = b.pick(x, x_stride, w, m, fp32, sk) orelse return g.bmmCaptured(x, x_stride, w, m, out, fp32, part, stream);
+        try b.run(i, x, x_stride, w, m, out, sk, stream);
+        if (!b.check) return;
+        // TF_GLM_PROMPT_CHECK: the captured kernels' output on the same call, byte for byte
+        const bytes = m * w.n * @as(usize, if (fp32) 4 else 2);
+        var ref = try cuda.DeviceBuffer.alloc(b.d, bytes);
+        defer ref.free();
+        try g.bmmCaptured(x, x_stride, w, m, ref.ptr, fp32, part, stream);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try ref.download(0, want);
+        const view: cuda.DeviceBuffer = .{ .d = b.d, .ptr = out, .len = bytes };
+        try view.download(0, got);
+        var bad: usize = 0;
+        for (want, got) |p, q| bad += @intFromBool(p != q);
+        if (bad != 0) {
+            std.log.err("glm53: bmm.cu {s} ({d} rows, n {d}, k {d}, sk {d}): {d} of {d} bytes differ from _bmm", .{ Bmm.kernels[i].name, m, w.n, w.k, sk, bad, bytes });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("glm53: bmm.cu {s} ({d} rows, n {d}, k {d}, sk {d}): byte-equal to _bmm", .{ Bmm.kernels[i].name, m, w.n, w.k, sk });
+    }
+
+    /// `bmm` through the captured `_bmm` (and `_reduce`).
+    fn bmmCaptured(g: Glue, x: Ptr, x_stride: usize, w: B16, m: usize, out: Ptr, fp32: bool, part: Ptr, stream: cuda.Stream) !void {
         const bm = bucket(@min(m, 128));
         const sk = b16SplitK(w.n, w.k);
         const seq = sk > 1 and m >= seq_rows and w.n >= 512 and w.k <= 4096;
