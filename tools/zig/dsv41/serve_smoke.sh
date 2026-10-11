@@ -13,7 +13,10 @@
 # CONTEXT (16384: a stream's positions at most), POOL (TF_DS_POOL: the positions the streams share, at least CONTEXT and
 # a multiple of 2048; empty: CONTEXT), MAX_TOKENS (64), ENGRAM (the Engram tables under ~/models, DeepSeek-V4.1-Flash-Engram; empty: run
 # without them, degraded; the token map is ~/aot/$KERNELS/token_map.json on both nodes), LOG_DIR (where both ranks' logs are kept), FORCE=1 (start even when the GPU
-# already has compute processes), NO_COPY=1 (use the ~/bin/tensorfold-native already on each node).
+# already has compute processes), NO_COPY=1 (use the ~/bin/tensorfold-native already on each node), RAILS (the RDMA
+# devices NCCL gathers over: auto, every device of RAIL_HCAS whose port is active with a RoCE v2 IPv4 GID at index
+# RAIL_GID on both nodes, else a comma list; two or more rails also set NCCL_MAX_NCHANNELS=4), EXTRA_ENVS (docker -e
+# flags after the script's own, so they override them).
 set -euo pipefail
 
 R0=${R0:-spark-616b}
@@ -35,6 +38,9 @@ PARALLEL=${PARALLEL:-1}        # streams decoded together (--parallel)
 RESERVE=${RESERVE:-4}          # TENSORFOLD_MEMORY_RESERVE_GIB
 REPLAY=${REPLAY:-1}            # TF_DS_REPLAY: bounded replay for prompts (0: every row through every layer)
 ROPE=${ROPE:-device}           # TF_DS_ROPE: device (rows computed from rope/rope_*_freqs.bin) or table (rope/rope_*_<rows>.bin)
+RAILS=${RAILS:-auto}
+RAIL_HCAS=${RAIL_HCAS:-rocep1s0f0 roceP2p1s0f0}   # a Spark's QSFP cable reaches the peer over two PCIe Gen5 x4 functions
+RAIL_GID=${RAIL_GID:-3}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -132,11 +138,29 @@ sum1=$(on "$R1" "sha256sum \$HOME/bin/tensorfold-native | cut -c1-16")
 [ "$sum0" = "$sum1" ] || die "the binaries differ between the nodes ($sum0 vs $sum1)"
 say "binary $sum0 on both nodes; context $CONTEXT, pool ${POOL:-$CONTEXT}, RoPE $ROPE ($ROWS positions)"
 
+# -- the rails -----------------------------------------------------------------------------------------------------
+# A rail serves only when both ends have it: a device whose GID lacks an IPv4 address (link-local only) makes NCCL's
+# connection fail. All-gather time each rank's 40 MiB (prompt chunk), NCCL 2.30.7: one rail 3.8-4.2 ms, two rails with
+# 4 channels 2.3 ms (2 channels 2.6 ms, 8 channels 2.5 ms); 256 KiB (a round): 62-70 us vs 44-54 us.
+usable_rails() { # host -> the devices of RAIL_HCAS usable on it, one a line
+  on "$1" "for d in $RAIL_HCAS; do p=/sys/class/infiniband/\$d/ports/1; grep -q ACTIVE \$p/state 2>/dev/null || continue;
+    [ \"\$(cat \$p/gid_attrs/types/$RAIL_GID 2>/dev/null)\" = 'RoCE v2' ] || continue;
+    case \$(cat \$p/gids/$RAIL_GID) in 0000:0000:0000:0000:0000:ffff:*) echo \$d ;; esac; done"
+}
+if [ "$RAILS" = auto ]; then
+  RAILS=$(comm -12 <(usable_rails "$R0" | sort) <(usable_rails "$R1" | sort) | paste -sd, -)
+  [ -n "$RAILS" ] || die "no device of '$RAIL_HCAS' has an active RoCE v2 IPv4 GID $RAIL_GID on both $R0 and $R1"
+fi
+# NCCL lists devices in the order given; keep RAIL_HCAS's (the first is the rail the ranks always had)
+RAILS=$(for d in $RAIL_HCAS; do case ",$RAILS," in (*",$d,"*) echo "$d" ;; esac; done | paste -sd, -)
+say "NCCL rails: $RAILS (GID $RAIL_GID)"
+
 # -- the ranks ----------------------------------------------------------------------------------------------------
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
 DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/aot/$KERNELS:/k:ro -v \$HOME/bin:/b:ro"
 ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE -e TF_DS_REPLAY=$REPLAY -e TF_DS_ROPE=$ROPE"
-ENVS="$ENVS -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
+ENVS="$ENVS -e NCCL_IB_HCA=$RAILS -e NCCL_IB_GID_INDEX=$RAIL_GID -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
+case "$RAILS" in *,*) ENVS="$ENVS -e NCCL_MAX_NCHANNELS=4" ;; esac
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"

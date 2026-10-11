@@ -17,7 +17,8 @@ GB10 (`zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=safe native
 DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1
       -v $HOME/models:/models:ro -v $HOME/tfcache/rank:/rc:ro -v $HOME/aot/dsv41-all:/k:ro -v $HOME/bin:/b:ro"
 ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=4
-      -e TF_DS_ENGRAM=/models/DeepSeek-V4.1-Flash-Engram -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
+      -e TF_DS_ENGRAM=/models/DeepSeek-V4.1-Flash-Engram -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_MAX_NCHANNELS=4
+      -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
 SERVE="/b/tensorfold-native serve /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw --tp 2 --master 10.0.1.1 --master-port 29551
       --context 16384 --parallel 1 --temperature 0 --no-thinking --no-drafts --no-update-check --name dsv41
       --host 0.0.0.0 --port 8000"
@@ -25,6 +26,12 @@ SERVE="/b/tensorfold-native serve /models/DeepSeek-V4.1-Flash-EXL3-2.9bpw --tp 2
 docker run -d --name tfz0 $DOCK $ENVS nvcr.io/nvidia/pytorch:26.07-py3 bash -c "$SERVE --rank 0"
 ssh 10.0.1.2 docker run -d --name tfz1 $DOCK $ENVS nvcr.io/nvidia/pytorch:26.07-py3 bash -c "$SERVE --rank 1"
 ```
+
+The QSFP cable between the Sparks reaches each node's ConnectX-7 over two PCIe Gen5 x4 functions, `rocep1s0f0`
+(`enp1s0f0np0`, 10.0.1.x/24) and `roceP2p1s0f0` (`enP2p1s0f0np0`, 10.0.2.x/24, NetworkManager connection `qsfp-p2`, MTU
+9000); each needs an IPv4 address for its RoCE v2 GID 3. NCCL gathers over both with 4 channels: a rank's 40 MiB in
+2.3 ms instead of 3.8-4.2 ms over one. `serve_smoke.sh` lists the devices usable on both nodes (`RAILS=auto`) and
+falls back to `rocep1s0f0` alone, with NCCL's channels left to the binary, when the second has no IPv4 GID.
 
 Engram (`TF_DS_ENGRAM`, the original FP8 tables beside the pack) needs the Python engine's compressed token map: it
 is `~/aot/dsv41-all/token_map.json` on both nodes (`<kernels>/token_map.json`, the default; `TF_DS_TOKEN_MAP`
