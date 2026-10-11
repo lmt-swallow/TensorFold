@@ -39,6 +39,12 @@ pub const Model = struct {
     // copies priced against the head's drafts by expected tokens a ms from each stream's own copy acceptance
     // (windows.copyProposal); false: Python's rule (a copy whenever one matches, a fixed width ramp, `copy_rate`)
     copy_pricing: bool = false,
+    // copy_pricing: a lone window's forward ms by rows at two or more positions (as `position_costs`), so a copy's
+    // window is priced at its stream's position (empty: at the window costs alone)
+    copy_position_costs: []const alloc.PositionCosts.Timed = &.{},
+    // shared rounds: every stream first gets the rows it would get were each copying stream drafting with its head
+    // instead, and copies take only rows past those (false: copies compete for every row by their chances)
+    copy_share: bool = false,
 };
 
 pub const Config = struct {
@@ -72,6 +78,8 @@ pub const Config = struct {
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation (copy_pricing: the prior by depth)
     copy_pricing: bool = false, // Model.copy_pricing
+    copy_position_costs: alloc.PositionCosts = .{}, // Model.copy_position_costs, to the window's widest
+    copy_share: bool = false, // Model.copy_share
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
@@ -128,6 +136,8 @@ pub const Config = struct {
             .mtp_step_ms = m.mtp_step_ms,
             .k = if (m.draft_slack) |slack| .{ .draft_slack = slack } else .{},
             .copy_pricing = m.copy_pricing,
+            .copy_position_costs = try alloc.PositionCosts.init(gpa, m.copy_position_costs, width),
+            .copy_share = m.copy_share,
         };
     }
 
@@ -137,6 +147,7 @@ pub const Config = struct {
         c.shared_costs.deinit(gpa);
         c.lane_costs.deinit(gpa);
         c.position_costs.deinit(gpa);
+        c.copy_position_costs.deinit(gpa);
     }
 };
 

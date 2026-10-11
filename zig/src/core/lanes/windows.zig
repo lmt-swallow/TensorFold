@@ -2,6 +2,7 @@
 const std = @import("std");
 const accept = @import("accept.zig");
 const alloc = @import("allocate.zig");
+const Table = @import("table.zig").Table;
 const be = @import("backend.zig");
 const depth = @import("depth.zig");
 const fill = @import("fill.zig");
@@ -159,13 +160,13 @@ pub fn observeCopy(e: *Engine, s: *Stream, proposed: i64, accepted: i64) !void {
 }
 
 /// The prefix of `copied` whose window lands the most expected tokens a ms of the window costs (`family_costs`,
-/// the stream's copy acceptance), when that beats the head's drafts at their best by the same measure (its
-/// per-depth acceptance, up to the drafts it may hold); else none (the head drafts). A prefix under 2 tokens is
-/// none. Without window costs, the whole copy.
+/// plus what its rows add at the stream's position by `copy_position_costs`; the stream's copy acceptance), when
+/// that beats the head's drafts at their best by the same measure (its per-depth acceptance, up to the drafts it
+/// may hold); else none (the head drafts). A prefix under 2 tokens is none. Without window costs, the whole copy.
 fn pricedCopy(e: *Engine, s: *Stream, copied: []const u32) ![]const u32 {
-    const costs = &e.cfg.family_costs;
-    if (costs.empty()) return copied;
+    if (e.cfg.family_costs.empty()) return copied;
     const a = e.arena.allocator();
+    const costs = try windowCostsAt(e, s.cache_len);
     const copy = alloc.bestPrefix(try alloc.chainProbabilities(a, try copyRates(e, s), copied.len), costs) orelse return copied;
     if (copy.count < 2) return &.{};
     if (e.cfg.family_mtp and s.drafts and e.cfg.most_drafts > 0) {
@@ -189,6 +190,21 @@ pub fn probe(e: *Engine) depth.Probe {
 
 pub fn who(s: *Stream) depth.Who {
     return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s, .position = s.cache_len };
+}
+
+/// The window costs by rows (`family_costs`) of a stream at `position`: each plus what its rows add there by
+/// `copy_position_costs` (none without them). Arena-owned.
+fn windowCostsAt(e: *Engine, position: u64) !*const Table {
+    const pc = &e.cfg.copy_position_costs;
+    if (pc.empty()) return &e.cfg.family_costs;
+    const a = e.arena.allocator();
+    const t = try a.create(Table);
+    t.* = .{};
+    for (e.cfg.family_costs.slots, 0..) |slot, rows| {
+        const ms = slot orelse continue;
+        try t.put(a, @intCast(rows), ms + pc.extraMs(position, @intCast(rows)));
+    }
+    return t;
 }
 
 /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.
@@ -220,7 +236,12 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         }
         row_ms = prices;
     }
-    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, row_ms, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
+    var copying = false;
+    for (plans) |p| copying = copying or p.kind == .copy;
+    const counts = if (e.cfg.copy_share and copying)
+        try shareRows(e, plans, fixed, probs, row_ms)
+    else
+        try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, row_ms, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
     for (plans, probs, counts) |*p, chances, c| {
         if (p.kind == .head) p.stream.granted = c;
         if (chances.len == 0 or c == chances.len) continue;
@@ -245,6 +266,33 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         r.* = .{ .list = pair };
     }
     try trail.event(e, &.{ f("ev", trail.str("alloc")), f("plans", .{ .list = rows }) });
+}
+
+/// `copy_share`: the rows `allocate` grants each stream when every copying stream's chances are its head's
+/// (its per-depth acceptance, up to the drafts it may hold, at most its copy's length); then, the round holding those
+/// rows, the copying streams' further copied rows by their own chances. A stream that does not copy gets exactly its
+/// first grant, which no copy changes; a copying stream at least its first grant.
+fn shareRows(e: *Engine, plans: []const Plan, fixed: []const u32, probs: []const []const f64, row_ms: []const []const f64) ![]u32 {
+    const a = e.arena.allocator();
+    const most = @max(plans.len, e.cfg.batch_rows);
+    const overhead = e.rule.overheadMs(plans.len);
+    const head = try a.alloc([]const f64, plans.len);
+    for (plans, probs, head) |p, pr, *h| {
+        h.* = pr;
+        if (p.kind != .copy) continue;
+        const n = @min(pr.len, @as(usize, e.cfg.most_drafts));
+        h.* = if (e.cfg.family_mtp and p.stream.drafts and n > 0) try alloc.chainProbabilities(a, try e.rule.rates(who(p.stream)), n) else &.{};
+    }
+    const base = try alloc.allocate(a, fixed, head, &e.cfg.shared_costs, row_ms, overhead, most);
+    const held = try a.alloc(u32, plans.len);
+    const rest = try a.alloc([]const f64, plans.len);
+    for (plans, probs, base, fixed, held, rest) |p, pr, b, fx, *hd, *r| {
+        hd.* = fx + b;
+        r.* = if (p.kind == .copy) pr[@min(b, pr.len)..] else &.{};
+    }
+    const more = try alloc.allocate(a, held, rest, &e.cfg.shared_costs, row_ms, overhead, most);
+    for (base, more) |*b, m| b.* += m;
+    return base;
 }
 
 /// The head's chance for each held draft, else chain chances from the stream's per-depth acceptance.

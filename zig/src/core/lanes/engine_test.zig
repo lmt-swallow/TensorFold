@@ -368,3 +368,67 @@ test "a priced copy gives way to the head's drafts once its copies stop landing"
     for (0..40) |_| try win.observeCopy(&engine, &s, 15, 0);
     try std.testing.expectEqual(@as(usize, 0), (try win.copyProposal(&engine, &s)).len);
 }
+
+test "a priced copy's window shrinks where its stream's rows cost more" {
+    var costs: [16]@import("config.zig").Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 20.0 + 4.0 * @as(f64, @floatFromInt(w)) };
+    var deep: [16]@import("config.zig").Cost = undefined;
+    for (&deep, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 20.0 + 12.0 * @as(f64, @floatFromInt(w)) };
+    const at = [_]@import("allocate.zig").PositionCosts.Timed{ .{ .position = 1024, .costs = &costs }, .{ .position = 262144, .costs = &deep } };
+    var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 5, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .hidden_rows = true, .copy_pricing = true, .copy_position_costs = &at }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+    defer p.deinit();
+    const text = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 } ++ [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &text, .max_new = 64, .proposer = p.proposer() });
+    defer s.deinit(gpa);
+    const win = @import("windows.zig");
+    s.cache_len = 1024; // at the shallow table: the window costs alone (10 tokens, as without position costs)
+    const near = (try win.copyProposal(&engine, &s)).len;
+    try std.testing.expectEqual(@as(usize, 10), near);
+    s.cache_len = 262144; // rows three times dearer: a shorter window pays
+    const far = (try win.copyProposal(&engine, &s)).len;
+    try std.testing.expect(far < near);
+}
+
+test "shared copies take only the rows the other streams would not get" {
+    var costs: [32]@import("config.zig").Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 20.0 + 4.0 * @as(f64, @floatFromInt(w)) };
+    const win = @import("windows.zig");
+    var counts: [2][3]usize = undefined; // [share off, on][the copy's rows, the head stream's rows, head-only]
+    for ([_]bool{ false, true }, 0..) |share, k| {
+        var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 6, .mtp = true, .speculate = true, .drafts = 5, .window_costs = costs[0..16], .shared_costs = &costs, .hidden_rows = true, .batch_rows = 16, .max_streams = 4, .draft_streams = true, .copy_pricing = true, .copy_share = share }, 16, 15);
+        defer cfg.deinit(gpa);
+        var target: fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        var clock: fake.FixedClock = .{};
+        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+        defer engine.deinit();
+        engine.alone = false;
+        var a = try sm.Stream.init(gpa, .{ .id = "a", .prompt = &p1, .max_new = 64 });
+        defer a.deinit(gpa);
+        var b = try sm.Stream.init(gpa, .{ .id = "b", .prompt = &p2, .max_new = 64 });
+        defer b.deinit(gpa);
+        a.copy_p = try gpa.alloc(f64, 15);
+        @memset(a.copy_p.?, 0.99);
+        const copied = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        var plans = [_]win.Plan{ .{ .stream = &a, .position = 64, .kind = .copy, .tokens = &copied }, .{ .stream = &b, .position = 64, .kind = .head, .held = 5 } };
+        try win.allocate(&engine, &plans);
+        counts[k][0] = plans[0].count();
+        counts[k][1] = plans[1].count();
+        // the head stream's rows were the other one drafting with its head too
+        var heads = [_]win.Plan{ .{ .stream = &a, .position = 64, .kind = .head, .held = 5 }, .{ .stream = &b, .position = 64, .kind = .head, .held = 5 } };
+        try win.allocate(&engine, &heads);
+        counts[k][2] = heads[1].count();
+        _ = engine.arena.reset(.retain_capacity);
+    }
+    // off: the sure copy crowds the head stream out of rows it would have had; on: it keeps them
+    try std.testing.expect(counts[0][1] < counts[0][2]);
+    try std.testing.expectEqual(counts[1][2], counts[1][1]);
+    try std.testing.expect(counts[1][0] >= 2 and counts[1][0] + counts[1][1] <= 15);
+}
