@@ -130,7 +130,8 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
     if (by_rows) rows_a.report(&rows_b);
     var bad: usize = 0;
     for (want.items, got.items, 0..) |a, b, i| if (a != b) {
-        if (bad < 8) std.debug.print("  differs: {s}\n", .{digestName(&fwd, i)});
+        var nb: [64]u8 = undefined;
+        if (bad < 8) std.debug.print("  differs: {s}\n", .{digestName(&fwd, i, &nb)});
         bad += 1;
     };
     try check.expect(bad == 0, "dsv41-prompt-time chunk {d} vs {d}: {d} tokens, replay {s}: {d} of {d} buffers differ", .{ chunk, c2, tokens, if (replay) "on" else "off", bad, want.items.len });
@@ -140,10 +141,17 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
 const plane_fields = .{ "comp_codes", "comp_scales", "idxk_codes", "idxk_scales", "raw_kv", "raw_score" };
 
 /// Which buffer digest `i` of `digests` is.
-fn digestName(fwd: *const dsv41.forward.Forward, i: usize) []const u8 {
+fn digestName(fwd: *const dsv41.forward.Forward, i: usize, buf: []u8) []const u8 {
     if (i == 0) return "logits";
     const k = i - 1;
-    if (k < fwd.rings.len) return "a ring";
+    if (k < fwd.rings.len) return std.fmt.bufPrint(buf, "layer {d}'s ring", .{k}) catch "a ring";
+    var j = k - fwd.rings.len;
+    for (fwd.planes, 0..) |pl, li| if (pl != null) {
+        if (j < plane_fields.len) {
+            inline for (plane_fields, 0..) |f, fi| if (fi == j) return std.fmt.bufPrint(buf, "layer {d}'s {s}", .{ li, f }) catch "a plane";
+        }
+        j -= plane_fields.len;
+    };
     return "a plane";
 }
 
