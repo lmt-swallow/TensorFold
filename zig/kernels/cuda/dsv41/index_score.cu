@@ -3,7 +3,7 @@
 //
 // What `_index_score_rows` computes for a row r and a key t, and what these kernels compute the same way:
 //  - the key's dims as bf16: e2m1(code) * 2^(e - 127) in fp32, rounded to bf16 (exact for the codes and scales a
-//    cache holds); tf_dsv41_index_keys_bf16 writes them once a call instead of once a program;
+//    cache holds); tf_dsv41_index_keys_bf16 writes them once a call (in segments of keys) instead of once a program;
 //  - s[h] = q[r, h] . k[t] as one mma.m16n8k16 (bf16 in, fp32 accumulate) chain from zero over the 128 dims in steps
 //    of 16, in order (the captured cubin's: its two 64-dim dots fused into one 8-step chain);
 //  - the score = the sum over heads of max(s[h], 0) * w[r, h], added as the captured kernel adds them (recovered by
@@ -22,7 +22,6 @@ namespace {
 constexpr int IH = 32;          // heads
 constexpr int ID = 128;         // dims
 constexpr int BN = 64;          // keys a tile
-constexpr int RB = 4;           // rows a program (8 warps: a row's two 16-head halves each)
 constexpr int KLD = ID + 8;     // halfs a staged key row (padded: B fragment loads fall in distinct banks)
 
 __device__ __forceinline__ float e2m1(uint32_t code) {
@@ -81,11 +80,12 @@ __device__ __forceinline__ void tile_halves(const uint32_t (&a)[8][4], const __n
     }
 }
 
-template <bool KEYS>
+// RB rows a program, 64 RB threads: warp w takes row w / 2's heads 16 (w % 2) .. + 15.
+template <bool KEYS, int RB>
 __device__ __forceinline__ void score_rows(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KB,
                                            const __nv_bfloat16* __restrict__ Wt, const long long* __restrict__ VIS,
                                            void* __restrict__ OUT, int n, int rows, long long* __restrict__ TM, int nt,
-                                           int tiles, bool tmax) {
+                                           int tiles, int tile0, int tile1, bool tmax) {
     __shared__ __align__(16) __nv_bfloat16 ks[2][BN * KLD];
     __shared__ float hs[RB][2][BN];
     __shared__ long long tmx[RB][2];
@@ -113,15 +113,17 @@ __device__ __forceinline__ void score_rows(const __nv_bfloat16* __restrict__ Q, 
     const int er = blockIdx.x * RB + eo_r;
     const long long vis = er < rows ? VIS[er] : 0;
 
-    const int tb0 = blockIdx.y * tiles, tb1 = min(nt, tb0 + tiles);
-    // staging: 64 keys x 256 bytes a tile, 16 bytes a copy, 4 copies a thread
+    // this program's tiles, within the segment [tile0, tile1) whose keys KB holds (KB row 0: key tile0 * 64)
+    const int tb0 = tile0 + blockIdx.y * tiles, tb1 = min(tile1, tb0 + tiles);
+    const int key0 = tile0 * BN;
+    // staging: 64 keys x 256 bytes a tile, 16 bytes a copy, 1024 / (64 RB) copies a thread
     auto stage = [&](int buf, int tb) {
 #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            const int idx = threadIdx.x + c * 256;          // 1024 chunks: key idx / 16, 16-byte part idx % 16
+        for (int c = 0; c < 16 / RB; ++c) {
+            const int idx = threadIdx.x + c * 64 * RB;      // 1024 chunks: key idx / 16, 16-byte part idx % 16
             const int key = idx >> 4, part = idx & 15;
             const int tk = tb * BN + key;
-            cp_async16(&ks[buf][key * KLD + part * 8], KB + (size_t)(tk < n ? tk : 0) * ID + part * 8, tk < n);
+            cp_async16(&ks[buf][key * KLD + part * 8], KB + (size_t)(tk < n ? tk - key0 : 0) * ID + part * 8, tk < n);
         }
         cp_async_commit();
     };
@@ -172,8 +174,8 @@ __device__ __forceinline__ void score_rows(const __nv_bfloat16* __restrict__ Q, 
 
 }  // namespace
 
-// KB [n, 128] bf16 from the packed cache rows: codes [n, 64] (byte j: dim j low nibble, dim j + 64 high), E8M0
-// scales [n, 4] (dims 0-31, 32-63, 64-95, 96-127). One thread a byte (two dims).
+// KB [n, 128] bf16 from n packed cache rows: codes [n, 64] (byte j: dim j low nibble, dim j + 64 high), E8M0 scales
+// [n, 4] (dims 0-31, 32-63, 64-95, 96-127). One thread a byte (two dims).
 extern "C" __global__ void tf_dsv41_index_keys_bf16(const uint8_t* __restrict__ K, const uint8_t* __restrict__ KS,
                                                      __nv_bfloat16* __restrict__ KB, int n) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -187,15 +189,21 @@ extern "C" __global__ void tf_dsv41_index_keys_bf16(const uint8_t* __restrict__ 
     KB[key * ID + ID / 2 + j] = __float2bfloat16_rn(__fmul_rn(e2m1(cb >> 4), sh));
 }
 
-// grid (ceil(rows / 4), ceil(nt / tiles)), 256 threads: rows 4 a program, `tiles` 64-key tiles a program.
-extern "C" __global__ void __launch_bounds__(256) tf_dsv41_index_score_rows(
-    const __nv_bfloat16* Q, const __nv_bfloat16* KB, const __nv_bfloat16* Wt, const long long* VIS, float* OUT, int n,
-    int rows, int nt, int tiles) {
-    score_rows<false>(Q, KB, Wt, VIS, OUT, n, rows, nullptr, nt, tiles, false);
-}
-
-extern "C" __global__ void __launch_bounds__(256) tf_dsv41_index_keys_rows(
-    const __nv_bfloat16* Q, const __nv_bfloat16* KB, const __nv_bfloat16* Wt, const long long* VIS, long long* OUT,
-    int n, int rows, long long* TM, int nt, int tiles, int has_tmax) {
-    score_rows<true>(Q, KB, Wt, VIS, OUT, n, rows, TM, nt, tiles, has_tmax != 0);
-}
+// One segment of the keys: tiles [tile0, tile1) of the row block's n keys, KB [their keys, 128] bf16 (from
+// tf_dsv41_index_keys_bf16 at the segment's first key). grid (ceil(rows / RB), ceil((tile1 - tile0) / tiles)), 64 RB
+// threads: RB rows a program (4 or 8), `tiles` 64-key tiles a program. OUT [rows, n], TM [rows, nt]: absolute keys
+// and tiles.
+#define TF_INDEX_ROWS(RB_)                                                                                         \
+    extern "C" __global__ void __launch_bounds__(64 * RB_) tf_dsv41_index_score_rows##RB_(                         \
+        const __nv_bfloat16* Q, const __nv_bfloat16* KB, const __nv_bfloat16* Wt, const long long* VIS, float* OUT, \
+        int n, int rows, int nt, int tiles, int tile0, int tile1) {                                                 \
+        score_rows<false, RB_>(Q, KB, Wt, VIS, OUT, n, rows, nullptr, nt, tiles, tile0, tile1, false);             \
+    }                                                                                                               \
+    extern "C" __global__ void __launch_bounds__(64 * RB_) tf_dsv41_index_keys_rows##RB_(                          \
+        const __nv_bfloat16* Q, const __nv_bfloat16* KB, const __nv_bfloat16* Wt, const long long* VIS,             \
+        long long* OUT, int n, int rows, long long* TM, int nt, int tiles, int tile0, int tile1, int has_tmax) {    \
+        score_rows<true, RB_>(Q, KB, Wt, VIS, OUT, n, rows, TM, nt, tiles, tile0, tile1, has_tmax != 0);           \
+    }
+TF_INDEX_ROWS(4)
+TF_INDEX_ROWS(8)
+#undef TF_INDEX_ROWS
