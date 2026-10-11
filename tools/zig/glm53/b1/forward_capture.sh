@@ -3,7 +3,9 @@
 # both ranks in the pinned image, NCCL over the CX7 rails (TF_GLM_COMM=nccl), the pack from each node's Hugging Face
 # cache. Usage: bash forward_capture.sh <work-dir> [dump args]; writes <work-dir>/r{0,1}/out on the head and the worker.
 # Run only when neither node serves (reference.sh stop; gpu_guard both). EXTRA_ENV: more `-e K=V` for both ranks
-# (TF_GLM_HC_SPLIT=0 TF_GLM_PREFILL_OVERLAP=0: prompt chunks unsplit, for the split's same-bits claim).
+# (TF_GLM_HC_SPLIT=0 TF_GLM_PREFILL_OVERLAP=0: prompt chunks unsplit, for the split's same-bits claim). SCRIPT: the
+# b1/ script both ranks run (default dump_forward.py; logit_probe.py takes the same rank arguments); SRC: the
+# worktree mounted as /w on both nodes (default ~/src/TensorFold-wt-glm-opus).
 set -euo pipefail
 WORK=$1; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -15,14 +17,16 @@ IMAGE=${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold@sha
 REPO=models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold
 REV=078455ffe6472f9a52fbc1139f58b9db2881b25c
 RAILS=${RAILS:-rocep1s0f0,roceP2p1s0f0}
+SCRIPT=${SCRIPT:-dump_forward.py}
+SRC=${SRC:-\$HOME/src/TensorFold-wt-glm-opus}
 DOCK="--rm --name glm53-fwd --gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 --pull=never"
 ENVS="-e TF_GLM_COMM=nccl -e NCCL_IB_HCA=$RAILS -e NCCL_IB_GID_INDEX=3 -e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e HF_HUB_OFFLINE=1"
 ENVS="$ENVS ${EXTRA_ENV:-} -e TRITON_CACHE_DIR=/aot/triton -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e HOME=/tmp"
 run_rank() { # rank, dump args -> the docker command line for it
   local r=$1; shift
   echo "mkdir -p $WORK/r$r/out $WORK/r$r/triton \$HOME/.cache/tensorfold-glm53-v1.5/torch_extensions && docker run $DOCK $ENVS --user \$(id -u):\$(id -g) \
- -v \$HOME/src/TensorFold-wt-glm-opus:/w:ro -v $WORK/r$r:/aot -v \$HOME/.cache/huggingface/hub:/hub:ro \
- -v \$HOME/.cache/tensorfold-glm53-v1.5:/cache --entrypoint python3 $IMAGE -B /w/tools/zig/glm53/b1/dump_forward.py \
+ -v $SRC:/w:ro -v $WORK/r$r:/aot -v \$HOME/.cache/huggingface/hub:/hub:ro \
+ -v \$HOME/.cache/tensorfold-glm53-v1.5:/cache --entrypoint python3 $IMAGE -B /w/tools/zig/glm53/b1/$SCRIPT \
  --tools /w/tools/zig --out /aot/out --model /hub/$REPO/snapshots/$REV --rank $r --master $MASTER --port $PORT $*"
 }
 for w in local worker; do
