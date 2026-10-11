@@ -41,6 +41,15 @@ pub const prompt_rows: u32 = @intCast(lanesmod.default_chunk);
 /// their speed; 2, 4 and 8 rounds cost 33%, 45% and 70% for 13%, 24% and 33% (three streams decoding during a cold
 /// 64k prompt).
 pub const prefill_interleave: u32 = 1;
+/// Prompt parts run beside the decoding streams' rounds (LaneHost.overlap, `Settings.overlap`) unless
+/// TENSORFOLD_PREFILL_OVERLAP=0: the next 2048-row chunk is issued once the last one ran, rounds run meanwhile. Three
+/// streams decoding during a cold 64k prompt keep 21% of their speed for +23% prefill (interleaving alone: 7% for
+/// +19%); with the rounds at the greatest stream priority (TF_DS_ROUNDS_URGENT=1) 32% for +50%. The default leaves
+/// the priority alone: it costs the long prompt's first token little more than interleaving does, and the tokens
+/// the decoding streams gain with the priority roughly equal those they lose while the prompt takes longer. Every
+/// stream's tokens are the same either way; it costs ~450 MiB (a second communicator, the prompt path's own
+/// counters and absorber, the rounds' Engram buffers).
+pub const prefill_overlap: bool = true;
 
 /// `prefill_overlap`: prompt passes in parts run beside the rounds (TENSORFOLD_PREFILL_OVERLAP=1; `Settings.overlap`).
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, prefill_overlap: bool = false };

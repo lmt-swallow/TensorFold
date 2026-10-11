@@ -2022,8 +2022,9 @@ pub const Engine = struct {
         e.w = try weights.load(gpa, ctx.d, &e.cfg, &rc, &e.kernels, s.rank, s.world, .mul1, null);
         errdefer e.w.deinit();
         clock.mark("the weights", .{});
-        // beside prompt passes, the rounds' blocks start first where both wait for the GPU (TF_DS_ROUNDS_URGENT=0: not)
-        const urgent = s.overlap and !std.mem.eql(u8, getenv("TF_DS_ROUNDS_URGENT") orelse "1", "0");
+        // TF_DS_ROUNDS_URGENT=1: beside prompt passes, the rounds' blocks start first where both wait for the GPU
+        // (cuda_native `prefill_overlap` weighs it)
+        const urgent = s.overlap and std.mem.eql(u8, getenv("TF_DS_ROUNDS_URGENT") orelse "0", "1");
         e.stream = if (urgent) try cuda.Stream.initUrgent(ctx.d, true) else try cuda.Stream.init(ctx.d, true);
         errdefer e.stream.deinit();
         const rows = ropeRows(s.context);
