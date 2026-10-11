@@ -507,10 +507,10 @@ pub fn parallel(gpu: Gpu, dir: []const u8, cache_dir: []const u8, model_dir: []c
     }
     std.debug.print("dsv41-lanes-parallel rank {d}: rounds of 1..16 rows {any} ms, batched drafts of 1..3 streams {any} ms through {d} layers (gathers local)\n", .{ rank, round_ms, draft_ms, layers });
     const mcap = (1 << 20) + L.extra;
-    const pool_bytes = dsv41.rounds.Pool.bytesFor(&cfg, cfg.n_layers, mcap, L.max_slots);
-    const rings = L.max_slots * cfg.nextn * (cfg.window + 16) * cfg.head_dim * 2;
-    const per = L.Streams.bytesPerSlot(&cfg, cfg.n_layers, mcap, L.max_slots, cfg.nextn);
-    std.debug.print("dsv41-lanes-parallel: at a 1M-position context and {d} slots over {d} layers: the pool {d} bytes ({d:.1} MiB), the drafter rings {d} bytes ({d:.1} MiB), stream_bytes {d} ({d:.1} MiB)\n", .{ L.max_slots, cfg.n_layers, pool_bytes, mib(pool_bytes), rings, mib(rings), per, mib(per) });
+    const pool_bytes = dsv41.rounds.Pool.bytesFor(&cfg, cfg.n_layers, mcap, L.default_slots);
+    const rings = L.default_slots * cfg.nextn * (cfg.window + 16) * cfg.head_dim * 2;
+    const per = L.Streams.bytesPerSlot(&cfg, cfg.n_layers, mcap, L.default_slots, cfg.nextn);
+    std.debug.print("dsv41-lanes-parallel: at a 1M-position context and {d} slots over {d} layers: the pool {d} bytes ({d:.1} MiB), the drafter rings {d} bytes ({d:.1} MiB), stream_bytes {d} ({d:.1} MiB)\n", .{ L.default_slots, cfg.n_layers, pool_bytes, mib(pool_bytes), rings, mib(rings), per, mib(per) });
     try check.expect(ck.failures == 0, "{d} concurrent step(s) differ from the fork", .{ck.failures});
 }
 

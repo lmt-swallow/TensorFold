@@ -63,9 +63,9 @@ pub const Dims = struct {
     route_scale: f32,
     /// markov.py SPLIT (TP > 1): each rank scores its vocabulary half, the bests go through one gather a step.
     markov_split: bool = true,
-    /// The streams a batched draft takes at most (the pool's slots): the drafter's buffers hold their blocks'
-    /// rows, so every drafting stream of a round drafts in one pass (multi.py `_drafts`, one BatchDraftGraph a
-    /// stream count).
+    /// The streams a batched draft takes at most (`Drafter.streamsFor` the pool's slots): the drafter's buffers
+    /// hold their blocks' rows, so up to this many drafting streams of a round draft in one pass (multi.py
+    /// `_drafts`, one BatchDraftGraph a stream count), more in `Drafter.passCount` passes.
     streams: usize = 4,
 };
 
@@ -589,6 +589,23 @@ pub const Drafter = struct {
     /// The streams one batched draft takes at most.
     pub fn passStreams(self: *const Drafter) usize {
         return self.rows / self.dims.block;
+    }
+
+    /// The streams a pass holds for a pool of `slots` slots and blocks of `block` rows: every slot, unless the
+    /// Markov loop's streams (`Markov.np`) or the pass's rows (`max_rows`) hold fewer. At least 1 for `block` <=
+    /// `max_rows`.
+    pub fn streamsFor(slots: usize, block: usize) usize {
+        return @max(1, @min(@min(slots, Markov.np), max_rows / @max(block, 1)));
+    }
+
+    /// The streams of the pass that starts at stream `at` of `n` drafting streams, `per` (>= 1) a pass at most: the
+    /// fewest passes, their sizes as even as can be (the earlier passes no smaller), so a pass's stream count is
+    /// one the drafter recorded at load (`warmBatch` of 1 .. `per`). The sizes of the passes from 0 sum to `n`.
+    pub fn passCount(n: usize, per: usize, at: usize) usize {
+        const passes = (n + per - 1) / per;
+        const q = n / passes;
+        const wide = n % passes; // the first `wide` passes take q + 1 streams
+        return @min(if (at < wide * (q + 1)) q + 1 else q, n - at);
     }
 
     pub fn deinit(self: *Drafter) void {
@@ -1456,4 +1473,36 @@ test "the Markov loop's tiling follows markov.py" {
     try std.testing.expectEqual(@as(usize, 127), (v + 1023) / 1024); // s_tiles
     try std.testing.expectEqual(@as(usize, 128), std.math.ceilPowerOfTwo(usize, 127) catch unreachable);
     try std.testing.expectEqual(@as(usize, 64), (v / 2 + 1023) / 1024);
+}
+
+test "draft passes: the fewest of at most `per` streams, even, covering every stream once" {
+    for (1..17) |per| for (1..33) |n| {
+        var at: usize = 0;
+        var passes: usize = 0;
+        var first: usize = 0;
+        while (at < n) {
+            const m = Drafter.passCount(n, per, at);
+            try std.testing.expect(m >= 1 and m <= per);
+            if (passes == 0) first = m;
+            try std.testing.expect(m <= first and first - m <= 1);
+            at += m;
+            passes += 1;
+        }
+        try std.testing.expectEqual(n, at);
+        try std.testing.expectEqual((n + per - 1) / per, passes);
+    };
+    try std.testing.expectEqual(@as(usize, 8), Drafter.passCount(16, 12, 0));
+    try std.testing.expectEqual(@as(usize, 4), Drafter.passCount(4, 12, 0));
+}
+
+test "a pass's streams: the slots, at most Markov.np and a pass's rows" {
+    try std.testing.expectEqual(@as(usize, 4), Drafter.streamsFor(4, 5));
+    try std.testing.expectEqual(@as(usize, 8), Drafter.streamsFor(8, 5));
+    try std.testing.expectEqual(@as(usize, 12), Drafter.streamsFor(16, 5));
+    try std.testing.expectEqual(@as(usize, 16), Drafter.streamsFor(16, 4));
+    try std.testing.expectEqual(@as(usize, 1), Drafter.streamsFor(1, 5));
+    for (1..17) |slots| for (1..Drafter.max_rows + 1) |block| {
+        const per = Drafter.streamsFor(slots, block);
+        try std.testing.expect(per >= 1 and per <= slots and per <= Markov.np and per * block <= Drafter.max_rows);
+    };
 }

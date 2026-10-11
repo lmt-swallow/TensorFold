@@ -23,8 +23,9 @@
 //!   theirs kept again), and the oldest entries go past `entries`.
 const std = @import("std");
 
-/// Streams a pool holds at most (cuda_lanes.zig max_slots).
-pub const max_slots: usize = 4;
+/// Streams a pool holds at most (cuda_lanes.zig max_slots): the batched drafts' Markov loop holds 16 streams
+/// (cuda_dspark.zig Markov.np).
+pub const max_slots: usize = 16;
 /// Kept prompts at most (TF_DS_KEEP_ENTRIES is capped one below: a finishing stream is kept before the trim).
 pub const max_kept: usize = 16;
 /// Boundaries a stream or kept prompt holds at most (a 2^30-token prompt's doubling ones, its last two, its 3/4 and
@@ -706,6 +707,8 @@ test "placement: a free extent, then the continued prompt's own in place, then t
 
 test "placement keeps the book and the extents consistent: kept and taken extents disjoint, a trial changes nothing" {
     const C = 2048;
+    // four streams at once in a window of 24 chunks: often full, so every placement kind happens
+    const slots = 4;
     var prng = std.Random.DefaultPrng.init(0x6b70);
     const r = prng.random();
     const ids = try testing.allocator.alloc(i32, 24 * C);
@@ -722,7 +725,7 @@ test "placement keeps the book and the extents consistent: kept and taken extent
         b.released = &rel;
         b.set.shrink = r.boolean();
         var ex = Extents.init(24 * C);
-        var streams: [max_slots][2]usize = undefined;
+        var streams: [slots][2]usize = undefined;
         var ns: usize = 0;
         for (0..40) |_| {
             const before = b.fingerprint(&ex);
@@ -733,7 +736,7 @@ test "placement keeps the book and the extents consistent: kept and taken extent
             var tex = ex;
             const want = t.place(&tex, need, src);
             try testing.expectEqual(before, b.fingerprint(&ex));
-            if (ns == max_slots) {
+            if (ns == slots) {
                 // a stream finishes: kept (its prompt's boundaries) or released
                 const i = r.uintLessThan(usize, ns);
                 const s = streams[i];

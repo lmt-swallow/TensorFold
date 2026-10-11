@@ -99,7 +99,7 @@ pub const Op = enum(u8) { prefill = 1, round = 2, release = 3, stop = 4, verify 
 
 /// The bytes a step's record takes at most for a context of `context` positions (a prompt of the whole context).
 pub fn maxOpBytes(context: usize) usize {
-    return @max(Prefill.header, Admit.header) + 8 * (context + extra);
+    return @max(@max(Prefill.header, Admit.header) + 8 * (context + extra), @max(Round.max_bytes, DraftsRec.max_bytes));
 }
 
 /// The prefill step's record (little-endian): the opcode, the chunk rows (u32), the flags (u8: bit 0, Engram on;
@@ -260,7 +260,7 @@ pub const Settings = struct {
     /// Load the DSpark drafter (the rank cache's `mtp.*` blocks) and serve drafted rounds.
     drafts: bool = false,
     /// Streams at once (the pool's slots), 1 to `max_slots`.
-    slots: usize = max_slots,
+    slots: usize = default_slots,
     /// Positions the streams' pool holds (TF_DS_POOL): at least `context`; 0 means `context`. Each stream still
     /// reaches at most `context` positions.
     pool: usize = 0,
@@ -536,9 +536,13 @@ pub fn ropeRows(context: usize) usize {
 
 // -- concurrent streams over one pool (multi.py MultiDecoder) ------------------------------------------------------
 
-/// Slots the served engine holds: a round's 16 rows hold four streams' windows of up to four rows (the fork's
-/// DEPTH_BY "5,5,3,3" at three and four streams).
+/// Slots the served engine holds at most (TF_DS_SLOTS): every stream of a round takes one row at least, so more
+/// slots than `Settings.rows` leave the rest waiting a round; a drafts step drafts them in passes of
+/// `dspark.Drafter.passStreams` streams.
 pub const max_slots: usize = kept_prompts.max_slots;
+/// Slots unless TF_DS_SLOTS says otherwise: a round's 16 rows hold four streams' windows of up to four rows (the
+/// fork's DEPTH_BY "5,5,3,3" at three and four streams).
+pub const default_slots: usize = 4;
 /// Extents start and end on multiples of this many positions (multi.py ALIGN).
 pub const extent_align: usize = kept_prompts.extent_align;
 /// Positions an extent holds past its stream's prompt and reply (multi.py `_need`: a round's rows, 8, and the
@@ -710,6 +714,8 @@ pub const Round = struct {
     ids: [round_rows_most]i64,
 
     const per: usize = 26;
+    /// The bytes a record takes at most: `max_slots` windows of `round_rows_most` rows in all.
+    pub const max_bytes: usize = 2 + max_slots * per + 8 * round_rows_most;
 
     pub fn encode(buf: []u8, windows: []const RoundWindow) []const u8 {
         buf[0] = @intFromEnum(Op.rounds);
@@ -777,6 +783,8 @@ pub const DraftsRec = struct {
     count: usize,
 
     const per: usize = 33;
+    /// The bytes a record takes at most: `max_slots` asks.
+    pub const max_bytes: usize = 2 + max_slots * per;
 
     pub fn encode(buf: []u8, asks: []const DraftAsk) []const u8 {
         buf[0] = @intFromEnum(Op.drafts);
@@ -1765,7 +1773,7 @@ pub const Streams = struct {
         var out: [max_slots]dspark.Drafts = undefined;
         var at: usize = 0;
         while (at < n) {
-            const m = @min(per, n - at);
+            const m = dspark.Drafter.passCount(n, per, at);
             try sp.batchDraft(dp, tokens[at..][0..m], q0[at..][0..m], slots[at..][0..m], self.base.w.embed.ptr(), rope, self.stream, out[at..][0..m]);
             at += m;
         }
@@ -2067,7 +2075,7 @@ pub const Engine = struct {
             e.stages = try gpa.alloc(dspark.Stage, e.ds.?.blocks.len);
             for (e.stages, e.ds.?.blocks) |*st, *b| st.* = dspark.Stage.of(b);
             var dims = dspark.dimsOf(&e.cfg, s.rank, s.world);
-            dims.streams = s.slots; // every slot's block in one pass
+            dims.streams = dspark.Drafter.streamsFor(s.slots, dims.block); // every slot's block in one pass, or as few as hold them
             e.drafter = try dspark.Drafter.init(gpa, ctx.d, dims, &e.set, &e.glue, &e.ek, e.stages, dspark.headOf(&e.ds.?, &e.w.head), &e.comm);
             try e.drafter.?.enableWide(&e.kernels);
             std.log.info("deepseek_v41 rank {d}: DSpark drafter ({d} stages, taps of layers {any})", .{ s.rank, e.stages.len, e.cfg.dspark_taps.slice() });
@@ -2949,13 +2957,18 @@ pub const Lanes = struct {
             const rows = i + 1;
             var ms = e.round_ms[i];
             if (e.drafter != null and rows > 1) {
-                var streams = @min((rows + self.width() - 1) / self.width(), e.streams.lanes.len);
-                while (streams > 0) : (streams -|= per) ms += e.draft_ms[@min(streams, per) - 1];
+                const streams = @min((rows + self.width() - 1) / self.width(), e.streams.lanes.len);
+                var at: usize = 0;
+                while (at < streams) {
+                    const m = dspark.Drafter.passCount(streams, per, at);
+                    ms += e.draft_ms[m - 1];
+                    at += m;
+                }
             }
             c.* = .{ .width = @intCast(rows), .ms = ms };
         }
         for (self.window_costs[0..self.width()], 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = e.round_ms[i] + if (e.drafter != null and i > 0) e.draft_ms[0] else 0 };
-        std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket, batched drafts of 1..{d} streams {any} ms", .{ e.streams.rows, e.round_ms[0..e.streams.rows], rounds.bucket_min, max_slots, e.draft_ms });
+        std.log.info("deepseek_v41: rounds of 1..{d} rows {any} ms at the {d}-position bucket, batched drafts of 1..{d} streams {any} ms", .{ e.streams.rows, e.round_ms[0..e.streams.rows], rounds.bucket_min, per, e.draft_ms[0..per] });
         // the forwards by position: the least bucket's rows, then each timed end's
         var row_counts: [Engine.probe_rows_most]usize = undefined;
         const counts = Engine.probeRows(e.streams.rows, &row_counts);
@@ -3466,7 +3479,7 @@ test "extents: first fit, taken extents never overlap, freed extents merge back 
 test "admission, free, fill, join, round, drafts, keeps and measure records parse back to what was encoded; cut or foreign ones are refused" {
     var prng = std.Random.DefaultPrng.init(0x9a7a);
     const r = prng.random();
-    var buf: [Admit.header + 8 * 64]u8 = undefined;
+    var buf: [@max(Admit.header + 8 * 64, @max(Round.max_bytes, DraftsRec.max_bytes))]u8 = undefined;
     var ids: [64]i64 = undefined;
     var back: [64]i64 = undefined;
     for (0..300) |_| {

@@ -3,11 +3,11 @@
 //! --master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT), the weights from the Python
 //! family's rank cache (TF_DS_RANK_CACHE), the RoPE frequencies (TF_DS_ROPE=device, the default: each pass's rows
 //! computed on the device) or whole tables (TF_DS_ROPE=table) from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
-//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 4096). Up to four streams decode together in shared
+//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 4096). Up to TF_DS_SLOTS streams decode together in shared
 //! rounds (TF_DS_MAX_ROWS rows a round at most: default 16, up to 32, the same on both ranks), their caches in one
 //! pool of TF_DS_POOL positions (cuda_lanes.zig `Streams`; default the context, else at least the context and a
 //! multiple of 2048, the same on both ranks), each stream within the context (`--context`: at most the model's
-//! window); TF_DS_SLOTS (default 4, 1 to 4, the same on both ranks) sets the pool's slots. With drafts (the default;
+//! window); TF_DS_SLOTS (default 4, 1 to 16, the same on both ranks) sets the pool's slots. With drafts (the default;
 //! `--no-drafts` turns them off on both ranks) the rank cache's DSpark blocks load and every stream verifies drafted
 //! windows of up to 6 rows (TF_DS_DRAFTS: up to that many drafts and the pending token, 1 to the checkpoint's block
 //! of 5, the same on both ranks), the rounds' and drafts' costs timed on both ranks at load. The load logs each phase's
@@ -101,7 +101,7 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
         std.log.err("TF_DS_PREFILL_CHUNK is {d}: it takes 1 to {d} rows", .{ chunk, lanesmod.max_chunk });
         return error.BadEnvironment;
     }
-    const slots = try envInt("TF_DS_SLOTS", @intCast(lanesmod.max_slots));
+    const slots = try envInt("TF_DS_SLOTS", @intCast(lanesmod.default_slots));
     if (slots < 1 or slots > lanesmod.max_slots) {
         std.log.err("TF_DS_SLOTS is {d}: it takes 1 to {d} streams", .{ slots, lanesmod.max_slots });
         return error.BadEnvironment;
