@@ -144,6 +144,7 @@ pub const Model = struct {
         // the experts' trellises (most of the pack's bytes) through pinned staging halves
         var up = try upload.Uploader.init(d, 256 << 20);
         defer up.deinit();
+        try up.withSpans(d, 1100 << 20); // a layer's experts: 0.95 GB at 3.05 bpw
         for (0..layers) |i| {
             var l: Layer = undefined;
             l.index = i;

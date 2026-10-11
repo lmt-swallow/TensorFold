@@ -122,7 +122,22 @@ pub const Experts = struct {
         };
         var trellis = try cuda.DeviceBuffer.alloc(d, total);
         errdefer trellis.free();
-        if (up != null) for (groups) |g| upload.prefetch(g.trellis);
+        // the layer's trellises as one direct read when they share a file (each layer's span is contiguous)
+        var span: ?struct { bytes: []const u8, lo: u64 } = null;
+        if (up) |u| if (u.span) |*r| span: {
+            const first = pack.locate(groups[0].trellis) orelse break :span;
+            var lo: u64 = first.offset;
+            var hi: u64 = first.offset + groups[0].trellis.len;
+            for (groups) |g| {
+                const at = pack.locate(g.trellis) orelse break :span;
+                if (!std.mem.eql(u8, at.path, first.path)) break :span;
+                lo = @min(lo, at.offset);
+                hi = @max(hi, at.offset + g.trellis.len);
+            }
+            if (hi - lo > r.buf[0].bytes.len - 2 * 4096) break :span;
+            span = .{ .bytes = try r.read(first.path, lo, @intCast(hi - lo)), .lo = lo };
+        };
+        if (up != null and span == null) for (groups) |g| upload.prefetch(g.trellis);
         const ptrs = try gpa.alloc(i64, 3 * E);
         defer gpa.free(ptrs);
         const k2s = try gpa.alloc(i32, 3 * E);
@@ -132,7 +147,10 @@ pub const Experts = struct {
         var k2_d: [2]u32 = .{ 16, 2 };
         for (0..E) |e| for (0..3) |j| {
             const g = groups[3 * e + j];
-            if (up) |u| try u.put(trellis, at, g.trellis) else try trellis.upload(at, g.trellis);
+            if (span) |sp| {
+                const off: usize = @intCast(pack.locate(g.trellis).?.offset - sp.lo);
+                try up.?.putPinned(trellis, at, sp.bytes[off..][0..g.trellis.len]);
+            } else if (up) |u| try u.put(trellis, at, g.trellis) else try trellis.upload(at, g.trellis);
             ptrs[j * E + e] = @intCast(trellis.ptr + at);
             const k2: u32 = @intCast(g.w16 / 8);
             k2s[j * E + e] = @intCast(k2);
@@ -141,6 +159,7 @@ pub const Experts = struct {
             r[1] = @max(r[1], k2);
             at += std.mem.alignForward(usize, g.trellis.len, 256);
         };
+        if (span != null) try up.?.span.?.done(up.?);
         var bufs: [12]cuda.DeviceBuffer = undefined;
         var made: usize = 0;
         errdefer for (bufs[0..made]) |*b| b.free();

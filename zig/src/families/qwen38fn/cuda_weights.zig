@@ -45,6 +45,16 @@ pub const Pack = struct {
         return &self.head;
     }
 
+    /// The shard file holding `bytes` (a tensor's mapped bytes) and their offset in it.
+    pub fn locate(self: *Pack, bytes: []const u8) ?struct { path: [:0]const u8, offset: u64 } {
+        for ([_]*Checkpoint{ &self.lm, &self.head, &self.mtp }) |c| for (c.files.items) |*f| {
+            const lo = @intFromPtr(f.map.memory.ptr);
+            const at = @intFromPtr(bytes.ptr);
+            if (at >= lo and at + bytes.len <= lo + f.map.memory.len) return .{ .path = f.path, .offset = at - lo };
+        };
+        return null;
+    }
+
     pub fn has(self: *Pack, name: []const u8) bool {
         for (self.of(name).files.items) |*f| if (f.get(name) != null) return true;
         return false;
