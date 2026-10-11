@@ -124,7 +124,7 @@ const Nccl = struct {
 };
 
 /// Two ranks' all-gathers in host memory: each copies its rows to its slot, both wait, each reads both slots.
-const Host = struct {
+pub const Host = struct {
     slots: [2][]u8,
     arrived: std.atomic.Value(u32) = .init(0),
     gen: std.atomic.Value(u32) = .init(0),
@@ -144,12 +144,13 @@ const Host = struct {
     }
 };
 
-const HostLink = struct {
+/// One rank's side of a `Host` (two ranks as threads on one GPU): `gather` is a `M.Gather` / `E.Link` gather.
+pub const HostLink = struct {
     h: *Host,
     rank: usize,
     d: *const cuda.Driver,
 
-    fn gather(p: *anyopaque, send: Ptr, recv: Ptr, floats: usize, stream: cuda.Stream) anyerror!void {
+    pub fn gather(p: *anyopaque, send: Ptr, recv: Ptr, floats: usize, stream: cuda.Stream) anyerror!void {
         const l: *HostLink = @ptrCast(@alignCast(p));
         const n = floats * 4;
         if (n > l.h.slots[0].len) return error.GatherTooLarge;

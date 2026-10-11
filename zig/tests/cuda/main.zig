@@ -41,6 +41,7 @@ const glm53_prompt_time = @import("glm53_prompt_time.zig");
 const glm53_keep = @import("glm53_keep_tests.zig");
 const glm53_shared = @import("glm53_shared_tests.zig");
 const glm53_tier = @import("glm53_tier_tests.zig");
+const glm53_seg = @import("glm53_seg_tests.zig");
 const dsv41_ptx_lift_tests = @import("dsv41_ptx_lift_tests.zig");
 
 const usage =
@@ -88,6 +89,8 @@ const usage =
     \\  glm53-prompt-fp8 <work-dir> <model-dir>  glm53-prompt on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture
     \\  glm53-dsa-fp8 <work-dir> <model-dir> [isolated]  glm53-dsa on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture (glm53/capture.sh dsa with KV=fp8)
     \\  glm53-drafted <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>  GLM-5.3-Flash the fixture's request decoded with MTP and copy drafts on the pair: its reply and rounds against the reference's
+    \\  glm53-seg <work-dir> <model-dir>  GLM-5.3-Flash several streams' windows in one forward (forwardSegs, layers 0 and 3) against the Mia fork's batched verify windows, both ranks on this GPU (glm53/capture.sh seg)
+    \\  glm53-seg-fp8 <work-dir> <model-dir>  glm53-seg on FP8 DSA caches against a KV=fp8 capture
     \\  glm53-shared <fwd-dir> <model-dir> <rank> <master-ip|local> <port> <aot-dir> [layers]  GLM-5.3-Flash four streams' windows in one forward against each alone and the single-stream path, on the pair
     \\  glm53-keep <fwd-dir> <model-dir> <rank> <master-ip|local> <port> <aot-dir> [layers]  GLM-5.3-Flash a prompt continued from a kept prompt's boundary (pool extents, a snapshot) on the pair against its fresh prefill
     \\  glm53-generate <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>  GLM-5.3-Flash the fixture's request decoded serially on the pair, its reply against the reference's ids
@@ -186,6 +189,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-dsa")) return glm53_dsa.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"), null);
     if (std.mem.eql(u8, cmd, "glm53-dsa-fp8")) return glm53_dsa.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"), .fp8);
     if (std.mem.eql(u8, cmd, "glm53-drafted")) return glm53_generate.run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5));
+    if (std.mem.eql(u8, cmd, "glm53-seg")) return glm53_seg.run(gpu, try arg(rest, 0), try arg(rest, 1), null);
+    if (std.mem.eql(u8, cmd, "glm53-seg-fp8")) return glm53_seg.run(gpu, try arg(rest, 0), try arg(rest, 1), .fp8);
     if (std.mem.eql(u8, cmd, "glm53-shared")) return glm53_shared.run(gpu, .{ .dir = try arg(rest, 0), .model = try arg(rest, 1), .aot = try arg(rest, 5), .layers = if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null }, try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10));
     if (std.mem.eql(u8, cmd, "glm53-keep")) return glm53_keep.run(gpu, .{ .dir = try arg(rest, 0), .model = try arg(rest, 1), .aot = try arg(rest, 5), .layers = if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null }, try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10));
     if (std.mem.eql(u8, cmd, "glm53-generate")) return glm53_forward.generate(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5));
