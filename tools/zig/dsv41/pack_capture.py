@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Merge one or more DeepSeek-V4.1 Triton captures (each: a launches.json from the recorder shim or
 capture_kernel.py, its TRITON_CACHE_DIR, the mount path the run saw) into one Zig kernel set: <out>/aot.json +
-<out>/cubins/, deduplicated by specialization hash, with a report of kernel names x variant counts and of every
-variant aot.Set.load would refuse (global or profile scratch, clusters, a PTX ABI that is not the runtime argument
+<out>/cubins/ (each <hash>.cubin with the <hash>.ptx it was compiled from), deduplicated by specialization hash, with
+a report of kernel names x variant counts and of every variant aot.Set.load would refuse (global or profile scratch, clusters, a PTX ABI that is not the runtime argument
 list). Host-side, no GPU.
 
   python3 -B pack_capture.py --out <dir> \
@@ -130,6 +130,9 @@ def main() -> int:
             if hashlib.sha256(data).hexdigest() != k["cubin_sha256"]:
                 raise SystemExit(f"{cubin} changed since the manifest was written")
             (out / "cubins" / f"{k['hash']}.cubin").write_bytes(data)
+            ptx = cubin.with_suffix(".ptx")  # the PTX it was compiled from: ptx_lift.py's input
+            if ptx.exists():
+                shutil.copy(ptx, out / "cubins" / f"{k['hash']}.ptx")
             kernels[k["hash"]] = entry(k, jit)
             sources[k["hash"]].append(label)
     packed = sorted(kernels.values(), key=lambda x: (x["fn"], x["hash"]))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Union several captured Triton sets (aot.json + cubins/, as pack_capture.py / aot_pack.py write them) into one:
-variants are keyed by their cubin hash, the first occurrence wins, cubins are copied. Usage:
+variants are keyed by their cubin hash, the first occurrence wins, cubins (and the .ptx beside them) are copied. Usage:
 merge_aot.py --out <dir> <set-dir>... ; rope/ and token_map.json of the first set that has them are copied too."""
 import argparse, json, os, shutil, sys
 
@@ -24,6 +24,9 @@ for d in a.sets:
                 continue
             src = os.path.join(d, "cubins", cands[0])
         shutil.copy2(src, os.path.join(a.out, "cubins", os.path.basename(src)))
+        ptx = os.path.join(d, "cubins", k["hash"] + ".ptx")
+        if os.path.exists(ptx):
+            shutil.copy2(ptx, os.path.join(a.out, "cubins", k["hash"] + ".ptx"))
         seen.add(k["hash"])
         kernels.append(k)
     for extra in ("rope", "token_map.json"):
