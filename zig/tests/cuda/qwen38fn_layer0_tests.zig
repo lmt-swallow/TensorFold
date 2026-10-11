@@ -110,7 +110,7 @@ pub fn layer0(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !vo
     var gw = try qfn.weights.Gdn.load(gpa, d, &pack, &cfg, 0);
     defer gw.deinit();
     try check.expect(gw.ba.sk == @as(usize, @intCast(try fx.int("f16_sk_ba"))), "qwen38fn: (b ; a) K slices {d}, the reference's {d}", .{ gw.ba.sk, try fx.int("f16_sk_ba") });
-    var router = try qfn.weights.router(gpa, d, &pack, &cfg, 0);
+    var router = try qfn.weights.router(gpa, d, &pack, &cfg, .{ .lm = 0 });
     defer router.free();
     var xk = try dsv41.exl3.Kernels.load(d);
     defer xk.deinit();
@@ -156,7 +156,7 @@ pub fn layer0(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !vo
     defer wts.free();
     var xk_moe = try qfn.experts.Kernels.load(d);
     defer xk_moe.deinit();
-    var experts = try qfn.experts.Experts.load(gpa, d, &pack, &cfg, 0);
+    var experts = try qfn.experts.Experts.load(gpa, d, &pack, &cfg, .{ .lm = 0 });
     defer experts.deinit();
     var moe_scratch = try qfn.experts.Scratch.init(d, &experts, rows, slots);
     defer moe_scratch.deinit();
