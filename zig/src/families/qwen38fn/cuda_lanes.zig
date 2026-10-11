@@ -1,8 +1,8 @@
 //! Qwen3.8-Flash-Next streams behind the lane core (core/lanes): each stream owns its sequence (caches, DeltaNet
 //! states, n-gram tail) and shares the model and the window buffers; a round's windows of up to `max_streams`
 //! streams run as one forward (multi.py `round`), each row with the bits of its stream's own window.
-//! Greedy decoding only for now: a row's token is the first index of its largest logit (torch.argmax), read on the
-//! host. With the MTP head, a stream's drafts come from its greedy confidence chain (decode.py `draft`: up to 6, the
+//! Greedy decoding only for now: a row's token is the first index of its largest logit (torch.argmax, a NaN
+//! first), drawn on the device and read back as one int32 a row. With the MTP head, a stream's drafts come from its greedy confidence chain (decode.py `draft`: up to 6, the
 //! chain ending below 0.70) and are verified in its next window; the tokens kept are always the main model's.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -51,7 +51,9 @@ pub const Lanes = struct {
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
-    host_logits: []u16,
+    argmax_mod: cuda.Module,
+    argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu)
+    drawn_dev: cuda.DeviceBuffer, // int32 [shared_rows]
     rounds: u64 = 0,
     head: ?*mtp.Head = null,
     mb: ?fwd.Buffers = null, // the head's decode buffers
@@ -61,7 +63,7 @@ pub const Lanes = struct {
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *fwd.Model, set: *cuda.aot.Set, capacity: usize, sms: u32) !*Lanes {
         const self = try gpa.create(Lanes);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .d = d, .m = m, .set = set, .f = fwd.Forward.init(d, m, set), .pr = undefined, .b = undefined, .pb = undefined, .stream = undefined, .capacity = capacity, .host_logits = undefined };
+        self.* = .{ .gpa = gpa, .d = d, .m = m, .set = set, .f = fwd.Forward.init(d, m, set), .pr = undefined, .b = undefined, .pb = undefined, .stream = undefined, .capacity = capacity, .argmax_mod = undefined, .argmax_fn = undefined, .drawn_dev = undefined };
         self.pr = try prompt_mod.Prompt.init(&self.f, sms);
         errdefer self.pr.deinit();
         self.b = try fwd.Buffers.init(gpa, d, m, shared_rows, capacity);
@@ -70,7 +72,10 @@ pub const Lanes = struct {
         errdefer self.pb.deinit();
         self.stream = try cuda.Stream.init(d, true);
         errdefer self.stream.deinit();
-        self.host_logits = try gpa.alloc(u16, shared_rows * m.cfg.vocab);
+        self.argmax_mod = try cuda.Module.load(d, cuda.kernels.torch_argmax);
+        errdefer self.argmax_mod.unload();
+        self.argmax_fn = try self.argmax_mod.function("tf_argmax_rows_i32_kernel");
+        self.drawn_dev = try cuda.DeviceBuffer.alloc(d, shared_rows * 4);
         return self;
     }
 
@@ -90,7 +95,8 @@ pub const Lanes = struct {
         if (self.scp) |*x| x.deinit();
         if (self.head) |h| h.deinit();
         self.lanes.deinit(self.gpa);
-        self.gpa.free(self.host_logits);
+        self.drawn_dev.free();
+        self.argmax_mod.unload();
         self.stream.deinit();
         self.pb.deinit();
         self.b.deinit();
@@ -152,28 +158,21 @@ pub const Lanes = struct {
         return l;
     }
 
-    /// Greedy draws of `rows` logit rows (bf16, row stride vocab): the first index of each row's largest value.
+    /// Greedy draws of `rows` logit rows (bf16, row stride vocab): torch.argmax of each row (the first index of its
+    /// largest value, a NaN first) on the device, read back once the stream reaches it.
     fn argmax(self: *Lanes, logits: cuda.DeviceBuffer, rows: usize, out: []u32) !void {
         const v = self.m.cfg.vocab;
-        const host = self.host_logits[0 .. rows * v];
-        try logits.download(0, std.mem.sliceAsBytes(host));
-        for (0..rows) |r| {
-            const row = host[r * v ..][0..v];
-            var best: usize = 0;
-            var top = bf16(row[0]);
-            for (row[1..], 1..) |x, i| {
-                const f = bf16(x);
-                if (f > top) {
-                    top = f;
-                    best = i;
-                }
-            }
-            out[r] = @intCast(best);
-        }
-    }
-
-    fn bf16(x: u16) f32 {
-        return @bitCast(@as(u32, x) << 16);
+        if (rows > shared_rows) return error.WindowTooLarge;
+        var a: cuda.Args = .{};
+        a.add(logits.ptr);
+        a.add(self.drawn_dev.ptr);
+        for ([_]usize{ rows, v, v }) |x| a.add(@as(i64, @intCast(x)));
+        a.add(@as(i32, 0)); // bf16
+        try cuda.launch.launch(self.argmax_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, self.stream, &a);
+        var ids: [shared_rows]i32 = undefined;
+        try self.drawn_dev.downloadAsync(0, std.mem.sliceAsBytes(ids[0..rows]), self.stream.handle);
+        try self.stream.synchronize();
+        for (ids[0..rows], out[0..rows]) |x, *o| o.* = @intCast(x);
     }
 
     fn cancelledCtx(ctx: *anyopaque) bool {
@@ -253,7 +252,6 @@ pub const Lanes = struct {
         if (R == 0) return;
         try self.f.stageSegs(segs[0..windows.len], &self.b, ids[0..R], self.stream);
         try self.f.computeSegs(segs[0..windows.len], &self.b, .{}, self.stream);
-        try self.stream.synchronize();
         var drawn: [shared_rows]u32 = undefined;
         try self.argmax(self.b.logits, R, drawn[0..R]);
         self.rounds += 1;
