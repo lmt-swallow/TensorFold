@@ -3,6 +3,7 @@
 //! as fp32 `stored + offset`, A_log and dt_bias widened to fp32, the router's fp16 rows rounded to bf16 (nearest even).
 //! EXL3 groups stay host views (`Group`): the EXL3 linear that consumes them owns their device layout.
 const std = @import("std");
+const upload = @import("cuda_upload.zig");
 const cuda = @import("cuda");
 const core = @import("core");
 const Config = @import("config.zig").Config;
@@ -412,6 +413,22 @@ pub const NgramTable = struct {
             }.order) - 1;
             const at = (r - self.starts[shard]) * rb;
             @memcpy(out[i * rb ..][0..rb], self.shards[shard][at..][0..rb]);
+        }
+    }
+
+    /// Ask the kernel to read rows `ids` of the mapped table ahead of a `gather` (asynchronous readahead; a hint, so
+    /// ids out of range and failures are ignored).
+    pub fn prefetch(self: *const NgramTable, ids: []const i64) void {
+        const rb = 2 * self.words;
+        for (ids) |id| {
+            if (id < 0 or @as(usize, @intCast(id)) >= self.rows()) continue;
+            const r: usize = @intCast(id);
+            const shard = std.sort.upperBound(usize, self.starts, r, struct {
+                fn order(a: usize, b: usize) std.math.Order {
+                    return std.math.order(a, b);
+                }
+            }.order) - 1;
+            upload.prefetch(self.shards[shard][(r - self.starts[shard]) * rb ..][0..rb]);
         }
     }
 

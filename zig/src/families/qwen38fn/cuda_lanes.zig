@@ -197,6 +197,18 @@ pub const Lanes = struct {
         return h;
     }
 
+    /// The n-gram table rows a window of `tokens` after the stream's committed history reads, asked of the page cache
+    /// ahead of the round's `stage` (the mapped table is read from disk on a row's first use).
+    fn prefetchRows(self: *Lanes, st: *const fwd.Stream, tokens: []const i64) void {
+        const g = &(self.m.ng orelse return);
+        const t = &(self.m.table orelse return);
+        var ids: [max_rows * 64]i64 = undefined;
+        const n = tokens.len * g.heads();
+        if (n > ids.len) return;
+        g.ids(st.history[0 .. g.n - 1], tokens, ids[0..n]) catch return;
+        t.prefetch(ids[0..n]);
+    }
+
     /// The lane's stream, its pending window committed first (`kept` rows, else all of them).
     fn bindLane(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
         const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
@@ -377,7 +389,14 @@ pub const Lanes = struct {
             reqs[i] = .{ .st = l.st, .streams = streams, .next = next[i][0..n], .count = @min(r.depth, mtp.depth), .out = &l.held, .probs = &l.probs };
         }
         try h.draftAll(&self.f, reqs[0..requests.len], &self.mb.?, &self.sc.?, self.stream);
-        for (reqs[0..requests.len], held[0..requests.len]) |q, l| l.nheld = q.n;
+        for (reqs[0..requests.len], held[0..requests.len]) |q, l| {
+            l.nheld = q.n;
+            // the next window: the pending token (the last kept row's follower) and the drafts
+            var win: [max_rows]i64 = undefined;
+            win[0] = q.next[q.next.len - 1];
+            for (l.held[0..l.nheld], 1..) |t, k| win[k] = t;
+            self.prefetchRows(l.st, win[0 .. 1 + l.nheld]);
+        }
     }
 
     /// The held drafts as host tokens (a chain: no parents), read where the round loop plans the next window.
