@@ -27,10 +27,10 @@ const Buf = cuda.DeviceBuffer;
 pub const chunk_rows = 2048;
 
 /// A layer's token mixer on this rank: a KDA layer (its index `li` among the KDA layers of the stream's
-/// `forward.KdaState`) or a DSA layer with the stream's caches of it.
+/// `forward.KdaState`) or a DSA layer (its index `di` among the stream's DSA caches, `Stream.caches`).
 pub const Mixer = union(enum) {
     kda: struct { w: *const weights.Kda, li: usize },
-    dsa: struct { w: *const dsa.Dsa, cache: *const dsa.Cache },
+    dsa: struct { w: *const dsa.Dsa, di: usize },
 };
 
 pub const Ffn = union(enum) {
@@ -45,14 +45,13 @@ pub const Layer = struct {
 };
 
 /// What the prompt path reads of one rank's model: the layers in order, the embedding, the final norm, the head's
-/// BF16 vocabulary rows, and the MTP layer with the stream's caches of it.
+/// BF16 vocabulary rows and the MTP layer.
 pub const Model = struct {
     layers: []const Layer,
     embed: Ptr,
     norm: Ptr,
     head: glue_mod.B16,
     mtp: *const mtp.Mtp,
-    mtp_cache: *const dsa.Cache,
 };
 
 pub const Kernels = struct {
@@ -62,24 +61,38 @@ pub const Kernels = struct {
     mtp: *const mtp.Kernels,
 };
 
-/// A rank's prompt buffers for chunks of up to `rows` rows (decode.Engine's `pbuf` and the scratch its blocks use).
+/// The prompt buffers a chunk runs on (decode.Engine's `pbuf` and the scratch its blocks use), for chunks of up to
+/// `rows` rows; every one built for prompt chunks (`prefill` true). A caller that keeps its own (an engine's prompt
+/// work buffers) points at them; `Owned` allocates a set.
 pub const Prompt = struct {
+    rows: usize,
+    b: *const forward.Buffers,
+    temp: *const kda.Temp,
+    kscratch: *const kda.Scratch, // one layer's chain scratch: each KDA layer of a chunk commits before the next runs
+    ds: *const dsa.Scratch,
+    ms: *const moe.Scratch,
+    mb: *const mtp.Buffers,
+    fnormed: Ptr, // [rows, D] bf16: the final norm of the streams' mean (the MTP head's input)
+    fxs: Ptr, // [rows, D / 64] fp32
+    logits: Ptr, // [1, vocab share] bf16: the head of the chunk's last row
+};
+
+/// A set of prompt buffers of its own (`view`).
+pub const Owned = struct {
     rows: usize,
     b: forward.Buffers,
     temp: kda.Temp,
-    kscratch: kda.Scratch, // one layer's chain scratch: each KDA layer of a chunk commits before the next runs
+    kscratch: kda.Scratch,
     ds: dsa.Scratch,
     ms: moe.Scratch,
     mb: mtp.Buffers,
-    fnormed: Buf, // [rows, D] bf16: the final norm of the streams' mean (the MTP head's input)
+    fnormed: Buf,
     fxs: Buf,
-    logits: Buf, // [1, vocab share] bf16: the head of the chunk's last row
-    pos_dev: Buf, // int32: the chunk's first position
-    mtp_pos_dev: Buf, // int32: the absorb's first MTP position
+    logits: Buf,
 
-    pub fn init(d: *const cuda.Driver, lay: config.Layout, rows: usize, capacity: usize) !Prompt {
+    pub fn init(d: *const cuda.Driver, lay: config.Layout, rows: usize, capacity: usize) !Owned {
         const c = lay.cfg;
-        var p: Prompt = undefined;
+        var p: Owned = undefined;
         p.rows = rows;
         p.b = try forward.Buffers.init(d, lay, rows, true);
         errdefer p.b.deinit();
@@ -98,14 +111,10 @@ pub const Prompt = struct {
         p.fxs = try Buf.alloc(d, rows * c.hidden / 64 * 4);
         errdefer p.fxs.free();
         p.logits = try Buf.alloc(d, lay.size(.vocab) * 2);
-        errdefer p.logits.free();
-        p.pos_dev = try Buf.alloc(d, 16);
-        errdefer p.pos_dev.free();
-        p.mtp_pos_dev = try Buf.alloc(d, 16);
         return p;
     }
 
-    pub fn deinit(p: *Prompt) void {
+    pub fn deinit(p: *Owned) void {
         p.b.deinit();
         p.temp.deinit();
         p.kscratch.deinit();
@@ -115,22 +124,28 @@ pub const Prompt = struct {
         p.fnormed.free();
         p.fxs.free();
         p.logits.free();
-        p.pos_dev.free();
-        p.mtp_pos_dev.free();
     }
 
-    /// The final-normed row r of the last chunk (decode's `last_hidden` for its last row).
-    pub fn hidden(p: *const Prompt, r: usize, D: usize) Ptr {
-        return p.fnormed.ptr + r * D * 2;
+    pub fn view(p: *const Owned) Prompt {
+        return .{
+            .rows = p.rows, .b = &p.b, .temp = &p.temp, .kscratch = &p.kscratch, .ds = &p.ds, .ms = &p.ms, .mb = &p.mb,
+            .fnormed = p.fnormed.ptr, .fxs = p.fxs.ptr, .logits = p.logits.ptr,
+        };
     }
 };
 
-/// One stream's position state: its KDA state, its next position and the MTP cache's length.
+/// One stream on this rank: its KDA state, its DSA layers' caches and the MTP layer's (each a stream's view of the
+/// pool), its next position and the MTP cache's length, and two device int32s of its own that the chunk sets to
+/// them (the position the kernels read; 16-byte aligned, as the reference's tensors are).
 pub const Stream = struct {
     kda: *forward.KdaState,
+    caches: []const dsa.Cache,
+    mtp_cache: *const dsa.Cache,
     pos: usize,
     mtp_len: usize,
     capacity: usize,
+    pos_dev: Ptr,
+    mtp_pos_dev: Ptr,
 };
 
 /// What a segment leaves to all-gather: this rank's partial [rows, D] fp32 into every rank's `gath`.
@@ -153,13 +168,13 @@ pub const Kind = union(enum) {
 /// Rows `ids` at stream position st.pos (`next`: the token after each of the first `next.len` rows, which the MTP
 /// layer absorbs: R of them, or R - 1 at a prompt's end).
 pub const Chunk = struct {
-    p: *Prompt,
+    p: Prompt,
     m: *const Model,
     k: Kernels,
     lay: config.Layout,
     st: *Stream,
-    ids: []const i32,
-    next: []const i32,
+    ids: []const u32,
+    next: []const u32,
     head: bool = true,
 
     pub fn rows(c: *const Chunk) usize {
@@ -201,17 +216,17 @@ pub const Chunk = struct {
     }
 
     fn ctx(c: *const Chunk) forward.Ctx {
-        return .{ .g = c.k.g, .kk = c.k.kda, .temp = &c.p.temp, .prompt_scratch = &c.p.kscratch, .lay = c.lay };
+        return .{ .g = c.k.g, .kk = c.k.kda, .temp = c.p.temp, .prompt_scratch = c.p.kscratch, .lay = c.lay };
     }
 
     fn mixer(c: *const Chunk, l: *const Layer, stream: cuda.Stream) !void {
         const p = c.p;
         const R = c.rows();
-        try forward.hcPre(c.ctx(), l.frame, false, &p.b, R, stream);
+        try forward.hcPre(c.ctx(), l.frame, false, p.b, R, stream);
         switch (l.mixer) {
-            .kda => |x| try forward.kdaBlock(c.ctx(), x.w, c.st.kda, x.li, &p.b, R, stream),
-            .dsa => |x| try dsa.dsaBlock(c.k.g, c.lay, x.w, x.cache, &p.ds, .{
-                .normed = p.b.normed.ptr, .part = p.b.part.ptr, .sk = p.b.sk.ptr, .pos_dev = p.pos_dev.ptr,
+            .kda => |x| try forward.kdaBlock(c.ctx(), x.w, c.st.kda, x.li, p.b, R, stream),
+            .dsa => |x| try dsa.dsaBlock(c.k.g, c.lay, x.w, &c.st.caches[x.di], p.ds, .{
+                .normed = p.b.normed.ptr, .part = p.b.part.ptr, .sk = p.b.sk.ptr, .pos_dev = c.st.pos_dev,
                 .host_pos = c.st.pos, .nch = cdiv(c.st.pos + R, 512), .R = R,
             }, stream),
         }
@@ -231,50 +246,50 @@ pub const Chunk = struct {
                     try c.check();
                     const pos: i32 = @intCast(c.st.pos);
                     const mpos: i32 = @intCast(c.st.mtp_len);
-                    try p.pos_dev.uploadAsync(0, std.mem.asBytes(&pos), stream.handle);
-                    try p.mtp_pos_dev.uploadAsync(0, std.mem.asBytes(&mpos), stream.handle);
+                    try devInt(c.st.pos_dev, p.b.ids.d).uploadAsync(0, std.mem.asBytes(&pos), stream.handle);
+                    try devInt(c.st.mtp_pos_dev, p.b.ids.d).uploadAsync(0, std.mem.asBytes(&mpos), stream.handle);
                     try p.b.ids.uploadAsync(0, std.mem.sliceAsBytes(c.ids), stream.handle);
                     if (n > 0) try p.mb.ids.uploadAsync(0, std.mem.sliceAsBytes(c.next), stream.handle);
                     try stream.synchronize(); // the host slices need not outlive the call
                     try c.k.g.embed(p.b.ids.ptr, c.m.embed, p.b.x.ptr, R, cfg.streams, stream);
                 } else {
-                    try forward.hcPost(c.ctx(), &p.b, R, stream);
+                    try forward.hcPost(c.ctx(), p.b, R, stream);
                 }
                 try c.mixer(&layers[li], stream);
             },
             .ffn => |li| {
                 const l = &layers[li];
-                try forward.hcPost(c.ctx(), &p.b, R, stream);
-                try forward.hcPre(c.ctx(), l.frame, true, &p.b, R, stream);
+                try forward.hcPost(c.ctx(), p.b, R, stream);
+                try forward.hcPre(c.ctx(), l.frame, true, p.b, R, stream);
                 switch (l.ffn) {
-                    .mlp => |w| try forward.mlpBlock(c.ctx(), w, &p.b, R, stream),
-                    .moe => |w| try moe.moeBlock(c.k.g, c.k.moe, c.lay, w, &p.ms, p.b.normed.ptr, p.b.part.ptr, p.b.sk.ptr, R, stream),
+                    .mlp => |w| try forward.mlpBlock(c.ctx(), w, p.b, R, stream),
+                    .moe => |w| try moe.moeBlock(c.k.g, c.k.moe, c.lay, w, p.ms, p.b.normed.ptr, p.b.part.ptr, p.b.sk.ptr, R, stream),
                 }
             },
             .tail => {
-                try forward.hcPost(c.ctx(), &p.b, R, stream);
+                try forward.hcPost(c.ctx(), p.b, R, stream);
                 try c.k.g.streamMean(p.b.x.ptr, p.b.hidden.ptr, R, stream);
-                try c.k.g.rmsnorm(p.b.hidden.ptr, D, c.m.norm, p.fnormed.ptr, D, p.fxs.ptr, cfg.eps, R, D, stream);
+                try c.k.g.rmsnorm(p.b.hidden.ptr, D, c.m.norm, p.fnormed, D, p.fxs, cfg.eps, R, D, stream);
                 // the head reads the last row only (forward.py `_compute` of a prompt buffer)
-                if (c.head) try c.k.g.bmm(p.fnormed.ptr + (R - 1) * D * 2, D, c.m.head, 1, p.logits.ptr, false, p.b.sk.ptr, stream);
+                if (c.head) try c.k.g.bmm(p.fnormed + (R - 1) * D * 2, D, c.m.head, 1, p.logits, false, p.b.sk.ptr, stream);
                 if (n == 0) return c.commit(stream);
                 // decode._absorb_rows: the chunk's final-normed rows into the MTP head (mtp.py `mtp_stage`)
                 const hin: Buf = .{ .d = p.mb.hin.d, .ptr = p.mb.hin.ptr, .len = n * D * 2 };
-                try hin.copyFrom(0, p.fnormed.ptr, n * D * 2, stream.handle);
+                try hin.copyFrom(0, p.fnormed, n * D * 2, stream.handle);
                 const m = c.m.mtp;
-                try mtp.front(c.k.g, cfg, m, &p.mb, c.m.embed, n, c.st.mtp_len == 0, stream);
-                try dsa.dsaBlock(c.k.g, c.lay, &m.dsa, c.m.mtp_cache, &p.ds, .{
-                    .normed = p.mb.normed.ptr, .part = p.mb.part.ptr, .sk = p.mb.sk.ptr, .pos_dev = p.mtp_pos_dev.ptr,
+                try mtp.front(c.k.g, cfg, m, p.mb, c.m.embed, n, c.st.mtp_len == 0, stream);
+                try dsa.dsaBlock(c.k.g, c.lay, &m.dsa, c.st.mtp_cache, p.ds, .{
+                    .normed = p.mb.normed.ptr, .part = p.mb.part.ptr, .sk = p.mb.sk.ptr, .pos_dev = c.st.mtp_pos_dev,
                     .host_pos = c.st.mtp_len, .nch = cdiv(c.st.mtp_len + n, 512), .R = n,
                 }, stream);
             },
             .mtp_ffn => {
                 const m = c.m.mtp;
-                try mtp.afterAttention(c.k.g, cfg, m, &p.mb, c.lay.world, n, stream);
-                try moe.moeBlock(c.k.g, c.k.moe, c.lay, &m.moe, &p.ms, p.mb.normed.ptr, p.mb.part.ptr, p.mb.sk.ptr, n, stream);
+                try mtp.afterAttention(c.k.g, cfg, m, p.mb, c.lay.world, n, stream);
+                try moe.moeBlock(c.k.g, c.k.moe, c.lay, &m.moe, p.ms, p.mb.normed.ptr, p.mb.part.ptr, p.mb.sk.ptr, n, stream);
             },
             .mtp_end => {
-                try mtp.head(c.k.g, c.k.mtp, cfg, c.m.mtp, &p.mb, c.lay.world, n, stream);
+                try mtp.head(c.k.g, c.k.mtp, cfg, c.m.mtp, p.mb, c.lay.world, n, stream);
                 try c.commit(stream);
             },
         }
@@ -298,6 +313,10 @@ pub fn prefillChunk(c: *const Chunk, gather: Gather, stream: cuda.Stream) !void 
     }
 }
 
+fn devInt(ptr: Ptr, d: *const cuda.Driver) Buf {
+    return .{ .d = d, .ptr = ptr, .len = 4 };
+}
+
 fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
 }
@@ -308,8 +327,8 @@ test "a chunk's segments" {
     m.layers = &layers;
     var c: Chunk = undefined;
     c.m = &m;
-    c.ids = &[_]i32{ 1, 2, 3 };
-    c.next = &[_]i32{ 2, 3 };
+    c.ids = &[_]u32{ 1, 2, 3 };
+    c.next = &[_]u32{ 2, 3 };
     try std.testing.expectEqual(@as(usize, 6), c.sites());
     try std.testing.expectEqual(Kind{ .mixer = 1 }, c.kind(2));
     try std.testing.expectEqual(Kind.tail, c.kind(4));

@@ -148,11 +148,13 @@ const Rank = struct {
     norm: Buf,
     head_rows: []u8,
     head: Buf,
-    p: P.Prompt,
+    p: P.Owned,
     st: F.KdaState,
-    cache: A.Cache = undefined,
+    pos_dev: Buf,
+    mpos_dev: Buf,
+    caches: [1]A.Cache = undefined,
     mcache: A.Cache = undefined,
-    caches: bool = false,
+    have_caches: bool = false,
     layers: [2]P.Layer = undefined,
     model: P.Model = undefined,
     stream: P.Stream = undefined,
@@ -171,36 +173,41 @@ const Rank = struct {
         r.head.free();
         r.p.deinit();
         r.st.deinit();
+        r.pos_dev.free();
+        r.mpos_dev.free();
         r.dropCaches();
     }
 
     fn dropCaches(r: *Rank) void {
-        if (!r.caches) return;
-        r.cache.deinit();
+        if (!r.have_caches) return;
+        r.caches[0].deinit();
         r.mcache.deinit();
-        r.caches = false;
+        r.have_caches = false;
     }
 
     /// A fresh stream over `capacity` tokens: zero caches, KDA state and conv windows, position 0.
     fn fresh(r: *Rank, d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, ring: usize, kv: A.Kv) !void {
         r.dropCaches();
-        r.cache = try A.Cache.init(d, cfg, capacity, ring, kv);
+        r.caches[0] = try A.Cache.init(d, cfg, capacity, ring, kv);
         r.mcache = try A.Cache.init(d, cfg, capacity, ring, kv);
-        r.caches = true;
+        r.have_caches = true;
         try r.st.rec.fill8(0, null);
         try r.st.conv.fill8(0, null);
         r.st.cur = 0;
         r.st.pos = 0;
         r.layers = .{
             .{ .frame = &r.f0, .mixer = .{ .kda = .{ .w = &r.kda, .li = 0 } }, .ffn = .{ .mlp = &r.mlp } },
-            .{ .frame = &r.f3, .mixer = .{ .dsa = .{ .w = &r.dsa, .cache = &r.cache } }, .ffn = .{ .moe = &r.moe } },
+            .{ .frame = &r.f3, .mixer = .{ .dsa = .{ .w = &r.dsa, .di = 0 } }, .ffn = .{ .moe = &r.moe } },
         };
         r.model = .{
             .layers = &r.layers, .embed = r.embed.ptr, .norm = r.norm.ptr,
             .head = .{ .ptr = r.head.ptr, .n = r.head_rows.len / 2 / cfg.hidden, .k = cfg.hidden },
-            .mtp = &r.mtp, .mtp_cache = &r.mcache,
+            .mtp = &r.mtp,
         };
-        r.stream = .{ .kda = &r.st, .pos = 0, .mtp_len = 0, .capacity = capacity };
+        r.stream = .{
+            .kda = &r.st, .caches = &r.caches, .mtp_cache = &r.mcache, .pos = 0, .mtp_len = 0, .capacity = capacity,
+            .pos_dev = r.pos_dev.ptr, .mtp_pos_dev = r.mpos_dev.ptr,
+        };
     }
 };
 
@@ -334,9 +341,11 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
             .head = undefined,
             .p = undefined,
             .st = undefined,
+            .pos_dev = try Buf.alloc(d, 16),
+            .mpos_dev = try Buf.alloc(d, 16),
         };
         r.head = try Buf.fromHost(d, r.head_rows);
-        r.p = try P.Prompt.init(d, lay, prompt_rows, long_capacity);
+        r.p = try P.Owned.init(d, lay, prompt_rows, long_capacity);
         r.st = try F.KdaState.init(d, lay, 1, 16);
         loaded += 1;
     }
@@ -353,7 +362,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
         for (&ranks) |*r| try r.fresh(d, &cfg, if (long) long_capacity else capacity, if (long) long_ring else ring, kv);
         if (long) for (&ranks) |*r| {
             // dump_prompt.py's draws: layer 3's latents and pooled keys, then the MTP layer's
-            for ([_]Buf{ r.cache.latent, r.cache.pk, r.mcache.latent, r.mcache.pk }, 0..) |b, seed| try draw(gpa, b, seed);
+            for ([_]Buf{ r.caches[0].latent, r.caches[0].pk, r.mcache.latent, r.mcache.pk }, 0..) |b, seed| try draw(gpa, b, seed);
         };
         const list = e.value_ptr.array.items;
         for (list, 0..) |sv, si| {
@@ -375,21 +384,21 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
     const absorbed: usize = @intCast(s.get("absorbed").?.integer);
     const before = h.failures;
     var raws: [2][]u8 = undefined;
-    var ids: [2][]const i32 = undefined;
-    var next: [2][]i32 = undefined;
+    var ids: [2][]const u32 = undefined;
+    var next: [2][]u32 = undefined;
     var cs: [2]P.Chunk = undefined;
     for (ranks, 0..) |*r, ri| {
         var nb: [64]u8 = undefined;
         raws[ri] = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_ids", .{ ri, step }));
-        ids[ri] = @alignCast(std.mem.bytesAsSlice(i32, raws[ri]));
+        ids[ri] = @alignCast(std.mem.bytesAsSlice(u32, raws[ri]));
         // the next tokens: the chunk's own past its first row, then the next chunk's first (unless the prompt ends)
-        next[ri] = try gpa.alloc(i32, absorbed);
+        next[ri] = try gpa.alloc(u32, absorbed);
         @memcpy(next[ri][0..@min(absorbed, R - 1)], ids[ri][1..][0..@min(absorbed, R - 1)]);
         if (absorbed == R) {
             const a = after orelse return error.BadFixture;
             const raw2 = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_ids", .{ ri, a.get("step").?.string }));
             defer gpa.free(raw2);
-            next[ri][R - 1] = std.mem.bytesToValue(i32, raw2[0..4]);
+            next[ri][R - 1] = std.mem.bytesToValue(u32, raw2[0..4]);
         }
         // a prompt continuing a cached context (the long run) starts where the fixture says
         if (r.stream.pos != pos) {
@@ -397,7 +406,7 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
             r.st.pos = pos;
         }
         r.stream.mtp_len = mtp0;
-        cs[ri] = .{ .p = &r.p, .m = &r.model, .k = k, .lay = .{ .rank = ri, .world = 2, .cfg = cfg }, .st = &r.stream, .ids = ids[ri], .next = next[ri] };
+        cs[ri] = .{ .p = r.p.view(), .m = &r.model, .k = k, .lay = .{ .rank = ri, .world = 2, .cfg = cfg }, .st = &r.stream, .ids = ids[ri], .next = next[ri] };
         try h.begin(ri, step);
     }
     defer for (0..2) |ri| {
@@ -429,8 +438,8 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
         try h.state("x_out", r.p.b.x.ptr);
         try h.state("rec", r.st.state(r.st.cur, 0));
         try h.state("conv", r.st.convOf(0));
-        try h.state("latent", r.cache.latent.ptr + r.cache.latentAt(cfg, pos));
-        try h.state("pk", r.cache.pk.ptr);
+        try h.state("latent", r.caches[0].latent.ptr + r.caches[0].latentAt(cfg, pos));
+        try h.state("pk", r.caches[0].pk.ptr);
         if (absorbed > 0) try h.state("mtp_latent", r.mcache.latent.ptr + r.mcache.latentAt(cfg, mtp0));
         var nb: [64]u8 = undefined;
         const want = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_head", .{ ri, step }));
@@ -470,7 +479,7 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: us
                     try h.also("state_out", r.st.state(1 - r.st.cur, 0));
                     try h.call("_shift_conv", "conv", r.st.convOf(0));
                 },
-                .dsa => |x| try compareDsa(h, &p.ds, x.cache, pos, R, limit),
+                .dsa => |x| try compareDsa(h, &p.ds, &r.caches[x.di], pos, R, limit),
             }
             try h.call("mm", "out", b.part.ptr);
         },
@@ -501,7 +510,7 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: us
             try h.next("rmsnorm");
             try h.call("mm", "out", mb.mx.ptr);
             try h.call("rmsnorm", "out", mb.normed.ptr);
-            try compareDsa(h, &p.ds, c.m.mtp_cache, mtp0, c.next.len, limit);
+            try compareDsa(h, &p.ds, &r.mcache, mtp0, c.next.len, limit);
             try h.call("mm", "out", mb.part.ptr);
         },
         .mtp_ffn => {
