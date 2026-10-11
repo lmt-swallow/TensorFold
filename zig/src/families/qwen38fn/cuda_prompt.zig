@@ -93,7 +93,7 @@ pub const Kernels = struct {
 /// every call (error.F16Differ).
 pub const F16Mode = enum { captured, fused, check };
 
-/// TF_QFN_PROMPT_F16: `captured` (default), `fused` or `check` (F16Mode).
+/// TF_QFN_PROMPT_F16: `fused` (default), `captured` or `check` (F16Mode).
 fn f16Mode() !F16Mode {
     return modeOf(F16Mode, "TF_QFN_PROMPT_F16");
 }
@@ -101,20 +101,20 @@ fn f16Mode() !F16Mode {
 /// scores.cu SMEM: a scores program's dynamic shared bytes (32 rows' queries as fp32, 64 keys).
 const scores_shared: u32 = 32 * 4 * 128 * 4 + 64 * (128 + 8) * 2;
 
-/// TF_QFN_PROMPT_SCORES: the indexer's block scores of a prompt block: `captured` (default) 0.6.6's `_scores`,
-/// `fused` scores.cu (the same bytes, the keys read once for 32 rows), `check` both, compared after every call.
+/// TF_QFN_PROMPT_SCORES: the indexer's block scores of a prompt block: `fused` (default) scores.cu (the keys read
+/// once for 32 rows), `captured` 0.6.6's `_scores` (the same bytes), `check` both, compared after every call.
 fn scoresMode() !F16Mode {
     return modeOf(F16Mode, "TF_QFN_PROMPT_SCORES");
 }
 
 fn modeOf(comptime M: type, comptime name: [:0]const u8) !M {
-    const v = std.mem.span(std.c.getenv(name) orelse return .captured);
-    if (v.len == 0) return .captured;
+    const v = std.mem.span(std.c.getenv(name) orelse return .fused);
+    if (v.len == 0) return .fused;
     return std.meta.stringToEnum(M, v) orelse error.BadPromptMode;
 }
 
-/// TF_QFN_PROMPT_EXPERTS: the kernels of a prompt window's routed experts (cuda_experts.zig `Mode`): `captured`
-/// (default) 0.6.6's, `fused` experts_prompt.cu (the same bytes), `check` both, compared after every window.
+/// TF_QFN_PROMPT_EXPERTS: the kernels of a prompt window's routed experts (cuda_experts.zig `Mode`): `fused`
+/// (default) experts_prompt.cu, `captured` 0.6.6's (the same bytes), `check` both, compared after every window.
 fn expertsMode() !experts.Mode {
     return modeOf(experts.Mode, "TF_QFN_PROMPT_EXPERTS");
 }
@@ -162,8 +162,8 @@ pub const Buffers = struct {
     ple_nrow: cuda.DeviceBuffer,
     streams: cuda.DeviceBuffer,
     logits: cuda.DeviceBuffer, // bf16 [1, vocab]: the chunk's last row
-    f16_mode: F16Mode = .captured,
-    scores_mode: F16Mode = .captured,
+    f16_mode: F16Mode = .fused,
+    scores_mode: F16Mode = .fused,
     scores_check: ?cuda.DeviceBuffer = null, // check: the fused scores (fp32 [att_rows, nb])
     f16_check: ?cuda.DeviceBuffer = null, // check: the fused call's rows (bf16 [rows, widest N])
     f16_part: ?cuda.DeviceBuffer = null, // fused: K slices' sums (fp32 [sk, rows, n], the largest matrix's)
