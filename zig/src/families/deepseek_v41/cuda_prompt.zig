@@ -625,6 +625,8 @@ pub const Prompt = struct {
     top_rows: usize = 0,
     /// A chunk issued in pieces (`piece`): the layer loop's state between them.
     at_piece: Walk = undefined,
+    /// `piece`: bounded replay left the current chunk no row past its cut, so its later pieces issue nothing
+    piece_cut: bool = false,
 
     /// The layer loop's state: the residual streams and mixes it reads next, the rows and positions it runs, and
     /// the next layer.
@@ -881,9 +883,10 @@ pub const Prompt = struct {
     }
 
     /// How many pieces `piece` issues a chunk of `n` rows with options `o` in when asked for `want`: `want` (at
-    /// most the layers) for a chunk through the layer loop without bounded replay, profile or trace; else 1.
+    /// most the layers) for a chunk through the layer loop without profile or trace (bounded replay included: the
+    /// cut happens in the piece holding layer n_layers / 2); else 1.
     pub fn piecesFor(self: *const Prompt, n: usize, o: Options, want: usize) usize {
-        if (want <= 1 or o.replay != null or self.profile != null or self.trace != null) return 1;
+        if (want <= 1 or self.profile != null or self.trace != null) return 1;
         if (n <= decode_rows and o.taps == null and o.logits) return 1;
         return @min(want, self.fwd.w.layers.len);
     }
@@ -897,9 +900,17 @@ pub const Prompt = struct {
         if (k >= pieces or pieces != self.piecesFor(ids.len, o, pieces)) return error.BadShape;
         const L = self.fwd.w.layers.len;
         var engram_ns: i128 = 0;
-        if (k == 0) try self.walkBegin(ids, start, stream);
+        if (k == 0) {
+            try self.walkBegin(ids, start, stream);
+            self.piece_cut = false;
+        }
+        // bounded replay left the chunk no row past its cut (in an earlier piece): the rest is empty, as in `layers`
+        if (self.piece_cut) return null;
         if (self.at_piece.li != L * k / pieces) return error.BadShape;
-        if (!try self.walk(gather, o, stream, &engram_ns, L * (k + 1) / pieces)) return error.BadShape; // no replay here
+        if (!try self.walk(gather, o, stream, &engram_ns, L * (k + 1) / pieces)) {
+            self.piece_cut = true;
+            return null;
+        }
         if (k + 1 < pieces) return null;
         return try self.walkHead(gather, o, stream);
     }
