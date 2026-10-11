@@ -92,7 +92,7 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         tier.deinit(gpa);
         _ = std.c.unlink(path.ptr);
     }
-    try tier.open(0);
+    try tier.open(0, 1);
     var whole = try Buf.alloc(d, N * rb);
     defer whole.free();
     try whole.fill8(0, null);

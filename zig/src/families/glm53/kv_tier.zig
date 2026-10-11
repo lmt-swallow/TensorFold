@@ -45,13 +45,14 @@ pub const Options = struct {
     recent_runs: usize = 32,
     /// Windows a selected pool stays out of the first eviction pass.
     hot_windows: u32 = 2,
-    /// Reads and writes in flight at most (Linux AIO).
-    depth: usize = 256,
+    /// Reads and writes in flight at most a lane (Linux AIO), and lanes (threads) a large batch spreads over.
+    depth: usize = 64,
+    lanes: usize = 4,
 };
 
 const none: u32 = std.math.maxInt(u32);
 const Kind = enum(u8) { free, linear, loose };
-const Run = struct { kind: Kind = .free, key0: u32 = 0 };
+const Run = struct { kind: Kind = .free, key0: u32 = 0, held: u32 = 0 }; // held: slots owning a pool
 
 pub const Piece = struct {
     /// Byte offset from the slab's start of position 0's row (position p's row is at base + p * row_bytes); may be
@@ -87,6 +88,7 @@ pub const Tier = struct {
 
     const Stream = struct {
         open: bool = false,
+        layers: usize = 0, // layers 0 .. layers - 1 in use (the MTP head's cache: 1)
         hi: usize = 0, // newest segment a window touched
         committed: usize = 0,
         dirty_lo: usize = 0, // pools below this are persisted wherever full and committed
@@ -142,7 +144,7 @@ pub const Tier = struct {
         t.streams = try gpa.alloc(Stream, o.streams);
         errdefer gpa.free(t.streams);
         @memset(t.streams, .{});
-        t.io = try Io.open(gpa, path, o.depth);
+        t.io = try Io.open(gpa, path, o.depth, o.lanes);
         return t;
     }
 
@@ -177,27 +179,30 @@ pub const Tier = struct {
         return @alignCast(t.slab[slot * block ..][0..block]);
     }
 
-    /// A stream's home blocks (one a layer); its previous contents are dropped.
-    pub fn open(t: *Tier, s: usize) Error!void {
+    /// A stream of `layers` layers (at most Options.layers; the MTP head's cache is a stream of its own, 1 layer):
+    /// its home blocks, one a layer; its previous contents are dropped.
+    pub fn open(t: *Tier, s: usize, layers: usize) Error!void {
+        if (layers == 0 or layers > t.o.layers) return error.BadShape;
         if (t.streams[s].open) t.close(s);
-        for (0..t.o.layers) |l| {
+        t.streams[s].layers = layers;
+        for (0..layers) |l| {
             const r = try t.takeRuns(home_runs);
             t.home[s * t.o.layers + l] = r;
             for (0..home_runs) |i| try t.placeLinear(s, l, i, r + @as(u32, @intCast(i)));
         }
-        t.streams[s] = .{ .open = true };
+        t.streams[s] = .{ .open = true, .layers = layers };
     }
 
     /// Drops a stream: its runs and slots are free, its pools forgotten.
     pub fn close(t: *Tier, s: usize) void {
         t.io.finish() catch {};
-        for (0..t.o.layers) |l| {
+        for (0..t.streams[s].layers) |l| {
             const k0 = t.mapBase(s, l);
             for (0..t.pools) |p| {
                 const slot = t.map[k0 + p];
                 if (slot >= 0) {
                     const u: usize = @intCast(slot);
-                    t.owner[u] = none;
+                    t.disown(u);
                     if (t.runs[u / run_pools].kind == .loose) t.free_slots.append(t.gpa, @intCast(u)) catch {};
                 }
                 t.map[k0 + p] = -1;
@@ -224,11 +229,11 @@ pub const Tier = struct {
         const first = pos / seg_positions;
         const last = (pos + R - 1) / seg_positions;
         st.hi = @max(st.hi, last);
-        for (0..t.o.layers) |l| {
+        for (0..st.layers) |l| {
             const sr = t.seg_run[(s * t.o.layers + l) * t.segs ..][0..t.segs];
             for (home_runs..t.segs) |g| if (sr[g] != none and g < first and g + t.o.recent_runs <= st.hi) t.demote(sr, g);
         }
-        for (0..t.o.layers) |l| {
+        for (0..st.layers) |l| {
             for (first..last + 1) |g| if (t.seg_run[(s * t.o.layers + l) * t.segs + g] == none) {
                 const r = try t.takeRuns(1);
                 try t.placeLinear(s, l, g, r);
@@ -276,6 +281,7 @@ pub const Tier = struct {
     /// next fetch.
     pub fn fetch(t: *Tier, s: usize, l: usize, tokens: []const i32, counts: []const i32, W: usize) Error!void {
         if (!t.streams[s].open) return error.NotOpen;
+        if (l >= t.streams[s].layers) return error.BadShape;
         try t.io.finish();
         t.gen +%= 1;
         const k0 = t.mapBase(s, l);
@@ -307,6 +313,7 @@ pub const Tier = struct {
     /// next call on the tier waits for them. `ensureRange` waits at once.
     pub fn prefetchRange(t: *Tier, s: usize, l: usize, end: usize) Error!void {
         if (!t.streams[s].open) return error.NotOpen;
+        if (l >= t.streams[s].layers) return error.BadShape;
         if (end > t.o.capacity) return error.PastCapacity;
         try t.io.finish();
         t.gen +%= 1;
@@ -350,7 +357,7 @@ pub const Tier = struct {
         try t.io.finish();
         const hi = pos / pool_rows;
         if (hi > st.dirty_lo) {
-            for (0..t.o.layers) |l| {
+            for (0..st.layers) |l| {
                 const k0 = t.mapBase(s, l);
                 var p = st.dirty_lo;
                 while (p < hi) {
@@ -384,6 +391,16 @@ pub const Tier = struct {
 
     // -- slots and runs --------------------------------------------------------------------------------------------
 
+    fn own(t: *Tier, slot: usize, k: u32) void {
+        if (t.owner[slot] == none) t.runs[slot / run_pools].held += 1;
+        t.owner[slot] = k;
+    }
+
+    fn disown(t: *Tier, slot: usize) void {
+        if (t.owner[slot] != none) t.runs[slot / run_pools].held -= 1;
+        t.owner[slot] = none;
+    }
+
     fn touch(t: *Tier, slot: u32) void {
         t.pin[slot] = t.gen;
         t.used[slot] = t.window;
@@ -394,7 +411,7 @@ pub const Tier = struct {
     fn readIn(t: *Tier, keys: []const u32) Error!void {
         for (keys) |k| {
             const slot = try t.allocLoose();
-            t.owner[slot] = k;
+            t.own(slot, k);
             t.map[k] = @intCast(slot);
             t.touch(slot);
             try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
@@ -414,13 +431,13 @@ pub const Tier = struct {
             if (old >= 0) {
                 const u: u32 = @intCast(old);
                 @memcpy(t.slotBytes(slot), t.slotBytes(u));
-                t.owner[u] = none;
+                t.disown(u);
                 try t.free_slots.append(t.gpa, u);
             } else if (t.persisted.isSet(k)) {
                 try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
                 t.reads += 1;
             }
-            t.owner[slot] = k;
+            t.own(slot, k);
             t.map[k] = @intCast(slot);
             t.used[slot] = t.window;
         }
@@ -444,7 +461,7 @@ pub const Tier = struct {
 
     fn evict(t: *Tier, slot: usize) void {
         t.map[t.owner[slot]] = -1;
-        t.owner[slot] = none;
+        t.disown(slot);
         t.ref.unset(slot);
     }
 
@@ -488,6 +505,7 @@ pub const Tier = struct {
                 return @intCast(b);
             }
         }
+        // the block of loose runs holding the fewest pools (each is evicted or moved)
         var best: ?usize = null;
         var best_cost: usize = std.math.maxInt(usize);
         var a: usize = 0;
@@ -500,9 +518,7 @@ pub const Tier = struct {
                     ok = false;
                     break;
                 },
-                .loose => for (r * run_pools..(r + 1) * run_pools) |slot| {
-                    if (t.owner[slot] != none) cost += if (t.evictable(slot, false)) 1 else run_pools;
-                },
+                .loose => cost += t.runs[r].held,
             };
             if (ok and cost < best_cost) {
                 best = a;
@@ -525,11 +541,11 @@ pub const Tier = struct {
                 return e;
             };
             @memcpy(t.slotBytes(dst), t.slotBytes(slot));
-            t.owner[dst] = k;
+            t.own(dst, k);
             t.map[k] = @intCast(dst);
             t.pin[dst] = t.pin[slot];
             t.used[dst] = t.used[slot];
-            t.owner[slot] = none;
+            t.disown(slot);
         }
         for (b * run_pools..(b + n) * run_pools) |slot| t.ref.unset(slot);
         return @intCast(b);
@@ -544,6 +560,11 @@ pub const Tier = struct {
             if (t.map[k] != @as(i32, @intCast(slot))) return error.Inconsistent;
             if (t.runs[slot / run_pools].kind == .free) return error.Inconsistent;
         };
+        for (t.runs, 0..) |r, i| {
+            var held: u32 = 0;
+            for (t.owner[i * run_pools ..][0..run_pools]) |k| held += @intFromBool(k != none);
+            if (held != r.held) return error.Inconsistent;
+        }
     }
 };
 
@@ -555,17 +576,17 @@ pub const Tier = struct {
 pub const Io = struct {
     gpa: std.mem.Allocator,
     fd: c_int,
-    ctx: usize = 0,
     aio: bool = false,
     direct: bool = false,
     depth: usize,
     queue: std.ArrayList(Req) = .empty,
-    cbs: []Iocb = &.{},
-    ptrs: []*Iocb = &.{},
-    failed: bool = false,
+    lanes: []Lane = &.{},
 
     const Op = enum { read, write };
     const Req = struct { op: Op, buf: []u8, off: u64 };
+
+    /// Transfers a lane takes before a second lane (thread) starts: below it a thread costs more than it saves.
+    const lane_min = 128;
 
     const Iocb = extern struct {
         data: u64 = 0,
@@ -583,7 +604,18 @@ pub const Io = struct {
     };
     const IoEvent = extern struct { data: u64, obj: u64, res: i64, res2: i64 };
 
-    pub fn open(gpa: std.mem.Allocator, path: [:0]const u8, depth: usize) Error!Io {
+    /// One AIO context and its control blocks: a thread's share of a finish.
+    const Lane = struct {
+        ctx: usize = 0,
+        cbs: []Iocb,
+        ptrs: []*Iocb,
+        free: []u32,
+        bad: bool = false,
+    };
+
+    /// `lanes` AIO contexts of `depth` transfers each (the measured NVMe: QD 64 on one thread reads 1.0M 4 KiB
+    /// blocks a second, four threads 2.2M).
+    pub fn open(gpa: std.mem.Allocator, path: [:0]const u8, depth: usize, lanes: usize) Error!Io {
         var io: Io = .{ .gpa = gpa, .fd = -1, .depth = @max(depth, 1) };
         if (builtin.os.tag == .linux) {
             io.fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .DIRECT = true }, @as(c_uint, 0o600));
@@ -593,34 +625,73 @@ pub const Io = struct {
         if (io.fd < 0) return error.OpenFailed;
         errdefer _ = std.c.close(io.fd);
         if (builtin.os.tag == .linux) {
-            if (linux.errno(linux.syscall2(.io_setup, io.depth, @intFromPtr(&io.ctx))) == .SUCCESS) io.aio = true;
-            io.cbs = try gpa.alloc(Iocb, io.depth);
-            io.ptrs = try gpa.alloc(*Iocb, io.depth);
+            io.lanes = try gpa.alloc(Lane, @max(lanes, 1));
+            var made: usize = 0;
+            errdefer io.freeLanes(made);
+            for (io.lanes) |*l| {
+                l.* = .{ .cbs = try gpa.alloc(Iocb, io.depth), .ptrs = undefined, .free = undefined };
+                l.ptrs = gpa.alloc(*Iocb, io.depth) catch |e| {
+                    gpa.free(l.cbs);
+                    return e;
+                };
+                l.free = gpa.alloc(u32, io.depth) catch |e| {
+                    gpa.free(l.cbs);
+                    gpa.free(l.ptrs);
+                    return e;
+                };
+                made += 1;
+                if (linux.errno(linux.syscall2(.io_setup, io.depth, @intFromPtr(&l.ctx))) != .SUCCESS) l.ctx = 0;
+            }
+            io.aio = true;
+            for (io.lanes) |l| io.aio = io.aio and l.ctx != 0;
         }
         return io;
     }
 
+    fn freeLanes(io: *Io, n: usize) void {
+        for (io.lanes[0..n]) |l| {
+            if (l.ctx != 0) _ = linux.syscall1(.io_destroy, l.ctx);
+            io.gpa.free(l.cbs);
+            io.gpa.free(l.ptrs);
+            io.gpa.free(l.free);
+        }
+        io.gpa.free(io.lanes);
+    }
+
     pub fn close(io: *Io) void {
         io.finish() catch {};
-        if (builtin.os.tag == .linux) {
-            if (io.aio) _ = linux.syscall1(.io_destroy, io.ctx);
-            io.gpa.free(io.cbs);
-            io.gpa.free(io.ptrs);
-        }
+        if (builtin.os.tag == .linux) io.freeLanes(io.lanes.len);
         io.queue.deinit(io.gpa);
         _ = std.c.close(io.fd);
     }
 
     pub fn add(io: *Io, op: Op, buf: []u8, off: u64) Error!void {
         try io.queue.append(io.gpa, .{ .op = op, .buf = buf, .off = off });
-        if (io.queue.items.len >= io.depth * 16) try io.finish();
+        if (io.queue.items.len >= io.depth * 64) try io.finish();
     }
 
     pub fn finish(io: *Io) Error!void {
         defer io.queue.clearRetainingCapacity();
-        if (io.queue.items.len == 0) return;
-        if (builtin.os.tag == .linux and io.aio) return io.finishAio();
-        for (io.queue.items) |q| {
+        const items = io.queue.items;
+        if (items.len == 0) return;
+        if (builtin.os.tag == .linux and io.aio) {
+            // contiguous shares, one a lane; the caller runs the first
+            const n = std.math.clamp(items.len / lane_min, 1, io.lanes.len);
+            var threads: [16]?std.Thread = @splat(null);
+            for (1..@min(n, threads.len)) |i| {
+                threads[i] = std.Thread.spawn(.{}, runLane, .{ io, &io.lanes[i], items[i * items.len / n .. (i + 1) * items.len / n] }) catch null;
+                if (threads[i] == null) runLane(io, &io.lanes[i], items[i * items.len / n .. (i + 1) * items.len / n]);
+            }
+            runLane(io, &io.lanes[0], items[0 .. items.len / n]);
+            var bad = false;
+            for (0..n) |i| {
+                if (threads[i]) |t| t.join();
+                bad = bad or io.lanes[i].bad;
+            }
+            if (bad) return error.ReadFailed;
+            return;
+        }
+        for (items) |q| {
             var done: usize = 0;
             while (done < q.buf.len) {
                 const n = switch (q.op) {
@@ -633,21 +704,21 @@ pub const Io = struct {
         }
     }
 
-    /// Every queued transfer through the AIO context, at most `depth` in flight, polled to completion.
-    fn finishAio(io: *Io) Error!void {
-        const items = io.queue.items;
+    /// `items` through one lane's AIO context, at most `depth` in flight, to completion; a short or failed
+    /// transfer marks the lane bad.
+    fn runLane(io: *const Io, l: *Lane, items: []const Req) void {
+        l.bad = false;
+        var nfree: usize = io.depth;
+        for (l.free, 0..) |*f, i| f.* = @intCast(i);
         var next: usize = 0;
         var inflight: usize = 0;
-        var free: std.ArrayList(u32) = .empty;
-        defer free.deinit(io.gpa);
-        for (0..io.depth) |i| try free.append(io.gpa, @intCast(io.depth - 1 - i));
-        var bad = false;
         while (next < items.len or inflight > 0) {
             var n: usize = 0;
-            while (next < items.len and free.items.len > 0) : (next += 1) {
+            while (next < items.len and nfree > 0) : (next += 1) {
                 const q = items[next];
-                const c = free.pop().?;
-                io.cbs[c] = .{
+                nfree -= 1;
+                const c = l.free[nfree];
+                l.cbs[c] = .{
                     .data = (@as(u64, c) << 32) | q.buf.len,
                     .lio_opcode = if (q.op == .read) 0 else 1,
                     .fildes = @intCast(io.fd),
@@ -655,31 +726,42 @@ pub const Io = struct {
                     .nbytes = q.buf.len,
                     .offset = @intCast(q.off),
                 };
-                io.ptrs[n] = &io.cbs[c];
+                l.ptrs[n] = &l.cbs[c];
                 n += 1;
             }
             var sent: usize = 0;
             while (sent < n) {
-                const r: isize = @bitCast(linux.syscall3(.io_submit, io.ctx, n - sent, @intFromPtr(io.ptrs[sent..].ptr)));
+                const r: isize = @bitCast(linux.syscall3(.io_submit, l.ctx, n - sent, @intFromPtr(l.ptrs[sent..].ptr)));
                 if (r == -@as(isize, @intFromEnum(linux.E.AGAIN)) or r == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
-                if (r <= 0) return error.ReadFailed;
+                if (r <= 0) {
+                    // never submitted: count them done, the lane failed
+                    l.bad = true;
+                    for (l.ptrs[sent..n]) |cb| {
+                        l.free[nfree] = @intCast(cb.data >> 32);
+                        nfree += 1;
+                    }
+                    n = sent;
+                    next = items.len;
+                    break;
+                }
                 sent += @intCast(r);
             }
             inflight += n;
             if (inflight == 0) break;
             var ev: [256]IoEvent = undefined;
-            const got: isize = @bitCast(linux.syscall5(.io_getevents, io.ctx, 1, ev.len, @intFromPtr(&ev), 0));
+            const got: isize = @bitCast(linux.syscall5(.io_getevents, l.ctx, 1, ev.len, @intFromPtr(&ev), 0));
             if (got < 0) {
                 if (got == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
-                return error.ReadFailed;
+                l.bad = true;
+                return;
             }
             for (ev[0..@intCast(got)]) |e| {
-                if (e.res != @as(i64, @intCast(e.data & 0xFFFF_FFFF))) bad = true;
-                try free.append(io.gpa, @intCast(e.data >> 32));
+                if (e.res != @as(i64, @intCast(e.data & 0xFFFF_FFFF))) l.bad = true;
+                l.free[nfree] = @intCast(e.data >> 32);
+                nfree += 1;
                 inflight -= 1;
             }
         }
-        if (bad) return error.ReadFailed;
     }
 };
 
@@ -798,7 +880,7 @@ test "a selection reads the bytes last written, through windows, drafts, commits
     const f = try Fixture.init(o, 32, 1);
     defer f.deinit();
     const t = &f.tier;
-    for (0..o.streams) |s| try t.open(s);
+    for (0..o.streams) |s| try t.open(s, o.layers);
     var committed: [2]usize = .{ 0, 0 };
     var steps: usize = 0;
     while (steps < 400) : (steps += 1) {
@@ -834,7 +916,7 @@ test "prefetchRange brings a layer's whole context back" {
     const f = try Fixture.init(o, 24, 2);
     defer f.deinit();
     const t = &f.tier;
-    for (0..2) |s| try t.open(s);
+    for (0..2) |s| try t.open(s, 1);
     // both streams to 30,720 positions: 15 segments each, 30 runs of rows in a 24-run slab
     for (0..2) |s| {
         var pos: usize = 0;
@@ -862,7 +944,7 @@ test "a fetch that cannot hold its own pools fails instead of evicting them" {
     const f = try Fixture.init(o, 5, 3);
     defer f.deinit();
     const t = &f.tier;
-    try t.open(0);
+    try t.open(0, 1);
     var pos: usize = 0;
     while (pos < 8 * seg_positions) : (pos += seg_positions) {
         try f.write(rnd, 0, pos, seg_positions);
@@ -881,7 +963,7 @@ test "writeRuns splits a window at a segment's end and keeps the home block whol
     const f = try Fixture.init(o, 8, 4);
     defer f.deinit();
     const t = &f.tier;
-    try t.open(0);
+    try t.open(0, 1);
     try f.write(prng.random(), 0, 2040, 2048); // inside the home block: one piece
     try testing.expect((try t.writeRuns(0, 0, 2040, 2048))[1] == null);
     try f.write(prng.random(), 0, home_positions + seg_positions - 5, 16); // across segments 4 and 5
@@ -889,4 +971,74 @@ test "writeRuns splits a window at a segment's end and keeps the home block whol
     try testing.expectEqual(@as(usize, 5), p[0].?.rows);
     try testing.expectEqual(@as(usize, 11), p[1].?.rows);
     try testing.expectEqual(t.denseBase(0, 0), (try t.writeRuns(0, 0, 0, 1))[0].?.base);
+}
+
+test "bench (TF_TIER_BENCH=positions): a 1M-position stream-layer's prompt and decode selections" {
+    const arg = std.c.getenv("TF_TIER_BENCH") orelse return error.SkipZigTest;
+    const N = try std.fmt.parseInt(usize, std.mem.span(arg), 10);
+    const gpa = std.heap.page_allocator;
+    const env = struct {
+        fn get(name: [*:0]const u8, default: usize) usize {
+            const e = std.c.getenv(name) orelse return default;
+            return std.fmt.parseInt(usize, std.mem.span(e), 10) catch default;
+        }
+    }.get;
+    const o: Options = .{ .streams = 1, .layers = 1, .capacity = N, .recent_runs = 32, .depth = env("TF_TIER_DEPTH", 64), .lanes = env("TF_TIER_LANES", 4) };
+    const runs = home_runs + o.recent_runs + 2 + (N / seg_positions) / 2;
+    const slab = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * block);
+    defer gpa.free(slab);
+    const map = try gpa.alloc(i32, N / pool_rows);
+    defer gpa.free(map);
+    var buf: [256]u8 = undefined;
+    const dir = if (std.c.getenv("TF_TIER_TEST_DIR")) |e| std.mem.span(e) else "/tmp";
+    const name = try std.fmt.bufPrint(&buf, "{s}/kv_tier_bench_{d}.bin\x00", .{ dir, std.c.getpid() });
+    const path = name[0 .. name.len - 1 :0];
+    defer _ = std.c.unlink(path.ptr);
+    var t = try Tier.init(gpa, slab, map, path, o);
+    defer t.deinit();
+    try t.open(0, 1);
+    var prng = std.Random.DefaultPrng.init(9);
+    const rnd = prng.random();
+    var ts: std.c.timespec = undefined;
+    const clock = struct {
+        fn ns(x: *std.c.timespec) i128 {
+            _ = std.c.clock_gettime(.MONOTONIC, x);
+            return @as(i128, x.sec) * 1_000_000_000 + x.nsec;
+        }
+    }.ns;
+    var pos: usize = 0;
+    const t0 = clock(&ts);
+    while (pos + 2 * seg_positions <= N) : (pos += seg_positions) {
+        try t.beginWindow(0, pos, seg_positions);
+        try t.commit(0, pos + seg_positions);
+    }
+    const fill_ms = @as(f64, @floatFromInt(clock(&ts) - t0)) / 1e6;
+    const W = 2051;
+    var tokens: [4 * W]i32 = undefined;
+    var counts: [4]i32 = undefined;
+    var fetch_ns: i128 = 0;
+    var hit_ns: i128 = 0;
+    const reads0 = t.reads;
+    const windows = 200;
+    for (0..windows) |_| {
+        try t.beginWindow(0, pos, 4);
+        for (0..4) |r| {
+            for (0..512) |i| {
+                const full = (pos + r + 1) / 4;
+                const p = if (rnd.uintLessThan(u8, 3) == 0) full - 1 - rnd.uintLessThan(usize, 4096) else rnd.uintLessThan(usize, full);
+                for (0..4) |j| tokens[r * W + i * 4 + j] = @intCast(p * 4 + j);
+            }
+            counts[r] = 2048;
+        }
+        const a = clock(&ts);
+        try t.fetch(0, 0, &tokens, &counts, W);
+        fetch_ns += clock(&ts) - a;
+        // the same selection again: resident, the bookkeeping alone
+        const b = clock(&ts);
+        try t.fetch(0, 0, &tokens, &counts, W);
+        hit_ns += clock(&ts) - b;
+        pos += 2;
+        try t.commit(0, pos);
+    }
+    std.debug.print("\nkv_tier bench: {d} positions, slab {d} of {d} runs; prompt bookkeeping and writes {d:.0} ms ({d:.2} ms a 2,048-row chunk); decode fetch of 4 rows x 512 pools: {d:.3} ms a window ({d:.3} ms when resident), {d:.0} pools read a window (aio {}, direct {}, {d} lanes of {d})\n", .{ N, runs, N / seg_positions, fill_ms, fill_ms / @as(f64, @floatFromInt(N / seg_positions)), @as(f64, @floatFromInt(fetch_ns)) / 1e6 / windows, @as(f64, @floatFromInt(hit_ns)) / 1e6 / windows, @as(f64, @floatFromInt(t.reads - reads0)) / windows, t.io.aio, t.io.direct, o.lanes, o.depth });
 }

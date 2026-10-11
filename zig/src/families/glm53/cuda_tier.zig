@@ -80,8 +80,9 @@ pub const Tier = struct {
         gpa.destroy(t);
     }
 
-    pub fn open(t: *Tier, s: usize) !void {
-        try t.host.open(s);
+    /// kv_tier.Tier.open: stream `s` with `layers` layers (the backbone's DSA layers, or 1 for the MTP head).
+    pub fn open(t: *Tier, s: usize, layers: usize) !void {
+        try t.host.open(s, layers);
     }
 
     pub fn close(t: *Tier, s: usize) void {
