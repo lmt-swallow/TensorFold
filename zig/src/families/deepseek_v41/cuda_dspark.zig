@@ -324,7 +324,8 @@ pub const Drafter = struct {
     comm: ?*const cuda.comm.Comm,
     /// Rows a draft pass holds: dims.streams blocks (every per-row buffer's rows).
     rows: usize,
-    /// When set, every gather goes here instead of `comm` (a test's supply of the other ranks' partials).
+    /// When set, every gather goes here instead of `comm` (the engine's RDMA ring routing, or a test's supply of the
+    /// other ranks' partials).
     gather_hook: ?GatherHook = null,
     /// The prompt GEMM for absorbs past 128 rows (`enableWide`); null: 128-row pieces of the row kernel.
     wide: ?*Wide = null,

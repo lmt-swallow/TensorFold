@@ -53,6 +53,7 @@ pub const kept_prompts = @import("cuda_keep.zig");
 const RankCache = @import("rank_cache.zig").RankCache;
 const mem_note = @import("mem_note.zig");
 const draft_stats = @import("draft_stats.zig");
+const rdma = @import("rdma.zig");
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -1975,6 +1976,10 @@ pub const Engine = struct {
     /// The prompt path's communicator when passes run beside the rounds (`Settings.overlap`): its gathers order
     /// among themselves on the prompt's stream, the rounds' and drafts' on `comm` on `stream`.
     comm2: ?cuda.comm.Comm = null,
+    /// TF_DS_RDMA's ring: the rounds' and drafts' gathers that fit its slot go over it instead of `comm` (`gather`),
+    /// the same bytes; null: every gather on NCCL.
+    ring: ?*rdma.Ring = null,
+    rdma_mod: ?cuda.Module = null,
     stream: cuda.Stream,
     agree_send: cuda.DeviceBuffer,
     agree_recv: cuda.DeviceBuffer,
@@ -2104,6 +2109,8 @@ pub const Engine = struct {
         e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
         errdefer e.comm.deinit();
         e.comm2 = null;
+        e.ring = null;
+        e.rdma_mod = null;
         errdefer if (e.comm2) |*c| c.deinit();
         if (s.overlap) {
             const before_comm = (try ctx.memInfo()).free;
@@ -2124,6 +2131,13 @@ pub const Engine = struct {
         if (!e.comm.busyPoll(e.link.busy_poll_us)) std.log.warn("deepseek_v41 rank {d}: SO_BUSY_POLL refused on the control link", .{s.rank});
         std.log.info("deepseek_v41 rank {d}: control link busy poll {d} us, follower spin {d} us{s}", .{ s.rank, e.link.busy_poll_us, e.link.spin_ns / 1000, if (e.link.profile) ", profiled (TF_DS_LINK_PROFILE)" else "" });
         clock.mark("the ranks' rendezvous", .{});
+        // the ring before the graphs: they record its kernels in place of the NCCL gathers it takes
+        errdefer e.closeRing();
+        if (getenv("TF_DS_RDMA")) |list| {
+            try e.openRing(list);
+            if (e.drafter) |dr| dr.gather_hook = .{ .ctx = e, .call = gatherFn };
+            clock.mark("the RDMA ring", .{});
+        }
         {
             // every rank records the same graphs in the same order here (the gathers are recorded, not issued)
             const t0 = nowNs();
@@ -2166,6 +2180,7 @@ pub const Engine = struct {
         e.kernels.deinit();
         e.glue.deinit();
         e.set.deinit();
+        e.closeRing();
         if (e.comm2) |*c| c.deinit();
         e.comm.deinit();
         e.gpa.destroy(e);
@@ -2189,9 +2204,38 @@ pub const Engine = struct {
         return .{ .ctx = self, .call = gatherFn };
     }
 
+    /// out [world, words] <- every rank's `partial` [words] f32, rank after rank: the ring when there is one and the
+    /// slice is whole float4s that fit its slot, else NCCL on `comm`. Either way the bytes are the partials'.
     fn gatherFn(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
         const e: *Engine = @ptrCast(@alignCast(ctx));
+        if (e.ring) |r| if (words % 4 == 0 and words * 4 <= r.s.max_bytes) return r.gather(stream, partial, @intCast(words / 4), out);
         try e.comm.allGather(partial, out, words, .f32, stream.handle);
+    }
+
+    /// The ring's slot: the fork's served 4.25 MiB (a 16-row round's logits half fits; wider gathers take NCCL).
+    const ring_bytes: usize = 4456448;
+
+    /// TF_DS_RDMA's devices (comma separated, the same on every rank) carry the ring; TF_DS_RDMA_GID (default 3, the
+    /// pair's RoCE v2 IPv4 GID) names each device's GID.
+    fn openRing(e: *Engine, list: []const u8) !void {
+        const s = e.settings;
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var names: [rdma.max_devices][]const u8 = undefined;
+        const devices = rdma.deviceList(list, &names) catch {
+            std.log.err("TF_DS_RDMA is {s}: it takes 1 to {d} RDMA device names, comma separated", .{ list, rdma.max_devices });
+            return error.BadEnvironment;
+        };
+        const gid: u8 = if (getenv("TF_DS_RDMA_GID")) |g| std.fmt.parseInt(u8, g, 10) catch return error.BadEnvironment else 3;
+        e.rdma_mod = try cuda.Module.load(e.d, cuda.kernels.dsv41_rdma);
+        e.ring = try rdma.openOver(e.gpa, e.d, try rdma.Kernels.load(e.rdma_mod.?), devices, &e.comm, e.stream, .{ .max_bytes = ring_bytes, .gid_index = gid });
+        std.log.info("deepseek_v41 rank {d}: the rounds' gathers over the RDMA ring (TF_DS_RDMA={s}, GID {d}): {d} slots of {d:.2} MiB, larger gathers on NCCL", .{ s.rank, list, gid, e.ring.?.s.slots, @as(f64, @floatFromInt(ring_bytes)) / (1 << 20) });
+    }
+
+    fn closeRing(e: *Engine) void {
+        if (e.ring) |r| r.destroy(e.gpa);
+        e.ring = null;
+        if (e.rdma_mod) |*m| m.unload();
+        e.rdma_mod = null;
     }
 
     /// The prompt path's gathers: on `comm2` when passes run beside the rounds, else `gather`'s.

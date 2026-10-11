@@ -22,6 +22,7 @@ const dsv41_parallel_tests = @import("dsv41_parallel_tests.zig");
 const dsv41_topk_tests = @import("dsv41_topk_tests.zig");
 const dsv41_rope_tests = @import("dsv41_rope_tests.zig");
 const dsv41_prompt_time = @import("dsv41_prompt_time.zig");
+const dsv41_rdma_tests = @import("dsv41_rdma_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -37,6 +38,7 @@ const usage =
     \\  nccl                      one-rank NCCL all-reduce and all-gather
     \\  comm <rank> <world> <master-ip> <port>  two-machine NCCL communicator: id exchange, all-gather, control link
     \\  comm-overlap <rank> <world> <master-ip> <port>  a round-sized all-gather's latency beside another communicator's gathers
+    \\  dsv41-rdma <rank> <world> <master-ip> <port> <devices> [gid]  DSV4.1 rounds' RDMA ring: its gathers' bytes against NCCL's (eager and graphs) and both paths' times
     \\  dsv41-attn <dir>          DSV4.1 attention sublayer (decode rows) against the fork's fixture (dsv41/dump_attention.py)
     \\  dsv41-forward <dir> <rank-cache-dir> <model-dir> [rank] [layers|all] [aot-dir]  DSV4.1 layer loop against the fork's fixture (dsv41/dump_forward.py)
     \\  dsv41-prompt <dir> <rank-cache-dir> <model-dir> [rank] [layers]  DSV4.1 prompt path (chunks of 2048 and 512) against the fork's fixture (dsv41/dump_prompt.py)
@@ -119,6 +121,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "dsv41-prompt-time")) return dsv41_prompt_time.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), try std.fmt.parseInt(usize, try arg(rest, 4), 10), try std.fmt.parseInt(usize, try arg(rest, 5), 10), if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else 1);
     if (std.mem.eql(u8, cmd, "dsv41-gemm-rows")) return dsv41_prompt_time.gemmRows(gpu);
     if (std.mem.eql(u8, cmd, "dsv41-lanes-parallel")) return dsv41_parallel_tests.parallel(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);
+    if (std.mem.eql(u8, cmd, "dsv41-rdma")) return dsv41_rdma_tests.rdmaRing(gpu, try std.fmt.parseInt(u32, try arg(rest, 0), 10), try std.fmt.parseInt(u32, try arg(rest, 1), 10), try arg(rest, 2), try std.fmt.parseInt(u16, try arg(rest, 3), 10), try arg(rest, 4), if (rest.len > 5) try std.fmt.parseInt(u8, rest[5], 10) else 3);
     if (std.mem.eql(u8, cmd, "comm-overlap")) return libs_tests.commOverlap(gpu, try std.fmt.parseInt(u32, try arg(rest, 0), 10), try std.fmt.parseInt(u32, try arg(rest, 1), 10), try arg(rest, 2), try std.fmt.parseInt(u16, try arg(rest, 3), 10));
     if (std.mem.eql(u8, cmd, "comm")) return libs_tests.comm(gpu, try std.fmt.parseInt(u32, try arg(rest, 0), 10), try std.fmt.parseInt(u32, try arg(rest, 1), 10), try arg(rest, 2), try std.fmt.parseInt(u16, try arg(rest, 3), 10));
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
