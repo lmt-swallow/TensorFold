@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Four short code prompts at once against a running native server (greedy, 768 tokens each): each reply's tokens,
-decode tok/s and token_sha, and the aggregate. Run where the server listens (the smoke's node), e.g.
+"""Four short code prompts at once against a running native server (greedy, 768 tokens each; a second argument
+sends only that prompt): each reply's tokens, decode tok/s and token_sha, and the aggregate. Run where the server listens (the smoke's node), e.g.
   ssh spark-616b python3 - < tools/zig/qwen38fn/code4.py
 With the server started under TF_QFN_ROUND_STATS=1 (serve_native.sh ENGINE_ENV), its log then says where the
 rounds' time went (round_stats.zig)."""
@@ -36,8 +36,9 @@ def ask(prompt: str, max_tokens: int, out: dict) -> None:
 
 def main() -> int:
     max_tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 768
-    outs = [{} for _ in PROMPTS]
-    ts = [threading.Thread(target=ask, args=(p, max_tokens, o)) for p, o in zip(PROMPTS, outs)]
+    prompts = [PROMPTS[int(sys.argv[2])]] if len(sys.argv) > 2 else list(PROMPTS)  # one prompt alone
+    outs = [{} for _ in prompts]
+    ts = [threading.Thread(target=ask, args=(p, max_tokens, o)) for p, o in zip(prompts, outs)]
     t0 = time.time()
     for t in ts:
         t.start()
