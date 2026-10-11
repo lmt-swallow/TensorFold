@@ -1003,6 +1003,18 @@ pub const RoundRunner = struct {
         return self;
     }
 
+    /// The side streams (the mHC half, the L2 prefetches) at the context's greatest priority, as the stream the
+    /// caller issues rounds on: a round's every block then starts before default-priority work waiting for the GPU.
+    /// Before any graph is recorded (a recorded graph keeps the streams it forked to). Changes no result.
+    pub fn urgentSides(self: *RoundRunner) !void {
+        const side = try cuda.Stream.initUrgent(self.d, true);
+        self.side.deinit();
+        self.side = side;
+        const l2 = try cuda.Stream.initUrgent(self.d, true);
+        self.l2.side.deinit();
+        self.l2.side = l2;
+    }
+
     pub fn deinit(self: *RoundRunner) void {
         for (self.idx_proj_h) |*b| if (b.len > 0) b.free();
         self.gpa.free(self.idx_proj_h);

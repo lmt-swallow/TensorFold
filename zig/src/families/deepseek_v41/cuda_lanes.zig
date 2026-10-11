@@ -713,10 +713,20 @@ pub const Round = struct {
     windows: [max_slots]RoundWindow,
     count: usize,
     ids: [round_rows_most]i64,
+    /// A prompt part issued right after the round's work (`Engine.run`), its fill record appended.
+    fill: ?Fill = null,
 
     const per: usize = 26;
-    /// The bytes a record takes at most: `max_slots` windows of `round_rows_most` rows in all.
-    pub const max_bytes: usize = 2 + max_slots * per + 8 * round_rows_most;
+    /// The bytes a record takes at most: `max_slots` windows of `round_rows_most` rows in all, and a fill.
+    pub const max_bytes: usize = 2 + max_slots * per + 8 * round_rows_most + Fill.bytes;
+
+    /// `encode` with `fill`'s record appended (none when null).
+    pub fn encodeWith(buf: []u8, windows: []const RoundWindow, fill: ?Fill) []const u8 {
+        const head = encode(buf, windows);
+        const f = fill orelse return head;
+        const tail = Fill.encode(buf[head.len..], f);
+        return buf[0 .. head.len + tail.len];
+    }
 
     pub fn encode(buf: []u8, windows: []const RoundWindow) []const u8 {
         buf[0] = @intFromEnum(Op.rounds);
@@ -749,7 +759,9 @@ pub const Round = struct {
             if (r < 1) return error.BadRecord;
             rows += r;
         }
-        if (rows > round_rows_most or op.len != 2 + per * count + 8 * rows) return error.BadRecord;
+        const len = 2 + per * count + 8 * rows;
+        if (rows > round_rows_most or (op.len != len and op.len != len + Fill.bytes)) return error.BadRecord;
+        out.fill = if (op.len > len) try Fill.parse(op[len..]) else null;
         out.count = count;
         var at: usize = 2 + per * count;
         var r0: usize = 0;
@@ -907,6 +919,8 @@ pub const Pass = struct {
     check: bool,
     marks: ?kept_prompts.Points,
     t0: i128,
+    /// The next piece of the chunk at `at` (`Streams.pieces`; 0: the chunk's first).
+    piece: usize = 0,
 };
 
 pub const Lane = struct {
@@ -989,16 +1003,39 @@ pub const Streams = struct {
     prompt_logits: Ptr = 0,
     /// Prompt passes beside the rounds (`enableOverlap`); null: they run on `stream`, in order with the rounds.
     side: ?*Side = null,
+    /// TF_DS_OVERLAP_GRAPHS=1: rounds beside a pass replay their graphs (else they run eager, `round`).
+    graphs_beside: bool = false,
+    /// TF_DS_PROMPT_PIECES: beside the rounds, a part issues this many pieces of a chunk's layers
+    /// (`Prompt.piece`) instead of whole chunks; 1: whole chunks.
+    pieces: usize = 1,
+    /// TF_DS_FILL_AHEAD=1: beside the rounds, the next part may be issued once the one before the last has run
+    /// (`partDone`), so one part waits queued behind the running one.
+    ahead: bool = false,
 
     /// What a prompt pass beside the rounds owns: its stream (its chunks, absorbs and snapshots), the event after its
     /// last part issued, the event of the rounds' stream each part waits for, the target's layers with split-K
-    /// counters of their own, and the drafter's absorber (`Drafter.absorber`).
+    /// counters of their own, and the drafter's absorber (`Drafter.absorber`). With `narrow`, a part issued while
+    /// other streams decode runs on it (a partition of the SMs, `enableOverlap`), any other part on `stream`;
+    /// `current` is the one the last part went to, and each part waits for the one before.
     pub const Side = struct {
         stream: cuda.Stream,
+        narrow: ?cuda.Stream = null,
+        current: cuda.Stream,
         issued: cuda.Event,
+        /// Recorded as each part starts: once it has fired the part before the last has run (`partDone` with
+        /// `ahead`).
+        before: cuda.Event,
+        /// `x.rounds` already holds the point the next part waits for (`markBeforeRound`).
+        marked: bool = false,
         rounds: cuda.Event,
         w: weights.Weights,
         absorber: ?*dspark.Drafter,
+
+        /// Waits for every part issued (best effort: a failed wait is a broken device, reported by the next step).
+        fn sync(x: *const Side) void {
+            x.stream.synchronize() catch {};
+            if (x.narrow) |n| n.synchronize() catch {};
+        }
     };
 
     /// `base`: the decode loop whose weights, kernels, scratch and RoPE tables the view and the round share (its
@@ -1074,12 +1111,14 @@ pub const Streams = struct {
     pub fn deinit(self: *Streams) void {
         const gpa = self.gpa;
         if (self.side) |x| {
-            x.stream.synchronize() catch {};
+            x.sync();
             if (x.absorber) |a| a.deinitAbsorber();
             weights.freeCounters(gpa, &x.w);
             x.issued.deinit();
+            x.before.deinit();
             x.rounds.deinit();
             x.stream.deinit();
+            if (x.narrow) |*n| n.deinit();
             gpa.destroy(x);
         }
         for (self.book.slice()) |k| gpa.free(k.ids);
@@ -1115,16 +1154,24 @@ pub const Streams = struct {
     /// writes is then the prompt path's or its slot's, none a round's or a draft's: a part's bits do not depend on
     /// what runs beside it. Each part waits for the work the rounds' stream holds when it is issued; `joinPass`
     /// makes the rounds' stream wait for the pass. While a pass is under way rounds run eager (`round`): a replayed
-    /// graph's branches would wait behind the part's queued kernels. Every rank calls it with the same arguments.
-    pub fn enableOverlap(self: *Streams, engram_threads: usize) !void {
+    /// graph's branches would wait behind the part's queued kernels (TF_DS_OVERLAP_GRAPHS=1: they replay anyway).
+    /// `narrow`: the stream (owned from here on) of an SM partition that parts issued while other streams decode
+    /// run on, so the rounds keep the other SMs to themselves; null: every part on a stream of every SM. Every rank
+    /// calls it with the same arguments.
+    pub fn enableOverlap(self: *Streams, engram_threads: usize, narrow: ?cuda.Stream) !void {
         if (self.side != null) return;
         const gpa = self.gpa;
         const x = try gpa.create(Side);
         errdefer gpa.destroy(x);
+        x.* = .{ .stream = undefined, .narrow = narrow, .current = undefined, .issued = undefined, .before = undefined, .rounds = undefined, .w = undefined, .absorber = null };
+        errdefer if (x.narrow) |*n| n.deinit();
         x.stream = try cuda.Stream.init(self.d, true);
         errdefer x.stream.deinit();
+        x.current = x.stream;
         x.issued = try cuda.Event.init(self.d, false);
         errdefer x.issued.deinit();
+        x.before = try cuda.Event.init(self.d, false);
+        errdefer x.before.deinit();
         x.rounds = try cuda.Event.init(self.d, false);
         errdefer x.rounds.deinit();
         x.w = try weights.withOwnCounters(gpa, self.base.w);
@@ -1139,9 +1186,15 @@ pub const Streams = struct {
         self.side = x;
     }
 
-    /// The stream a prompt pass's chunks run on.
+    /// The stream a prompt pass's chunks run on (beside the rounds: the one its last part went to).
     fn pstream(self: *const Streams) cuda.Stream {
-        return if (self.side) |x| x.stream else self.stream;
+        return if (self.side) |x| x.current else self.stream;
+    }
+
+    /// Whether some stream decodes: busy, its prompt pass done. Every rank sees the same.
+    fn decoding(self: *const Streams) bool {
+        for (self.lanes) |l| if (l.busy and l.pass == null) return true;
+        return false;
     }
 
     fn tapCols(self: *const Streams) usize {
@@ -1353,14 +1406,23 @@ pub const Streams = struct {
         self.point(slot, lane.base, lane.size);
         if (self.engram) |g| g.history = lane.hist[0..ids.len];
         if (self.side) |x| {
-            // the part after what the rounds' stream holds now (an admission's copies, the rounds before it)
-            try x.rounds.record(self.stream);
-            try x.stream.wait(x.rounds);
+            // the part after what the rounds' stream holds now (an admission's copies, the rounds before it) and
+            // after the part before it, on the narrow stream while other streams decode
+            const next = if (x.narrow) |n| (if (self.decoding()) n else x.stream) else x.stream;
+            if (next.handle != x.current.handle) try next.wait(x.issued);
+            x.current = next;
+            if (!x.marked) try x.rounds.record(self.stream);
+            x.marked = false;
+            try x.current.wait(x.rounds);
+            try x.before.record(x.current);
         }
-        p.at = try self.fillChunks(gather, slot, ids, p.at, chunks, p.chunk, p.replay, if (p.marks) |*m| m else null);
+        if (self.side != null and self.pieces > 1)
+            try self.fillPiece(gather, slot, ids, &p)
+        else
+            p.at = try self.fillChunks(gather, slot, ids, p.at, chunks, p.chunk, p.replay, if (p.marks) |*m| m else null);
         lane.pass = p;
         if (self.side) |x| {
-            try x.issued.record(x.stream);
+            try x.issued.record(x.current);
             return false; // `joinPass` ends it
         }
         if (p.at < ids.len) return false;
@@ -1382,10 +1444,19 @@ pub const Streams = struct {
         return false;
     }
 
-    /// Whether the last part issued beside the rounds has run (true without a pass beside them).
+    /// Whether the last part issued beside the rounds has run (with `ahead`: the one before it; true without a
+    /// pass beside them).
     pub fn partDone(self: *const Streams) !bool {
         const x = self.side orelse return true;
-        return x.issued.done();
+        return if (self.ahead) x.before.done() else x.issued.done();
+    }
+
+    /// Beside the rounds: the next part waits for the rounds' stream as it stands now, not for the round issued
+    /// next (`Engine.run` issues a part right after a round; the part reads and writes none of the round's buffers).
+    pub fn markBeforeRound(self: *Streams) !void {
+        const x = self.side orelse return;
+        try x.rounds.record(self.stream);
+        x.marked = true;
     }
 
     /// The end of a pass beside the rounds whose every chunk was issued: the rounds' stream waits for its last part,
@@ -1474,6 +1545,44 @@ pub const Streams = struct {
         lane.absorbed = if (dc) |c| c.absorbed else 0;
         if (s == ids.len) lane.pos = ids.len;
         return s;
+    }
+
+    /// One piece of the chunk at `p.at` (`Prompt.piece`, `pieces` of them; a chunk the prompt path cannot split
+    /// runs whole): the next chunk's Engram rows read ahead with the first, the chunk's tail work (absorb, logits,
+    /// snapshot) after the last. The pieces of every chunk in order issue exactly `fillChunks`' work.
+    fn fillPiece(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, p: *Pass) !void {
+        const lane = &self.lanes[slot];
+        const s = p.at;
+        const e = @min(ids.len, s + p.chunk);
+        const last = e == ids.len;
+        const from_row = replayFrom(p.replay, ids.len, self.cfg.window);
+        const o: prompt.Options = .{
+            .replay = from_row,
+            .logits = last or e - s <= max_rows,
+            .taps = if (self.spark != null) .{ .buf = self.taps.ptr, .stride = self.tapCols() } else null,
+        };
+        const tapped = self.spark != null and e - s <= max_rows and (from_row orelse 0) <= s;
+        const n = if (tapped) 1 else self.pr.piecesFor(e - s, o, self.pieces);
+        if (n <= 1) {
+            p.at = try self.fillChunks(gather, slot, ids, s, 1, p.chunk, p.replay, if (p.marks) |*m| m else null);
+            return;
+        }
+        const ps = self.pstream();
+        if (p.piece == 0) if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, @min(ids.len, e + p.chunk) - e);
+        const out = try self.pr.piece(gather, ids[s..e], s, o, ps, p.piece, n);
+        p.piece += 1;
+        if (p.piece < n) return;
+        p.piece = 0;
+        var dc: ?dspark.Cache = if (self.spark != null) self.slotCache(slot) else null;
+        const absorber: ?*dspark.Drafter = if (self.side) |x| x.absorber orelse self.spark else self.spark;
+        if (absorber) |sp| if (self.pr.top_rows > 0) try sp.absorb(&dc.?, self.taps.ptr, self.pr.top_start, self.pr.top_rows, self.draftRope(), ps);
+        if (last) self.prompt_logits = out orelse return error.BadChunk;
+        if (p.marks) |*m| if (e % p.chunk == 0 and m.has(e) and lane.marks.find(e) == null and lane.marks.n < kept_prompts.max_marks) {
+            if (try self.snapshot(slot, ps)) |id| lane.marks.add(.{ .at = e, .snap = id });
+        };
+        lane.absorbed = if (dc) |c| c.absorbed else 0;
+        if (last) lane.pos = ids.len;
+        p.at = e;
     }
 
     /// What the book let go, freed: its snapshots' holds dropped, its kept ids' storage.
@@ -1680,7 +1789,7 @@ pub const Streams = struct {
             o.* = .{ .slot = w.slot, .base = l.base, .size = l.size, .position = l.pos, .ids = w.ids, .host = l.hist[0 .. l.pos + w.ids.len] };
         }
         // beside a prompt pass's chunk, rounds run eager: replayed graphs wait behind the chunk's queued work
-        self.runner.eager_now = self.side != null and self.passUnderWay();
+        self.runner.eager_now = self.side != null and !self.graphs_beside and self.passUnderWay();
         self.logits = try self.runner.forward(ws[0..windows.len], gather, self.stream);
         var r: usize = 0;
         for (windows) |w| {
@@ -1790,7 +1899,7 @@ pub const Streams = struct {
         if (slot >= self.lanes.len or !self.lanes[slot].busy) return;
         const l = &self.lanes[slot];
         // a pass beside the rounds still writing the extent finishes before it is given back
-        if (l.pass != null) if (self.side) |x| x.stream.synchronize() catch {};
+        if (l.pass != null) if (self.side) |x| x.sync();
         self.extents.give(l.base, l.size);
         for (l.marks.slice()) |m| self.snap_refs[m.snap] -|= 1;
         l.marks = .{};
@@ -1805,7 +1914,7 @@ pub const Streams = struct {
     pub fn finish(self: *Streams, slot: usize, drops: []const u32) void {
         if (slot >= self.lanes.len or !self.lanes[slot].busy) return;
         const l = &self.lanes[slot];
-        if (l.pass != null) if (self.side) |x| x.stream.synchronize() catch {};
+        if (l.pass != null) if (self.side) |x| x.sync();
         const owned: ?[]i32 = if (self.book.set.on and l.marks.n > 0) self.gpa.alloc(i32, l.marks.last().?) catch null else null;
         if (owned) |o| {
             self.book.keep(&self.extents, l.base, l.size, l.hist[0..l.prompt_len], &l.marks, self.keep_replay, o);
@@ -1976,6 +2085,11 @@ pub const Engine = struct {
     /// The prompt path's communicator when passes run beside the rounds (`Settings.overlap`): its gathers order
     /// among themselves on the prompt's stream, the rounds' and drafts' on `comm` on `stream`.
     comm2: ?cuda.comm.Comm = null,
+    /// TF_DS_PROMPT_SMS beside the rounds: the SM partition prompt parts run on while other streams decode.
+    prompt_sms: ?cuda.green.Partition = null,
+    /// TF_DS_FILL_WITH_ROUND=1 beside the rounds: a part asked for while streams decode goes out with the next
+    /// round's record and is issued right after the round's work (`Lanes.pending`).
+    with_round: bool = false,
     /// TF_DS_RDMA's ring: the rounds' and drafts' gathers that fit its slot go over it instead of `comm` (`gather`),
     /// the same bytes; null: every gather on NCCL.
     ring: ?*rdma.Ring = null,
@@ -2109,6 +2223,8 @@ pub const Engine = struct {
         e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
         errdefer e.comm.deinit();
         e.comm2 = null;
+        e.prompt_sms = null;
+        e.with_round = false;
         e.ring = null;
         e.rdma_mod = null;
         errdefer if (e.comm2) |*c| c.deinit();
@@ -2118,7 +2234,26 @@ pub const Engine = struct {
             // the rounds' Engram reader: TF_DS_ENGRAM_ROUND_THREADS, else as many workers as the prompt's
             const main_threads: usize = if (getenv("TF_DS_ENGRAM_THREADS")) |t| std.fmt.parseInt(usize, t, 10) catch 32 else 32;
             const threads: usize = if (getenv("TF_DS_ENGRAM_ROUND_THREADS")) |t| std.fmt.parseInt(usize, t, 10) catch main_threads else main_threads;
-            try e.streams.enableOverlap(threads);
+            // TF_DS_PROMPT_SMS=N: parts issued while other streams decode run on a partition of at least N SMs
+            const sms: u32 = if (getenv("TF_DS_PROMPT_SMS")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
+            var narrow: ?cuda.Stream = null;
+            if (sms > 0) {
+                e.prompt_sms = cuda.green.Partition.init(ctx.d, ctx.device, sms) catch |err| blk: {
+                    std.log.warn("deepseek_v41 rank {d}: no SM partition of {d} for prompt parts ({s}); they use every SM", .{ s.rank, sms, @errorName(err) });
+                    break :blk null;
+                };
+                if (e.prompt_sms) |*pp| {
+                    narrow = try pp.stream();
+                    std.log.info("deepseek_v41 rank {d}: prompt parts beside decoding streams run on {d} SMs (TF_DS_PROMPT_SMS)", .{ s.rank, pp.sms });
+                }
+            }
+            try e.streams.enableOverlap(threads, narrow);
+            e.streams.graphs_beside = std.mem.eql(u8, getenv("TF_DS_OVERLAP_GRAPHS") orelse "0", "1");
+            e.streams.pieces = if (getenv("TF_DS_PROMPT_PIECES")) |v| @max(1, std.fmt.parseInt(usize, v, 10) catch 1) else 1;
+            e.streams.ahead = if (getenv("TF_DS_FILL_AHEAD")) |v| std.mem.eql(u8, v, "1") else e.streams.pieces > 1;
+            e.with_round = std.mem.eql(u8, getenv("TF_DS_FILL_WITH_ROUND") orelse "0", "1");
+            if (s.rank == 0) std.log.info("deepseek_v41: beside the rounds: graphs {}, pieces {d}, ahead {}, parts with rounds {}, urgent rounds {}", .{ e.streams.graphs_beside, e.streams.pieces, e.streams.ahead, e.with_round, urgent });
+            if (urgent) try e.streams.runner.urgentSides();
             mem_note.note(ctx.d, "prompt passes beside the rounds", .{});
             std.log.info("deepseek_v41 rank {d}: prompt passes beside the rounds (TENSORFOLD_PREFILL_OVERLAP=1): a second communicator, the prompt's stream, counters, absorber and the rounds' Engram buffers, {d:.0} MiB", .{ s.rank, @as(f64, @floatFromInt(@as(i64, @intCast(before_comm)) - @as(i64, @intCast((try ctx.memInfo()).free)))) / (1 << 20) });
         }
@@ -2169,6 +2304,7 @@ pub const Engine = struct {
         e.agree_recv.free();
         e.agree_send.free();
         e.streams.deinit();
+        if (e.prompt_sms) |*pp| pp.deinit();
         e.freeDrafter();
         if (e.engram) |g| g.deinit();
         e.fwd.deinit();
@@ -2338,7 +2474,10 @@ pub const Engine = struct {
             .rounds => {
                 var r: Round = undefined;
                 try Round.parse(op, &r);
+                if (r.fill) |f| if (!e.streams.fills(f.slot, f.at, f.chunks)) return error.PositionMismatch;
+                if (r.fill != null) try e.streams.markBeforeRound();
                 try e.streams.round(e.gather(), r.windows[0..r.count]);
+                if (r.fill) |f| try e.fillStep(f);
             },
             .drafts => {
                 var d: DraftsRec = undefined;
@@ -2358,10 +2497,7 @@ pub const Engine = struct {
                 const f = try Fill.parse(op);
                 if (!e.streams.fills(f.slot, f.at, f.chunks)) return error.PositionMismatch;
                 if (e.fprof) |fp| fp.report(e.settings.rank, f.at, e.engram, .{ e.streams.runner.captures, e.streams.runner.eager });
-                const l = &e.streams.lanes[f.slot];
-                const ids = e.ids_buf[0..l.prompt_len];
-                for (ids, l.hist[0..l.prompt_len]) |*id, h| id.* = h;
-                _ = try e.streams.fillPart(e.promptGather(), f.slot, ids, f.chunks);
+                try e.fillStep(f);
             },
             .join => {
                 const j = try Join.parse(op);
@@ -2374,6 +2510,14 @@ pub const Engine = struct {
             .measure => try e.runMeasure(try Measure.parse(op)),
             else => return error.BadRecord,
         }
+    }
+
+    /// A fill record's part (checked runnable by the caller): the slot's prompt ids from its history, its next part.
+    fn fillStep(e: *Engine, f: Fill) !void {
+        const l = &e.streams.lanes[f.slot];
+        const ids = e.ids_buf[0..l.prompt_len];
+        for (ids, l.hist[0..l.prompt_len]) |*id, h| id.* = h;
+        _ = try e.streams.fillPart(e.promptGather(), f.slot, ids, f.chunks);
     }
 
     /// The measure step (every rank): rounds of 1 .. `streams.rows` rows at position 0 of slot 0 (the least bucket),
@@ -2879,6 +3023,9 @@ pub fn rowsOf(drafting: bool) u32 {
 pub const Lanes = struct {
     gpa: std.mem.Allocator,
     e: *Engine,
+    /// A part asked for while streams decode (`Engine.with_round`): the next round's record carries it; a part
+    /// asked for while one is pending, or a release of its slot, sends or drops it first.
+    pending: ?Fill = null,
     owner: [max_slots]?*const lanes.Stream = @splat(null),
     drawn: [1024]u32 = undefined,
     next: u64 = 0,
@@ -3093,11 +3240,22 @@ pub const Lanes = struct {
         try self.sendKeeps();
         const e = self.e;
         const pass = e.streams.lanes[slot].pass orelse return error.PositionMismatch;
+        if (self.pending) |f| {
+            // no round took it: it goes on its own
+            self.pending = null;
+            try e.both(Fill.encode(e.op_buf, f));
+            return false;
+        }
+        const f: Fill = .{ .slot = slot, .chunks = @max(chunks, 1), .at = pass.at };
+        if (e.with_round and !e.streams.joins(slot) and e.streams.decoding()) {
+            self.pending = f;
+            return false;
+        }
         // beside the rounds, a pass whose every chunk was issued ends with the join step
         if (e.streams.joins(slot)) {
             var buf: [Join.bytes]u8 = undefined;
             try e.both(Join.encode(&buf, .{ .slot = slot, .at = e.streams.lanes[slot].prompt_len }));
-        } else try e.both(Fill.encode(e.op_buf, .{ .slot = slot, .chunks = @max(chunks, 1), .at = pass.at }));
+        } else try e.both(Fill.encode(e.op_buf, f));
         if (e.streams.lanes[slot].pass != null) return false;
         try self.drawFirst();
         return true;
@@ -3105,7 +3263,9 @@ pub const Lanes = struct {
 
     /// Beside the rounds, whether the part last issued has run (`Streams.partDone`, an event query of this rank's).
     fn prefillReadyFn(ptr: *anyopaque, _: *lanes.Stream) bool {
-        return of(ptr).e.streams.partDone() catch true;
+        const self = of(ptr);
+        if (self.pending != null) return false; // the next round issues it
+        return self.e.streams.partDone() catch true;
     }
 
     /// The first token from the prompt's last row (the logits its last chunk left), held for `firstFn`.
@@ -3193,7 +3353,9 @@ pub const Lanes = struct {
         }
         if (self.stats_on) self.round_rows[r] += 1;
         const t0 = nowNs();
-        try e.both(Round.encode(e.op_buf, rws[0..windows.len]));
+        const fill = self.pending;
+        self.pending = null;
+        try e.both(Round.encodeWith(e.op_buf, rws[0..windows.len], fill));
         // every window's rows in one draw (one read back), then each window's share
         var sampled: [round_rows_most]u32 = undefined;
         try st.argmaxRows(0, sampled[0..r]);
@@ -3285,6 +3447,9 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const slot = self.slotOf(s) catch return;
+        if (self.pending) |f| if (f.slot == slot) {
+            self.pending = null;
+        };
         self.owner[slot] = null;
         if (self.stats_on) self.logStats(slot);
         const e = self.e;
@@ -3588,6 +3753,16 @@ test "admission, free, fill, join, round, drafts, keeps and measure records pars
             try std.testing.expectEqualSlices(i64, w.ids, g.ids);
         }
         try std.testing.expectError(error.BadRecord, Round.parse(rop[0 .. rop.len - 1], &rr));
+        try std.testing.expect(rr.fill == null);
+        // a round carrying a fill: the same windows, the fill back; a cut fill is refused
+        var buf2: [Round.max_bytes]u8 = undefined;
+        const rfop = Round.encodeWith(&buf2, windows[0..count], fill);
+        try Round.parse(rfop, &rr);
+        try std.testing.expectEqual(count, rr.count);
+        for (windows[0..count], rr.windows[0..count]) |w, g| try std.testing.expectEqualSlices(i64, w.ids, g.ids);
+        try std.testing.expect(std.meta.eql(fill, rr.fill.?));
+        try std.testing.expectError(error.BadRecord, Round.parse(rfop[0 .. rfop.len - 1], &rr));
+        try std.testing.expectEqualSlices(u8, rop, Round.encodeWith(&buf2, windows[0..count], null));
 
         var asks: [max_slots]DraftAsk = undefined;
         for (asks[0..count]) |*d| d.* = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .start = r.int(u40), .absorb = r.intRangeAtMost(usize, 0, draft_width), .token = r.intRangeAtMost(i64, 0, 129279), .q0 = r.int(u40), .depth = r.intRangeAtMost(usize, 0, draft_width - 1) };

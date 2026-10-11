@@ -509,6 +509,22 @@ pub const Prompt = struct {
     /// these rows (model.py `taps_start`).
     top_start: usize = 0,
     top_rows: usize = 0,
+    /// A chunk issued in pieces (`piece`): the layer loop's state between them.
+    at_piece: Walk = undefined,
+
+    /// The layer loop's state: the residual streams and mixes it reads next, the rows and positions it runs, and
+    /// the next layer.
+    const Walk = struct {
+        h: Ptr,
+        pre: Ptr,
+        pre_f: Ptr,
+        rows: usize,
+        at: usize,
+        floor: usize,
+        kv_done: bool,
+        window_picks: ?attention.Picks,
+        li: usize,
+    };
 
     /// Buffers for chunks of up to `rows` rows (at most max_chunk), sharing `fwd`'s weights and caches.
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, fwd: *Forward, kernels: *const exl3.Kernels, rows: usize) !Prompt {
@@ -747,6 +763,30 @@ pub const Prompt = struct {
         return out;
     }
 
+    /// How many pieces `piece` issues a chunk of `n` rows with options `o` in when asked for `want`: `want` (at
+    /// most the layers) for a chunk through the layer loop without bounded replay, profile or trace; else 1.
+    pub fn piecesFor(self: *const Prompt, n: usize, o: Options, want: usize) usize {
+        if (want <= 1 or o.replay != null or self.profile != null or self.trace != null) return 1;
+        if (n <= decode_rows and o.taps == null and o.logits) return 1;
+        return @min(want, self.fwd.w.layers.len);
+    }
+
+    /// Piece `k` of `pieces` (`piecesFor`) of `chunk(gather, ids, start, o, stream)`: the embedding with the first,
+    /// layers [L * k / pieces, L * (k + 1) / pieces), the head with the last, which returns what `chunk` returns
+    /// (the others null). The pieces in order, on one stream, issue exactly `chunk`'s work in `chunk`'s order;
+    /// between them the caller may issue other work that writes none of this path's buffers.
+    pub fn piece(self: *Prompt, gather: Gather, ids: []const i64, start: usize, o: Options, stream: cuda.Stream, k: usize, pieces: usize) !?Ptr {
+        if (pieces <= 1) return self.chunk(gather, ids, start, o, stream);
+        if (k >= pieces or pieces != self.piecesFor(ids.len, o, pieces)) return error.BadShape;
+        const L = self.fwd.w.layers.len;
+        var engram_ns: i128 = 0;
+        if (k == 0) try self.walkBegin(ids, start, stream);
+        if (self.at_piece.li != L * k / pieces) return error.BadShape;
+        if (!try self.walk(gather, o, stream, &engram_ns, L * (k + 1) / pieces)) return error.BadShape; // no replay here
+        if (k + 1 < pieces) return null;
+        return try self.walkHead(gather, o, stream);
+    }
+
     fn mark(self: *const Prompt, i: usize, stream: cuda.Stream) !void {
         if (self.profile) |p| try p.marks[i].record(stream);
     }
@@ -787,51 +827,63 @@ pub const Prompt = struct {
     }
 
     fn layers(self: *Prompt, gather: Gather, ids: []const i64, start: usize, o: Options, stream: cuda.Stream, engram_ns: *i128) !?Ptr {
+        try self.walkBegin(ids, start, stream);
+        if (!try self.walk(gather, o, stream, engram_ns, self.fwd.w.layers.len)) return null;
+        return try self.walkHead(gather, o, stream);
+    }
+
+    /// The chunk's ids up and embedded, the layer loop at its first layer (`at_piece`).
+    fn walkBegin(self: *Prompt, ids: []const i64, start: usize, stream: cuda.Stream) !void {
         const n = ids.len;
-        const c = self.fwd.cfg;
-        const dm = c.dim;
         const w = self.fwd.w;
-        const fwd = self.fwd;
         @memcpy(self.ids_h[0..n], ids);
         // every host table goes up in stream order: a layer rewrites the tables (positions, gather and scatter rows,
         // picks) that launches still queued from the layer before read, and a plain upload (the legacy stream) is not
         // ordered after a non-blocking stream's work
         try self.ids.uploadAsync(0, std.mem.sliceAsBytes(self.ids_h[0..n]), stream.handle);
-        try fwd.hc.embedInit(stream, w.embed.ptr(), self.ids.ptr, self.h.ptr, self.pre.ptr, @intCast(n));
-        var h = self.h.ptr;
-        var pre = self.pre.ptr;
-        var pre_f = self.pre_f.ptr;
-        var rows = n;
-        var at = start;
-        var floor: usize = 0;
-        var kv_done = false;
-        var nb: [32]u8 = undefined;
+        try self.fwd.hc.embedInit(stream, w.embed.ptr(), self.ids.ptr, self.h.ptr, self.pre.ptr, @intCast(n));
         self.cidx_cols = 0;
         self.cidx_stride = 0;
         self.cand_rows = 0;
         self.top_start = start;
         self.top_rows = n;
         // the window layers' picks (shared["topk"]) once replay leaves 16 rows or fewer: `attendWindow`
-        var window_picks: ?attention.Picks = null;
-        for (w.layers, 0..) |*l, li| {
+        self.at_piece = .{ .h = self.h.ptr, .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .rows = n, .at = start, .floor = 0, .kv_done = false, .window_picks = null, .li = 0 };
+    }
+
+    /// The layer loop from `at_piece.li` to layer `end`; false when bounded replay leaves no row past the cut (the
+    /// chunk then holds no decoder rows: no head).
+    fn walk(self: *Prompt, gather: Gather, o: Options, stream: cuda.Stream, engram_ns: *i128, end: usize) !bool {
+        const c = self.fwd.cfg;
+        const dm = c.dim;
+        const w = self.fwd.w;
+        const fwd = self.fwd;
+        const st = &self.at_piece;
+        var nb: [32]u8 = undefined;
+        while (st.li < end) : (st.li += 1) {
+            const li = st.li;
+            const l = &w.layers[li];
             if (o.replay) |replay| if (li == c.n_layers / 2) {
                 // CED bounded replay: this layer's kv source over every row, then only the rows at or past `replay`
-                try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
-                try self.kvSourceUpdate(li, self.x.ptr, rows, at, stream);
-                const first = @max(at, replay) - at;
-                if (first >= rows) {
+                try fwd.hc.pre(stream, st.h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), st.pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(st.rows));
+                try self.kvSourceUpdate(li, self.x.ptr, st.rows, st.at, stream);
+                const first = @max(st.at, replay) - st.at;
+                if (first >= st.rows) {
                     self.top_rows = 0;
-                    return null;
+                    return false;
                 }
-                h += first * hcmod.hc_streams * dm * 2;
-                pre += first * hcmod.hc_streams * 4;
-                at += first;
-                rows -= first;
-                floor = replay;
-                kv_done = true;
-                self.top_start = at;
-                self.top_rows = rows;
+                st.h += first * hcmod.hc_streams * dm * 2;
+                st.pre += first * hcmod.hc_streams * 4;
+                st.at += first;
+                st.rows -= first;
+                st.floor = replay;
+                st.kv_done = true;
+                self.top_start = st.at;
+                self.top_rows = st.rows;
             };
+            const h = st.h;
+            const rows = st.rows;
+            const at = st.at;
             const m0 = 1 + li * Profile.groups.len;
             if (l.engram_wkv != null) if (fwd.engram) |e| {
                 const te = nowNs();
@@ -843,20 +895,20 @@ pub const Prompt = struct {
                 try fwd.hc.tap(stream, h, t.buf + ti * dm * 2, @intCast(t.stride), @intCast(rows));
             };
             try self.mark(m0, stream);
-            try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
+            try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), st.pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, rows * dm * 2, stream);
             // 16 rows or fewer past a replay cut run model.py attention_k's ring mode: the window kernels
-            const pa = if (kv_done and rows <= decode_rows)
-                try self.attendWindow(li, self.x.ptr, rows, at, li == c.n_layers / 2, &window_picks, stream)
+            const pa = if (st.kv_done and rows <= decode_rows)
+                try self.attendWindow(li, self.x.ptr, rows, at, li == c.n_layers / 2, &st.window_picks, stream)
             else
-                try self.attend(li, self.x.ptr, rows, at, floor, kv_done and li == c.n_layers / 2, stream);
+                try self.attend(li, self.x.ptr, rows, at, st.floor, st.kv_done and li == c.n_layers / 2, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, rows * dm * 4, stream);
             try self.mark(m0 + 1, stream);
             try gather.run(pa, rows * dm, self.gathered.ptr, stream);
             try fwd.hc.post(stream, self.gathered.ptr, fwd.world, h, self.post.ptr, self.comb.ptr, h, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_attn", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
             try self.mark(m0 + 2, stream);
-            try fwd.hc.pre(stream, h, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), self.x.ptr, pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
+            try fwd.hc.pre(stream, h, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), self.x.ptr, st.pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_ffn", .{li}), self.x.ptr, rows * dm * 2, stream);
             const pm = try self.moeRows(li, self.x.ptr, rows, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r0", .{li}), pm, rows * dm * 4, stream);
@@ -865,14 +917,22 @@ pub const Prompt = struct {
             try fwd.hc.post(stream, self.gathered.ptr, fwd.world, h, self.post.ptr, self.comb.ptr, h, @intCast(rows));
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
             try self.mark(m0 + 4, stream);
-            const t = pre;
-            pre = pre_f;
-            pre_f = t;
+            const t = st.pre;
+            st.pre = st.pre_f;
+            st.pre_f = t;
         }
-        // the head on the last row
+        return true;
+    }
+
+    /// The head on the walked chunk's last row (null without `o.logits`).
+    fn walkHead(self: *Prompt, gather: Gather, o: Options, stream: cuda.Stream) !?Ptr {
         if (!o.logits) return null;
-        const h0 = h + (rows - 1) * hcmod.hc_streams * dm * 2;
-        const pre0 = pre + (rows - 1) * hcmod.hc_streams * 4;
+        const fwd = self.fwd;
+        const w = fwd.w;
+        const dm = fwd.cfg.dim;
+        const st = &self.at_piece;
+        const h0 = st.h + (st.rows - 1) * hcmod.hc_streams * dm * 2;
+        const pre0 = st.pre + (st.rows - 1) * hcmod.hc_streams * 4;
         try fwd.hc.collapseNorm(stream, h0, pre0, w.norm.ptr(), self.xc.ptr, 1);
         try self.probeOut("head.xc", self.xc.ptr, dm * 2, stream);
         const vh = w.vocab[1] - w.vocab[0];
