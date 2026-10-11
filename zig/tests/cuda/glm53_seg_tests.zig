@@ -43,11 +43,27 @@ const Rank = struct {
     stream: cuda.Stream,
     failures: usize = 0,
     passes: usize = 0,
+    loaded: [watched]Watch = undefined,
 
     fn kernels(r: *const Rank) M.Kernels {
         return .{ .g = .{ .set = r.set, .hc = &r.hck, .hidden = r.cfg.hidden, .streams = r.cfg.streams }, .kk = &r.kk, .mk = &r.mk };
     }
 };
+
+/// The rank's weights and tables a window only reads: their sha256 at load and after every window (a write into them
+/// from elsewhere shows as a change).
+const watched = 4;
+const Watch = [64]u8;
+
+fn watchBufs(r: *const Rank) [watched]Buf {
+    return .{ r.layers[0].kda.?.proj.buf, r.mdl.embed, r.layers[0].frame.attn_hc.fn_, r.layers[1].dsa.?.proj.buf };
+}
+
+fn watch(r: *const Rank, gpa: std.mem.Allocator) ![watched]Watch {
+    var out: [watched]Watch = undefined;
+    for (watchBufs(r), &out) |b, *o| o.* = try hs.sha(gpa, b);
+    return out;
+}
 
 fn param(fx: *const fixture.Fixture, name: []const u8) Json {
     return fx.parsed.value.object.get("params").?.object.get(name).?;
@@ -142,6 +158,7 @@ fn load(r: *Rank, gpu: Gpu, cfg: *const glm.config.Config, set: *const cuda.aot.
         st.pos = st.kda.pos;
     }
     r.work = try M.Work.init(d, r.lay, int(param(fx, "window_rows")), slot_rows, pool_rows);
+    r.loaded = try watch(r, gpa);
 }
 
 fn unload(r: *Rank) void {
@@ -183,7 +200,7 @@ fn traced(fx: *const fixture.Fixture, rank: usize, k: usize, name: []const u8, n
         const o = call.object;
         if (int(o.get("rank").?) != rank or !std.mem.eql(u8, o.get("step").?.string, step)) continue;
         const f = o.get("fn").?.string;
-        if (!std.mem.endsWith(f, name) or f[f.len - name.len - 1] != '.') continue;
+        if (!std.mem.endsWith(u8, f, name) or f[f.len - name.len - 1] != '.') continue;
         if (seen == nth) return o.get("digests").?.object.get(arg);
         seen += 1;
     }
@@ -308,6 +325,11 @@ fn windows(j: *Job) !void {
             }
             try same(r, fx, j.rank, wi, what, all.items);
         }
+        const now = try watch(r, gpa);
+        for (now, r.loaded, 0..) |a, b, i| if (!std.mem.eql(u8, &a, &b)) {
+            std.debug.print("FAIL glm53-seg rank {d} window {d}: read-only buffer {d} (kda proj, embed, attn_hc fn, dsa proj) changed\n", .{ j.rank, wi, i });
+            r.failures += 1;
+        };
         if (j.rank == 0) check.pass("glm53-seg window {d}: {d} segments, {d} rows", .{ wi, n, R });
     }
 }
