@@ -365,7 +365,8 @@ pub const Buffers = struct {
             .{ &b.pa, rows * aw * 2 },                     .{ &b.q, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.iq, rows * cfg.index_heads * cfg.index_dim * 2 }, .{ &b.gated, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.xs_gated, rows * cfg.heads * cfg.head_dim / 32 * 4 }, .{ &b.xh, rows * @max(kmax, cfg.wide()) * 2 },
-            .{ &b.z, @max(zmax, 8 * rows * cfg.wide() * 4) }, // the MTP head's fc_hidden runs S rows a row                               .{ &b.logits_router, rows * (cfg.experts + 1) * 4 },
+            .{ &b.z, @max(zmax, 8 * rows * cfg.wide() * 4) }, // the MTP head's fc_hidden: S rows a row
+            .{ &b.logits_router, rows * (cfg.experts + 1) * 4 },
             .{ &b.pick, rows * slots * 4 },                .{ &b.wts, rows * slots * 4 },
             .{ &b.ple_dev, rows * ple_heads * ple_words * 2 }, .{ &b.ple_emb, rows * cfg.hidden * 2 },
             .{ &b.ple_keys, rows * wide * 2 },             .{ &b.ple_vals, rows * cfg.hidden * 2 },
