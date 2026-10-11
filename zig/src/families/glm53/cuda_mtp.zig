@@ -247,3 +247,40 @@ pub fn headLogits(k: *const Kernels, h: *const DraftHead, x: Ptr, xs: Ptr, out: 
         try cuda.launch.launch(k.dec, .{ .grid = .{ .x = blocks, .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = k.dec_smem }, stream, &a);
     }
 }
+
+/// The all-gather the head's two blocks end in (cuda_model.zig `Gather`'s shape).
+pub const Gather = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, part: Ptr, gath: Ptr, floats: usize, stream: cuda.Stream) anyerror!void,
+};
+
+/// What `run` needs besides the head: its caches and the blocks' scratch (a prompt chunk's or a decode window's).
+pub const Step = struct {
+    cache: *const dsa.Cache,
+    ds: *const dsa.Scratch,
+    ms: *const moe.Scratch,
+    pos_dev: Buf, // an int32 for the head's position
+};
+
+/// mtp.py `mtp_forward`: `next` tokens (host) and their input rows (`hidden`, n rows of D bf16 on the device, row
+/// stride D) at head position `mtp_len` (the first position's embedding zeroed at 0); the draft head's logits of the
+/// last row in b.logits and its shared_head.norm output in b.fnormed (the next chained draft's input).
+pub fn run(g: Glue, k: *const Kernels, mk: *const moe.Kernels, lay: config.Layout, m: *const Mtp, b: *const Buffers, step: Step, embed: Ptr, next: []const u32, hidden: Ptr, mtp_len: usize, gather: Gather, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const D = c.hidden;
+    const n = next.len;
+    try b.ids.uploadAsync(0, std.mem.sliceAsBytes(next), stream.handle);
+    if (hidden != b.hin.ptr) try b.hin.copyFrom(0, hidden, n * D * 2, stream.handle);
+    const p32: i32 = @intCast(mtp_len);
+    try step.pos_dev.uploadAsync(0, std.mem.asBytes(&p32), stream.handle);
+    try front(g, c, m, b, embed, n, mtp_len == 0, stream);
+    try dsa.dsaBlock(g, lay, &m.dsa, step.cache, step.ds, .{
+        .normed = b.normed.ptr, .part = b.part.ptr, .sk = b.sk.ptr, .pos_dev = step.pos_dev.ptr,
+        .host_pos = mtp_len,    .nch = (mtp_len + n + 511) / 512, .R = n,
+    }, stream);
+    try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, n * D, stream);
+    try afterAttention(g, c, m, b, lay.world, n, stream);
+    try moe.moeBlock(g, mk, lay, &m.moe, step.ms, b.normed.ptr, b.part.ptr, b.sk.ptr, n, stream);
+    try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, n * D, stream);
+    try head(g, k, c, m, b, lay.world, n, stream);
+}
