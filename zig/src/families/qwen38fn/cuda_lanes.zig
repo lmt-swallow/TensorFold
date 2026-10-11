@@ -144,13 +144,14 @@ pub const Lanes = struct {
         } };
     }
 
-    /// The facts the round loop reads: up to `max_streams` streams a round, greedy draws on the host. Without the
+    /// The facts the round loop reads: up to `max_streams` streams a round (hidden_rows: their windows in one
+    /// forward), greedy draws on the device. Without the
     /// head, one-row windows; with it, windows of the pending token and up to 6 drafts, the head's own chain deciding
     /// how many (its probabilities given, no cost table: the round loop keeps every draft it holds).
     pub fn facts(self: *Lanes) lanes.Model {
         const rows = max_streams * self.windowRows();
         if (self.head == null) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = false, .max_streams = max_streams, .batch_rows = rows };
-        return .{ .exact_width = self.windowRows(), .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = mtp.depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = false, .max_streams = max_streams, .batch_rows = rows };
+        return .{ .exact_width = self.windowRows(), .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = mtp.depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
     }
 
     /// A window's rows at most: the pending token and, with the head, its drafts.
