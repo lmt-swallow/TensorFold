@@ -1,6 +1,6 @@
 // The MTP draft head's pick for each row of its logits (decode.py `sample_draft`, greedy): the first index of the
-// row's largest value (a NaN never wins) and that value's probability 1 / sum(exp(x - top)), summed in fp64. One
-// block a row and a fixed reduction order, so a row's result depends on its values alone.
+// row's largest value (a NaN never wins) and that value's probability 1 / sum(exp(x - top)), each term in fp32 and
+// their sum in fp64. One block a row and a fixed reduction order, so a row's result depends on its values alone.
 #include <cuda_bf16.h>
 
 #define PICK_THREADS 1024
@@ -35,9 +35,10 @@ extern "C" __global__ void __launch_bounds__(PICK_THREADS) tf_qfn_draft_pick(con
         }
         __syncthreads();
     }
-    const double best = (double)top_s[0];
+    // each term exp(x - top) in fp32 (GB10's fp64 exp is slow), the terms summed in fp64
+    const float best = top_s[0];
     double sum = 0.0;
-    for (int i = t; i < n; i += PICK_THREADS) sum += exp((double)__bfloat162float(x[i]) - best);
+    for (int i = t; i < n; i += PICK_THREADS) sum += (double)expf(__bfloat162float(x[i]) - best);
     sum_s[t] = sum;
     __syncthreads();
     for (int s = PICK_THREADS / 2; s > 0; s >>= 1) {
