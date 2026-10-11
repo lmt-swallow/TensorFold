@@ -3,10 +3,16 @@
 const std = @import("std");
 
 /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
-const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
+/// `nvcc_release`: the only nvcc release the kernel may be built with (its SASS is checked against a reference built by
+/// that release; another release compiles other instructions), refused at build time otherwise.
+const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false, nvcc_release: ?[]const u8 = null };
 
 /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
 const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
+
+/// The Mia fork's GLM-5.3-Flash image builds its extensions with nvcc 13.3 (CUDA 13.3.1): the glm53 kernels are
+/// SASS-identical to them only from that release (13.0 gives other instructions in every kernel).
+const glm53_nvcc = "13.3";
 
 const kernels = [_]Kernel{
     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
@@ -46,9 +52,9 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_gdn_prefill", .src = "qwen38fn/gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 cuda/kernels/gdn.py's gdn_prefill.cu, tensorfold_gdn_v2
     .{ .name = "qwen38fn_qmm", .src = "qwen38fn/qmm", .flags = &.{"-O3"} }, // 0.6.6 cuda/kernels/qmm.py's qmm.cu, tensorfold_qmm_v5: the MTP draft head
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
-    .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" } }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
-    .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"} }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
-    .{ .name = "glm53_exl3", .src = "glm53/exl3", .flags = &.{"-O3"} }, // the Mia fork's exl3_mm.py, tensorfold_glm_exl3_v20
+    .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
+    .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
+    .{ .name = "glm53_exl3", .src = "glm53/exl3", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's exl3_mm.py, tensorfold_glm_exl3_v20
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -111,19 +117,18 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the CUDA kernel fatbins");
     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
     const sms = b.option([]const u8, "sm", "SASS targets, comma separated (121; later 120,89)") orelse "121";
+    // the kernels that must come from one nvcc release (`nvcc_release`) take their own compiler; default -Dnvcc
+    const pinned = b.option([]const u8, "glm53-nvcc", "nvcc 13.3 for the glm53 kernels (their reference's release; default -Dnvcc)") orelse nvcc;
     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
-    const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
-        const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
-        run.has_side_effects = true;
-        break :blk run.captureStdOut(.{});
-    } else null;
+    const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) versionOf(b, nvcc.?) else null;
+    const pinned_version: ?std.Build.LazyPath = if (prebuilt == null and pinned != null) versionOf(b, pinned.?) else null;
     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
     const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
     for (kernels, &images) |k, *image| {
         if (prebuilt) |dir| {
             image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
         } else if (nvcc) |tool| {
-            image.* = fatbin(b, tool, version.?, k, sms);
+            image.* = if (k.nvcc_release != null) fatbin(b, pinned.?, pinned_version.?, k, sms) else fatbin(b, tool, version.?, k, sms);
         }
         if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
     }
@@ -201,10 +206,22 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
 }
 
+fn versionOf(b: *std.Build, nvcc: []const u8) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ nvcc, "--version" });
+    run.has_side_effects = true;
+    return run.captureStdOut(.{});
+}
+
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
 fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kernel, sms: []const u8) std.Build.LazyPath {
     const run = b.addSystemCommand(&.{ nvcc, "-fatbin" });
     run.addFileInput(version);
+    if (k.nvcc_release) |want| {
+        const gate = b.addSystemCommand(&.{ "sh", "-c", "grep -q \"release $2,\" \"$1\" || { echo \"$3 needs nvcc release $2 (its SASS is checked against a reference built by it); -Dglm53-nvcc (default -Dnvcc) gives: $(tail -n 2 \"$1\" | head -n 1)\" >&2; exit 1; }", "nvcc-release" });
+        gate.addFileArg(version);
+        gate.addArgs(&.{ want, k.name });
+        run.step.dependOn(&gate.step);
+    }
     run.addArgs(&torch_flags);
     run.addArgs(k.flags);
     const a = if (k.arch_specific) "a" else "";
