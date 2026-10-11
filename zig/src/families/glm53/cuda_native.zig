@@ -4,7 +4,9 @@
 //! (TENSORFOLD_CUDA_KERNELS) must hold the reference's captured Triton kernels (tools/zig/glm53/capture.sh). Up to 4
 //! streams decode together, their DSA caches in one pool of TF_GLM_POOL positions (default: one stream's context;
 //! at least that, a multiple of 2,048), each stream an extent of it; every slot's other state (KDA states, rings, the
-//! head's rows) is made at load. Both ranks must run with the same --context, TF_GLM_POOL and drafts setting.
+//! head's rows) is made at load. TF_GLM_TIER=<dir> (bf16 caches) puts the DSA latent rows on a tier (cuda_tier.zig):
+//! a pinned slab of TF_GLM_TIER_GIB (default 8) GiB of resident pools, the rest in <dir>/glm53-kv-rank<r>.bin.
+//! Both ranks must run with the same --context, TF_GLM_POOL, TF_GLM_TIER and drafts setting.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -20,6 +22,8 @@ const M = @import("cuda_model.zig");
 const engine = @import("cuda_engine.zig");
 const lanesmod = @import("cuda_lanes.zig");
 const P = @import("cuda_pool.zig");
+const Tr = @import("cuda_tier.zig");
+const keep = @import("cuda_keep.zig");
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3"};
@@ -60,6 +64,7 @@ const Owned = struct {
     stream: cuda.Stream,
     runner: engine.Runner,
     pool: P.Pool,
+    tier: ?*Tr.Tier,
     lanes: *lanesmod.Lanes,
 };
 
@@ -175,9 +180,25 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         std.log.err("TF_GLM_KV is {s}: bf16 or fp8", .{getenv("TF_GLM_KV").?});
         return error.BadEnvironment;
     };
-    own.pool = try P.Pool.init(gpa, d, &own.cfg, planes, positions, kv);
+    own.tier = null;
+    if (getenv("TF_GLM_TIER")) |tdir| {
+        if (kv != .bf16) {
+            std.log.err("TF_GLM_TIER holds bf16 latent rows: unset TF_GLM_KV or set it to bf16", .{});
+            return error.BadEnvironment;
+        }
+        const kvt = Tr.kv;
+        const gib = try envInt("TF_GLM_TIER_GIB", 8);
+        const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-kv-rank{d}.bin", .{ tdir, rank }, 0);
+        defer gpa.free(path);
+        const tcap = @max(std.mem.alignForward(usize, capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
+        // a slot's backbone and head streams, and the kept prompts' (each until the prompts reading through it end)
+        const tstreams = 2 * (lanesmod.max_streams + keep.book.max_kept + 1);
+        own.tier = try Tr.Tier.init(gpa, d, .{ .streams = tstreams, .layers = own.cfg.count(.dsa), .capacity = tcap, .row_bytes = own.cfg.kv_lora * 2 }, @as(usize, gib) << 30, engine.prompt_rows, glue.sparse_tokens, path);
+    }
+    errdefer if (own.tier) |t| t.deinit(gpa);
+    own.pool = try P.Pool.init(gpa, d, &own.cfg, planes, positions, kv, own.tier == null);
     errdefer own.pool.deinit();
-    own.lanes = try lanesmod.Lanes.init(gpa, d, lay, &own.runner, &own.comm, &own.pool, capacity, o.drafts);
+    own.lanes = try lanesmod.Lanes.init(gpa, d, lay, &own.runner, &own.comm, &own.pool, capacity, o.drafts, own.tier);
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
@@ -185,7 +206,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         // the pool and every slot are allocated by the load: a stream needs no more
         .stream_bytes = 0,
         .pool_positions = positions,
-        .pool_bytes = P.Pool.bytes(&own.cfg, planes, positions, kv),
+        .pool_bytes = P.Pool.bytes(&own.cfg, planes, positions, kv, own.tier == null),
         .ctx = own,
         .deinit = release,
     };
@@ -214,6 +235,7 @@ fn release(p: *anyopaque) void {
     own.lanes.stop();
     own.lanes.deinit();
     own.pool.deinit();
+    if (own.tier) |t| t.deinit(own.gpa);
     own.runner.deinit();
     own.stream.deinit();
     own.comm.deinit();

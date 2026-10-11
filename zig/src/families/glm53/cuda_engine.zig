@@ -17,6 +17,7 @@ const M = @import("cuda_model.zig");
 const T = @import("cuda_mtp.zig");
 const copy_drafts = @import("copy_drafts.zig");
 const P = @import("cuda_pool.zig");
+const Tr = @import("cuda_tier.zig");
 const Pm = @import("cuda_prompt.zig");
 
 const Ptr = cuda.abi.DevicePtr;
@@ -52,6 +53,10 @@ pub const Seq = struct {
     mtp_len: usize = 0,
     mtp_drafted: usize = 0,
     fresh: bool = false, // the head's logits are its last absorbed row's (`absorb` ran a step; a chain may start)
+    /// The latent rows on a tier (cuda_tier.zig): the backbone's DSA layers as tier stream `h`, the head's as `hm`.
+    tier: ?SeqTier = null,
+
+    pub const SeqTier = struct { t: *Tr.Tier, h: usize, hm: usize };
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, capacity: usize, kv: A.Kv) !Seq {
         const c = lay.cfg;
@@ -86,6 +91,8 @@ pub const Seq = struct {
     pub fn bind(q: *Seq, pool: *const P.Pool, base: usize, size: usize) !void {
         try q.st.bind(pool, base, size);
         try pool.bind(q.st.caches.len, &q.mcache, base, size);
+        for (q.st.caches, 0..) |*c, i| c.tier = if (q.tier) |x| .{ .t = x.t, .h = x.h, .layer = i } else null;
+        q.mcache.tier = if (q.tier) |x| .{ .t = x.t, .h = x.hm, .layer = 0 } else null;
     }
 
     /// A new sequence from position 0 (the head's too).
@@ -316,7 +323,24 @@ pub const Runner = struct {
         }
     }
 
+    /// Before a window of `n` rows at `pos` of the sequence's tier stream (`head`: the head's): its earlier calls
+    /// finished on the device, then cuda_tier `beginWindow`. Nothing without a tier.
+    fn tierBegin(r: *Runner, q: *const Seq, head: bool, pos: usize, n: usize) !void {
+        const x = q.tier orelse return;
+        try r.stream.synchronize();
+        try x.t.beginWindow(if (head) x.hm else x.h, pos, n);
+    }
+
+    /// The tier stream's positions before `pos` final, the ones from it dropped (rejected rows).
+    fn tierSettle(q: *const Seq, head: bool, pos: usize) !void {
+        const x = q.tier orelse return;
+        const h = if (head) x.hm else x.h;
+        x.t.rewind(h, pos);
+        try x.t.commit(h, pos);
+    }
+
     fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr) !void {
+        if (!b.prefill) try r.tierBegin(q, true, q.mtp_len, next.len);
         const pre = b.prefill;
         try T.run(r.k.g, r.tk, r.k.mk, r.lay, r.mtp, b, .{ .cache = &q.mcache, .ds = if (pre) &r.w.pds else &r.w.ds, .ms = if (pre) &r.w.pms else &r.w.ms, .pos_dev = q.mpos }, r.model.embed.ptr, next, hidden, q.mtp_len, r.mtpGather(), r.stream);
     }
@@ -348,10 +372,14 @@ pub const Runner = struct {
             .next = prompt[start + 1 .. @min(start + R + 1, prompt.len)],
             .split = r.split,
         };
+        try r.tierBegin(q, false, q.st.pos, R);
+        if (c.next.len > 0) try r.tierBegin(q, true, q.mtp_len, c.next.len);
         try Pm.prefillChunk(&c, r.gpa, .{ .ctx = r, .gather = promptGatherFn }, r.overlap, r.stream);
         try q.last.copyFrom(0, w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
         q.st.pos = ps.pos;
         q.mtp_len = ps.mtp_len;
+        try tierSettle(q, false, q.st.pos);
+        try tierSettle(q, true, q.mtp_len);
         return start + R;
     }
 
@@ -369,6 +397,7 @@ pub const Runner = struct {
         const R = ids.len;
         if (R == 0 or R > rows) return error.WindowTooWide;
         if (q.st.pos + R >= q.st.caches[0].capacity) return error.PromptTooLong;
+        try r.tierBegin(q, false, q.st.pos, R);
         try r.w.b.ids.upload(0, std.mem.sliceAsBytes(ids));
         try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, false, r.gather(), null, r.stream);
         try q.last.copyFrom(0, r.w.fnormed.ptr, R * D * 2, r.stream.handle);
@@ -391,6 +420,7 @@ pub const Runner = struct {
             if (n == 0 or n > rows) return error.WindowTooWide;
             if (w.q.st.pos + n >= w.q.st.caches[0].capacity) return error.PromptTooLong;
             if (R + n > batch_rows) return error.WindowTooWide;
+            try r.tierBegin(w.q, false, w.q.st.pos, n);
             try r.w.b.ids.uploadAsync(R * 4, std.mem.sliceAsBytes(w.ids), r.stream.handle);
             sg.* = .{ .st = &w.q.st, .a0 = R, .n = n };
             R += n;
@@ -407,6 +437,7 @@ pub const Runner = struct {
     /// Keep the last window's first `keep` of its `R` rows.
     pub fn commit(r: *Runner, q: *Seq, R: usize, keep: usize) !void {
         try M.commit(r.k, r.lay, &q.st, R, keep, false, &r.w, r.stream);
+        try tierSettle(q, false, q.st.pos);
     }
 
     /// The head owes the rows at `hidden` (one a token of `next`, the token after each); absorbed by `absorb`.
@@ -429,6 +460,7 @@ pub const Runner = struct {
         q.fresh = false;
         q.mtp_len -= q.mtp_drafted;
         q.mtp_drafted = 0;
+        if (q.tier) |x| x.t.rewind(x.hm, q.mtp_len);
         var s0: usize = 0;
         while (s0 < q.m_next.items.len) : (s0 += rows) {
             const part = q.m_next.items[s0..@min(s0 + rows, q.m_next.items.len)];
@@ -437,6 +469,8 @@ pub const Runner = struct {
             q.fresh = true;
         }
         q.m_next.clearRetainingCapacity();
+        // the absorbed rows are final; the chain's drafts after them are not
+        try tierSettle(q, true, q.mtp_len);
     }
 
     /// decode.py `draft`'s chain after `absorb`: up to `depth` drafts, cut where the product of their confidences

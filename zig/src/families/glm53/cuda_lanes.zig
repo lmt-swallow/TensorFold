@@ -25,6 +25,7 @@ const copy_drafts = @import("copy_drafts.zig");
 const dsa = @import("cuda_dsa.zig");
 const keep = @import("cuda_keep.zig");
 const kb = keep.book;
+const Tr = @import("cuda_tier.zig");
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -74,6 +75,8 @@ const Slot = struct {
     nheld: usize = 0,
 };
 
+const KeptTier = struct { eid: u32, h: usize, hm: usize };
+
 pub const Lanes = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -87,6 +90,10 @@ pub const Lanes = struct {
     book: kb.Book,
     released: kb.Released = .{},
     snaps: ?keep.Snaps = null,
+    /// The DSA latent rows on a tier (TF_GLM_TIER): each stream's caches tier streams of their own, a kept prompt's
+    /// kept with it (`kept_tier`) and read through by the prompts that continue it (cuda_tier `alias`).
+    tier: ?*Tr.Tier = null,
+    kept_tier: [kb.max_kept + 1]?KeptTier = @splat(null),
     slots: [max_streams]Slot = @splat(.{}),
     // rank 0: the stream each slot serves
     owners: [max_streams]?*const lanes.Stream = @splat(null),
@@ -100,7 +107,7 @@ pub const Lanes = struct {
 
     /// Lanes over `pool`, each stream at most `capacity` positions; every slot's sequence made now (its KDA states,
     /// rings and head buffers), so a stream waits for none.
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, r: *engine.Runner, comm: *const cuda.comm.Comm, pool: *P.Pool, capacity: usize, drafts: bool) !*Lanes {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, r: *engine.Runner, comm: *const cuda.comm.Comm, pool: *P.Pool, capacity: usize, drafts: bool, tier: ?*Tr.Tier) !*Lanes {
         const self = try gpa.create(Lanes);
         errdefer gpa.destroy(self);
         const op_buf = try gpa.alloc(u8, maxOpBytes(capacity));
@@ -110,6 +117,7 @@ pub const Lanes = struct {
         self.* = .{ .gpa = gpa, .d = d, .lay = lay, .r = r, .comm = comm, .capacity = capacity, .pool = pool, .ring = dsa.indexRing(capacity, engine.prompt_rows), .drafts = drafts, .book = .{ .set = keep.settings(), .chunk = keep.chunk, .window = 0 }, .op_buf = op_buf, .agree_send = send, .agree_recv = try Buf.alloc(d, 16 * lay.world) };
         errdefer self.deinit();
         self.book.released = &self.released;
+        self.tier = tier;
         for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
         if (self.book.set.on) self.snaps = try keep.Snaps.init(gpa, d, self.book.set.snaps, keep.snapBytes(&self.slots[0].seq.?));
         return self;
@@ -166,6 +174,11 @@ pub const Lanes = struct {
     /// for the next stream.
     fn clear(self: *Lanes, s: *Slot) void {
         if (s.prompt) |p| self.gpa.free(p);
+        if (s.seq) |*q| if (q.tier) |x| {
+            x.t.close(x.h);
+            x.t.close(x.hm);
+            q.tier = null;
+        };
         if (s.busy) {
             self.pool.extents.give(s.base, s.size);
             if (self.snaps) |*x| for (s.marks.slice()) |m| {
@@ -194,6 +207,14 @@ pub const Lanes = struct {
         const keepable = self.book.set.on and !s.filling and s.marks.n > 0;
         const owned: ?[]i32 = if (keepable) self.gpa.alloc(i32, s.marks.last().?) catch null else null;
         if (owned) |o| {
+            if (s.seq.?.tier) |x| {
+                // the kept prompt keeps the stream's tier streams (its entry's id is the book's next)
+                for (&self.kept_tier) |*k| if (k.* == null) {
+                    k.* = .{ .eid = self.book.next_eid, .h = x.h, .hm = x.hm };
+                    break;
+                };
+                s.seq.?.tier = null;
+            }
             self.book.keep(&self.pool.extents, s.base, s.size, asI32(ids), &s.marks, false, o);
             s.marks = .{};
             s.busy = false;
@@ -201,6 +222,23 @@ pub const Lanes = struct {
         self.clear(s);
         self.book.finish(&self.pool.extents, drops);
         self.settle();
+        self.sweepTier();
+    }
+
+    /// The tier streams of kept prompts the book no longer holds, closed (a stream that a continuing prompt reads
+    /// through stays until that one closes).
+    fn sweepTier(self: *Lanes) void {
+        const t = self.tier orelse return;
+        for (&self.kept_tier) |*k| if (k.*) |x| if (self.book.find(x.eid) == null) {
+            t.close(x.h);
+            t.close(x.hm);
+            k.* = null;
+        };
+    }
+
+    fn keptTier(self: *const Lanes, eid: u32) ?KeptTier {
+        for (self.kept_tier) |k| if (k) |x| if (x.eid == eid) return x;
+        return null;
     }
 
     /// Positions a stream of `prompt` tokens and up to `max_new` more takes (its windows' rows included), aligned;
@@ -368,6 +406,7 @@ pub const Lanes = struct {
                 if (s.start == ids.len) {
                     s.first = try self.r.first(q);
                     s.filling = false;
+                    if (q.tier) |x| x.t.favor(x.h, false);
                 }
             },
             .verify => {
@@ -466,16 +505,30 @@ pub const Lanes = struct {
         self.settle();
         s.* = .{ .seq = s.seq, .busy = true, .base = base, .size = size, .prompt = ids, .filling = true, .marks = inherited };
         const q = &s.seq.?;
+        if (self.tier) |t| {
+            const nd = q.st.caches.len;
+            const h = try t.acquire(nd);
+            errdefer t.close(h);
+            q.tier = .{ .t = t, .h = h, .hm = try t.acquire(1) };
+            t.favor(h, true);
+        }
         try q.bind(self.pool, base, size);
         try q.reset(self.r.stream);
         if (reuse) |r| {
             const at = r.cut - 1; // the book's point is one past the boundary
+            // the latent rows before the boundary: read through the kept prompt's tier streams, else copied
+            if (q.tier) |x| {
+                const src = self.keptTier(r.eid) orelse return error.NoKeptTier;
+                try x.t.alias(src.h, x.h, at);
+                try x.t.alias(src.hm, x.hm, at);
+            }
             if (placed.how == .copy or placed.how == .move) try keep.copyRows(self.pool, src_base, base, at, self.r.stream);
             try self.snaps.?.restore(cut_snap, q, at, self.r.stream);
             s.start = at;
             if (self.lay.rank == 0) std.log.info("glm53: a prompt of {d} continues kept prompt {d} from {d} ({t})", .{ ids.len, r.eid, at, placed.how });
         }
         if (self.book.set.on) s.points = keep.pointsFor(&self.book, ids.len);
+        self.sweepTier();
     }
 
     /// The slot's sequence into a free snapshot (the least recently used kept prompts give theirs back first); null

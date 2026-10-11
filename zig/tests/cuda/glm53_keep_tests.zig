@@ -165,7 +165,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const capacity: usize = 8192;
     var r = try rk.runner(gpa, d, link, capacity);
     defer r.deinit();
-    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 4 * capacity, .bf16);
+    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 4 * capacity, .bf16, true);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(capacity, E.prompt_rows);
     var seqs: [3]E.Seq = undefined;

@@ -21,8 +21,9 @@ pub const Pool = struct {
     extents: Extents,
 
     /// Planes for `planes` DSA layers (the backbone's, then the MTP layer's) over `positions` positions (aligned down
-    /// to `extent_align`).
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const config.Config, planes: usize, positions: usize, kv: dsa.Kv) !Pool {
+    /// to `extent_align`); without `latent` the pooled keys only (the latent rows live on a tier, cuda_tier.zig: a
+    /// cache's latent view is then empty and its rows are the tier's).
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const config.Config, planes: usize, positions: usize, kv: dsa.Kv, latent_planes: bool) !Pool {
         const rows = positions / extent_align * extent_align;
         if (rows == 0) return error.BadPool;
         const latent = try gpa.alloc(Buf, planes);
@@ -35,7 +36,7 @@ pub const Pool = struct {
             b.free();
         };
         for (latent, pk) |*a, *b| {
-            a.* = try Buf.alloc(d, rows * kv.rowBytes(c.kv_lora));
+            a.* = try Buf.alloc(d, if (latent_planes) rows * kv.rowBytes(c.kv_lora) else 0);
             errdefer a.free();
             b.* = try Buf.alloc(d, (rows / 4 + 2) * kv.rowBytes(c.index_dim));
             errdefer b.free();
@@ -56,9 +57,9 @@ pub const Pool = struct {
     }
 
     /// Device bytes of a pool of `planes` planes over `positions` positions.
-    pub fn bytes(c: *const config.Config, planes: usize, positions: usize, kv: dsa.Kv) usize {
+    pub fn bytes(c: *const config.Config, planes: usize, positions: usize, kv: dsa.Kv, latent_planes: bool) usize {
         const rows = positions / extent_align * extent_align;
-        return planes * (rows * kv.rowBytes(c.kv_lora) + (rows / 4 + 2) * kv.rowBytes(c.index_dim));
+        return planes * ((if (latent_planes) rows * kv.rowBytes(c.kv_lora) else 0) + (rows / 4 + 2) * kv.rowBytes(c.index_dim));
     }
 
     /// Plane `i`'s rows of the extent [base, base + size) bound to `cache` (base and size multiples of the alignment).

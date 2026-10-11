@@ -108,7 +108,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const lay = rk.lay;
     var r = try rk.runner(gpa, d, link, 8192);
     defer r.deinit();
-    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, streams * 8192, .bf16);
+    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, streams * 8192, .bf16, true);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(8192, E.prompt_rows);
     var seqs: [streams]E.Seq = undefined;

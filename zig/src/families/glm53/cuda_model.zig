@@ -14,6 +14,7 @@ const F = @import("cuda_forward.zig");
 const A = @import("cuda_dsa.zig");
 const M = @import("cuda_moe.zig");
 const P = @import("cuda_pool.zig");
+const Tr = @import("cuda_tier.zig");
 
 const Glue = glue_mod.Glue;
 const Ptr = cuda.abi.DevicePtr;
@@ -297,7 +298,24 @@ pub fn forwardSegs(k: Kernels, lay: config.Layout, m: *const Model, segs: []cons
             try A.dsaIndex(k.g, lay, a, &w.ds, b.normed.ptr, b.sk.ptr, R, sparse, stream);
             // every stream's selection, then every stream's attention (a tier resolves all selections between)
             for (segs, 0..) |sg, i| try A.dsaSelect(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), stream);
-            for (segs, 0..) |sg, i| try A.dsaAttendRows(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), null, stream);
+            // on a tier, every stream's selected pools made resident in one batch (the drive's latency paid once)
+            var resolved: [max_segs]?Tr.Tier.Resolved = @splat(null);
+            if (segs[0].st.caches[li].tier) |tr| {
+                var sels: [max_segs]Tr.Tier.Sel = undefined;
+                var which: [max_segs]usize = undefined;
+                var n: usize = 0;
+                for (segs, 0..) |sg, i| if (A.sparseRows(c, sg.st.pos, sg.n)) {
+                    const x = sg.st.caches[li].tier.?;
+                    const sel = w.ds.selection(i);
+                    sels[n] = .{ .h = x.h, .layer = x.layer, .tokens = sel.tokens, .counts = sel.counts, .R = sg.n };
+                    which[n] = i;
+                    n += 1;
+                };
+                var out: [max_segs]Tr.Tier.Resolved = undefined;
+                if (n > 0) try tr.t.resolveMany(sels[0..n], glue_mod.sparse_tokens, stream, out[0..n]);
+                for (which[0..n], out[0..n]) |i, o| resolved[i] = o;
+            }
+            for (segs, 0..) |sg, i| try A.dsaAttendRows(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), resolved[i], stream);
             try A.dsaExpand(k.g, lay, a, &w.ds, R, stream);
             try A.dsaOut(k.g, lay, a, &w.ds, b.part.ptr, b.sk.ptr, 0, R, stream);
         }
