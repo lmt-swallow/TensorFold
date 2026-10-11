@@ -46,6 +46,8 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_gdn_prefill", .src = "qwen38fn/gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 cuda/kernels/gdn.py's gdn_prefill.cu, tensorfold_gdn_v2
     .{ .name = "qwen38fn_qmm", .src = "qwen38fn/qmm", .flags = &.{"-O3"} }, // 0.6.6 cuda/kernels/qmm.py's qmm.cu, tensorfold_qmm_v5: the MTP draft head
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
+    .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" } }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
+    .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"} }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -98,6 +100,8 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     qwen38fn.addImport("dsv41", dsv41); // its EXL3 linear (0.6.6's kernel body) until that moves to the core
     qwen38fn.addImport("lanes", lanes);
     const glm53 = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm53/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53.addImport("cuda", cuda);
+    glm53.addImport("core", core);
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41, .qwen38fn = qwen38fn, .glm53 = glm53 };
 }
 
@@ -135,6 +139,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("lanes", mods.lanes);
     runner.addImport("dsv41", mods.dsv41);
     runner.addImport("qwen38fn", mods.qwen38fn);
+    runner.addImport("glm53", mods.glm53);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     // GLM-5.3-Flash's pack against the family's plan: headers only, no GPU (safe beside a serving rank)
     const glm53_validate = b.createModule(.{ .root_source_file = b.path("zig/tests/glm53/validate.zig"), .target = target, .optimize = optimize, .link_libc = true });
