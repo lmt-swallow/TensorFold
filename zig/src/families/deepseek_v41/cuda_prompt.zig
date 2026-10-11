@@ -34,7 +34,7 @@ const Gather = forward.Gather;
 pub const Error = error{ TooManyRows, BadShape, OutOfMemory, NoCandidateSource, PromptKernelMismatch } || cuda.Error || exl3.Error || experts.Error || cuda.cublaslt.Error;
 
 /// The widest chunk a `Prompt` holds buffers for (TF_DS_PREFILL_CHUNK at most this).
-pub const max_chunk: usize = 4096;
+pub const max_chunk: usize = 8192;
 /// The fork's production chunk (TF_DS_PREFILL_CHUNK's default). A wider chunk holds whole chunks of this width
 /// (lanes.chunkEnd), and the work whose bits depend on the row count (the fp32 GEMMs: cuBLAS picks its algorithm by
 /// the rows) runs on them one at a time, so a wider pass makes the bytes of this one.

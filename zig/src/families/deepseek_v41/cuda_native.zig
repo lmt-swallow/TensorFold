@@ -3,7 +3,7 @@
 //! --master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT), the weights from the Python
 //! family's rank cache (TF_DS_RANK_CACHE), the RoPE frequencies (TF_DS_ROPE=device, the default: each pass's rows
 //! computed on the device) or whole tables (TF_DS_ROPE=table) from TF_DS_ROPE_DIR (default `<kernels>/rope`), the prompt
-//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 4096). Up to TF_DS_SLOTS streams decode together in shared
+//! chunk's rows from TF_DS_PREFILL_CHUNK (default 2048, at most 8192). Up to TF_DS_SLOTS streams decode together in shared
 //! rounds (TF_DS_MAX_ROWS rows a round at most: default 16, up to 32, the same on both ranks), their caches in one
 //! pool of TF_DS_POOL positions (cuda_lanes.zig `Streams`; default the context, else at least the context and a
 //! multiple of 2048, the same on both ranks), each stream within the context (`--context`: at most the model's
