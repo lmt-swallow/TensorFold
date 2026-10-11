@@ -141,6 +141,25 @@ pub fn chainProbabilities(gpa: Allocator, rates: []const f64, count: usize) ![]f
     return out;
 }
 
+/// A chain prefix's node count and its expected tokens a ms.
+pub const Prefix = struct { count: usize, rate: f64 };
+
+/// The prefix of a chain (its nodes' chances of landing, `reach`, non-increasing) whose window, the pending row and
+/// `count` nodes, lands the most expected tokens (1 + the prefix's chances) a ms of `costs` at its rows; the
+/// shortest of equal rates. Prefixes whose rows `costs` lacks are skipped; null when it has none of them.
+pub fn bestPrefix(reach: []const f64, costs: *const Table) ?Prefix {
+    var best: ?Prefix = null;
+    var tokens: f64 = 1.0;
+    for (0..reach.len + 1) |count| {
+        if (count > 0) tokens += reach[count - 1];
+        const ms = costs.get(@intCast(count + 1)) orelse continue;
+        if (ms <= 0) continue;
+        const rate_now = tokens / ms;
+        if (best == null or rate_now > best.?.rate) best = .{ .count = count, .rate = rate_now };
+    }
+    return best;
+}
+
 /// Costs for 1..rows: timed widths as measured, interpolated between them, the widest's ms a row past it.
 pub fn extendCosts(gpa: Allocator, costs: []const Cost, rows: u32) !Table {
     var out: Table = .{};
@@ -194,6 +213,29 @@ test "allocate takes the widest round when no cost is timed" {
     const counts = try allocate(gpa, &.{ 1, 1 }, &probs, &empty, &.{}, 0.0, 8);
     defer gpa.free(counts);
     try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, counts);
+}
+
+test "bestPrefix takes the prefix with the most expected tokens a ms" {
+    const gpa = std.testing.allocator;
+    // 20 ms a window plus 4 ms a row: a node pays when its chance beats the window's tokens a ms times 4 ms
+    var costs = try extendCosts(gpa, &.{ .{ .width = 1, .ms = 20.0 }, .{ .width = 16, .ms = 80.0 } }, 16);
+    defer costs.deinit(gpa);
+    const sure = [_]f64{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    try std.testing.expectEqual(@as(usize, 15), bestPrefix(&sure, &costs).?.count);
+    try std.testing.expectApproxEqAbs(@as(f64, 16.0 / 80.0), bestPrefix(&sure, &costs).?.rate, 1e-12);
+    // a cliff after three nodes: the window stops at the cliff
+    const cliff = [_]f64{ 0.95, 0.9, 0.85, 0.01, 0.0, 0.0 };
+    try std.testing.expectEqual(@as(usize, 3), bestPrefix(&cliff, &costs).?.count);
+    // nothing worth a row: the pending row alone
+    const none = [_]f64{ 0.05, 0.01 };
+    try std.testing.expectEqual(@as(usize, 0), bestPrefix(&none, &costs).?.count);
+    // rows past the table are skipped; an empty table prices nothing
+    const short = try extendCosts(gpa, &.{.{ .width = 2, .ms = 10.0 }}, 2);
+    var s2 = short;
+    defer s2.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), bestPrefix(&sure, &s2).?.count);
+    const empty: Table = .{};
+    try std.testing.expectEqual(@as(?Prefix, null), bestPrefix(&sure, &empty));
 }
 
 test "extendCosts interpolates and extrapolates" {

@@ -165,6 +165,7 @@ pub const Stream = struct {
     served: ?u64 = null,
     granted: ?u32 = null,
     copy_width: ?u32 = null,
+    copy_p: ?[]f64 = null, // copy_pricing: a copied token's chance of landing by depth, given the ones before (gpa)
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
         var s: Stream = .{
@@ -205,6 +206,8 @@ pub const Stream = struct {
         s.served = null;
         s.granted = null;
         s.copy_width = null;
+        if (s.copy_p) |p| gpa.free(p);
+        s.copy_p = null;
     }
 
     pub fn dropHeld(s: *Stream, gpa: Allocator) void {

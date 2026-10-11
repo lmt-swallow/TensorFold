@@ -38,6 +38,20 @@ pub const Who = struct {
     position: u64 = 0, // the stream's cache length (its next round's rows follow it)
 };
 
+/// A chain's acceptance by depth after one round that tried `proposed` nodes and kept the first `accepted`: each
+/// node tried (every earlier one kept), up to `p.len`, moves its estimate by `rate` toward whether it was kept; the
+/// nodes past the first rejected one, untried, keep theirs.
+pub fn observeChain(p: []f64, rate: f64, proposed: i64, accepted: i64) void {
+    const n = @min(@max(proposed, 0), @as(i64, @intCast(p.len)));
+    var j: i64 = 0;
+    while (j < n) : (j += 1) {
+        if (accepted < j) break;
+        const hit: f64 = if (accepted > j) 1.0 else 0.0;
+        const at: usize = @intCast(j);
+        p[at] += rate * (hit - p[at]);
+    }
+}
+
 /// Whether a copied continuation is ahead of a stream (the round loop proposes; Python `_copy_proposal`).
 pub const Probe = struct {
     ptr: *anyopaque,
@@ -76,15 +90,7 @@ pub const Rule = struct {
 
     /// Draft j was tried when drafts 1 .. j - 1 were kept; its estimate moves toward whether it was kept.
     pub fn observeDepth(r: *Rule, who: Who, proposed: i64, accepted: i64) !void {
-        const p = try r.rates(who);
-        const n = @min(@max(proposed, 0), @as(i64, @intCast(p.len)));
-        var j: i64 = 0;
-        while (j < n) : (j += 1) {
-            if (accepted < j) break;
-            const hit: f64 = if (accepted > j) 1.0 else 0.0;
-            const at: usize = @intCast(j);
-            p[at] += r.k.depth_rate * (hit - p[at]);
-        }
+        observeChain(try r.rates(who), r.k.depth_rate, proposed, accepted);
     }
 
     /// Round times by depth: the stream's own under `plain_guard` (its sampling sets a row's host work), else shared.

@@ -280,3 +280,91 @@ test "without prefill_part a stream's pass runs whole at its first part" {
     while (engine.activeCount() > 0) try engine.step();
     try std.testing.expectEqual(@as(usize, 8), s.emitted().len);
 }
+
+/// One stream on a target whose reply cycles `pattern` after `cycle_after` tokens: its emitted tokens and its copy
+/// windows' drafts (from the round events).
+fn runCopies(copy_pricing: bool, drafts: bool, pattern: []const u32, copies: *std.ArrayList(usize)) ![]u32 {
+    var costs: [16]@import("config.zig").Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 20.0 + 4.0 * @as(f64, @floatFromInt(w)) };
+    var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 5, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .hidden_rows = true, .batch_rows = 32, .max_streams = 8, .draft_streams = true, .copy_pricing = copy_pricing }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .cycle_after = 12, .probe_prompt = p1.len, .pattern = pattern };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var log = @import("events.zig").Log.init(gpa);
+    defer log.deinit();
+    engine.log = &log;
+    var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+    defer p.deinit();
+    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 240, .eos = &.{}, .drafts = drafts, .proposer = p.proposer() });
+    defer s.deinit(gpa);
+    try engine.addStream(&s);
+    while (engine.activeCount() > 0) try engine.step();
+    for (log.events.items) |fields| {
+        var round = false;
+        var copy = false;
+        var rows: usize = 0;
+        for (fields) |x| {
+            if (std.mem.eql(u8, x.k, "ev")) round = std.mem.eql(u8, x.v.str, "round");
+            if (std.mem.eql(u8, x.k, "kind")) copy = x.v == .str and std.mem.eql(u8, x.v.str, "copy");
+            if (std.mem.eql(u8, x.k, "window") and x.v == .u32s) rows = x.v.u32s.len;
+        }
+        if (round and copy) try copies.append(gpa, rows - 1);
+    }
+    return gpa.dupe(u32, s.emitted());
+}
+
+test "priced copies keep the one-token decode and widen past the ramp's first width on a repeating reply" {
+    const pattern = [_]u32{ 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59 };
+    var none: std.ArrayList(usize) = .empty;
+    defer none.deinit(gpa);
+    const plain = try runCopies(false, false, &pattern, &none);
+    defer gpa.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+    var python: std.ArrayList(usize) = .empty;
+    defer python.deinit(gpa);
+    const ramp = try runCopies(false, true, &pattern, &python);
+    defer gpa.free(ramp);
+    var priced: std.ArrayList(usize) = .empty;
+    defer priced.deinit(gpa);
+    const got = try runCopies(true, true, &pattern, &priced);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u32, plain, ramp);
+    try std.testing.expectEqualSlices(u32, plain, got);
+    // the ramp's copies start at its first width; priced ones take the widest window the costs pay for at once
+    // the ramp's copies start at its first width; priced ones as wide as the match's continuation at once
+    try std.testing.expect(python.items.len > 0 and python.items[0] <= 4);
+    try std.testing.expect(priced.items.len > 0 and priced.items[0] > python.items[0]);
+    try std.testing.expectEqual(@as(usize, 15), std.mem.max(usize, priced.items));
+}
+
+test "a priced copy gives way to the head's drafts once its copies stop landing" {
+    var costs: [16]@import("config.zig").Cost = undefined;
+    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 20.0 + 4.0 * @as(f64, @floatFromInt(w)) };
+    var cfg = try Config.init(gpa, .{ .exact_width = 16, .first_copy_rows = 5, .mtp = true, .speculate = true, .drafts = 4, .window_costs = &costs, .hidden_rows = true, .copy_pricing = true }, 16, 15);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var p = try SuffixLookup.init(gpa, .{ .min_match = 4, .silence_rounds = 0 });
+    defer p.deinit();
+    const text = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 } ++ [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &text, .max_new = 64, .proposer = p.proposer() });
+    defer s.deinit(gpa);
+    const win = @import("windows.zig");
+    // the prior (copy_rate 0.94 a token) pays for a window wider than the head's (4 drafts at its prior); at 20 ms
+    // a window and 4 ms a row, 10 copied tokens land the most a ms
+    const continuation = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1, 2, 3, 4, 5 };
+    try std.testing.expectEqualSlices(u32, continuation[0..10], try win.copyProposal(&engine, &s));
+    // copies that land half their tokens: a shorter window still pays
+    for (0..8) |_| try win.observeCopy(&engine, &s, 15, 3);
+    const half = try win.copyProposal(&engine, &s);
+    try std.testing.expect(half.len >= 2 and half.len < 15);
+    // copies whose first token never lands: the head drafts instead
+    for (0..40) |_| try win.observeCopy(&engine, &s, 15, 0);
+    try std.testing.expectEqual(@as(usize, 0), (try win.copyProposal(&engine, &s)).len);
+}

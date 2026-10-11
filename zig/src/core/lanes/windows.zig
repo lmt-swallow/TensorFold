@@ -130,14 +130,50 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
     return .{ .tokens = chain, .others = others };
 }
 
-/// Copied spans backed by `enter_match` matching tokens (Python `_copy_proposal`); the proposer owns them.
+/// Copied spans backed by `enter_match` matching tokens (Python `_copy_proposal`); the proposer owns them. With
+/// `copy_pricing`, up to `max_copy` tokens are proposed and the span is `pricedCopy`'s prefix.
 pub fn copyProposal(e: *Engine, s: *Stream) ![]const u32 {
     const p = s.proposer orelse return &.{};
     if (e.cfg.max_copy == 0 or s.force.items.len > 0) return &.{};
-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+    const width: u32 = if (e.cfg.copy_pricing) e.cfg.max_copy else if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
     const copied = p.propose(s.context.items, @min(@as(i64, width), s.draftRoom() - 1)) catch return &.{};
     if (copied.len < 2 or p.lastMatch() < e.cfg.enter_match) return &.{};
+    if (e.cfg.copy_pricing) return pricedCopy(e, s, copied);
     return copied;
+}
+
+/// `copy_pricing`: a stream's copied tokens' chance of landing by depth given the ones before, `max_copy` deep,
+/// `copy_rate` until its copy windows are judged (`observeCopy`).
+pub fn copyRates(e: *Engine, s: *Stream) ![]f64 {
+    if (s.copy_p == null) {
+        const p = try e.gpa.alloc(f64, @max(1, e.cfg.max_copy));
+        @memset(p, e.cfg.copy_rate);
+        s.copy_p = p;
+    }
+    return s.copy_p.?;
+}
+
+/// `copy_pricing`: a copy window of `proposed` tokens kept its first `accepted`.
+pub fn observeCopy(e: *Engine, s: *Stream, proposed: i64, accepted: i64) !void {
+    depth.observeChain(try copyRates(e, s), e.cfg.k.depth_rate, proposed, accepted);
+}
+
+/// The prefix of `copied` whose window lands the most expected tokens a ms of the window costs (`family_costs`,
+/// the stream's copy acceptance), when that beats the head's drafts at their best by the same measure (its
+/// per-depth acceptance, up to the drafts it may hold); else none (the head drafts). A prefix under 2 tokens is
+/// none. Without window costs, the whole copy.
+fn pricedCopy(e: *Engine, s: *Stream, copied: []const u32) ![]const u32 {
+    const costs = &e.cfg.family_costs;
+    if (costs.empty()) return copied;
+    const a = e.arena.allocator();
+    const copy = alloc.bestPrefix(try alloc.chainProbabilities(a, try copyRates(e, s), copied.len), costs) orelse return copied;
+    if (copy.count < 2) return &.{};
+    if (e.cfg.family_mtp and s.drafts and e.cfg.most_drafts > 0) {
+        const n: usize = @intCast(@min(@as(i64, e.cfg.most_drafts), @max(1, s.draftRoom() - 1)));
+        const head = try alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
+        if (alloc.bestPrefix(head, costs)) |h| if (h.rate >= copy.rate) return &.{};
+    }
+    return copied[0..copy.count];
 }
 
 pub fn copyAhead(ptr: *anyopaque, w: *const depth.Who) bool {
@@ -167,7 +203,8 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = &.{};
         } else if (p.kind == .copy) {
             fx.* = 1;
-            pr.* = try alloc.chainProbabilities(a, &.{e.cfg.copy_rate}, n);
+            const rates: []const f64 = if (e.cfg.copy_pricing) try copyRates(e, p.stream) else &.{e.cfg.copy_rate};
+            pr.* = try alloc.chainProbabilities(a, rates, n);
         } else {
             fx.* = 1;
             pr.* = try nodeChances(e, p.stream, n);

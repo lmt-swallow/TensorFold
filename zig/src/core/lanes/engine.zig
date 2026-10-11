@@ -398,6 +398,7 @@ pub const Engine = struct {
                 s.accepted += kept;
                 if (p.kind == .copy) {
                     if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
+                    if (e.cfg.copy_pricing) try win.observeCopy(e, s, @intCast(rows - 1), @intCast(kept));
                     if (e.alone) {
                         const width = s.copy_width orelse e.cfg.first_copy;
                         s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
