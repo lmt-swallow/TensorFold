@@ -31,14 +31,28 @@ pub const NGram = struct {
     pub fn ids(self: *const NGram, history: []const i64, tokens: []const i64, out: []i64) !void {
         const ctx = self.n - 1;
         if (history.len != ctx or out.len != tokens.len * self.heads()) return error.BadShape;
-        const width = ctx + tokens.len;
         var buf: [256]i64 = undefined;
-        if (width > buf.len) return error.WindowTooLarge;
-        const seq = buf[0..width];
+        if (ctx + tokens.len > buf.len) return error.WindowTooLarge;
+        const seq = buf[0 .. ctx + tokens.len];
         @memcpy(seq[0..ctx], history);
         @memcpy(seq[ctx..], tokens);
-        var last_eos: i64 = -1; // the latest EOS strictly before the position
-        for (0..width) |p| {
+        self.idsOf(seq, ctx, out);
+    }
+
+    /// `ids` for any number of tokens (a prompt chunk), through a scratch allocation.
+    pub fn idsAny(self: *const NGram, gpa: std.mem.Allocator, history: []const i64, tokens: []const i64, out: []i64) !void {
+        const ctx = self.n - 1;
+        if (history.len != ctx or out.len != tokens.len * self.heads()) return error.BadShape;
+        const seq = try gpa.alloc(i64, ctx + tokens.len);
+        defer gpa.free(seq);
+        @memcpy(seq[0..ctx], history);
+        @memcpy(seq[ctx..], tokens);
+        self.idsOf(seq, ctx, out);
+    }
+
+    fn idsOf(self: *const NGram, seq: []const i64, ctx: usize, out: []i64) void {
+        var last_eos: i64 = -1;
+        for (0..seq.len) |p| {
             const in_segment: i64 = @as(i64, @intCast(p)) - (last_eos + 1);
             if (p >= ctx) {
                 var shifted: [max_n]i64 = undefined;

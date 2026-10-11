@@ -38,6 +38,7 @@ pub const Glue = struct {
         none,
         branch: struct { branch: Ptr, inject: Ptr }, // bf16 [rows, D], bf16 [rows, S]
         moe: struct { y: Ptr, wts: Ptr, inject: Ptr, slots: usize }, // fp32 [rows, slots, D], fp32 [rows, slots], bf16 [rows, S]
+        moe_bf16: struct { y: Ptr, wts: Ptr, inject: Ptr, slots: usize }, // a prompt chunk's slots, kept as bf16
     };
 
     /// glue.py `hc_writeback(h, h, pss, S, mode, ...)`: the pending branch added into the streams h (in place), and
@@ -47,6 +48,7 @@ pub const Glue = struct {
             .none => .{ 0, aot.ptr("BR", "*bf16", h), aot.ptr("INJ", "*bf16", h), aot.ptr("Y", "*bf16", h), aot.ptr("WTS", "*bf16", h), 1, 1 },
             .branch => |b| .{ 1, aot.ptr("BR", "*bf16", b.branch), aot.ptr("INJ", "*bf16", b.inject), aot.ptr("Y", "*bf16", h), aot.ptr("WTS", "*bf16", h), 1, 1 },
             .moe => |m| .{ 2, aot.ptr("BR", "*bf16", h), aot.ptr("INJ", "*bf16", m.inject), aot.ptr("Y", "*fp32", m.y), aot.ptr("WTS", "*fp32", m.wts), @intCast(m.slots - 1), @intCast(m.slots) },
+            .moe_bf16 => |m| .{ 2, aot.ptr("BR", "*bf16", h), aot.ptr("INJ", "*bf16", m.inject), aot.ptr("Y", "*bf16", m.y), aot.ptr("WTS", "*fp32", m.wts), @intCast(m.slots - 1), @intCast(m.slots) },
         };
         try g.set.run(stream, "_hc_writeback", .{ @intCast(rows), @intCast(g.hidden / 256), 1 }, &.{
             aot.ptr("H", "*bf16", h), aot.ptr("HOUT", "*bf16", h), aot.ptr("PSS", "*fp32", pss), br, inj, y, wts,
@@ -151,6 +153,50 @@ pub const Glue = struct {
         });
     }
 
+    /// glue.py `hc_act`: the down projection's rows dn [rows, ndn] bf16 (already summed) -> act [rows, low] bf16 =
+    /// bf16(silu(bf16(v / S))), its group sums, and (when `inject` is not 0) the inject gates bf16 [rows, S].
+    pub fn hcAct(g: Glue, dn: Ptr, ndn: usize, act: Ptr, xs: Ptr, inject: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_hc_act", .{ @intCast(rows), 1, 1 }, &.{
+            aot.ptr("DN", "*bf16", dn), aot.ptr("ACT", "*bf16", act), aot.ptr("XS", "*fp32", xs),
+            aot.ptr("INJ", "*bf16", if (inject != 0) inject else act),
+        }, &.{
+            aot.ci("S", @intCast(g.streams)), aot.ci("LOW", @intCast(g.low)), aot.ci("LOWP", @intCast(std.math.ceilPowerOfTwoAssert(usize, g.low))),
+            aot.ci("HAS_INJ", @intFromBool(inject != 0)), aot.ci("NDN", @intCast(ndn)),
+        });
+    }
+
+    /// exl3/prefill.py `_gemm`: out [m, n] (row stride o_stride, bf16) = ((xh @ W_q) @ H) * scale * svh for the rotated
+    /// inputs xh [m, k] fp16 and the decoded W_q [k, n] fp16, a 128-column Hadamard block a program, K in 32 steps.
+    pub fn gemm(g: Glue, xh: Ptr, wq: Ptr, hadamard: Ptr, svh: Ptr, out: Ptr, o_stride: usize, m: usize, k: usize, n: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_gemm", .{ @intCast(((m + 127) / 128) * (n / 128)), 1, 1 }, &.{
+            aot.ptr("X", "*fp16", xh), aot.ptr("W", "*fp16", wq), aot.ptr("H", "*bf16", hadamard), aot.ptr("SVH", "*fp16", svh),
+            aot.ptr("BIAS", "*fp16", svh), aot.ptr("OUT", "*bf16", out), aot.int("M", n32(m)), aot.int("o_stride", n32(o_stride)),
+        }, &.{
+            aot.ci("K", @intCast(k)), aot.ci("N", @intCast(n)), aot.ci("BM", 128), aot.ci("BK", 32), aot.ci("GROUP", 8),
+            aot.ci("HAS_BIAS", 0),    aot.cf("SCALE", had_scale),
+        });
+    }
+
+    /// exl3_mm.py `F16.__call__` for any row count: one launch when the matrix has no K slices, else 128-row calls of
+    /// the slices and their in-order sum (rows are independent, so the calls keep every row's bits).
+    pub fn f16Rows(g: Glue, w: *const F16, x: Ptr, x_ty: []const u8, x_stride: usize, m: usize, out: Ptr, o_stride: usize, part: Ptr, stream: cuda.Stream) !void {
+        if (w.sk == 1) {
+            try g.set.run(stream, "_f16_mm", .{ @intCast((m + 15) / 16), @intCast((w.n + 63) / 64), 1 }, &.{
+                aot.ptr("X", x_ty, x),        aot.ptr("W", "*fp16", w.w.ptr),   aot.ptr("OUT", "*bf16", out),
+                aot.int("M", n32(m)),         aot.int("N", n32(w.n)),           aot.int("x_stride", n32(x_stride)),
+                aot.int("o_stride", n32(o_stride)),
+            }, &.{ aot.ci("K", @intCast(w.k)), aot.ci("KS", @intCast(w.k)), aot.ci("BM", 16), aot.ci("BN", 64), aot.ci("BK", 64), aot.ci("F32", 0) });
+            return;
+        }
+        const esize: usize = if (std.mem.eql(u8, x_ty, "*fp32")) 4 else 2;
+        var r0: usize = 0;
+        while (r0 < m) : (r0 += call_rows) {
+            const rows = @min(call_rows, m - r0);
+            try g.f16mmOf(w, x + r0 * x_stride * esize, x_ty, x_stride, rows, part, 0, true, stream);
+            try g.reduce(part, w.sk, rows, w.n, out + r0 * o_stride * 2, o_stride, stream);
+        }
+    }
+
     /// exl3_mm.py `ple_rows`: staged table rows (row r * heads + h: an fp16 scale word, then dh `bits`-bit values)
     /// -> out [rows, heads * dh] fp16, decoded as ExLlamaV3's `ngram_dequant` plus each head's bias.
     pub fn pleRows(g: Glue, staged: Ptr, words: usize, head_bias: Ptr, heads: usize, dh: usize, bits: usize, out: Ptr, rows: usize, stream: cuda.Stream) !void {
@@ -184,6 +230,9 @@ pub const Glue = struct {
         }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("TAPS", @intCast(taps)), aot.ci("DIL", @intCast(dilation)), aot.ci("BLOCK", 512) });
     }
 };
+
+/// exl3/prefill.py HAD_SCALE: 1 / sqrt(128), as Python passes it (a float).
+pub const had_scale: f32 = @floatCast(@as(f64, 0.08838834764831845));
 
 /// exl3_mm.py K_INV, K_BIAS: the mul1 codebook's fp16 constants 0x1EEE and 0xC931, as Python passes them (floats).
 pub const ple_k_inv: f32 = @floatCast(@as(f16, @bitCast(@as(u16, 0x1EEE))));

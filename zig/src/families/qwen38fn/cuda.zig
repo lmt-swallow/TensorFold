@@ -12,6 +12,7 @@ pub const hc = @import("cuda_hc.zig");
 pub const ngram = @import("ngram.zig");
 pub const attn = @import("cuda_attn.zig");
 pub const forward = @import("cuda_forward.zig");
+pub const prompt = @import("cuda_prompt.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

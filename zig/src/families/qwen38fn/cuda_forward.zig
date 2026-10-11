@@ -205,6 +205,7 @@ pub const Stream = struct {
     caches: []attn.Caches,
     ple_tail: cuda.DeviceBuffer, // bf16 [(ple_kernel - 1) * ngram, S * D]
     history: [ngram.max_n]i64 = @splat(0),
+    prompt_history: [ngram.max_n]i64 = @splat(0), // the history after the prompt chunk being run
     last: ?struct { history: [ngram.max_n]i64, tokens: [64]i64, n: usize } = null,
     gpa: std.mem.Allocator,
 

@@ -44,6 +44,9 @@ pub const dsv41_rope: []const u8 = if (available) &Blob("fatbin_dsv41_rope").byt
 pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").bytes else &.{};
 pub const qwen38fn_gdn: []const u8 = if (available) &Blob("fatbin_qwen38fn_gdn").bytes else &.{};
 pub const qwen38fn_experts: []const u8 = if (available) &Blob("fatbin_qwen38fn_experts").bytes else &.{};
+pub const qwen38fn_gdn_io: []const u8 = if (available) &Blob("fatbin_qwen38fn_gdn_io").bytes else &.{};
+pub const qwen38fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_qwen38fn_gdn_prefill").bytes else &.{};
+pub const qwen38fn_prompt_glue: []const u8 = if (available) &Blob("fatbin_qwen38fn_prompt_glue").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

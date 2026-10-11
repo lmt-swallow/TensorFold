@@ -157,6 +157,11 @@ pub const Kernels = struct {
 
     /// attention.py `attention` (bf16 caches): q [rows, heads, head_dim] against each row's keys -> s.out bf16.
     pub fn attend(k: Kernels, q: Ptr, c: *const Caches, pos0: Ptr, s: *const Scratch, rows: usize, context: usize, stream: cuda.Stream) !void {
+        return k.attendInto(q, c, pos0, s, rows, context, s.out.ptr, stream);
+    }
+
+    /// `attend` merging into `out` (a prompt block's rows of the chunk's output).
+    pub fn attendInto(k: Kernels, q: Ptr, c: *const Caches, pos0: Ptr, s: *const Scratch, rows: usize, context: usize, out: Ptr, stream: cuda.Stream) !void {
         const cfg = k.cfg;
         const g = cfg.heads / cfg.kv_heads;
         var keys = context;
@@ -175,7 +180,7 @@ pub const Kernels = struct {
         }, &(consts ++ [_]aot.Const{ aot.cf("SCALE", scale), aot.ci("IDW", @intCast(s.idw)) }));
         try k.set.run(stream, "_merge", .{ @intCast(rows), @intCast(cfg.kv_heads), 1 }, &.{
             aot.ptr("PO", "*fp32", s.po.ptr), aot.ptr("PM", "*fp32", s.pm.ptr), aot.ptr("PL", "*fp32", s.pl.ptr),
-            aot.ptr("POS0", "*i32", pos0),    aot.ptr("OUT", "*bf16", s.out.ptr), aot.ptr("NKR", "*i32", s.nk.ptr),
+            aot.ptr("POS0", "*i32", pos0),    aot.ptr("OUT", "*bf16", out),       aot.ptr("NKR", "*i32", s.nk.ptr),
             aot.ptr("SPR", "*i32", s.sparse.ptr),
         }, &consts);
     }
