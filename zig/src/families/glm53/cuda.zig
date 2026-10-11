@@ -23,6 +23,7 @@ pub const pool = @import("cuda_pool.zig");
 pub const kept = @import("cuda_keep.zig");
 pub const serve_lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
+pub const tier = @import("cuda_tier.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
