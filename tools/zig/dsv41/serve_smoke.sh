@@ -15,8 +15,9 @@
 # without them, degraded; the token map is ~/aot/$KERNELS/token_map.json on both nodes), LOG_DIR (where both ranks' logs are kept), FORCE=1 (start even when the GPU
 # already has compute processes), NO_COPY=1 (use the ~/bin/tensorfold-native already on each node), RAILS (the RDMA
 # devices NCCL gathers over: auto, every device of RAIL_HCAS whose port is active with a RoCE v2 IPv4 GID at index
-# RAIL_GID on both nodes, else a comma list; two or more rails also set NCCL_MAX_NCHANNELS=4), EXTRA_ENVS (docker -e
-# flags after the script's own, so they override them).
+# RAIL_GID on both nodes, else a comma list; two or more rails also set NCCL_MAX_NCHANNELS=4 and, unless RDMA=0, send
+# the rounds' gathers over the RDMA ring: TF_DS_RDMA), EXTRA_ENVS (docker -e flags after the script's own, so they
+# override them).
 set -euo pipefail
 
 R0=${R0:-spark-616b}
@@ -41,6 +42,7 @@ ROPE=${ROPE:-device}           # TF_DS_ROPE: device (rows computed from rope/rop
 RAILS=${RAILS:-auto}
 RAIL_HCAS=${RAIL_HCAS:-rocep1s0f0 roceP2p1s0f0}   # a Spark's QSFP cable reaches the peer over two PCIe Gen5 x4 functions
 RAIL_GID=${RAIL_GID:-3}
+RDMA=${RDMA:-1}                # 1: with two or more rails, the rounds' gathers over the RDMA ring (TF_DS_RDMA); 0: NCCL only
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -160,7 +162,13 @@ DOCK="--gpus all --ipc=host --net=host --shm-size 16g --device /dev/infiniband -
 DOCK="$DOCK -v \$HOME/models:/models:ro -v \$HOME/tfcache/rank:/rc:ro -v \$HOME/aot/$KERNELS:/k:ro -v \$HOME/bin:/b:ro"
 ENVS="-e TENSORFOLD_CUDA_KERNELS=/k -e TF_DS_RANK_CACHE=/rc -e TENSORFOLD_MEMORY_RESERVE_GIB=$RESERVE -e TF_DS_REPLAY=$REPLAY -e TF_DS_ROPE=$ROPE"
 ENVS="$ENVS -e NCCL_IB_HCA=$RAILS -e NCCL_IB_GID_INDEX=$RAIL_GID -e NCCL_SOCKET_IFNAME=enp1s0f0np0"
-case "$RAILS" in *,*) ENVS="$ENVS -e NCCL_MAX_NCHANNELS=4" ;; esac
+case "$RAILS" in *,*)
+  ENVS="$ENVS -e NCCL_MAX_NCHANNELS=4"
+  # the ring's gathers in a graph (tf-cuda-test dsv41-rdma): 256 KiB a rank 23 us vs NCCL's 51, 4 MiB 254 vs 265; over
+  # one rail it trails NCCL from 1 MiB, so it rides only with two
+  if [ "$RDMA" = 1 ]; then ENVS="$ENVS -e TF_DS_RDMA=$RAILS -e TF_DS_RDMA_GID=$RAIL_GID"; fi
+  ;;
+esac
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"

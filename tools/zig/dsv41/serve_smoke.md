@@ -32,6 +32,9 @@ The QSFP cable between the Sparks reaches each node's ConnectX-7 over two PCIe G
 9000); each needs an IPv4 address for its RoCE v2 GID 3. NCCL gathers over both with 4 channels: a rank's 40 MiB in
 2.3 ms instead of 3.8-4.2 ms over one. `serve_smoke.sh` lists the devices usable on both nodes (`RAILS=auto`) and
 falls back to `rocep1s0f0` alone, with NCCL's channels left to the binary, when the second has no IPv4 GID.
+With both rails it also sends the rounds' and drafts' gathers that fit a 4.25 MiB slot over the RDMA ring
+(`TF_DS_RDMA`, deepseek_v41/rdma.zig; `RDMA=0` keeps them on NCCL): in a CUDA graph a 16-row round's 256 KiB gather
+takes 23 us instead of NCCL's 51, and the decode speeds rise 2-17% with the same tokens.
 
 Engram (`TF_DS_ENGRAM`, the original FP8 tables beside the pack) needs the Python engine's compressed token map: it
 is `~/aot/dsv41-all/token_map.json` on both nodes (`<kernels>/token_map.json`, the default; `TF_DS_TOKEN_MAP`
