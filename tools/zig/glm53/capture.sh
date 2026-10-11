@@ -7,7 +7,8 @@
 # image $IMAGE (the recipe's v1.5 pin, present on the node: never pulled). Writes <work-dir>/out/fixture
 # (manifest.json + arrays), weights.json, launches.json, capture.json, <work-dir>/aot/{aot.json,cubins/} and
 # <work-dir>/extensions/ (the torch extensions the run built: kda, exl3, hc, experts, qmm). Host memory: the dumps
-# need 6 (hc) to 20 (dsa, its 600k-token caches) GiB; NEED_GIB raises the guard's bar.
+# need 6 (hc) to 20 (dsa, its 600k-token caches) GiB; NEED_GIB raises the guard's bar. KV=fp8: the dsa and prompt
+# dumps on FP8 DSA caches (ref.py TF_GLM53_REF_KV, GLM-5.3-Flash-2's reference); default bf16.
 set -euo pipefail
 NAME=$1; shift
 WORK=$1; shift
@@ -24,7 +25,7 @@ if [ -e "$WORK" ]; then echo "$WORK exists; pass a fresh work dir" >&2; exit 1; 
 mkdir -p "$WORK/out" "$WORK/triton" "$CACHE/torch_extensions"
 # the snapshot's files link into ../../blobs: mount the repo folder whole
 docker run --rm --pull=never --gpus all --ipc=host --net=host --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -e TRITON_CACHE_DIR=/aot/triton -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions \
+  -e TF_GLM53_REF_KV="${KV:-bf16}" -e TRITON_CACHE_DIR=/aot/triton -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions \
   -e TF_GLM53_IMAGE_PATCHES="$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE")" \
   -v "$TF:/w:ro" -v "$WORK:/aot" -v "$HF_REPO:/hf:ro" -v "$CACHE:/cache" --entrypoint python3 "$IMAGE" \
   -B "/w/tools/zig/glm53/dump_$NAME.py" --tools /w/tools/zig --out /aot/out --model "/hf/snapshots/$REV" "$@"

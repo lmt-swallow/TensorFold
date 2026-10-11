@@ -6,6 +6,7 @@
 #   bash reference.sh sync    the head's snapshot (blobs and links) to the worker's cache, the bytes it lacks only,
 #                             and this worktree to the worker (forward_capture.sh runs it there)
 #   bash reference.sh start   start.sh with DENSE=bf16 KV=bf16 KDA_CHUNKED=0 DRAFTER=mtp PARALLEL=1 CONTEXT=524288
+#                             (KV=fp8, PARALLEL, CONTEXT from the caller's environment override those three)
 #   bash reference.sh mem     MemAvailable on both nodes (after the load)
 #   bash reference.sh stop    the recipe's stop.sh (both ranks); the pair is left stopped
 # RECIPE (default ~/src/glm53-mia-recipe-v15, an rsync of the recipe at 83d653f), WORKER (default spark-616b.local,
@@ -23,7 +24,9 @@ REV=078455ffe6472f9a52fbc1139f58b9db2881b25c
 DIGEST=sha256:ef83797d791fef96c4605e8d37367aca6de5aeac7bb672792cb682e2e55d4237
 
 # the strict setting (design-glm53-native: the oracle) and what start.sh needs to serve it without the network
-export DENSE=bf16 KV=bf16 KDA_CHUNKED=0 DRAFTER=mtp PARALLEL=1 CONTEXT=524288 VISION=${VISION:-0}
+# KV=fp8: GLM-5.3-Flash-2's reference (the same setting, FP8 DSA caches); PARALLEL and CONTEXT for a fit check
+export DENSE=bf16 KV=${KV:-bf16} KDA_CHUNKED=0 DRAFTER=mtp PARALLEL=${PARALLEL:-1} CONTEXT=${CONTEXT:-524288}
+export VISION=${VISION:-0}
 export PULL=0 HF_HUB_OFFLINE=1
 
 node() { # where, command

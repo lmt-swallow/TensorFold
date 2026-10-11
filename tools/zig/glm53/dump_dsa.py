@@ -22,6 +22,9 @@ manifest's "trace") and the manifest's params ("steps": kind, rows, keep, positi
      decode windows at P = 40,000 (the split top-k selection, past 8,192 pools) and P = 600,000 (past 524,288);
      the drawn caches as l_latent0 and l_pk0 (layer 3's latent rows and pooled keys before the first window).
 
+TF_GLM53_REF_KV=fp8 (ref.KV): the same runs on FP8 caches (kv8 rows: e4m3 codes, a power-of-two scale, pad; uint8
+arrays), run l's rows drawn in bf16 and quantized as the write kernels store them; params "kv" says which.
+
 weights.json: the sha256 of every tensor each rank's layers 3 and 45, head and draft head hold.
 
   python3 -B /w/tools/zig/glm53/dump_dsa.py --tools /w/tools/zig --out /aot/out --model /model
@@ -63,7 +66,7 @@ def main() -> int:
     rec = ck.load_recorder(a.tools)
     from tensorfold.cuda import experts as grouped
     from tensorfold.families.glm5_next.cuda import decode as D
-    from tensorfold.families.glm5_next.cuda import exl3_mm, glue, latent, qmm, sparse
+    from tensorfold.families.glm5_next.cuda import exl3_mm, glue, kv8, latent, qmm, sparse
     from tensorfold.families.glm5_next.cuda import forward as F
     from tensorfold.families.glm5_next.cuda import mtp as M
 
@@ -91,7 +94,7 @@ def main() -> int:
     def engine_state(w, capacity: int):
         """decode.Engine's caches, slot and state for one stream (the shared pool's first ``capacity`` tokens)."""
         caches = F.Caches(w, capacity, streams=1, ring=F.index_ring(capacity, max(MAX_ROWS, PREFILL_ROWS)),
-                          kv="bf16")
+                          kv=ref.KV)
         slots = F.Slots(w, 1, MAX_ROWS)
         return F.State(w, capacity, MAX_ROWS, caches=caches, slots=slots)
 
@@ -169,11 +172,22 @@ def main() -> int:
         torch.cuda.empty_cache()
         st = engine_state(w, LONG_CAPACITY)
         g = ref.seeded(20261012)
+
+        def draw(cache: torch.Tensor) -> None:
+            """Seeded normal rows into a cache: bf16 as drawn, an FP8 cache's rows quantized from the bf16 draw
+            (kv8.quantize_rows, the write kernels' bytes), drawn in slices to bound the fp32 temporaries."""
+            if not kv8.quantized(cache):
+                cache.copy_(torch.randn(cache.shape, generator=g, device=ref.DEV).to(cache.dtype))
+                return
+            width = kv8.width(cache)
+            for i in range(0, cache.shape[0], 65536):
+                n = min(65536, cache.shape[0] - i)
+                rows = torch.randn((n, width), generator=g, device=ref.DEV).to(torch.bfloat16)
+                cache[i:i + n].copy_(kv8.quantize_rows(rows))
+
         for di in range(len(st.kc)):
-            kc = st.kc[di]
-            kc.copy_(torch.randn(kc.shape, generator=g, device=ref.DEV).to(kc.dtype))
-            pk = st.index[di][2]
-            pk.copy_(torch.randn(pk.shape, generator=g, device=ref.DEV).to(pk.dtype))
+            draw(st.kc[di])
+            draw(st.index[di][2])
         torch.cuda.synchronize()
         if r == 0:                       # the drawn caches (the same on both ranks), for the Zig test to start from
             arrays["l_latent0"] = st.kc[0].clone()
@@ -195,7 +209,7 @@ def main() -> int:
                              f"vocabulary half)")
     params = {"layer": LAYER, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
               "rows": MAX_ROWS, "prompt_rows": PREFILL_ROWS, "world": 2, "steps": steps,
-              "dense_limit": ws[0].cfg.dense_limit, "ring": F.index_ring(CAPACITY, max(MAX_ROWS, PREFILL_ROWS))}
+              "dense_limit": ws[0].cfg.dense_limit, "kv": ref.KV, "ring": F.index_ring(CAPACITY, max(MAX_ROWS, PREFILL_ROWS))}
     ck.save(out / "fixture", params, arrays, extra={"trace": tr.calls})
     rec.dump(out / "launches.json")
     (out / "jit.json").write_text(json.dumps(ck.specialization(), indent=1, sort_keys=True) + "\n")

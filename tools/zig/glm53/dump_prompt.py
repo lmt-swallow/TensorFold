@@ -187,7 +187,7 @@ def main() -> int:
     def engine(w, capacity: int):
         """decode.Engine's prompt side for one stream (the shared pool's first ``capacity`` tokens)."""
         caches = F.Caches(w, capacity, streams=1, ring=F.index_ring(capacity, max(MAX_ROWS, PREFILL_ROWS)),
-                          kv="bf16")
+                          kv=ref.KV)
         slots = F.Slots(w, 1, MAX_ROWS)
         st = F.State(w, capacity, MAX_ROWS, caches=caches, slots=slots)
         pb = F.Buffers(w, PREFILL_ROWS, capacity, prefill=True)
