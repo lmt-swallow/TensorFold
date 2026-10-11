@@ -1,7 +1,8 @@
 //! TF_QFN_ROUND_STATS=1: where the serving time goes, logged every ten seconds the backend is busy. Rounds by
 //! stream count; verify forwards by total rows (count and wall ms, the device's work and the draws' read-back
 //! included); the head's drafting (wall ms, of it the host's draft sampling); commits; prompt chunks; and the time
-//! between backend calls (the round loop, the HTTP side, an idle server). It only observes: no choice reads it.
+//! between backend calls (the round loop, the HTTP side, an idle server). A window also ends when the last stream
+//! leaves. It only observes: no choice reads it.
 const std = @import("std");
 
 pub const max_streams = 4;
@@ -32,6 +33,7 @@ pub const Stats = struct {
     prompt_ms: f64 = 0,
     prompt_chunks: u64 = 0,
     between_ms: f64 = 0,
+    idle: bool = false, // the last stream left; the next call starts a new window
 
     /// Stats when TF_QFN_ROUND_STATS is "1", else null.
     pub fn fromEnv() ?Stats {
@@ -43,6 +45,10 @@ pub const Stats = struct {
     /// A backend call starts: the time since the last one ended counts as between calls.
     pub fn begin(s: *Stats) i128 {
         const t = nowNs();
+        if (s.idle) { // the first call after the server went idle opens the window: the idle time is not counted
+            s.* = .{ .since = t };
+            return t;
+        }
         if (s.last_end != 0) s.between_ms += ms(t - s.last_end);
         return t;
     }
@@ -80,10 +86,21 @@ pub const Stats = struct {
         s.maybeLog();
     }
 
+    /// The window so far, logged now (the last stream left: the window's rounds are over).
+    pub fn flush(s: *Stats) void {
+        s.log(true);
+        s.idle = true;
+    }
+
     fn maybeLog(s: *Stats) void {
+        s.log(false);
+    }
+
+    fn log(s: *Stats, now: bool) void {
         const t = nowNs();
         const wall = ms(t - s.since);
-        if (wall < 10_000) return;
+        if (wall < 10_000 and !now) return;
+        if (s.verify_ms == 0 and s.prompt_ms == 0) return;
         var buf: [2048]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         w.print("qwen38fn round stats over {d:.1} s: rounds by streams", .{wall / 1000}) catch {};

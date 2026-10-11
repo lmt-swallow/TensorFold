@@ -444,5 +444,6 @@ pub const Lanes = struct {
         var kv = self.lanes.fetchRemove(s) orelse return;
         self.stream.synchronize() catch {};
         self.drop(&kv.value);
+        if (self.stats) |*st| if (self.lanes.count() == 0) st.flush();
     }
 };
