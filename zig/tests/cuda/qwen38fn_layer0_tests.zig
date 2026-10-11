@@ -6,8 +6,7 @@
 //! One stream decodes the fixture's windows in order, carrying its own conv window and recurrent state from window to
 //! window. Every stage's bytes are compared with the reference's, so a first mismatch names the kernel. By default each
 //! stage runs on this engine's own outputs of the stage before; `isolated` feeds every stage the reference's inputs
-//! instead (a mismatch then cannot hide the stages after it). The routed experts are not ported yet: the MoE
-//! write-back takes the reference's expert slots (`y`), and everything else is this engine's.
+//! instead (a mismatch then cannot hide the stages after it).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -155,8 +154,12 @@ pub fn layer0(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !vo
     defer pick.free();
     var wts = try cuda.DeviceBuffer.alloc(d, rows * slots * 4);
     defer wts.free();
-    var y = try cuda.DeviceBuffer.alloc(d, rows * slots * cfg.hidden * 4);
-    defer y.free();
+    var xk_moe = try qfn.experts.Kernels.load(d);
+    defer xk_moe.deinit();
+    var experts = try qfn.experts.Experts.load(gpa, d, &pack, &cfg, 0);
+    defer experts.deinit();
+    var moe_scratch = try qfn.experts.Scratch.init(d, &experts, rows, slots);
+    defer moe_scratch.deinit();
     var cur: usize = 0;
 
     const g: Glue = .{ .set = &set, .hidden = cfg.hidden, .streams = cfg.streams, .low = cfg.low };
@@ -229,9 +232,10 @@ pub fn layer0(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !vo
         try h.stage(i, "pick", pick, 0);
         try h.stage(i, "wts", wts, 0);
 
-        // the MoE write-back (mode 2) of the reference's expert slots: layer 0's output streams
-        try h.feed(i, "y", y, 0);
-        try g.hcWriteback(w.h.ptr, w.pss.ptr, R, .{ .moe = .{ .y = y.ptr, .wts = wts.ptr, .inject = w.inj_m.ptr, .slots = slots } }, stream);
+        // the routed experts and the shared one, then the MoE write-back (mode 2): layer 0's output streams
+        _ = try qfn.experts.routed(&xk_moe, &experts, &moe_scratch, w.mixed.ptr, cfg.hidden, pick.ptr, R, stream);
+        try h.stage(i, "y", moe_scratch.y, 0);
+        try g.hcWriteback(w.h.ptr, w.pss.ptr, R, .{ .moe = .{ .y = moe_scratch.y.ptr, .wts = wts.ptr, .inject = w.inj_m.ptr, .slots = slots } }, stream);
         try h.stage(i, "h2", w.h, 0);
         try h.stage(i, "pss2", w.pss, 0);
 

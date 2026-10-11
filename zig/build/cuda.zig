@@ -40,6 +40,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_rope", .src = "dsv41/rope", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: ops.py rope_cs's table rows (glibc's sinf / cosf) at given positions
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // the DSV4.1 fork's cuda/rdma_gather.cu v7 kernel pair: the rounds' gathers over the RDMA ring
     .{ .name = "qwen38fn_gdn", .src = "qwen38fn/gdn", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
+    .{ .name = "qwen38fn_experts", .src = "qwen38fn/experts", .flags = &.{ "-O3", "-lineinfo" } }, // 0.6.6 cuda/exl3/experts.py, tensorfold_exl3_experts_v1
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
