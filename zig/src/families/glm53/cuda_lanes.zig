@@ -10,6 +10,11 @@
 //! the host. With drafts, a stream's drafts are its MTP head's greedy chain (up to 3, cut where the product of their
 //! confidences falls under 0.35, decode.py `draft`); the head absorbs the kept rows only when it drafts (or when it
 //! owes 256), as drafter_choice.py's backlog does. Drafts never change a token, only how many a round lands.
+//!
+//! The streams' DSA caches are extents of one pool (cuda_pool.zig); a finished prompt stays there as a kept prompt
+//! (cuda_keep.zig), and a later prompt that starts the same continues it from their longest shared boundary. Rank 0
+//! alone chooses (the book's match and placement, the kept prompts a finishing one covers) and sends its choice in
+//! the records; every rank's book follows the same records, so the ranks keep the same book.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -18,6 +23,8 @@ const engine = @import("cuda_engine.zig");
 const P = @import("cuda_pool.zig");
 const copy_drafts = @import("copy_drafts.zig");
 const dsa = @import("cuda_dsa.zig");
+const keep = @import("cuda_keep.zig");
+const kb = keep.book;
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -38,13 +45,14 @@ pub const depth = copy_drafts.depth_most;
 /// Step opcodes; each record starts with one.
 pub const Op = enum(u8) { open = 1, fill = 2, verify = 3, keep = 4, draft = 5, release = 6, stop = 7 };
 
-/// A record's fixed header before a prompt's ids (u32 each): the opcode, the slot, the flags, the extent's base and
-/// size (u32 each, positions), the prompt's length.
-const open_header = 15;
+/// A record's fixed header before a prompt's ids (u32 each): the opcode, the slot, the flags (bit 0: drafts; bit 1:
+/// continues a kept prompt), the extent's base and size (positions), the kept prompt and its boundary (book points),
+/// the prompt's length (u32 each).
+const open_header = 23;
 
 /// The bytes a record takes at most for sequences of `capacity` positions (an `open` of a whole prompt).
 pub fn maxOpBytes(capacity: usize) usize {
-    return @max(open_header + 4 * capacity, 2 + max_streams * (3 + 4 * max_rows));
+    return @max(open_header + 4 * capacity, @max(2 + max_streams * (3 + 4 * max_rows), 3 + 4 * kb.max_kept));
 }
 
 const Slot = struct {
@@ -52,8 +60,11 @@ const Slot = struct {
     busy: bool = false,
     base: usize = 0, // the stream's extent of the pool
     size: usize = 0,
-    prompt: ?[]u32 = null, // the prompt pass under way: its ids
+    prompt: ?[]u32 = null, // the stream's prompt (held until it leaves: a kept prompt keeps its ids)
+    filling: bool = false, // the prompt pass is under way
     start: usize = 0, // the next chunk's first row
+    marks: kb.Marks = .{}, // the snapshots at its boundaries (book points), inherited ones first
+    points: kb.Points = .{}, // the boundaries its pass snapshots at
     first: u32 = 0, // the reply's first token, once the pass ended
     pending: ?usize = null, // the last window's rows, uncommitted
     drafts: bool = false, // the stream drafts: its head absorbs the kept rows
@@ -73,6 +84,9 @@ pub const Lanes = struct {
     pool: *P.Pool,
     ring: usize, // each slot's index ring rows
     drafts: bool,
+    book: kb.Book,
+    released: kb.Released = .{},
+    snaps: ?keep.Snaps = null,
     slots: [max_streams]Slot = @splat(.{}),
     // rank 0: the stream each slot serves
     owners: [max_streams]?*const lanes.Stream = @splat(null),
@@ -93,9 +107,11 @@ pub const Lanes = struct {
         errdefer gpa.free(op_buf);
         var send = try Buf.alloc(d, 16);
         errdefer send.free();
-        self.* = .{ .gpa = gpa, .d = d, .lay = lay, .r = r, .comm = comm, .capacity = capacity, .pool = pool, .ring = dsa.indexRing(capacity, engine.prompt_rows), .drafts = drafts, .op_buf = op_buf, .agree_send = send, .agree_recv = try Buf.alloc(d, 16 * lay.world) };
+        self.* = .{ .gpa = gpa, .d = d, .lay = lay, .r = r, .comm = comm, .capacity = capacity, .pool = pool, .ring = dsa.indexRing(capacity, engine.prompt_rows), .drafts = drafts, .book = .{ .set = keep.settings(), .chunk = keep.chunk, .window = 0 }, .op_buf = op_buf, .agree_send = send, .agree_recv = try Buf.alloc(d, 16 * lay.world) };
         errdefer self.deinit();
+        self.book.released = &self.released;
         for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
+        if (self.book.set.on) self.snaps = try keep.Snaps.init(gpa, d, self.book.set.snaps, keep.snapBytes(&self.slots[0].seq.?));
         return self;
     }
 
@@ -104,6 +120,8 @@ pub const Lanes = struct {
             self.clear(s);
             if (s.seq) |*q| q.deinit();
         }
+        for (self.book.slice()) |k| self.gpa.free(k.ids);
+        if (self.snaps) |*x| x.deinit();
         self.agree_send.free();
         self.agree_recv.free();
         self.gpa.free(self.op_buf);
@@ -143,12 +161,45 @@ pub const Lanes = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    /// The slot free again: its extent back to the pool, its prompt freed; its sequence kept for the next stream.
+    /// The slot free again: its extent back to the pool, its snapshots let go, its prompt freed; its sequence kept
+    /// for the next stream.
     fn clear(self: *Lanes, s: *Slot) void {
         if (s.prompt) |p| self.gpa.free(p);
-        if (s.busy) self.pool.extents.give(s.base, s.size);
+        if (s.busy) {
+            self.pool.extents.give(s.base, s.size);
+            if (self.snaps) |*x| for (s.marks.slice()) |m| {
+                x.refs[m.snap] -|= 1;
+            };
+        }
         const seq = s.seq;
         s.* = .{ .seq = seq };
+    }
+
+    /// What the book let go, freed: its snapshots' holds dropped, its kept ids' storage.
+    fn settle(self: *Lanes) void {
+        const r = &self.released;
+        if (self.snaps) |*x| for (r.snaps[0..r.n_snaps]) |id| {
+            x.refs[id] -|= 1;
+        };
+        for (r.ids[0..r.n_ids]) |ids| self.gpa.free(ids);
+        r.* = .{};
+    }
+
+    /// A finishing stream's prompt kept (`Book.keep`) when its pass ended with a boundary snapshotted, else its
+    /// extent freed; then the kept prompts `drops` (rank 0's `Book.covered`) go, and the oldest past the entries.
+    fn finish(self: *Lanes, s: *Slot, drops: []const u32) void {
+        if (!s.busy) return;
+        const ids = s.prompt.?;
+        const keepable = self.book.set.on and !s.filling and s.marks.n > 0;
+        const owned: ?[]i32 = if (keepable) self.gpa.alloc(i32, s.marks.last().?) catch null else null;
+        if (owned) |o| {
+            self.book.keep(&self.pool.extents, s.base, s.size, asI32(ids), &s.marks, false, o);
+            s.marks = .{};
+            s.busy = false;
+        }
+        self.clear(s);
+        self.book.finish(&self.pool.extents, drops);
+        self.settle();
     }
 
     /// Positions a stream of `prompt` tokens and up to `max_new` more takes (its windows' rows included), aligned;
@@ -235,27 +286,37 @@ pub const Lanes = struct {
                 const flags = rd.byte() orelse return false;
                 const base = rd.int() orelse return false;
                 const size = rd.int() orelse return false;
+                const eid = rd.int() orelse return false;
+                const cut = rd.int() orelse return false;
                 const n = rd.int() orelse return false;
-                if (slot >= max_streams or self.slots[slot].busy or flags > 1 or n == 0 or rd.b.len != 4 * @as(usize, n)) return false;
-                if (size > self.capacity or n + max_rows >= size) return false;
-                var ex = self.pool.extents;
-                return ex.takeAt(base, size);
+                if (slot >= max_streams or self.slots[slot].busy or flags > 3 or n == 0 or rd.b.len != 4 * @as(usize, n)) return false;
+                if (size > self.capacity or size % P.extent_align != 0 or n + max_rows >= size) return false;
+                const reuse: ?kb.Reuse = if (flags & 2 != 0) .{ .eid = eid, .cut = cut } else null;
+                if (reuse) |ru| {
+                    if (!self.book.set.on or ru.cut >= n) return false;
+                    const k = &self.book.kept[self.book.find(ru.eid) orelse return false];
+                    if (k.marks.find(ru.cut) == null or ru.cut > k.top) return false;
+                    for (k.keys()[0..ru.cut], 0..) |a, i| if (@as(u32, @bitCast(a)) != std.mem.readInt(u32, rd.b[4 * i ..][0..4], .little)) return false;
+                }
+                const placed = self.trialPlace(size, reuse) orelse return false;
+                return placed.base == base;
             },
             .fill => {
                 const slot = rd.byte() orelse return false;
                 _ = rd.int() orelse return false;
-                return slot < max_streams and self.slots[slot].busy and self.slots[slot].prompt != null and rd.b.len == 0;
+                return slot < max_streams and self.slots[slot].busy and self.slots[slot].filling and rd.b.len == 0;
             },
             .release => {
                 const slot = rd.byte() orelse return false;
-                return slot < max_streams and rd.b.len == 0;
+                const n = rd.byte() orelse return false;
+                return slot < max_streams and n <= kb.max_kept and rd.b.len == 4 * @as(usize, n);
             },
             .verify, .keep, .draft => {
                 const n = rd.byte() orelse return false;
                 if (n > max_streams) return false;
                 for (0..n) |_| {
                     const slot = rd.byte() orelse return false;
-                    if (slot >= max_streams or !self.slots[slot].busy or self.slots[slot].prompt != null) return false;
+                    if (slot >= max_streams or !self.slots[slot].busy or self.slots[slot].filling) return false;
                     const rows = rd.byte() orelse return false;
                     if (rows > max_rows) return false;
                     switch (code) {
@@ -284,20 +345,13 @@ pub const Lanes = struct {
                 const flags = rd.byte().?;
                 const base: usize = rd.int().?;
                 const size: usize = rd.int().?;
+                const eid = rd.int().?;
+                const cut: usize = rd.int().?;
                 const n = rd.int().?;
                 const ids = try self.gpa.alloc(u32, n);
                 errdefer self.gpa.free(ids);
                 for (ids) |*t| t.* = rd.int().?;
-                if (!self.pool.extents.takeAt(base, size)) return error.BadExtent;
-                errdefer self.pool.extents.give(base, size);
-                const q = &s.seq.?;
-                try q.bind(self.pool, base, size);
-                try q.reset(self.r.stream);
-                s.busy = true;
-                s.base = base;
-                s.size = size;
-                s.prompt = ids;
-                s.start = 0;
+                try self.admit(s, base, size, ids, if (flags & 2 != 0) .{ .eid = eid, .cut = cut } else null);
                 s.drafts = flags & 1 != 0;
             },
             .fill => {
@@ -306,11 +360,13 @@ pub const Lanes = struct {
                 const q = &s.seq.?;
                 const ids = s.prompt.?;
                 var n: u32 = 0;
-                while (n < chunks and s.start < ids.len) : (n += 1) s.start = try self.r.fill(q, ids, s.start);
+                while (n < chunks and s.start < ids.len) : (n += 1) {
+                    s.start = try self.r.fill(q, ids, s.start);
+                    if (s.points.has(s.start + 1)) if (self.snapshot(s)) |id| s.marks.add(.{ .at = s.start + 1, .snap = id });
+                }
                 if (s.start == ids.len) {
                     s.first = try self.r.first(q);
-                    self.gpa.free(ids);
-                    s.prompt = null;
+                    s.filling = false;
                 }
             },
             .verify => {
@@ -356,9 +412,80 @@ pub const Lanes = struct {
                     }
                 }
             },
-            .release => self.clear(&self.slots[rd.byte().?]),
+            .release => {
+                const s = &self.slots[rd.byte().?];
+                var drops: [kb.max_kept]u32 = undefined;
+                const n = rd.byte().?;
+                for (drops[0..n]) |*x| x.* = rd.int().?;
+                self.finish(s, drops[0..n]);
+            },
             .stop => {},
         }
+    }
+
+    /// Where an admission of `size` positions continuing `reuse` would go (the book and extents untouched); null:
+    /// no room even with every kept prompt gone.
+    fn trialPlace(self: *const Lanes, size: usize, reuse: ?kb.Reuse) ?kb.Placed {
+        var b = self.book.trial();
+        var ex = self.pool.extents;
+        return b.place(&ex, size, if (reuse) |r| r.eid else null);
+    }
+
+    /// The stream's extent placed by the book at `base` (continuing `reuse`: the kept prompt's rows before its
+    /// boundary copied in unless the extent grew in place, and the slot's state restored from the snapshot there, so
+    /// the prompt's chunks from the boundary are a fresh prefill's own).
+    fn admit(self: *Lanes, s: *Slot, base: usize, size: usize, ids: []u32, reuse: ?kb.Reuse) !void {
+        var inherited: kb.Marks = .{};
+        var src_base: usize = 0;
+        var cut_snap: u16 = 0;
+        if (reuse) |r| {
+            const k = &self.book.kept[self.book.find(r.eid).?];
+            src_base = k.base;
+            cut_snap = k.marks.find(r.cut).?;
+            // the kept prompt's snapshots to the boundary become the stream's too (placing may forget it)
+            for (k.marks.slice()) |m| if (m.at <= r.cut) {
+                inherited.add(m);
+                self.snaps.?.refs[m.snap] += 1;
+            };
+        }
+        self.book.ticks += 1;
+        const placed = self.book.place(&self.pool.extents, size, if (reuse) |r| r.eid else null) orelse return error.NoRoom;
+        if (placed.base != base) return error.PositionMismatch;
+        if (placed.how == .copy) {
+            const k = &self.book.kept[self.book.find(reuse.?.eid).?];
+            k.tick = self.book.ticks;
+            k.hits += 1;
+        }
+        self.settle();
+        s.* = .{ .seq = s.seq, .busy = true, .base = base, .size = size, .prompt = ids, .filling = true, .marks = inherited };
+        const q = &s.seq.?;
+        try q.bind(self.pool, base, size);
+        try q.reset(self.r.stream);
+        if (reuse) |r| {
+            const at = r.cut - 1; // the book's point is one past the boundary
+            if (placed.how == .copy or placed.how == .move) try keep.copyRows(self.pool, src_base, base, at, self.r.stream);
+            try self.snaps.?.restore(cut_snap, q, at, self.r.stream);
+            s.start = at;
+            if (self.lay.rank == 0) std.log.info("glm53: a prompt of {d} continues kept prompt {d} from {d} ({t})", .{ ids.len, r.eid, at, placed.how });
+        }
+        if (self.book.set.on) s.points = keep.pointsFor(&self.book, ids.len);
+    }
+
+    /// The slot's sequence into a free snapshot (the least recently used kept prompts give theirs back first); null
+    /// when none frees (the boundary is not kept).
+    fn snapshot(self: *Lanes, s: *Slot) ?u16 {
+        const x = &(self.snaps orelse return null);
+        var id = x.open();
+        while (id == null) {
+            if (!self.book.forgetOldest(&self.pool.extents)) return null;
+            self.settle();
+            id = x.open();
+        }
+        x.save(id.?, &s.seq.?, self.r.stream) catch {
+            x.refs[id.?] = 0;
+            return null;
+        };
+        return id;
     }
 
     /// The slot's last window committed: its first `kept` rows, else all of them.
@@ -393,7 +520,7 @@ pub const Lanes = struct {
     fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream, chunks: u32) anyerror!bool {
         const self = of(ptr);
         var slot = self.slotOf(s);
-        if (slot) |i| if (self.slots[i].prompt == null) { // a stream prefilled again: a new sequence
+        if (slot) |i| if (!self.slots[i].filling) { // a stream prefilled again: a new sequence
             releaseFn(ptr, s);
             slot = null;
         };
@@ -404,7 +531,7 @@ pub const Lanes = struct {
         buf[1] = slot.?;
         std.mem.writeInt(u32, buf[2..6], chunks, .little);
         try self.both(buf[0..6]);
-        return self.slots[slot.?].prompt == null;
+        return !self.slots[slot.?].filling;
     }
 
     fn open(self: *Lanes, s: *lanes.Stream) !u8 {
@@ -415,14 +542,17 @@ pub const Lanes = struct {
         const slot: u8 = for (self.owners, 0..) |o, i| {
             if (o == null) break @intCast(i);
         } else return error.NoRoom;
-        const base = self.pool.extents.first(size) orelse return error.NoRoom;
+        const reuse: ?kb.Reuse = if (self.book.set.on) self.book.match(ids, false) else null;
+        const base = (self.trialPlace(size, reuse) orelse return error.NoRoom).base;
         const op = self.op_buf[0 .. open_header + 4 * ids.len];
         op[0] = @intFromEnum(Op.open);
         op[1] = slot;
-        op[2] = @intFromBool(self.drafts);
+        op[2] = @as(u8, @intFromBool(self.drafts)) | @as(u8, @intFromBool(reuse != null)) << 1;
         std.mem.writeInt(u32, op[3..7], @intCast(base), .little);
         std.mem.writeInt(u32, op[7..11], @intCast(size), .little);
-        std.mem.writeInt(u32, op[11..15], @intCast(ids.len), .little);
+        std.mem.writeInt(u32, op[11..15], if (reuse) |r| r.eid else 0, .little);
+        std.mem.writeInt(u32, op[15..19], if (reuse) |r| @intCast(r.cut) else 0, .little);
+        std.mem.writeInt(u32, op[19..23], @intCast(ids.len), .little);
         for (ids, 0..) |t, i| std.mem.writeInt(u32, op[open_header + 4 * i ..][0..4], t, .little);
         try self.both(op);
         self.owners[slot] = s;
@@ -433,7 +563,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         if (position != s.prompt_len) return error.PositionMismatch;
         const i = self.slotOf(s) orelse return error.UnknownStream;
-        if (self.slots[i].prompt != null) return error.PromptNotDone;
+        if (self.slots[i].filling) return error.PromptNotDone;
         return self.take(self.slots[i].first);
     }
 
@@ -547,10 +677,28 @@ pub const Lanes = struct {
         const self = of(ptr);
         const i = self.slotOf(s) orelse return;
         self.owners[i] = null;
-        const op = [_]u8{ @intFromEnum(Op.release), i };
-        self.both(&op) catch |e| std.log.err("glm53: releasing slot {d} failed ({s})", .{ i, @errorName(e) });
+        // the kept prompts this one covers when it is kept (the same ids to their top, their boundaries all kept)
+        const sl = &self.slots[i];
+        var drops: [kb.max_kept]u32 = undefined;
+        var nd: usize = 0;
+        if (self.book.set.on and !sl.filling and sl.marks.n > 0) {
+            var have: [kb.max_marks]usize = undefined;
+            for (sl.marks.slice(), have[0..sl.marks.n]) |m, *at| at.* = m.at;
+            nd = self.book.covered(asI32(sl.prompt.?), have[0..sl.marks.n], false, &drops);
+        }
+        var w: Writer = .{ .b = self.op_buf };
+        w.byte(@intFromEnum(Op.release));
+        w.byte(i);
+        w.byte(@intCast(nd));
+        for (drops[0..nd]) |e| w.int(e);
+        self.both(w.done()) catch |e| std.log.err("glm53: releasing slot {d} failed ({s})", .{ i, @errorName(e) });
     }
 };
+
+/// Token ids as the book holds them (ids are below 2^31).
+fn asI32(ids: []const u32) []const i32 {
+    return @ptrCast(ids);
+}
 
 /// A record's little-endian fields.
 const Writer = struct {
@@ -613,15 +761,18 @@ test "records the follower parses: a verify of two windows, a short one refused"
 test "a follower runs only records whose slots hold what the step needs" {
     var cfg: config.Config = undefined;
     var pool: P.Pool = .{ .gpa = std.testing.allocator, .latent = &.{}, .pk = &.{}, .rows = 2 * P.extent_align, .kv = .bf16, .extents = P.Extents.init(2 * P.extent_align) };
-    var l: Lanes = .{ .gpa = std.testing.allocator, .d = undefined, .lay = .{ .rank = 1, .world = 2, .cfg = &cfg }, .r = undefined, .comm = undefined, .capacity = 2 * P.extent_align, .pool = &pool, .ring = 64, .drafts = true, .op_buf = &.{}, .agree_send = undefined, .agree_recv = undefined };
+    var l: Lanes = .{ .gpa = std.testing.allocator, .d = undefined, .lay = .{ .rank = 1, .world = 2, .cfg = &cfg }, .r = undefined, .comm = undefined, .capacity = 2 * P.extent_align, .pool = &pool, .ring = 64, .drafts = true, .book = .{ .set = .{ .on = false }, .chunk = keep.chunk, .window = 0 }, .op_buf = &.{}, .agree_send = undefined, .agree_recv = undefined };
     var buf: [64]u8 = undefined;
-    // open: slot 0, drafts, the extent [2048, 4096), two ids
+    // open: slot 0, drafts, the extent [2048, 4096) (the book places the first free one: [0, 2048) is taken), two ids
+    try std.testing.expect(pool.extents.takeAt(0, P.extent_align));
     var w: Writer = .{ .b = &buf };
     w.byte(@intFromEnum(Op.open));
     w.byte(0);
     w.byte(1);
     w.int(P.extent_align);
     w.int(P.extent_align);
+    w.int(0);
+    w.int(0);
     w.int(2);
     w.int(5);
     w.int(6);
@@ -632,6 +783,10 @@ test "a follower runs only records whose slots hold what the step needs" {
     try std.testing.expect(!l.runnable(w.done()));
     buf[1] = 0;
     try std.testing.expect(pool.extents.takeAt(P.extent_align, P.extent_align));
+    try std.testing.expect(!l.runnable(w.done()));
+    // continuing a kept prompt with kept prompts off
+    pool.extents.give(P.extent_align, P.extent_align);
+    buf[2] = 3;
     try std.testing.expect(!l.runnable(w.done()));
     // a verify names a slot no stream holds: refused
     var v: Writer = .{ .b = &buf };
