@@ -138,6 +138,42 @@ pub const ExpertKernels = struct {
     }
 };
 
+/// index_score.cu: the prompt indexer's scores with `_index_score_rows`' bits at the mma rate (TF_DS_INDEX_SCORE=mma,
+/// the default; `triton` takes the captured kernel), the keys dequantized to bf16 once a call. TF_DS_INDEX_CHECK=1
+/// runs the captured kernel beside it on every row block and fails unless scores, keys and tile maxima are
+/// byte-equal.
+pub const IndexKernels = struct {
+    module: cuda.Module,
+    keys_bf16: cuda.Function,
+    score: cuda.Function,
+    keys: cuda.Function,
+    use: bool,
+    check: bool,
+    /// 64-key tiles a program (TF_DS_INDEX_TILES)
+    tiles: usize,
+
+    pub fn load(d: *const cuda.Driver) !IndexKernels {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_index_score);
+        errdefer module.unload();
+        const mode = envOr("TF_DS_INDEX_SCORE", "mma");
+        if (!std.mem.eql(u8, mode, "mma") and !std.mem.eql(u8, mode, "triton")) return error.BadShape;
+        return .{
+            .module = module,
+            .keys_bf16 = try module.function("tf_dsv41_index_keys_bf16"),
+            .score = try module.function("tf_dsv41_index_score_rows"),
+            .keys = try module.function("tf_dsv41_index_keys_rows"),
+            .use = std.mem.eql(u8, mode, "mma"),
+            .check = std.mem.eql(u8, envOr("TF_DS_INDEX_CHECK", "0"), "1"),
+            .tiles = std.fmt.parseInt(usize, envOr("TF_DS_INDEX_TILES", "16"), 10) catch return error.BadShape,
+        };
+    }
+
+    pub fn deinit(self: *IndexKernels) void {
+        self.module.unload();
+    }
+};
+
 /// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).
 pub const Gu = enum { mma, mmb };
 
@@ -487,6 +523,9 @@ pub const Prompt = struct {
     kernels: *const exl3.Kernels,
     glue: Glue,
     pk: ExpertKernels,
+    ix: IndexKernels,
+    /// bf16 [n_comp, 128]: the index keys of the call (IndexKernels), made on first use at the planes' capacity
+    kbf: ?cuda.DeviceBuffer = null,
     gemm: Gemm32,
     rows: usize, // the chunk rows this holds buffers for (at most max_chunk)
     rr: attention.RopeRows, // a chunk's rope rows (the device path's: its positions, its groups', the indexer's)
@@ -610,6 +649,9 @@ pub const Prompt = struct {
         errdefer self.glue.deinit();
         self.pk = try ExpertKernels.load(d, fwd.ek);
         errdefer self.pk.deinit();
+        self.ix = try IndexKernels.load(d);
+        errdefer self.ix.deinit();
+        self.kbf = null;
         self.gemm = try Gemm32.init(d);
         errdefer self.gemm.deinit();
         // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
@@ -786,6 +828,8 @@ pub const Prompt = struct {
         self.scratch.deinit();
         self.gemm.deinit();
         self.pk.deinit();
+        self.ix.deinit();
+        if (self.kbf) |*b| b.free();
         self.glue.deinit();
         self.rr.deinit();
         self.gpa.free(self.ids_h);
@@ -1363,6 +1407,22 @@ pub const Prompt = struct {
         const keyed = !is_cand_source and !after_cand and (kk & (kk - 1)) == 0;
         const cb = @max(1, c.cand_block);
         const ccols = (n_comp_end + cb - 1) / cb;
+        const fast = self.ix.use and n > decode_rows and c.idx_heads == 32 and c.idx_dim == 128;
+        if (fast) {
+            const need = n_comp_end * c.idx_dim * 2;
+            if (self.kbf == null or self.kbf.?.len < need) {
+                if (self.kbf) |*b| b.free();
+                self.kbf = null;
+                const cap = @max(need, caches.idxk_codes.len * 4);
+                self.kbf = try cuda.DeviceBuffer.alloc(self.d, cap);
+            }
+            var a: cuda.Args = .{};
+            a.add(caches.idxk_codes.ptr);
+            a.add(caches.idxk_scales.ptr);
+            a.add(self.kbf.?.ptr);
+            a.add(@as(c_int, @intCast(n_comp_end)));
+            try cuda.launch.launch(self.ix.keys_bf16, .{ .grid = .{ .x = @intCast((n_comp_end * c.idx_dim / 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+        }
         var r0: usize = 0;
         while (r0 < n) : (r0 += step) {
             const r1 = @min(n, r0 + step);
@@ -1384,6 +1444,8 @@ pub const Prompt = struct {
                     aot.ci("HAS_BASE", 0),                aot.ci("PDL", 1),                  aot.ci("HAS_CAND", 0), aot.ci("CB", 8),
                     aot.ci("KEYS", @intFromBool(keyed)),  aot.ci("HAS_TMAX", @intFromBool(keyed)), aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
                 });
+            } else if (fast and !self.ix.check) {
+                try self.indexScoreMma(q, wt, vr, rows, n_comp_end, nt, keyed, stream);
             } else {
                 try fwd.set.run(stream, "_index_score_rows", .{ @intCast((rows + 7) / 8), @intCast(nt), 1 }, &.{
                     aot.ptr("Q", "*bf16", q),                     aot.ptr("K", "*u8", caches.idxk_codes.ptr),
@@ -1392,6 +1454,7 @@ pub const Prompt = struct {
                     aot.int("n", @intCast(n_comp_end)),           aot.int("rows", @intCast(rows)),
                     aot.ptr("TMAX", if (keyed) "*i64" else "*fp32", if (keyed) self.tmax.ptr else self.score.ptr), aot.int("nt", @intCast(nt)),
                 }, &.{ aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64), aot.ci("RB", 8), aot.ci("PACKED", 1), aot.ci("KEYS", @intFromBool(keyed)), aot.ci("HAS_TMAX", @intFromBool(keyed)) });
+                if (fast) try self.indexCheck(li, q, wt, vr, rows, n_comp_end, nt, keyed, stream);
             }
             if (!host) {
                 const tg = &fwd.glue.topk.?;
@@ -1431,6 +1494,52 @@ pub const Prompt = struct {
         self.cidx_stride = kk;
         var nbuf: [32]u8 = undefined;
         try self.probeOut(try std.fmt.bufPrint(&nbuf, "L{d}.cidx", .{li}), self.cidx.ptr, n * kk * 8, stream);
+    }
+
+    /// `_index_score_rows` on the row block at `q` through index_score.cu (the keys in `kbf`): scores (or keyed, the
+    /// keys and tile maxima) into `score` / `tmax`.
+    fn indexScoreMma(self: *Prompt, q: Ptr, wt: Ptr, vr: Ptr, rows: usize, n: usize, nt: usize, keyed: bool, stream: cuda.Stream) !void {
+        const tiles = @max(1, self.ix.tiles);
+        var a: cuda.Args = .{};
+        a.add(q);
+        a.add(self.kbf.?.ptr);
+        a.add(wt);
+        a.add(vr);
+        a.add(self.score.ptr);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(rows)));
+        if (keyed) a.add(self.tmax.ptr);
+        a.add(@as(c_int, @intCast(nt)));
+        a.add(@as(c_int, @intCast(tiles)));
+        if (keyed) a.add(@as(c_int, 1));
+        const grid: cuda.launch.Dim3 = .{ .x = @intCast((rows + 3) / 4), .y = @intCast((nt + tiles - 1) / tiles) };
+        try cuda.launch.launch(if (keyed) self.ix.keys else self.ix.score, .{ .grid = grid, .block = .{ .x = 256 } }, stream, &a);
+    }
+
+    /// TF_DS_INDEX_CHECK: the captured kernel's output (just written) against index_score.cu's on the same block,
+    /// byte for byte (scores or keys, and the keyed path's tile maxima); index_score.cu's stays.
+    fn indexCheck(self: *Prompt, li: usize, q: Ptr, wt: Ptr, vr: Ptr, rows: usize, n: usize, nt: usize, keyed: bool, stream: cuda.Stream) !void {
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const sb = rows * n * @as(usize, if (keyed) 8 else 4);
+        const tb = if (keyed) rows * nt * 8 else 0;
+        const want = try gpa.alloc(u8, sb + tb);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, sb + tb);
+        defer gpa.free(got);
+        try self.score.download(0, want[0..sb]);
+        if (keyed) try self.tmax.download(0, want[sb..]);
+        try self.indexScoreMma(q, wt, vr, rows, n, nt, keyed, stream);
+        try stream.synchronize();
+        try self.score.download(0, got[0..sb]);
+        if (keyed) try self.tmax.download(0, got[sb..]);
+        var bad: usize = 0;
+        for (want, got) |x, y| bad += @intFromBool(x != y);
+        if (bad != 0) {
+            std.log.err("deepseek_v41: layer {d} indexer ({d} rows, {d} keys, keyed {}): {d} of {d} bytes differ from _index_score_rows", .{ li, rows, n, keyed, bad, want.len });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("deepseek_v41: layer {d} indexer ({d} rows, {d} keys, keyed {}): byte-equal to _index_score_rows", .{ li, rows, n, keyed });
     }
 
     /// cidx [n, n_idx] -> [n, n_pad] with -1 past n_idx (torch.nn.functional.pad): rows moved from the back, in place

@@ -37,6 +37,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_topk_glue", .src = "dsv41/topk_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the indexer's selection (topk_indices, the candidate pool and its mask) on the device
     .{ .name = "dsv41_exl3_grouped", .src = "dsv41/linear_grouped", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // the same extension's linear_grouped.cu: rot_many, glinear (grouped launches, rotation / RoPE epilogues)
     .{ .name = "dsv41_l2_prefetch", .src = "dsv41/l2_prefetch", .flags = &.{"-O3"} }, // cuda/exl3/prefetch.py, tensorfold_exl3_l2_prefetch_v6: paced L2 prefetch of weight ranges
+    .{ .name = "dsv41_index_score", .src = "dsv41/index_score", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt indexer's scores (kernels.py _index_score_rows' bits) at the mma rate
     .{ .name = "dsv41_rope", .src = "dsv41/rope", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: ops.py rope_cs's table rows (glibc's sinf / cosf) at given positions
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // the DSV4.1 fork's cuda/rdma_gather.cu v7 kernel pair: the rounds' gathers over the RDMA ring
     .{ .name = "qwen38fn_gdn", .src = "qwen38fn/gdn", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
