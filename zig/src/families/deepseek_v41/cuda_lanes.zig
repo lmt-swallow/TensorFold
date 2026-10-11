@@ -1829,6 +1829,8 @@ pub const Engine = struct {
     stepped: u64 = 0,
     /// How rank 1 waits for rank 0's records and the link's timings (`LinkWait`).
     link: LinkWait = .{},
+    /// TF_DS_FILL_PROFILE=1: each fill step logs where the time since the last one went (`FillProfile`).
+    fprof: ?*FillProfile = null,
     /// A step failed on this rank past its agreement: the other rank may sit in a collective, so no further
     /// collective is issued (it would pair with the wrong one or hang); the ranks must be restarted.
     broken: bool = false,
@@ -1942,6 +1944,11 @@ pub const Engine = struct {
         e.comm = try cuda.comm.Comm.init(s.rank, s.world, s.master, s.port, 1_800_000);
         errdefer e.comm.deinit();
         e.link = LinkWait.fromEnv();
+        e.fprof = null;
+        if (getenv("TF_DS_FILL_PROFILE")) |v| if (!std.mem.eql(u8, v, "0")) {
+            e.fprof = try FillProfile.init(gpa, ctx.d);
+        };
+        errdefer if (e.fprof) |fp| fp.deinit(gpa);
         if (!e.comm.busyPoll(e.link.busy_poll_us)) std.log.warn("deepseek_v41 rank {d}: SO_BUSY_POLL refused on the control link", .{s.rank});
         std.log.info("deepseek_v41 rank {d}: control link busy poll {d} us, follower spin {d} us{s}", .{ s.rank, e.link.busy_poll_us, e.link.spin_ns / 1000, if (e.link.profile) ", profiled (TF_DS_LINK_PROFILE)" else "" });
         clock.mark("the ranks' rendezvous", .{});
@@ -1969,6 +1976,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.fprof) |fp| fp.deinit(e.gpa);
         e.gpa.free(e.op_buf);
         e.gpa.free(e.ids_buf);
         e.agree_host.free();
@@ -2072,8 +2080,17 @@ pub const Engine = struct {
 
     /// Rank 0 announces `op` and every rank runs it (`run`, the same on every rank).
     fn both(e: *Engine, op: []const u8) !void {
+        const fp = e.fprof orelse {
+            try e.announce(op);
+            try e.step(Engine.run, .{ e, op });
+            return;
+        };
+        const t0 = nowNs();
         try e.announce(op);
+        const t1 = nowNs();
+        fp.begin(op[0], t1 - t0, e.stream);
         try e.step(Engine.run, .{ e, op });
+        fp.end(nowNs() - t1, e.stream);
     }
 
     // -- the steps (the same on every rank) -------------------------------------------------------------------
@@ -2113,6 +2130,7 @@ pub const Engine = struct {
             .fill => {
                 const f = try Fill.parse(op);
                 if (!e.streams.fills(f.slot, f.at, f.chunks)) return error.PositionMismatch;
+                if (e.fprof) |fp| fp.report(e.settings.rank, f.at, e.engram, .{ e.streams.runner.captures, e.streams.runner.eager });
                 const l = &e.streams.lanes[f.slot];
                 const ids = e.ids_buf[0..l.prompt_len];
                 for (ids, l.hist[0..l.prompt_len]) |*id, h| id.* = h;
@@ -2226,6 +2244,7 @@ pub const Engine = struct {
         std.log.info("deepseek_v41 rank {d}: following rank 0", .{e.settings.rank});
         while (true) {
             const t0 = nowNs();
+            const prof_t0 = t0;
             // the next record, polled before the read blocks (rank 0 sends it a fraction of a millisecond after this
             // rank's GPU goes idle; a sleeping thread would add its core's wake-up to every record)
             const op = e.comm.recvFromSpin(0, e.op_buf, e.link.spin_ns) catch |err| switch (err) {
@@ -2241,7 +2260,10 @@ pub const Engine = struct {
             if (!ok) std.log.err("rank {d}: step {d} ({s}, {d} bytes, first {x}) cannot run here", .{ e.settings.rank, e.stepped, @tagName(code), op.len, op[0..@min(op.len, 48)] });
             try e.agree(op, ok);
             if (e.link.profile) e.link.note(e.settings.rank, .{ t1 - t0, nowNs() - t1 });
+            const t2 = nowNs();
+            if (e.fprof) |fp| fp.begin(op[0], t2 - prof_t0, e.stream);
             try e.step(Engine.run, .{ e, op });
+            if (e.fprof) |fp| fp.end(nowNs() - t2, e.stream);
         }
     }
 
@@ -2280,6 +2302,126 @@ pub const Engine = struct {
         if (e.settings.rank != 0) return;
         const op = [_]u8{@intFromEnum(Op.stop)};
         for (1..e.settings.world) |peer| e.comm.sendTo(@intCast(peer), &op) catch {};
+    }
+};
+
+/// TF_DS_FILL_PROFILE=1: where the time between two fill steps (a prompt pass in parts) goes, logged at each fill
+/// step on every rank: the wall time since the last one, each step kind's count, host time in its announcement
+/// (the agreement, which waits for the stream to drain) and in its run, and its GPU span (an event before and after
+/// its run on the engine's stream), the first round's GPU span apart, the round graphs recorded and the rounds run
+/// eager since; with Engram, the host time of the rounds' direct row reads, of their waits for the read-ahead to
+/// idle, of the prompt's waits for a read-ahead batch, and the last batch's read time. Changes no step's work (the
+/// events are read back only once the agreement drained the stream).
+pub const FillProfile = struct {
+    events: [slots][2]cuda.Event,
+    ops: [slots]u8 = @splat(0),
+    n: usize = 0,
+    open: ?usize = null, // the pair of the step under way
+    captures: [2]usize = .{ 0, 0 }, // the round runner's graph recordings and eager rounds at the last summary
+    last: i128 = 0,
+    count: [16]u32 = @splat(0),
+    announce_ns: [16]i128 = @splat(0),
+    run_ns: [16]i128 = @splat(0),
+    gpu_ms: [16]f64 = @splat(0),
+
+    const slots = 64;
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver) !*FillProfile {
+        const fp = try gpa.create(FillProfile);
+        errdefer gpa.destroy(fp);
+        fp.* = .{ .events = undefined };
+        var made: usize = 0;
+        errdefer for (fp.events[0..made]) |*p| {
+            p[0].deinit();
+            p[1].deinit();
+        };
+        while (made < slots) : (made += 1) {
+            fp.events[made][0] = try cuda.Event.init(d, true);
+            fp.events[made][1] = cuda.Event.init(d, true) catch |err| {
+                fp.events[made][0].deinit();
+                return err;
+            };
+        }
+        fp.last = nowNs();
+        return fp;
+    }
+
+    pub fn deinit(fp: *FillProfile, gpa: std.mem.Allocator) void {
+        for (&fp.events) |*p| {
+            p[0].deinit();
+            p[1].deinit();
+        }
+        gpa.destroy(fp);
+    }
+
+    /// A step of opcode `code` whose announcement took `ns`, its run about to start (no pair when every pair is
+    /// taken until the next fill).
+    pub fn begin(fp: *FillProfile, code: u8, ns: i128, stream: cuda.Stream) void {
+        const c = code & 15;
+        fp.count[c] += 1;
+        fp.announce_ns[c] += ns;
+        fp.open = null;
+        if (fp.n == slots) return;
+        const i = fp.n;
+        fp.events[i][0].record(stream) catch return;
+        fp.n += 1;
+        fp.ops[i] = c;
+        fp.open = i;
+    }
+
+    /// The step `begin` began ran, its run taking `ns` on the host.
+    pub fn end(fp: *FillProfile, ns: i128, stream: cuda.Stream) void {
+        const i = fp.open orelse return;
+        fp.open = null;
+        fp.run_ns[fp.ops[i]] += ns;
+        fp.events[i][1].record(stream) catch {};
+    }
+
+    /// The summary since the last fill step (called at a fill step's run, after its agreement drained the stream;
+    /// that step's own pair, the last begun, carries over to the next summary).
+    pub fn report(fp: *FillProfile, rank: u32, at: usize, engram: ?*engram_apply.Engram, captures: [2]usize) void {
+        const carry = fp.open != null;
+        // the first round after the last fill apart: a chunk's caches (L2, TLB, Engram's page cache) are its
+        var first: ?f64 = null;
+        for (0..fp.n) |i| {
+            if (fp.open == i) continue;
+            const p = &fp.events[i];
+            const ms = cuda.Event.elapsedMs(p[0], p[1]) catch 0;
+            fp.gpu_ms[fp.ops[i]] += ms;
+            if (first == null and fp.ops[i] == @intFromEnum(Op.rounds)) first = ms;
+        }
+        const now = nowNs();
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (fp.count, 0..) |c, k| if (c > 0) {
+            const name = if (std.enums.fromInt(Op, k)) |o| @tagName(o) else "?";
+            w.print(" {s} x{d}: announce {d:.1} run {d:.1} gpu {d:.1};", .{ name, c, nsMs(fp.announce_ns[k]), nsMs(fp.run_ns[k]), fp.gpu_ms[k] }) catch {};
+        };
+        if (first) |ms| w.print(" first round gpu {d:.1};", .{ms}) catch {};
+        w.print(" round graphs recorded {d}, eager rounds {d};", .{ captures[0] - fp.captures[0], captures[1] - fp.captures[1] }) catch {};
+        fp.captures = captures;
+        if (engram) |g| {
+            w.print(" engram: round reads {d:.1} (idle-ahead waits {d:.1}), prompt take-ahead waits {d:.1}, last batch read {d:.1}", .{ nsMs(g.prof.read_ns), nsMs(g.prof.idle_ns), nsMs(g.prof.take_ns), nsMs(g.prof.batch_ns.load(.acquire)) }) catch {};
+            g.prof.read_ns = 0;
+            g.prof.idle_ns = 0;
+            g.prof.take_ns = 0;
+        }
+        std.log.info("deepseek_v41 rank {d}: fill at {d}: {d:.1} ms since the last fill step (ms):{s}", .{ rank, at, nsMs(now - fp.last), w.buffered() });
+        fp.last = now;
+        if (fp.open) |i| {
+            std.mem.swap([2]cuda.Event, &fp.events[0], &fp.events[i]);
+            fp.ops[0] = fp.ops[i];
+            fp.open = 0;
+        }
+        fp.n = @intFromBool(carry);
+        fp.count = @splat(0);
+        fp.announce_ns = @splat(0);
+        fp.run_ns = @splat(0);
+        fp.gpu_ms = @splat(0);
+    }
+
+    fn nsMs(ns: i128) f64 {
+        return @as(f64, @floatFromInt(ns)) / 1e6;
     }
 };
 

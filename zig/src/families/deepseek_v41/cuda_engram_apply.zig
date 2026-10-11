@@ -72,6 +72,16 @@ pub const Engram = struct {
     thread: ?std.Thread = null,
     /// The Engram layers this rank's weights hold (their slots in cfg.engram_layers).
     present: []usize,
+    /// Host times (cuda_lanes.zig `FillProfile` reads and clears them): rounds' direct reads, their waits for the
+    /// read-ahead to idle, the prompt's waits for a read-ahead batch, the last batch's read.
+    prof: Prof = .{},
+
+    pub const Prof = struct {
+        read_ns: i128 = 0,
+        idle_ns: i128 = 0,
+        take_ns: i128 = 0,
+        batch_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    };
 
     /// `dir`: the Engram shards (`layers.L.engram.embed.{weight,scale}`); `token_map_path`: the Python engine's
     /// compressed token map JSON. `max_rows`: the most rows a call runs. `threads`: the reader pool's workers.
@@ -165,6 +175,7 @@ pub const Engram = struct {
         self.finished = std.atomic.Value(u32).init(0);
         self.stop = std.atomic.Value(bool).init(false);
         self.thread = null;
+        self.prof = .{};
         self.sets[0] = try Batch.init(gpa, d, nl, max_rows * per);
         errdefer self.sets[0].deinit(gpa);
         self.sets[1] = try Batch.init(gpa, d, nl, max_rows * per);
@@ -262,7 +273,10 @@ pub const Engram = struct {
         // pinned staging (its previous copy to the device has run); then to the device
         const taken = if (ahead) try self.takeAhead(slot, spans, n, per, stream) else null;
         const st = if (taken) |batch| batch else blk: {
+            const t0 = nowNs();
             try self.idleAhead();
+            self.prof.idle_ns += nowNs() - t0;
+            defer self.prof.read_ns += nowNs() - t0;
             const st = &self.staging[slot];
             if (self.pending[slot]) try self.uploaded[slot].synchronize();
             self.pending[slot] = false;
@@ -336,6 +350,8 @@ pub const Engram = struct {
         const b = &self.sets[self.fifo[0]];
         const fits = spans.len == 1 and spans[0].start == b.start and n == b.n and !b.consumed[slot];
         if (fits) {
+            const t0 = nowNs();
+            defer self.prof.take_ns += nowNs() - t0;
             var spins: u32 = 0;
             while (b.ready[slot].load(.acquire) == 0) {
                 spins += 1;
@@ -386,6 +402,8 @@ pub const Engram = struct {
             }
             const b = &self.sets[self.queue[done % 2]];
             const per = self.cols[1] - self.cols[0];
+            const t0 = nowNs();
+            defer self.prof.batch_ns.store(@intCast(nowNs() - t0), .release);
             for (self.present) |slot| {
                 const table = self.tables.get(self.cfg.engram_layers.slice()[slot]).?;
                 const st = &b.staging[slot];
@@ -461,6 +479,12 @@ const Batch = struct {
         self.* = .{ .rows = 0, .idx = &.{}, .staging = &.{}, .uploaded = &.{}, .pending = &.{}, .ready = &.{}, .consumed = &.{} };
     }
 };
+
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
 
 fn sleepUs(us: u32) void {
     var req: std.c.timespec = .{ .sec = 0, .nsec = @intCast(us * 1000) };

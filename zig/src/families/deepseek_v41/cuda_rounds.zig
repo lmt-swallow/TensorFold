@@ -694,6 +694,8 @@ pub const RoundRunner = struct {
     graphs: bool,
     execs: std.AutoHashMapUnmanaged(u64, *Graphs),
     captures: usize,
+    /// Rounds run eager (no graph for their key: graphs off, or past the recorded keys' budget).
+    eager: usize = 0,
     /// Called before each graph launch (tests' gather supplies; the communicator needs none).
     launch_hook: ?GraphLaunch = null,
     /// Keys at buckets up to this one are kept once recorded (`Streams.warm` records them at load). Each key's
@@ -866,6 +868,7 @@ pub const RoundRunner = struct {
         self.tail = tailFromEnv();
         self.execs = .empty;
         self.captures = 0;
+        self.eager = 0;
         self.launch_hook = null;
         self.graph_bucket_max = std.math.maxInt(usize);
         self.graph_rows_max = std.math.maxInt(usize);
@@ -1067,7 +1070,7 @@ pub const RoundRunner = struct {
         }
         self.rounds += 1;
         const entry: ?*Graphs = if (self.graphed()) try self.graphsFor(R, self.round_bucket, ns, stream) else null;
-        if (entry) |g| g.used = self.rounds;
+        if (entry) |g| g.used = self.rounds else self.eager += 1;
         const fresh = if (entry) |g| g.execs[0] == null and !g.kept else false;
         var nb: [48]u8 = undefined;
         for (segs[0..ns], 0..) |sg, k| {
