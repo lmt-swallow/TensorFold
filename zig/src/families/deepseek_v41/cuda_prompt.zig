@@ -101,7 +101,7 @@ pub const ExpertKernels = struct {
     mmb: [3]cuda.Function,
     /// grouped_rows_cp_kernel<2, LO, HI> (down with its loads ahead, TF_DS_PROMPT_DOWN=rowscp)
     rowscp: [3]cuda.Function,
-    down: Down = .rows,
+    down: Down = .rowscp,
     /// The kernel a prompt chunk's gate/up takes (TF_DS_PROMPT_GU), and TF_DS_PROMPT_CHECK=1: every layer also runs
     /// gate/up on grouped_mma (the reference) and fails unless the outputs are byte-equal.
     gu: Gu = .mmb,
@@ -129,7 +129,7 @@ pub const ExpertKernels = struct {
         }
         k.gu = std.meta.stringToEnum(Gu, envOr("TF_DS_PROMPT_GU", "mmb")) orelse return error.BadShape;
         k.check = std.mem.eql(u8, envOr("TF_DS_PROMPT_CHECK", "0"), "1");
-        k.down = std.meta.stringToEnum(Down, envOr("TF_DS_PROMPT_DOWN", "rows")) orelse return error.BadShape;
+        k.down = std.meta.stringToEnum(Down, envOr("TF_DS_PROMPT_DOWN", "rowscp")) orelse return error.BadShape;
         k.group_count = try ek.prep_mod.function("_ZN16tf_exl3x_experts18group_count_kernelEPKiPii");
         k.group_place = try ek.prep_mod.function("_ZN16tf_exl3x_experts18group_place_kernelEPKiS1_PiS2_S2_iiii");
         k.work_list = try ek.prep_mod.function("_ZN16tf_exl3x_experts16work_list_kernelEPKiS1_S1_iPiiiS2_ii");
@@ -185,9 +185,9 @@ pub const IndexKernels = struct {
     }
 };
 
-/// down's prompt kernel: grouped_rows (the fork's) or grouped_rows_cp (the same programs, the loads several k tiles
-/// ahead through shared memory); the same bits in both: every output the same 4 chains of 18 k tiles from zero, added
-/// in order.
+/// down's prompt kernel (TF_DS_PROMPT_DOWN): grouped_rows_cp (the default: grouped_rows' programs, the loads several k
+/// tiles ahead through shared memory; GB10 down 228 -> 211 ms a 2,048-row chunk) or grouped_rows (the fork's); the same
+/// bits in both: every output the same 4 chains of 18 k tiles from zero, added in order.
 pub const Down = enum { rows, rowscp };
 
 /// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).

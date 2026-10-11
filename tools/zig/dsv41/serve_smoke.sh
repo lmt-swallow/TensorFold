@@ -47,6 +47,12 @@ RDMA=${RDMA:-1}                # 1: with two or more rails, the rounds' gathers 
 # latency-bound kernels by about 10% (the nodes share one memory), and rank 0 then waits for it at every gather. With
 # 0, the ranks' kernel times match within 4%, and a lone code stream gains 3-11%. 1: the engine's own busy poll and spin.
 LINK_POLL=${LINK_POLL:-0}
+# A prompt beside decoding streams: its parts on a partition of PROMPT_SMS SMs (TF_DS_PROMPT_SMS), the rounds ahead of
+# them with URGENT=1 (TF_DS_ROUNDS_URGENT). 36 and 1 keep the other streams at 35% of their standalone decode rate
+# during a cold 64k prefill (40 / 0: 31%), for a slower prefill while they decode (59 s against 48 s for that 64k);
+# a prompt alone runs as fast either way. results/bench/20261012-0310-overlap-sweep.md has the sweep.
+PROMPT_SMS=${PROMPT_SMS:-36}
+URGENT=${URGENT:-1}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -176,6 +182,7 @@ esac
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 [ "$LINK_POLL" = 0 ] && ENVS="$ENVS -e TF_DS_LINK_POLL=0"
+ENVS="$ENVS -e TF_DS_PROMPT_SMS=$PROMPT_SMS -e TF_DS_ROUNDS_URGENT=$URGENT"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
 [ "$DRAFTS" = 0 ] && SERVE="$SERVE --no-drafts"

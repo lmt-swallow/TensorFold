@@ -72,3 +72,9 @@ The JSON keeps more per row (`server_ttft_s`, `server_decode_tps`, `text_sha`, `
 scenario rank 0's admission lines (`slot N takes extent [base, +size) (how) ...`: slot, extent, placement, streams and
 kept prompts resident, free positions), its prompt lines (rows, start, ms, tok/s per admitted prompt) and its
 kept-prompt continuations.
+
+## Known issues
+
+- TF_DS_PROMPT_PIECES above 1 (a prompt chunk in layer pieces beside the rounds) leaves the decoding streams at about
+  7% of their rate during a cold 64k prefill, while the prefill runs as fast as with no stream beside it: the pieces
+  appear not to interleave with the rounds at all (results/bench/20261012-0310-overlap-sweep.md). Keep it at 1.
