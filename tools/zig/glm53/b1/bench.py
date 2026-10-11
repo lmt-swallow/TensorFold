@@ -58,6 +58,14 @@ def long_text(url: str, tokens: int, needle: bool, tag: str) -> str:
     return "".join(parts)
 
 
+def prompt_ids(url: str, content: str) -> list[int]:
+    """The chat route's rendering of the prompt as token ids (the server's /tokenize with messages)."""
+    req = urllib.request.Request(url + "/tokenize", data=json.dumps({"messages": [{"role": "user", "content": content}]}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return [int(t) for t in json.loads(r.read())["tokens"]]
+
+
 def ask(url: str, content: str, max_tokens: int, draft: bool) -> dict:
     body = {"messages": [{"role": "user", "content": content}], "max_tokens": max_tokens, "temperature": 0,
             "return_token_ids": True}
@@ -94,7 +102,8 @@ def main() -> int:
         same = runs[0]["ids"] == runs[1]["ids"]
         serial = runs[0]["ids"] == runs[2]["ids"]
         ok = ok and same and serial and bool(runs[0]["ids"])
-        result["prompts"][name] = {"deterministic": same, "drafts_exact": serial, "runs": runs}
+        result["prompts"][name] = {"deterministic": same, "drafts_exact": serial, "runs": runs,
+                                   "prompt_ids": prompt_ids(a.url, text)}
         s = runs[0]["stats"]
         dec = (len(runs[0]["ids"]) - 1) / s["decode_s"] if s.get("decode_s") else 0.0
         result["prompts"][name]["decode_tok_s"] = dec
