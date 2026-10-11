@@ -43,3 +43,6 @@ comparisons, and `glm53-prompt-fp8` matches 45 chunks and 8,586 digests.
 windows. Each window's batched run gave the same bytes as its segments run alone, on both ranks: the logits, latent
 rows, pooled keys, index rings, KDA states and conv windows. Each capture launched 196 Triton variants, among them
 `_seg_lat_write`, `_seg_index_write`, `_seg_pool_keys`, `_seg_chunks`, `_seg_scores` and `_conv_shift_seg`.
+`tf-cuda-test glm53-seg` (and `glm53-seg-fp8`) runs the six windows through `forwardSegs` from the fixture's state
+and matches 248 comparisons per format on both ranks: the logits, the latent rows, KDA states and conv windows of
+each segment, the pooled keys, the index rings, and layer 0's KDA projections and chain output.
