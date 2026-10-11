@@ -486,6 +486,9 @@ pub const Forward = struct {
     g: Glue,
     ak: attn.Kernels,
     d: *const cuda.Driver,
+    /// Decode attention scans a context bucket (attn.bucket) instead of the window's end: the same bits, launches
+    /// that depend on the position only through its bucket (what a captured round needs).
+    buckets: bool = false,
 
     pub fn init(d: *const cuda.Driver, m: *Model, set: *const cuda.aot.Set) Forward {
         return .{ .m = m, .d = d, .g = .{ .set = set, .hidden = m.cfg.hidden, .streams = m.cfg.streams, .low = m.cfg.low }, .ak = .{ .set = set, .cfg = &m.cfg } };
@@ -647,7 +650,9 @@ pub const Forward = struct {
                 try f.stack(&.{ &al.parts[0], &al.parts[1], &al.parts[2], &al.parts[3] }, null, w.mixed.ptr, R, b.pa.ptr, pw, b, stream);
                 for (segs) |sg| {
                     const a = cache.at(sg.st, al.ai);
-                    try f.ak.block(b.pa.ptr + sg.a0 * pw * 2, pw, a.pos_dev, a.pos, .{ al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, al.w.ik_scale.ptr }, m.inv.ptr, b.q.ptr + sg.a0 * qw * 2, b.iq.ptr + sg.a0 * iw * 2, a.caches, &b.attn, b.gated.ptr + sg.a0 * qw * 2, b.xs_gated.ptr + sg.a0 * qw / 32 * 4, sg.n, stream);
+                    const end = a.pos + sg.n;
+                    const context = if (f.buckets) attn.bucket(end, a.caches.capacity) else end;
+                    try f.ak.block(b.pa.ptr + sg.a0 * pw * 2, pw, a.pos_dev, a.pos, context, .{ al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, al.w.ik_scale.ptr }, m.inv.ptr, b.q.ptr + sg.a0 * qw * 2, b.iq.ptr + sg.a0 * iw * 2, a.caches, &b.attn, b.gated.ptr + sg.a0 * qw * 2, b.xs_gated.ptr + sg.a0 * qw / 32 * 4, sg.n, stream);
                 }
                 try f.mm(&al.o, b.gated.ptr, R, w.branch.ptr, b, stream);
             },

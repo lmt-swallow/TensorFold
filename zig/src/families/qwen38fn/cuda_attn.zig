@@ -95,6 +95,18 @@ pub const Scratch = struct {
     }
 };
 
+/// graphs.py `_bucket`: the context a window ending at `end` scans with buckets on, a power of two of at least 8,192
+/// positions, at most the caches' capacity.
+pub fn bucket(end: usize, capacity: usize) usize {
+    return @min(capacity, @max(8192, std.math.ceilPowerOfTwoAssert(usize, @max(end, 1))));
+}
+
+test "context buckets hold the window and stop at the capacity" {
+    try std.testing.expectEqual(@as(usize, 8192), bucket(1, 262208));
+    try std.testing.expectEqual(@as(usize, 16384), bucket(8193, 262208));
+    try std.testing.expectEqual(@as(usize, 262208), bucket(200000, 262208));
+}
+
 pub const Kernels = struct {
     set: *const aot.Set,
     cfg: *const Config,
@@ -196,8 +208,12 @@ pub const Kernels = struct {
 
     /// forward.py `attn_block`'s attention for one stream's window of `rows` rows at host position `pos` (pos0 its
     /// device copy): prep, the indexer's selection (qsa), chunked attention, the gate into `gated` / `xs_gated`.
-    pub fn block(k: Kernels, p: Ptr, pw: usize, pos0: Ptr, pos: usize, scales: [4]Ptr, inv: Ptr, q: Ptr, iq: Ptr, c: *const Caches, s: *const Scratch, gated: Ptr, xs_gated: Ptr, rows: usize, stream: cuda.Stream) !void {
-        const keys = pos + rows;
+    /// `context` (at least pos + rows) bounds the scans' launches; every row's bits are the same at any context that
+    /// holds it (the scans mask past a row's visible keys), so a context bucket makes the launches the position's
+    /// alone (graphs.py `_bucket`).
+    pub fn block(k: Kernels, p: Ptr, pw: usize, pos0: Ptr, pos: usize, context: usize, scales: [4]Ptr, inv: Ptr, q: Ptr, iq: Ptr, c: *const Caches, s: *const Scratch, gated: Ptr, xs_gated: Ptr, rows: usize, stream: cuda.Stream) !void {
+        if (context < pos + rows) return error.ContextTooShort;
+        const keys = context;
         try k.prep(p, pw, pos0, scales[0], scales[1], scales[2], inv, q, c, iq, rows, stream);
         if (s.qsa) {
             try k.pool(c, pos0, scales[3], inv, s, rows, stream);
