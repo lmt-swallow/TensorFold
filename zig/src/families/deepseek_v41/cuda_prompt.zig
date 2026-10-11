@@ -35,6 +35,10 @@ pub const Error = error{ TooManyRows, BadShape, OutOfMemory, NoCandidateSource, 
 
 /// The widest chunk a `Prompt` holds buffers for (TF_DS_PREFILL_CHUNK at most this).
 pub const max_chunk: usize = 4096;
+/// The fork's production chunk (TF_DS_PREFILL_CHUNK's default). A wider chunk holds whole chunks of this width
+/// (lanes.chunkEnd), and the work whose bits depend on the row count (the fp32 GEMMs: cuBLAS picks its algorithm by
+/// the rows) runs on them one at a time, so a wider pass makes the bytes of this one.
+pub const base_chunk: usize = 2048;
 const decode_rows: usize = 16; // kernels.DECODE_ROWS: rows at most of a window; more is a prompt chunk
 const linear_rows: usize = 128; // model.py mm: the row-invariant linear up to here, the prompt GEMM beyond
 const exact_rows: usize = 64; // experts.EXACT_ROWS: the experts' prompt path from here
@@ -266,6 +270,16 @@ pub const Gemm32 = struct {
 
     pub fn run(self: *Gemm32, x: Ptr, w: Ptr, out: Ptr, m: usize, n: usize, k: usize, stream: cuda.Stream) !void {
         return self.runAs(x, w, out, m, m, n, k, stream);
+    }
+
+    /// `run` on m rows in pieces of `base_chunk` rows (the last one shorter): the rows of each piece get the bits of
+    /// a `base_chunk`-row chunk's run, as the chunks of a wider pass hold whole such chunks.
+    pub fn runChunked(self: *Gemm32, x: Ptr, w: Ptr, out: Ptr, m: usize, n: usize, k: usize, stream: cuda.Stream) !void {
+        var r: usize = 0;
+        while (r < m) : (r += base_chunk) {
+            const p = @min(base_chunk, m - r);
+            try self.run(x + r * k * 4, w, out + r * n * 4, p, n, k, stream);
+        }
     }
 
     /// `run` on m rows with the algorithm the heuristic picks for `as_rows` rows (the rows of a whole chunk when it
@@ -716,9 +730,9 @@ pub const Prompt = struct {
         }
         // the fp32 GEMMs once at full chunk rows (the gate's, the indexer weights'): cuBLAS loads their kernels on
         // first use, which would otherwise land in the first prompt's first chunk (~170 ms); the outputs are scratch
-        try self.gemm.run(self.x32.ptr, self.gate_w32[0].ptr, self.logits.ptr, r, c.n_routed, dm, stream);
+        try self.gemm.runChunked(self.x32.ptr, self.gate_w32[0].ptr, self.logits.ptr, r, c.n_routed, dm, stream);
         for (w.layers) |*l| if (l.idx_proj) |ip| {
-            try self.gemm.run(self.x32.ptr, ip.ptr(), self.wl.ptr, r, c.idx_heads, dm, stream);
+            try self.gemm.runChunked(self.x32.ptr, ip.ptr(), self.wl.ptr, r, c.idx_heads, dm, stream);
             break;
         };
         // every setup copy and fill so far (this one's, and the weights' and caches' before it) ran on the legacy
@@ -1318,7 +1332,7 @@ pub const Prompt = struct {
         }, &.{ aot.ci("BLKS", 32), aot.ci("PDL", 1) });
         // the weights: x.float() @ idx_proj.t() (cuBLAS), to bf16, scaled
         try self.castBf16(x, self.x32.ptr, n * c.dim, stream);
-        try self.gemm.run(self.x32.ptr, fwd.w.layers[li].idx_proj.?.ptr(), self.wl.ptr, n, c.idx_heads, c.dim, stream);
+        try self.gemm.runChunked(self.x32.ptr, fwd.w.layers[li].idx_proj.?.ptr(), self.wl.ptr, n, c.idx_heads, c.dim, stream);
         {
             const scale: f32 = @floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(c.idx_dim))) * @sqrt(@as(f64, @floatFromInt(c.idx_heads)))));
             var a: cuda.Args = .{};
@@ -1452,7 +1466,7 @@ pub const Prompt = struct {
             try fwd.route.pick(stream, fwd.parts.ptr, l.gate_b.ptr(), self.pick.ptr, self.wts_moe.ptr, @intCast(n));
         } else {
             try self.castBf16(x, self.x32.ptr, n * c.dim, stream);
-            try self.gemm.run(self.x32.ptr, self.gate_w32[li].ptr, self.logits.ptr, n, E, c.dim, stream);
+            try self.gemm.runChunked(self.x32.ptr, self.gate_w32[li].ptr, self.logits.ptr, n, E, c.dim, stream);
             const nb = std.math.ceilPowerOfTwo(usize, E) catch return error.BadShape;
             const sp = std.math.ceilPowerOfTwo(usize, slots) catch return error.BadShape;
             try fwd.set.run(stream, "_route", .{ @intCast(n), 1, 1 }, &.{

@@ -91,7 +91,7 @@ pub const most_drafts_max: usize = max_rows - 1;
 pub const draft_prior: [most_drafts_max]f64 = @splat(0.75);
 
 /// Prompt rows a chunk unless TF_DS_PREFILL_CHUNK says otherwise (the fork's production setting).
-pub const default_chunk: usize = 2048;
+pub const default_chunk: usize = prompt.base_chunk;
 /// The widest prompt chunk TF_DS_PREFILL_CHUNK may name.
 pub const max_chunk: usize = prompt.max_chunk;
 
@@ -294,6 +294,28 @@ pub fn replayFrom(replay: bool, prompt_len: usize, window: usize) ?usize {
     return if (replay) prompt_len -| window else null;
 }
 
+/// The end of the prompt chunk that starts at `s` of a prompt of `len` rows, at most `chunk` rows a chunk, `replay`
+/// the bounded-replay cut (`replayFrom`). Up to `default_chunk` rows a chunk this is `min(len, s + chunk)`. A wider
+/// chunk is a run of whole `default_chunk`-aligned windows, each of which a `default_chunk` pass runs as one chunk,
+/// all on one side of the cut: a partial window (the prompt's last) and a window the cut falls inside run alone, as
+/// they do there. So every chunk of the wider pass holds whole chunks of the `default_chunk` pass, with the same
+/// rows in every layer, and the prompt path makes their bytes (it runs its row-count-dependent work, the fp32
+/// GEMMs, a `default_chunk` window at a time).
+pub fn chunkEnd(s: usize, len: usize, chunk: usize, replay: ?usize) usize {
+    const B = default_chunk;
+    if (chunk <= B or s % B != 0) return @min(len, s + chunk);
+    var e = s;
+    while (e < len and e - s + B <= chunk) {
+        const w = e + B;
+        const whole = w <= len;
+        const one_side = if (replay) |r| r <= s or r >= w else true;
+        if (e > s and !(whole and one_side)) break;
+        e = @min(w, len);
+        if (!(whole and one_side)) break;
+    }
+    return e;
+}
+
 /// One sequence on caches of its own (the fixture tests' path): the prompt path (`pr`) and the decode layer loop (`fwd`) over the same caches
 /// (`fwd`'s rings and compressed planes), the host ids Engram hashes, the drafter's cache and the taps, and the
 /// position the next row takes. Every rank holding the same sequence runs the same calls with the same arguments,
@@ -387,17 +409,17 @@ pub const Sequence = struct {
         if (self.dc) |*c| c.absorbed = 0;
         if (self.engram) |g| {
             try g.resetAhead();
-            try g.prefetch(self.hist[0..ids.len], 0, @min(ids.len, chunk));
+            try g.prefetch(self.hist[0..ids.len], 0, chunkEnd(0, ids.len, chunk, replayFrom(replay, ids.len, self.fwd.cfg.window)));
         }
         var s: usize = 0;
         while (s < ids.len) {
-            const e = @min(ids.len, s + chunk);
-            const last = e == ids.len;
-            // the next chunk's Engram rows read while this one runs
-            if (self.engram) |g| if (!last) try g.prefetch(self.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
             // A chunk of max_rows or fewer is a decode window (it runs the head): Prompt.chunk sends it through
             // `Forward.rows` only when it asks for logits; with taps it goes there through `rowsTapped`.
             const from = replayFrom(replay, ids.len, self.fwd.cfg.window);
+            const e = chunkEnd(s, ids.len, chunk, from);
+            const last = e == ids.len;
+            // the next chunk's Engram rows read while this one runs
+            if (self.engram) |g| if (!last) try g.prefetch(self.hist[0..ids.len], e, chunkEnd(e, ids.len, chunk, from) - e);
             var top: [2]usize = .{ s, e - s };
             const out = if (self.spark != null and e - s <= max_rows and (from orelse 0) <= s)
                 try self.rowsTapped(gather, ids[s..e], s, false)
@@ -1386,7 +1408,7 @@ pub const Streams = struct {
         if (reuse != null) self.keep_stats[@intFromEnum(placed.how)] += 1;
         const marks: ?kept_prompts.Points = if (self.keeping(replay) and chunk == self.book.chunk) self.book.marksFor(ids.len) else null;
         lane.pass = .{ .at = cut, .cut = cut, .chunk = chunk, .replay = replay, .check = check and reuse != null, .marks = marks, .t0 = nowNs() };
-        try self.fillStart(slot, ids, cut, chunk);
+        try self.fillStart(slot, ids, cut, chunk, replay);
         return placed.how;
     }
 
@@ -1489,12 +1511,12 @@ pub const Streams = struct {
     /// engine.py prefill_steps(start=from) on the slot's view; a ring snapshot after each chunk that ends on one of
     /// `marks`.
     fn fill(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, from: usize, chunk: usize, replay: bool, marks: ?*const kept_prompts.Points) !void {
-        try self.fillStart(slot, ids, from, chunk);
+        try self.fillStart(slot, ids, from, chunk, replay);
         _ = try self.fillChunks(gather, slot, ids, from, std.math.maxInt(u32), chunk, replay, marks);
     }
 
     /// A pass from `from`: no logits yet, nothing absorbed, the first chunk's Engram rows read ahead.
-    fn fillStart(self: *Streams, slot: usize, ids: []const i64, from: usize, chunk: usize) !void {
+    fn fillStart(self: *Streams, slot: usize, ids: []const i64, from: usize, chunk: usize, replay: bool) !void {
         const lane = &self.lanes[slot];
         self.prompt_logits = 0;
         if (self.side == null) self.logits = 0;
@@ -1502,7 +1524,7 @@ pub const Streams = struct {
         if (self.engram) |g| {
             g.history = lane.hist[0..ids.len];
             try g.resetAhead();
-            try g.prefetch(lane.hist[0..ids.len], from, @min(ids.len, from + chunk) - from);
+            try g.prefetch(lane.hist[0..ids.len], from, chunkEnd(from, ids.len, chunk, replayFrom(replay, ids.len, self.cfg.window)) - from);
         }
     }
 
@@ -1518,11 +1540,11 @@ pub const Streams = struct {
         var s: usize = from;
         var ran: u32 = 0;
         while (s < ids.len and ran < chunks) : (ran += 1) {
-            const e = @min(ids.len, s + chunk);
+            const from_row = replayFrom(replay, ids.len, self.cfg.window);
+            const e = chunkEnd(s, ids.len, chunk, from_row);
             const last = e == ids.len;
             // the next chunk's Engram rows read while this one runs (engine.py prefill_steps' `ahead`)
-            if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, @min(ids.len, e + chunk) - e);
-            const from_row = replayFrom(replay, ids.len, self.cfg.window);
+            if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, chunkEnd(e, ids.len, chunk, from_row) - e);
             var top: [2]usize = .{ s, e - s };
             const out = if (self.spark != null and e - s <= max_rows and (from_row orelse 0) <= s)
                 try self.rowsTapped(gather, ids[s..e], s)
@@ -1556,9 +1578,9 @@ pub const Streams = struct {
     fn fillPiece(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, p: *Pass) !void {
         const lane = &self.lanes[slot];
         const s = p.at;
-        const e = @min(ids.len, s + p.chunk);
-        const last = e == ids.len;
         const from_row = replayFrom(p.replay, ids.len, self.cfg.window);
+        const e = chunkEnd(s, ids.len, p.chunk, from_row);
+        const last = e == ids.len;
         const o: prompt.Options = .{
             .replay = from_row,
             .logits = last or e - s <= max_rows,
@@ -1571,7 +1593,7 @@ pub const Streams = struct {
             return;
         }
         const ps = self.pstream();
-        if (p.piece == 0) if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, @min(ids.len, e + p.chunk) - e);
+        if (p.piece == 0) if (self.engram) |g| if (!last) try g.prefetch(lane.hist[0..ids.len], e, chunkEnd(e, ids.len, p.chunk, from_row) - e);
         const out = try self.pr.piece(gather, ids[s..e], s, o, ps, p.piece, n);
         p.piece += 1;
         if (p.piece < n) return;
@@ -3554,6 +3576,51 @@ test "bounded replay starts the upper layers at the prompt's last window rows, a
     try std.testing.expectEqual(@as(?usize, 472), replayFrom(true, 600, 128));
     try std.testing.expectEqual(@as(?usize, 0), replayFrom(true, 128, 128));
     try std.testing.expectEqual(@as(?usize, 0), replayFrom(true, 5, 128));
+}
+
+test "chunkEnd: wide chunks are whole default windows on one side of the replay cut" {
+    // up to the default chunk: min(len, s + chunk)
+    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 6000, 2048, null));
+    try std.testing.expectEqual(@as(usize, 600), chunkEnd(0, 600, 4096, null));
+    try std.testing.expectEqual(@as(usize, 6000), chunkEnd(4096, 6000, 4096, null));
+    try std.testing.expectEqual(@as(usize, 4096), chunkEnd(0, 6000, 4096, null));
+    try std.testing.expectEqual(@as(usize, 4096), chunkEnd(0, 4096, 4096, null));
+    // a partial window runs alone
+    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 2148, 4096, null));
+    try std.testing.expectEqual(@as(usize, 2148), chunkEnd(2048, 2148, 4096, null));
+    // the replay cut inside the second window: the first window alone, then the cut's window alone
+    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 4096, 4096, 3968));
+    try std.testing.expectEqual(@as(usize, 4096), chunkEnd(2048, 4096, 4096, 3968));
+    try std.testing.expectEqual(@as(usize, 4096), chunkEnd(0, 8192, 4096, 8064));
+    try std.testing.expectEqual(@as(usize, 6144), chunkEnd(4096, 8192, 4096, 8064));
+    // a cut at or before the chunk's start
+    try std.testing.expectEqual(@as(usize, 8192), chunkEnd(4096, 8192, 4096, 4096));
+}
+
+test "chunkEnd: every wide chunk is a union of default chunks (property over lengths, cuts and widths)" {
+    var prng = std.Random.DefaultPrng.init(0x4096);
+    const r = prng.random();
+    for (0..2000) |_| {
+        const len = r.intRangeAtMost(usize, 1, 40000);
+        const chunk = default_chunk * r.intRangeAtMost(usize, 1, 2);
+        const cut: ?usize = if (r.boolean()) replayFrom(true, len, r.intRangeAtMost(usize, 1, 5000)) else null;
+        var s: usize = 0;
+        while (s < len) {
+            const e = chunkEnd(s, len, chunk, cut);
+            try std.testing.expect(e > s and e - s <= chunk and e <= len);
+            // the default pass's boundaries inside [s, e] are boundaries of the default windows, and none of them
+            // but the chunk's own straddle the cut
+            var d = s;
+            while (d < e) {
+                const de = chunkEnd(d, len, default_chunk, cut);
+                try std.testing.expect(de <= e);
+                if (cut) |c| if (e - s > default_chunk) try std.testing.expect(c <= s or c >= e);
+                d = de;
+            }
+            try std.testing.expectEqual(e, d);
+            s = e;
+        }
+    }
 }
 
 test "rope rows align up to 4096 past the context and the window's extra rows" {

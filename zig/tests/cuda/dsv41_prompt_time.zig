@@ -114,10 +114,20 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
         p.deinit();
         seq.pr.profile = null;
     }
+    // TF_DS_COMPARE_ROWS=1: every sublayer's rows hashed in both passes, the first sublayer whose rows differ named
+    var rows_a: RowLog = .{ .gpa = gpa, .seq = &seq };
+    defer rows_a.deinit();
+    var rows_b: RowLog = .{ .gpa = gpa, .seq = &seq };
+    defer rows_b.deinit();
+    const by_rows = std.mem.eql(u8, getenv("TF_DS_COMPARE_ROWS") orelse "0", "1");
+    if (by_rows) fwd.probe = .{ .ctx = &rows_a, .call = RowLog.call };
     var want = try digests(gpu, &fwd, &seq, gather, ids, chunk, replay, stream);
     defer want.deinit(gpa);
+    if (by_rows) fwd.probe = .{ .ctx = &rows_b, .call = RowLog.call };
     var got = try digests(gpu, &fwd, &seq, gather, ids, c2, replay, stream);
     defer got.deinit(gpa);
+    fwd.probe = null;
+    if (by_rows) rows_a.report(&rows_b);
     var bad: usize = 0;
     for (want.items, got.items, 0..) |a, b, i| if (a != b) {
         if (bad < 8) std.debug.print("  differs: {s}\n", .{digestName(&fwd, i)});
@@ -217,3 +227,62 @@ pub fn gemmRows(gpu: Gpu) !void {
     try check.expect(all_ok, "dsv41-gemm-rows: a pinned run differs from the 4096-row product", .{});
     check.pass("dsv41-gemm-rows: every pinned run equals the 4096-row product's rows", .{});
 }
+
+/// Per-row hashes of every probed sublayer output of a pass (`TF_DS_COMPARE_ROWS`), by name and absolute row: the
+/// probed buffer holds the rows of the prompt path's current walk (`Prompt.at_piece`).
+const RowLog = struct {
+    gpa: std.mem.Allocator,
+    seq: *dsv41.serve_lanes.Sequence,
+    names: std.ArrayList([]u8) = .empty,
+    rows: std.ArrayList(std.ArrayList(u64)) = .empty,
+
+    fn deinit(self: *RowLog) void {
+        for (self.names.items) |n| self.gpa.free(n);
+        self.names.deinit(self.gpa);
+        for (self.rows.items) |*r| r.deinit(self.gpa);
+        self.rows.deinit(self.gpa);
+    }
+
+    fn call(ctx: *anyopaque, name: []const u8, ptr: Ptr, bytes: usize, stream: cuda.Stream) anyerror!void {
+        const self: *RowLog = @ptrCast(@alignCast(ctx));
+        const wk = self.seq.pr.at_piece;
+        if (wk.rows == 0 or bytes % wk.rows != 0) return;
+        try stream.synchronize();
+        const host = try self.gpa.alloc(u8, bytes);
+        defer self.gpa.free(host);
+        const b: cuda.DeviceBuffer = .{ .d = bound.?, .ptr = ptr, .len = bytes };
+        try b.download(0, host);
+        var k: usize = 0;
+        while (k < self.names.items.len and !std.mem.eql(u8, self.names.items[k], name)) k += 1;
+        if (k == self.names.items.len) {
+            try self.names.append(self.gpa, try self.gpa.dupe(u8, name));
+            try self.rows.append(self.gpa, .empty);
+        }
+        const list = &self.rows.items[k];
+        const per = bytes / wk.rows;
+        if (list.items.len < wk.at + wk.rows) try list.appendNTimes(self.gpa, 0, wk.at + wk.rows - list.items.len);
+        for (0..wk.rows) |i| list.items[wk.at + i] = std.hash.Wyhash.hash(1, host[i * per ..][0..per]);
+    }
+
+    /// Prints the first sublayer (in probe order) whose rows differ from `other`'s, and how many sublayers differ.
+    fn report(self: *const RowLog, other: *const RowLog) void {
+        var bad: usize = 0;
+        for (self.names.items, self.rows.items) |name, a| {
+            var k: usize = 0;
+            while (k < other.names.items.len and !std.mem.eql(u8, other.names.items[k], name)) k += 1;
+            if (k == other.names.items.len) continue;
+            const b = other.rows.items[k].items;
+            var first: ?usize = null;
+            var n: usize = 0;
+            for (a.items, 0..) |h, i| if (i < b.len and h != b[i]) {
+                if (first == null) first = i;
+                n += 1;
+            };
+            if (n > 0) {
+                if (bad < 6) std.debug.print("  rows differ: {s}: {d} rows, the first at {d}\n", .{ name, n, first.? });
+                bad += 1;
+            }
+        }
+        std.debug.print("RESULT dsv41-prompt-time rows: {d} of {d} probed sublayers differ\n", .{ bad, self.names.items.len });
+    }
+};
