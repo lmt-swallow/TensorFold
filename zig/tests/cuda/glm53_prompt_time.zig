@@ -36,25 +36,6 @@ fn selfGather(_: *anyopaque, x: P.Exchange, stream: cuda.Stream) anyerror!void {
     try dst.copyFrom(x.bytes, x.part, x.bytes, stream.handle);
 }
 
-/// The pack's pages out of the page cache (unified memory: the pages would crowd out the model).
-fn dropCache(pack: *glm.weights.Pack) void {
-    const linux = std.os.linux;
-    for ([_]*@TypeOf(pack.text){ &pack.text, &pack.head }) |ck| for (ck.files.items) |*f| {
-        const mem = f.map.memory;
-        _ = std.c.madvise(@ptrCast(@alignCast(mem.ptr)), mem.len, linux.MADV.DONTNEED);
-        _ = linux.fadvise(f.file.handle, 0, 0, linux.POSIX_FADV.DONTNEED);
-    };
-}
-
-const Weights = struct {
-    frames: []glm.weights.Frame,
-    kdas: []glm.weights.Kda,
-    dsas: []A.Dsa,
-    mlps: []glm.weights.Mlp,
-    moes: []M.Moe,
-    layers: []P.Layer,
-};
-
 pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const usize) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
@@ -78,62 +59,22 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
     defer pack.close();
     const lay: glm.config.Layout = .{ .rank = 0, .world = 2, .cfg = &cfg };
     const l: glm.weights.Loader = .{ .gpa = gpa, .d = d, .pack = &pack, .lay = lay };
-    const L = cfg.layers;
+    const t0 = nowNs();
+    var whole = try glm.model.Model.load(l, cfg.layers);
+    defer whole.deinit();
+    var mtp = try T.Mtp.load(l);
+    defer mtp.deinit();
+    pack.dropCache();
+    std.debug.print("glm53-prompt-time: rank 0's {d} layers, the MTP layer and the head loaded in {d:.1} s\n", .{ cfg.layers, @as(f64, @floatFromInt(nowNs() - t0)) / 1e9 });
+    const players = try gpa.alloc(P.Layer, cfg.layers);
+    defer gpa.free(players);
+    const m = P.of(&whole, &cfg, &mtp, players);
     var nk: usize = 0;
     var nd: usize = 0;
-    for (0..L) |i| switch (cfg.kind(i)) {
+    for (0..cfg.layers) |i| switch (cfg.kind(i)) {
         .kda => nk += 1,
         .dsa => nd += 1,
     };
-    // the weights live for the process (a timing tool): no deinit
-    var w: Weights = .{
-        .frames = try gpa.alloc(glm.weights.Frame, L), .kdas = try gpa.alloc(glm.weights.Kda, nk), .dsas = try gpa.alloc(A.Dsa, nd),
-        .mlps = try gpa.alloc(glm.weights.Mlp, L), .moes = try gpa.alloc(M.Moe, L), .layers = try gpa.alloc(P.Layer, L),
-    };
-    var ki: usize = 0;
-    var di: usize = 0;
-    const t0 = nowNs();
-    for (0..L) |i| {
-        w.frames[i] = try glm.weights.Frame.load(l, i);
-        const mixer: P.Mixer = switch (cfg.kind(i)) {
-            .kda => blk: {
-                w.kdas[ki] = try glm.weights.Kda.load(l, i);
-                ki += 1;
-                break :blk .{ .kda = .{ .w = &w.kdas[ki - 1], .li = ki - 1 } };
-            },
-            .dsa => blk: {
-                w.dsas[di] = try A.Dsa.load(l, i);
-                di += 1;
-                break :blk .{ .dsa = .{ .w = &w.dsas[di - 1], .di = di - 1 } };
-            },
-        };
-        const ffn: P.Ffn = switch (cfg.mlpKind(i)) {
-            .dense => blk: {
-                w.mlps[i] = try glm.weights.Mlp.load(l, "mlp.", i);
-                break :blk .{ .mlp = &w.mlps[i] };
-            },
-            .moe => blk: {
-                w.moes[i] = try M.Moe.load(l, i);
-                break :blk .{ .moe = &w.moes[i] };
-            },
-        };
-        w.layers[i] = .{ .frame = &w.frames[i], .mixer = mixer, .ffn = ffn };
-        dropCache(&pack);
-    }
-    var mtp = try T.Mtp.load(l);
-    defer mtp.deinit();
-    var embed = try l.share(glm.weights_map.embed);
-    defer embed.free();
-    var norm = try l.share(glm.weights_map.norm);
-    defer norm.free();
-    const rows = try l.headRows();
-    defer gpa.free(rows);
-    var head = try Buf.fromHost(d, rows);
-    defer head.free();
-    dropCache(&pack);
-    std.debug.print("glm53-prompt-time: rank 0's {d} layers, the MTP layer and the head loaded in {d:.1} s\n", .{ L, @as(f64, @floatFromInt(nowNs() - t0)) / 1e9 });
-
-    const m: P.Model = .{ .layers = w.layers, .embed = embed.ptr, .norm = norm.ptr, .head = .{ .ptr = head.ptr, .n = rows.len / 2 / cfg.hidden, .k = cfg.hidden }, .mtp = &mtp };
     var po = try P.Owned.init(d, lay, P.chunk_rows, capacity);
     defer po.deinit();
     var st = try F.KdaState.init(d, lay, nk, 16);
