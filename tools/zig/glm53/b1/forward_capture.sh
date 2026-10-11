@@ -7,7 +7,7 @@ set -euo pipefail
 WORK=$1; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
 TF=${TF:-$(cd "$HERE/../../../.." && pwd)}
-WORKER=${WORKER:-10.0.1.1}
+WORKER=${WORKER:-spark-616b.local}   # ssh name; the ranks meet over the CX7 link at MASTER
 MASTER=${MASTER:-10.0.1.2}        # the head's address on the link
 PORT=${PORT:-29561}
 IMAGE=${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold@sha256:ef83797d791fef96c4605e8d37367aca6de5aeac7bb672792cb682e2e55d4237}

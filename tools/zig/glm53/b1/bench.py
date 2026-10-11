@@ -78,9 +78,13 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8888")
     ap.add_argument("--out", required=True)
     ap.add_argument("--tokens", type=int, default=512)
+    ap.add_argument("--only", help="one prompt (code, prose, structured, needle64k) and no prefill runs")
     a = ap.parse_args()
     prompts = dict(PROMPTS)
-    prompts["needle64k"] = long_text(a.url, 64_000, True) + "\n\nWhat is the verification code for the archive?"
+    if a.only != "code" and a.only not in PROMPTS:
+        prompts["needle64k"] = long_text(a.url, 64_000, True) + "\n\nWhat is the verification code for the archive?"
+    if a.only:
+        prompts = {a.only: prompts[a.only]}
     result: dict = {"url": a.url, "max_tokens": a.tokens, "prompts": {}, "prefill": {}}
     ok = True
     for name, text in prompts.items():
@@ -96,7 +100,7 @@ def main() -> int:
               f"prompt {runs[0]['prompt_tokens']} rounds {s.get('rounds')} tok/round {s.get('tokens_per_round')} "
               f"drafted {s.get('drafted')} accepted {s.get('accepted')} min_rows {s.get('min_rows')} "
               f"prefill {s.get('prefill_s')} s, decode {dec:.1f} tok/s", flush=True)
-    for k in (32_000, 128_000):
+    for k in (() if a.only else (32_000, 128_000)):
         r = ask(a.url, long_text(a.url, k, False) + "\n\nSummarize the text in one sentence.", 1, True)
         s = r["stats"]
         pre = s.get("prefill_s")

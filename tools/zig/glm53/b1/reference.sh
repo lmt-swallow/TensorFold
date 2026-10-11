@@ -8,11 +8,13 @@
 #   bash reference.sh start   start.sh with DENSE=bf16 KV=bf16 KDA_CHUNKED=0 DRAFTER=mtp PARALLEL=1 CONTEXT=524288
 #   bash reference.sh mem     MemAvailable on both nodes (after the load)
 #   bash reference.sh stop    the recipe's stop.sh (both ranks); the pair is left stopped
-# RECIPE (default ~/src/glm53-mia-recipe-v15, an rsync of the recipe at 83d653f), WORKER (default 10.0.1.1, the
-# other Spark on the CX7 link), WORKER_WEIGHTS (copy: the recipe copies what the worker's cache lacks; nfs).
+# RECIPE (default ~/src/glm53-mia-recipe-v15, an rsync of the recipe at 83d653f), WORKER (default spark-616b.local,
+# the other Spark's ssh name; FABRIC_PEER its CX7 address), WORKER_WEIGHTS (copy: the recipe copies what the worker's
+# cache lacks; nfs). VISION (default 0; 1: the recipe's default, rank 0 also runs the image tower).
 set -euo pipefail
 RECIPE=${RECIPE:-$HOME/src/glm53-mia-recipe-v15}
-export WORKER=${WORKER:-10.0.1.1}
+export WORKER=${WORKER:-spark-616b.local}      # the ssh target (key-based from the head)
+export FABRIC_PEER=${FABRIC_PEER:-10.0.1.1}     # the worker's address on the CX7 link (the ranks' rendezvous route)
 export WORKER_WEIGHTS=${WORKER_WEIGHTS:-copy}
 HERE=$(cd "$(dirname "$0")" && pwd)
 TF=${TF:-$(cd "$HERE/../../../.." && pwd)}
@@ -21,7 +23,7 @@ REV=078455ffe6472f9a52fbc1139f58b9db2881b25c
 DIGEST=sha256:ef83797d791fef96c4605e8d37367aca6de5aeac7bb672792cb682e2e55d4237
 
 # the strict setting (design-glm53-native: the oracle) and what start.sh needs to serve it without the network
-export DENSE=bf16 KV=bf16 KDA_CHUNKED=0 DRAFTER=mtp PARALLEL=1 CONTEXT=524288 VISION=0
+export DENSE=bf16 KV=bf16 KDA_CHUNKED=0 DRAFTER=mtp PARALLEL=1 CONTEXT=524288 VISION=${VISION:-0}
 export PULL=0 HF_HUB_OFFLINE=1
 
 node() { # where, command
