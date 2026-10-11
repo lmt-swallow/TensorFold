@@ -19,6 +19,7 @@ are chosen so that every prompt-form kernel variant the served engine can reach 
   s5  2,048, 1,500 (7 latent chunks)
   s6  2, 2,048, 2,048 (the third chunk at 2,050: one dense row, 9 latent chunks)
   s7  4 x 2,048, then 37 rows at 8,192 (decode-form scores over 4,096 pools: 64 programs a row)
+  t<n> one chunk of n rows (SHORT); u<n> 2,048 + n rows (PAST); v52 4,096 + 52 rows
   l   drawn caches (layer 3's and the MTP layer's latents and pooled keys from `draw`, KDA state zero), then chunks at 40,000
       (2,048, 549, 37) and 600,000 (549, 37): the selection over 10k-150k pools, positions past 524,288
 
@@ -68,6 +69,14 @@ SCENARIOS = {
     "s6": [(0, 2), (2, 2_048), (2_050, 2_048)],
     "s7": _chunks(8_192) + [(8_192, 37)],
 }
+# short prompts and prompts a few rows past a chunk: a matmul's variant depends on its rows (the 16-, 32-, 64- or
+# 128-row tile, a multiple of 16 or not, one row, the sequential K form from 256), and the MTP absorb of a prompt's
+# last chunk takes one row fewer
+SHORT = (1, 2, 7, 16, 17, 20, 32, 33, 48, 52, 64, 65, 100, 128, 129, 131, 144, 200, 256, 257, 300, 1_031, 2_047)
+PAST = (1, 2, 52, 300)
+SCENARIOS.update({f"t{n}": [(0, n)] for n in SHORT})
+SCENARIOS.update({f"u{n}": _chunks(2_048 + n) for n in PAST})
+SCENARIOS["v52"] = _chunks(4_096 + 52)         # a 52-row tail at 4,096: decode-form scores over 2,048 pools
 CAPACITY = 36_864
 LONG = [(40_000, (2_048, 549, 37)), (600_000, (549, 37))]
 LONG_CAPACITY = 602_112
