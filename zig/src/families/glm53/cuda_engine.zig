@@ -131,14 +131,13 @@ pub const Runner = struct {
     cand: Buf,
     players: []Pm.Layer, // the prompt path's view of the model (`pmodel`)
     pmodel: Pm.Model,
-    stage_part: Buf, // the prompt path's gather staging (prompt.Prompt)
-    stage_rows: Buf,
+    stage_rows: Buf, // the prompt path's gather staging (prompt.Prompt)
     argmax_mod: cuda.Module,
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu): each row's first largest
     picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_part = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined };
         r.w = try M.Work.init(d, lay, batch_rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -149,8 +148,6 @@ pub const Runner = struct {
         errdefer gpa.free(r.host);
         r.cand = try Buf.alloc(d, 6 * draft_k * 4);
         errdefer r.cand.free();
-        r.stage_part = try Buf.alloc(d, (prompt_rows + 2) * lay.cfg.hidden * 4);
-        errdefer r.stage_part.free();
         r.stage_rows = try Buf.alloc(d, (prompt_rows + 2) * lay.cfg.hidden * 2);
         errdefer r.stage_rows.free();
         r.argmax_mod = try cuda.Module.load(d, cuda.kernels.torch_argmax);
@@ -172,7 +169,6 @@ pub const Runner = struct {
         r.gpa.free(r.host);
         r.cand.free();
         r.gpa.free(r.players);
-        r.stage_part.free();
         r.stage_rows.free();
     }
 
@@ -309,7 +305,7 @@ pub const Runner = struct {
             .p = .{
                 .rows = prompt_rows, .b = &w.pb,  .temp = &w.temp,         .kscratch = &w.pscratch, .ds = &w.pds,
                 .ms = &w.pms,        .mb = &r.pmb, .fnormed = w.fnormed.ptr, .fxs = w.fxs.ptr,         .logits = w.logits.ptr,
-                .stage_part = r.stage_part.ptr, .stage_rows = r.stage_rows.ptr,
+                .stage_rows = r.stage_rows.ptr,
             },
             .m = &r.pmodel,
             .k = .{ .g = r.k.g, .kda = r.k.kk, .moe = r.k.mk, .mtp = r.tk },

@@ -88,8 +88,9 @@ pub const Prompt = struct {
     fnormed: Ptr, // [rows, D] bf16: the final norm of the streams' mean (the MTP head's input)
     fxs: Ptr, // [rows, D / 64] fp32
     logits: Ptr, // [1, vocab share] bf16: the head of the chunk's last row
-    stage_part: Ptr, // [rows + 2, D] fp32: the split's partial pieces as gathered ([2, n, D] a piece, in piece order)
-    stage_rows: Ptr, // [rows + 2, D] bf16: its swapped rows' pieces likewise
+    // the split gathers the peer's partial pieces into b.gath ([2, n, D] a piece, in piece order: hcsplit.py's
+    // `got`), which hc_post_pair reads at its element distance from b.part (an int32: the two stay close)
+    stage_rows: Ptr, // [rows + 2, D] bf16: the split's swapped rows' pieces as gathered
 };
 
 /// A set of prompt buffers of its own (`view`).
@@ -104,7 +105,6 @@ pub const Owned = struct {
     fnormed: Buf,
     fxs: Buf,
     logits: Buf,
-    stage_part: Buf,
     stage_rows: Buf,
 
     pub fn init(d: *const cuda.Driver, lay: config.Layout, rows: usize, capacity: usize) !Owned {
@@ -129,8 +129,6 @@ pub const Owned = struct {
         errdefer p.fxs.free();
         p.logits = try Buf.alloc(d, lay.size(.vocab) * 2);
         errdefer p.logits.free();
-        p.stage_part = try Buf.alloc(d, (rows + 2) * c.hidden * 4);
-        errdefer p.stage_part.free();
         p.stage_rows = try Buf.alloc(d, (rows + 2) * c.hidden * 2);
         return p;
     }
@@ -145,14 +143,13 @@ pub const Owned = struct {
         p.fnormed.free();
         p.fxs.free();
         p.logits.free();
-        p.stage_part.free();
         p.stage_rows.free();
     }
 
     pub fn view(p: *const Owned) Prompt {
         return .{
             .rows = p.rows, .b = &p.b, .temp = &p.temp, .kscratch = &p.kscratch, .ds = &p.ds, .ms = &p.ms, .mb = &p.mb,
-            .fnormed = p.fnormed.ptr, .fxs = p.fxs.ptr, .logits = p.logits.ptr, .stage_part = p.stage_part.ptr, .stage_rows = p.stage_rows.ptr,
+            .fnormed = p.fnormed.ptr, .fxs = p.fxs.ptr, .logits = p.logits.ptr, .stage_rows = p.stage_rows.ptr,
         };
     }
 };
@@ -361,7 +358,7 @@ pub const Chunk = struct {
         for (s.pieces[0..s.n], 0..) |pc, j| {
             try fill(c, gpa, ops, l, site, moe_ffn, done, s.theirs + pc.lo, s.theirs + pc.hi);
             const n = pc.hi - pc.lo;
-            try ops.append(gpa, .{ .gather = .{ .send = c.p.b.part.ptr + (s.theirs + pc.lo) * D * 4, .recv = c.p.stage_part + 2 * pc.lo * D * 4, .bytes = n * D * 4, .ev = @intCast(j) } });
+            try ops.append(gpa, .{ .gather = .{ .send = c.p.b.part.ptr + (s.theirs + pc.lo) * D * 4, .recv = c.p.b.gath.ptr + 2 * pc.lo * D * 4, .bytes = n * D * 4, .ev = @intCast(j) } });
         }
         try fill(c, gpa, ops, l, site, moe_ffn, done, s.mine, s.mine + s.H);
     }
@@ -425,7 +422,7 @@ pub const Chunk = struct {
             const hi = s.mine + pc.hi;
             const n = pc.hi - pc.lo;
             try ops.append(gpa, .{ .wait = @intCast(j) });
-            try ops.append(gpa, .{ .post_pair = .{ .lo = lo, .hi = hi, .got = c.p.stage_part + (2 * pc.lo + peer * n) * D * 4 } });
+            try ops.append(gpa, .{ .post_pair = .{ .lo = lo, .hi = hi, .got = c.p.b.gath.ptr + (2 * pc.lo + peer * n) * D * 4 } });
             if (final) try ops.append(gpa, .{ .mean = .{ .lo = lo, .hi = hi } });
             if (next) |x| try ops.append(gpa, .{ .hc_pre = .{ .l = x.l, .site = x.site, .lo = lo, .hi = hi } });
             // the rows the next step reads whole: the normed rows, or the hidden rows after the last layer
