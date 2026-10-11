@@ -402,6 +402,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     // a family that pools its streams (DeepSeek-V4.1: one window of slots) serves no more than it has slots for
     const streams = if (loaded.facts.max_streams > 0) @min(admitted, loaded.facts.max_streams) else admitted;
+    // a family that keeps a sequence per slot makes the admitted slots now, so no request waits for one
+    if (@hasField(@TypeOf(loaded), "prepare")) if (loaded.prepare) |prepare| prepare(loaded.ctx, @intCast(streams)) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot make its {d} stream slots ({s})", .{ streams, @errorName(e) });
+        return null;
+    };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
