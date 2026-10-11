@@ -76,6 +76,7 @@ const usage =
     \\  qwen38fn-prompt-time <kernel-set> <model-dir> [depths] [chunks]  Qwen3.8-Flash-Next served prompt chunks (MTP head included) timed at chosen depths (timing only)
     \\  qwen38fn-select <kernel-set> <model-dir>  Qwen3.8-Flash-Next indexer block selection (_select, _select_tiles past 131,072 keys) against a host oracle up to the capacity
     \\  qwen38fn-mtp <work-dir> <model-dir>  Qwen3.8-Flash-Next MTP drafting (draft head, head calls, rounds) against 0.6.6's serial drafted decoder (qwen38fn/capture_mtp.sh)
+    \\  qwen38fn-rounds <kernel-set> <model-dir> [rounds]  Qwen3.8-Flash-Next: four streams prefilled, then a few shared rounds timed (a profiler's workload)
     \\  qwen38fn-shared <kernel-set> <model-dir>  Qwen3.8-Flash-Next shared rounds: four streams' logits, drafts and tokens the same alone and in one forward a round
     \\  glm53-prompt <work-dir> <model-dir>  GLM-5.3-Flash prompt path (chunks, head, MTP absorb, commit) over layers 0 and 3 and the MTP layer on both ranks against the Mia fork's fixture (glm53/capture.sh prompt)
     \\  glm53-prompt-fp8 <work-dir> <model-dir>  glm53-prompt on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture
@@ -161,6 +162,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "exl3-linear")) return dsv41_tests.exl3Linear(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "exl3-experts")) return dsv41_tests.exl3Experts(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "qwen38fn-shared")) return qwen38fn_shared.shared(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "qwen38fn-rounds")) return qwen38fn_shared.rounds(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 8);
     if (std.mem.eql(u8, cmd, "qwen38fn-mtp")) return qwen38fn_mtp.mtp(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "qwen38fn-select")) return qwen38fn_select.select(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "qwen38fn-prompt-time")) return qwen38fn_prompt_time.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else null, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 3);

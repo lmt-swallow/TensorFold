@@ -249,6 +249,53 @@ fn compare(what: []const u8, s: usize, alone: *const Record, shared_: *const Rec
 }
 
 pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
+    try withEnv(gpu, kernels, model, sharedRun);
+}
+
+/// Rounds `qwen38fn-rounds` runs (a profiler's target: one model's memory, a few shared rounds).
+var rounds_n: usize = 8;
+
+/// `qwen38fn-rounds <kernel-set> <model-dir> [rounds]`: the four streams prefilled, then `rounds` shared rounds of
+/// all four (their windows in one forward, their drafts in one head call a depth), each round's rows and ms printed.
+/// Nothing is compared: it is a profiler's workload (ncu --launch-skip past the load and the prompts).
+pub fn rounds(gpu: Gpu, kernels: []const u8, model: []const u8, n: usize) !void {
+    rounds_n = n;
+    try withEnv(gpu, kernels, model, roundsRun);
+}
+
+fn roundsRun(e: *Env) anyerror!void {
+    const gpa = e.gpu.gpa;
+    var ls: [streams]Live = undefined;
+    var made: usize = 0;
+    defer for (ls[0..made]) |*l| Env.free(l, gpa);
+    var ptrs: [streams]*Live = undefined;
+    for (&ls, &ptrs, 0..) |*l, *p, s| {
+        try e.begin(l, s, true);
+        made += 1;
+        p.* = l;
+        try e.prefillAll(l);
+    }
+    try e.draft(&ptrs, true);
+    try e.stream.synchronize();
+    std.debug.print("qwen38fn-rounds: prompts done, {d} shared rounds follow\n", .{rounds_n});
+    var total: f64 = 0;
+    for (0..rounds_n) |i| {
+        var rows_n: usize = 0;
+        for (ptrs) |l| if (!l.done()) {
+            rows_n += 1 + l.nd;
+        };
+        const t0 = check.now(e.gpu.io);
+        if (!try e.step(&ptrs)) break;
+        try e.stream.synchronize();
+        const ms = @as(f64, @floatFromInt(check.now(e.gpu.io) - t0)) / 1e6;
+        total += ms;
+        std.debug.print("qwen38fn-rounds: round {d}: {d} rows, {d:.1} ms (verify and drafts)\n", .{ i, rows_n, ms });
+    }
+    check.pass("qwen38fn-rounds: {d} rounds in {d:.1} ms", .{ rounds_n, total });
+}
+
+/// The model, the head, the kernels and the buffers both commands use, around `body`.
+fn withEnv(gpu: Gpu, kernels: []const u8, model: []const u8, comptime body: fn (e: *Env) anyerror!void) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
     var why: qfn.config.Why = .{};
@@ -281,6 +328,13 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
     const vh = try gpa.alloc(u16, cfg.vocab * shared_rows);
     defer gpa.free(vh);
     var e: Env = .{ .gpu = gpu, .m = m, .head = head, .fw = &fw, .pr = &pr, .b = &b, .mb = &mb, .pb = &pb, .sc = &sc, .scp = &scp, .vh = vh, .stream = stream };
+    try body(&e);
+}
+
+fn sharedRun(e_: *Env) anyerror!void {
+    const e = e_;
+    const gpa = e.gpu.gpa;
+    const fw = e.fw;
 
     // each stream alone, on a new sequence
     var ls: [streams]Live = undefined;
@@ -299,8 +353,8 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
     }
     var failures: usize = 0;
     var equal: usize = 0;
-    var rounds: usize = 0;
-    for (&alone) |*x| rounds += x.logits.items.len;
+    var rounds_seen: usize = 0;
+    for (&alone) |*x| rounds_seen += x.logits.items.len;
     var ptrs: [streams]*Live = undefined;
     // each alone again on new sequences: the same bytes whatever ran before
     for (0..streams) |s| {
@@ -381,5 +435,5 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
     for (&alone, &ls, 0..) |*x, *y, s| compare("reset, shared, prompt chunks between rounds", s, x, &y.rec, &failures, &equal);
 
     try check.expect(failures == 0, "qwen38fn-shared: {d} records differ ({d} equal)", .{ failures, equal });
-    check.pass("BITEXACT qwen38fn-shared: {d} streams x {d} tokens, {d} rounds' logits, drafts and tokens equal alone and shared on reset sequences, {d} rounds between prompt chunks ({d} records)", .{ streams, tokens, rounds, interleaved, equal });
+    check.pass("BITEXACT qwen38fn-shared: {d} streams x {d} tokens, {d} rounds' logits, drafts and tokens equal alone and shared on reset sequences, {d} rounds between prompt chunks ({d} records)", .{ streams, tokens, rounds_seen, interleaved, equal });
 }
