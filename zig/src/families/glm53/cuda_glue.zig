@@ -159,14 +159,14 @@ pub const Bmm = struct {
     /// rest stay on the captured kernels (bmm.cu was slower there).
     const Shape = struct { n: usize, k: usize, f32: bool, kernel: []const u8 };
     const table = [_]Shape{
-        .{ .n = 12576, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256_1b" },
-        .{ .n = 12288, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256_1b" },
-        .{ .n = 2048, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64_sb" },
-        .{ .n = 4096, .k = 1024, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64_sf" },
-        .{ .n = 4096, .k = 1536, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64_sb" },
-        .{ .n = 4096, .k = 4096, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64_sf" },
-        .{ .n = 4096, .k = 6144, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64_sf" },
-        .{ .n = 4096, .k = 8192, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64_sb" },
+        .{ .n = 12576, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256k64z_1b" },
+        .{ .n = 12288, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256k64z_1b" },
+        .{ .n = 2048, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64z_sb" },
+        .{ .n = 4096, .k = 1024, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64z_sf" },
+        .{ .n = 4096, .k = 1536, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64z_sb" },
+        .{ .n = 4096, .k = 4096, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64z_sf" },
+        .{ .n = 4096, .k = 6144, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64z_sf" },
+        .{ .n = 4096, .k = 8192, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64z_sb" },
     };
 
     pub fn load(d: *const cuda.Driver) !Bmm {
