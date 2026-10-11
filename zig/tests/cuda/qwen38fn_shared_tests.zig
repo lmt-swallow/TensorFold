@@ -227,14 +227,17 @@ fn compare(what: []const u8, s: usize, alone: *const Record, shared_: *const Rec
         if (p[1].len != p[2].len) {
             std.debug.print("FAIL qwen38fn-shared {s} stream {d}: {d} {s} records alone, {d} shared\n", .{ what, s, p[1].len, p[0], p[2].len });
             failures.* += 1;
-        } else for (p[1], p[2], 0..) |x, y, i| {
+        }
+        var first_diff: ?usize = null;
+        for (p[1][0..@min(p[1].len, p[2].len)], p[2][0..@min(p[1].len, p[2].len)], 0..) |x, y, i| {
             if (std.mem.eql(u8, std.mem.sliceAsBytes(x), std.mem.sliceAsBytes(y))) {
                 equal.* += 1;
             } else {
-                std.debug.print("FAIL qwen38fn-shared {s} stream {d}: {s} {d} differs\n", .{ what, s, p[0], i });
+                if (first_diff == null) first_diff = i;
                 failures.* += 1;
             }
         }
+        if (first_diff) |i| std.debug.print("FAIL qwen38fn-shared {s} stream {d}: {s} differ from record {d}\n", .{ what, s, p[0], i });
     }
     if (!std.mem.eql(u32, alone.out.items, shared_.out.items)) {
         std.debug.print("FAIL qwen38fn-shared {s} stream {d}: tokens differ\n", .{ what, s });
@@ -291,26 +294,61 @@ pub fn shared(gpu: Gpu, kernels: []const u8, model: []const u8) !void {
         alone[s] = l.rec;
         l.rec = .{};
     }
-    // all four on the same sequences reset: three prompts, then the last one's chunks between the others' rounds
+    var failures: usize = 0;
+    var equal: usize = 0;
+    var rounds: usize = 0;
+    for (&alone) |*x| rounds += x.logits.items.len;
     var ptrs: [streams]*Live = undefined;
-    for (&ls, &ptrs, 0..) |*l, *p, s| {
-        p.* = l;
-        try e.begin(l, s, false);
+    // each alone again on new sequences: the same bytes whatever ran before
+    for (0..streams) |s| {
+        var l: Live = undefined;
+        try e.begin(&l, s, true);
+        defer Env.free(&l, gpa);
+        try e.prefillAll(&l);
+        try e.draft(&.{&l}, true);
+        while (try e.step(&.{&l})) {}
+        compare("alone again", s, &alone[s], &l.rec, &failures, &equal);
     }
+    // new sequences, the last prompt's chunks between the others' rounds
+    {
+        var fresh: [streams]Live = undefined;
+        var fm: usize = 0;
+        defer for (fresh[0..fm]) |*l| Env.free(l, gpa);
+        for (&fresh, &ptrs, 0..) |*l, *p, s| {
+            try e.begin(l, s, true);
+            fm += 1;
+            p.* = l;
+        }
+        for (ptrs[0 .. streams - 1]) |l| try e.prefillAll(l);
+        try e.draft(ptrs[0 .. streams - 1], true);
+        while (!try e.chunkStep(ptrs[streams - 1])) _ = try e.step(ptrs[0 .. streams - 1]);
+        try e.draft(ptrs[streams - 1 ..], true);
+        while (try e.step(&ptrs)) {}
+        for (&alone, &fresh, 0..) |*x, *y, s| compare("new sequences, prompt chunks between rounds", s, x, &y.rec, &failures, &equal);
+    }
+    for (&ls, &ptrs) |*l, *p| p.* = l;
+    // all four together on the same sequences reset, every prompt first
+    for (&ls, 0..) |*l, s| {
+        try e.begin(l, s, false);
+        try e.prefillAll(l);
+    }
+    try e.draft(&ptrs, true);
+    while (try e.step(&ptrs)) {}
+    for (&alone, &ls, 0..) |*x, *y, s| {
+        compare("reset, shared", s, x, &y.rec, &failures, &equal);
+        y.rec.deinit(gpa);
+        y.rec = .{};
+    }
+    // again, the last prompt's chunks between the others' rounds
+    for (&ls, 0..) |*l, s| try e.begin(l, s, false);
     for (ptrs[0 .. streams - 1]) |l| try e.prefillAll(l);
     try e.draft(ptrs[0 .. streams - 1], true);
     var interleaved: usize = 0;
     while (!try e.chunkStep(ptrs[streams - 1])) interleaved += @intFromBool(try e.step(ptrs[0 .. streams - 1]));
     try e.draft(ptrs[streams - 1 ..], true);
     while (try e.step(&ptrs)) {}
+    for (&alone, &ls, 0..) |*x, *y, s| compare("reset, shared, prompt chunks between rounds", s, x, &y.rec, &failures, &equal);
 
-    var failures: usize = 0;
-    var equal: usize = 0;
-    var rounds: usize = 0;
-    for (&alone, &ls, 0..) |*x, *y, s| {
-        compare("alone vs shared", s, x, &y.rec, &failures, &equal);
-        rounds += x.logits.items.len;
-    }
     try check.expect(failures == 0, "qwen38fn-shared: {d} records differ ({d} equal)", .{ failures, equal });
     check.pass("BITEXACT qwen38fn-shared: {d} streams x {d} tokens, {d} rounds' logits, drafts and tokens equal alone and shared on reset sequences, {d} rounds between prompt chunks ({d} records)", .{ streams, tokens, rounds, interleaved, equal });
 }
