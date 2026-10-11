@@ -52,6 +52,7 @@ ssh -o BatchMode=yes "$WORKER" "ln -s rank1 '$WORK/rankX'"
 cd "$WORK/recipe"
 bash "$HERE/reference.sh" check >/dev/null
 CAPTURE=1 RECIPE="$WORK/recipe" bash "$HERE/reference.sh" start
+bash "$HERE/reference.sh" mem | tee "$WORK/mem.txt"
 python3 -B "$TF/tools/zig/dsv41/capture_workload.py" --base "http://127.0.0.1:${PORT:-8888}/v1" --report "$WORK/workload.json" "$@"
 touch "$WORK/rank0/dump.now"; ssh -o BatchMode=yes "$WORKER" "touch '$WORK/rank1/dump.now'"
 sleep 5
