@@ -157,7 +157,9 @@ fn load(r: *Rank, gpu: Gpu, cfg: *const glm.config.Config, set: *const cuda.aot.
         st.kda.pos = int(positions[s]);
         st.pos = st.kda.pos;
     }
-    r.work = try M.Work.init(d, r.lay, int(param(fx, "window_rows")), slot_rows, pool_rows);
+    // Work's final-norm rows (fnormed, fxs) are its prompt rows: they must hold a whole window's
+    const window_rows = int(param(fx, "window_rows"));
+    r.work = try M.Work.init(d, r.lay, window_rows, @max(window_rows, slot_rows), pool_rows);
     r.loaded = try watch(r, gpa);
 }
 
