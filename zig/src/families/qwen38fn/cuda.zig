@@ -13,6 +13,7 @@ pub const ngram = @import("ngram.zig");
 pub const attn = @import("cuda_attn.zig");
 pub const forward = @import("cuda_forward.zig");
 pub const prompt = @import("cuda_prompt.zig");
+pub const mtp = @import("cuda_mtp.zig");
 pub const serve_lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
 

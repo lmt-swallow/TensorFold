@@ -149,7 +149,7 @@ pub const Buffers = struct {
             .{ &b.pa, rows * aw * 2 },                             .{ &b.q, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.iq, rows * cfg.index_heads * cfg.index_dim * 2 }, .{ &b.attn_o, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.gated, rows * cfg.heads * cfg.head_dim * 2 },    .{ &b.xs_gated, rows * cfg.heads * cfg.head_dim / 32 * 4 },
-            .{ &b.pos_blk, 16 },                                   .{ &b.xh, rows * kmax * 2 },
+            .{ &b.pos_blk, 16 },                                   .{ &b.xh, rows * @max(kmax, cfg.wide()) * 2 },
             .{ &b.wq, kn * 2 },                                    .{ &b.hadamard, 128 * 128 * 2 },
             .{ &b.z, zmax },                                       .{ &b.logits_router, rows * (cfg.experts + 1) * 4 },
             .{ &b.pick, rows * slots * 4 },                        .{ &b.wts, rows * slots * 4 },
@@ -212,7 +212,7 @@ pub const Prompt = struct {
     }
 
     /// exl3/prefill.py `matmul`: out [m, n] (row stride o_stride) = x [m, k] bf16 @ W for any m.
-    fn matmul(p: *Prompt, l: *const Linear, x: Ptr, m: usize, out: Ptr, o_stride: usize, b: *Buffers, stream: cuda.Stream) !void {
+    pub fn matmul(p: *Prompt, l: *const Linear, x: Ptr, m: usize, out: Ptr, o_stride: usize, b: *Buffers, stream: cuda.Stream) !void {
         const xk = &p.f.m.xk;
         {
             var a: cuda.Args = .{};
@@ -281,14 +281,13 @@ pub const Prompt = struct {
         }
     }
 
-    /// The chunk's forward on staged rows: every layer, and with `head` the last row's logits into b.logits.
+    /// The chunk's forward on staged rows: every layer, b.streams (the streams with the last write-back, for the MTP
+    /// head), and with `head` the last row's logits into b.logits.
     pub fn compute(p: *Prompt, st: *fwd.Stream, b: *Buffers, R: usize, head: bool, probe: Probe, stream: cuda.Stream) !void {
         const f = p.f;
         const m = f.m;
-        const cfg = &m.cfg;
         const g = f.g;
         const w = &b.w;
-        const lin = m.linearLayers();
         try g.embed(b.ids.ptr, m.embed.ptr, w.h.ptr, R, stream);
         var pending: Glue.Pending = .none;
         for (m.layers) |*layer| {
@@ -296,53 +295,81 @@ pub const Prompt = struct {
                 try stream.synchronize();
                 try cb(probe.ctx, layer.index, w.h, R);
             }
-            if (layer.ple) |*pl| {
-                if (pending != .none) {
-                    try g.hcWriteback(w.h.ptr, w.pss.ptr, R, pending, stream);
-                    pending = .none;
-                }
-                try p.pleBlock(pl, st, b, R, stream);
-            }
-            try p.block(b, &layer.attn_hc, R, pending, w.inj_a.ptr, stream);
-            switch (layer.mixer) {
-                .gdn => |*gl| {
-                    const pw = cfg.projWidth();
-                    // Stack.prefill: each part straight into its columns
-                    try p.matmul(&gl.qkv, w.mixed.ptr, R, b.proj.ptr, pw, b, stream);
-                    try p.matmul(&gl.z, w.mixed.ptr, R, b.proj.ptr + gl.qkv.n * 2, pw, b, stream);
-                    try g.f16Rows(&gl.w.ba, w.mixed.ptr, "*bf16", cfg.hidden, R, b.proj.ptr + (gl.qkv.n + gl.z.n) * 2, pw, w.part.ptr, stream);
-                    try p.chain(st, b, gl, lin, R, stream);
-                    try p.matmul(&gl.out, w.gout.ptr, R, w.branch.ptr, cfg.hidden, b, stream);
-                },
-                .attn => |*al| {
-                    const pw = al.w.projWidth();
-                    var at: usize = 0;
-                    for (&al.parts) |*part| {
-                        try p.matmul(part, w.mixed.ptr, R, b.pa.ptr + at * 2, pw, b, stream);
-                        at += part.n;
-                    }
-                    try p.attention(st, b, al, pw, R, stream);
-                    try p.matmul(&al.o, b.gated.ptr, R, w.branch.ptr, cfg.hidden, b, stream);
-                },
-            }
-            try p.block(b, &layer.mlp_hc, R, .{ .branch = .{ .branch = w.branch.ptr, .inject = w.inj_a.ptr } }, w.inj_m.ptr, stream);
-            try p.moe(layer, b, R, stream);
+            const at: ?fwd.AttnAt = switch (layer.mixer) {
+                .attn => |*al| st.mainAt(al.ai),
+                .gdn => null,
+            };
+            try p.layerStep(layer, st, b, R, pending, at, stream);
             if (probe.layer_out) |cb| {
                 try stream.synchronize();
                 try cb(probe.ctx, layer.index, b.y, b.wts, w.inj_m, R);
             }
-            pending = .{ .moe_bf16 = .{ .y = b.y.ptr, .wts = b.wts.ptr, .inject = w.inj_m.ptr, .slots = cfg.slots() } };
+            pending = p.moePending(b);
         }
+        try p.finish(&m.mixer, b, R, pending, stream);
         if (!head) return;
         const hl = if (m.head) |*x| x else return error.NoHead;
-        // finish(ends=()): the last write-back on a copy, the mixer on the last row only, the head
+        try hl.run(w.mixed.ptr, .bf16, 1, b.xh.ptr, b.z.ptr, b.logits.ptr, .bf16, stream);
+    }
+
+    pub fn moePending(p: *Prompt, b: *Buffers) Glue.Pending {
+        return .{ .moe_bf16 = .{ .y = b.y.ptr, .wts = b.wts.ptr, .inject = b.w.inj_m.ptr, .slots = p.f.m.cfg.slots() } };
+    }
+
+    /// forward.py `finish(ends=())` on the prompt path: b.streams = every row's streams with the last write-back, and
+    /// the read-out of `mixer` on the last row only into b.w.mixed (row 0).
+    pub fn finish(p: *Prompt, mixer: *const weights.Hc, b: *Buffers, R: usize, pending: Glue.Pending, stream: cuda.Stream) !void {
+        const cfg = &p.f.m.cfg;
+        const w = &b.w;
         try b.streams.copyFrom(0, w.h.ptr, R * cfg.wide() * 2, stream.handle);
-        try g.hcWriteback(b.streams.ptr, w.pss.ptr, R, pending, stream);
+        try p.f.g.hcWriteback(b.streams.ptr, w.pss.ptr, R, pending, stream);
         const last = R - 1;
         const pss_row = (cfg.hidden / 256) * cfg.streams * 4;
         try w.pss.copyFrom(0, w.pss.ptr + last * pss_row, pss_row, stream.handle);
-        try p.readout(b, b.streams.ptr + last * cfg.wide() * 2, &m.mixer, 1, 0, stream);
-        try hl.run(w.mixed.ptr, .bf16, 1, b.xh.ptr, b.z.ptr, b.logits.ptr, .bf16, stream);
+        try p.readout(b, b.streams.ptr + last * cfg.wide() * 2, mixer, 1, 0, stream);
+    }
+
+    /// forward.py `layer_forward` on the prompt path for one stream (attention at `at`); the write-back stays pending.
+    pub fn layerStep(p: *Prompt, layer: *const fwd.Layer, st: *fwd.Stream, b: *Buffers, R: usize, pending_in: Glue.Pending, at: ?fwd.AttnAt, stream: cuda.Stream) !void {
+        const f = p.f;
+        const m = f.m;
+        const cfg = &m.cfg;
+        const g = f.g;
+        const w = &b.w;
+        const lin = m.linearLayers();
+        var pending = pending_in;
+        if (layer.ple) |*pl| {
+            if (pending != .none) {
+                try g.hcWriteback(w.h.ptr, w.pss.ptr, R, pending, stream);
+                pending = .none;
+            }
+            try p.pleBlock(pl, st, b, R, stream);
+        }
+        try p.block(b, &layer.attn_hc, R, pending, w.inj_a.ptr, stream);
+        switch (layer.mixer) {
+            .gdn => |*gl| {
+                const pw = cfg.projWidth();
+                // Stack.prefill: each part straight into its columns
+                try p.matmul(&gl.qkv, w.mixed.ptr, R, b.proj.ptr, pw, b, stream);
+                try p.matmul(&gl.z, w.mixed.ptr, R, b.proj.ptr + gl.qkv.n * 2, pw, b, stream);
+                try g.f16Rows(&gl.w.ba, w.mixed.ptr, "*bf16", cfg.hidden, R, b.proj.ptr + (gl.qkv.n + gl.z.n) * 2, pw, w.part.ptr, stream);
+                try p.chain(st, b, gl, lin, R, stream);
+                try p.matmul(&gl.out, w.gout.ptr, R, w.branch.ptr, cfg.hidden, b, stream);
+            },
+            .attn => |*al| {
+                const a = at orelse return error.NoAttentionCache;
+                const pw = al.w.projWidth();
+                var col: usize = 0;
+                for (&al.parts) |*part| {
+                    try p.matmul(part, w.mixed.ptr, R, b.pa.ptr + col * 2, pw, b, stream);
+                    col += part.n;
+                }
+                try p.attention(a, b, al, pw, R, stream);
+                try p.matmul(&al.o, b.gated.ptr, R, w.branch.ptr, cfg.hidden, b, stream);
+            },
+        }
+        try p.block(b, &layer.mlp_hc, R, .{ .branch = .{ .branch = w.branch.ptr, .inject = w.inj_a.ptr } }, w.inj_m.ptr, stream);
+        try p.moe(layer, b, R, stream);
     }
 
     /// forward.py `_prefill_chain` (no kept point): front, the chunk chain from the committed state, back; the layer
@@ -380,19 +407,19 @@ pub const Prompt = struct {
     }
 
     /// forward.py `attn_block` on the prompt path for one stream.
-    fn attention(p: *Prompt, st: *fwd.Stream, b: *Buffers, al: *const fwd.AttnLayer, pw: usize, R: usize, stream: cuda.Stream) !void {
+    fn attention(p: *Prompt, a: fwd.AttnAt, b: *Buffers, al: *const fwd.AttnLayer, pw: usize, R: usize, stream: cuda.Stream) !void {
         const m = p.f.m;
         const ak = p.f.ak;
-        const c = &st.caches[al.ai];
-        try ak.prep(b.pa.ptr, pw, st.pos_dev.ptr, al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, m.inv.ptr, b.q.ptr, c, b.iq.ptr, R, stream);
-        if (b.attn.qsa) try ak.pool(c, st.pos_dev.ptr, al.w.ik_scale.ptr, m.inv.ptr, &b.attn, R, stream);
+        const c = a.caches;
+        try ak.prep(b.pa.ptr, pw, a.pos_dev, al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, m.inv.ptr, b.q.ptr, c, b.iq.ptr, R, stream);
+        if (b.attn.qsa) try ak.pool(c, a.pos_dev, al.w.ik_scale.ptr, m.inv.ptr, &b.attn, R, stream);
         const cfg = &m.cfg;
         var r0: usize = 0;
         while (r0 < R) : (r0 += att_rows) {
             const n = @min(att_rows, R - r0);
-            const p0: i32 = @intCast(st.pos + r0);
+            const p0: i32 = @intCast(a.pos + r0);
             try b.pos_blk.uploadAsync(0, std.mem.asBytes(&p0), stream.handle);
-            const ends = st.pos + r0 + n;
+            const ends = a.pos + r0 + n;
             const iq = b.iq.ptr + r0 * cfg.index_heads * cfg.index_dim * 2;
             const q = b.q.ptr + r0 * cfg.heads * cfg.head_dim * 2;
             if (b.attn.qsa) try ak.rowsSelect(iq, c, b.pos_blk.ptr, &b.attn, n, ends, stream);

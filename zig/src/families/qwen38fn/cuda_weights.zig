@@ -15,20 +15,33 @@ const Tensor = core.checkpoint.Tensor;
 pub const Pack = struct {
     lm: Checkpoint,
     head: Checkpoint,
+    mtp: Checkpoint, // the MTP head's tensors, and its mixer from the patch file beside the shards
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Pack {
         var lm = try Checkpoint.openModelPrefix(gpa, io, dir, names.lm);
         errdefer lm.close();
-        return .{ .lm = lm, .head = try Checkpoint.openModelPrefix(gpa, io, dir, names.head ++ ".") };
+        var head = try Checkpoint.openModelPrefix(gpa, io, dir, names.head ++ ".");
+        errdefer head.close();
+        var mtp = try Checkpoint.openModelPrefix(gpa, io, dir, names.mtp);
+        errdefer mtp.close();
+        const patch = try std.fs.path.join(gpa, &.{ dir, mtp_patch });
+        defer gpa.free(patch);
+        if (std.Io.Dir.cwd().access(io, patch, .{})) |_| {
+            try mtp.add(dir, mtp_patch);
+        } else |_| {}
+        return .{ .lm = lm, .head = head, .mtp = mtp };
     }
 
     pub fn close(self: *Pack) void {
         self.lm.close();
         self.head.close();
+        self.mtp.close();
     }
 
     fn of(self: *Pack, name: []const u8) *Checkpoint {
-        return if (std.mem.startsWith(u8, name, names.lm)) &self.lm else &self.head;
+        if (std.mem.startsWith(u8, name, names.lm)) return &self.lm;
+        if (std.mem.startsWith(u8, name, names.mtp)) return &self.mtp;
+        return &self.head;
     }
 
     pub fn has(self: *Pack, name: []const u8) bool {
@@ -57,6 +70,9 @@ pub const Pack = struct {
         return .{ .trellis = tr.bytes, .kt = kt, .nt = nt, .w16 = tr.shape[2], .suh = suh.bytes, .svh = svh.bytes, .codebook = cb };
     }
 };
+
+/// exl3_pack.py EXTRA_FILES: the MTP head's hyper-connection mixer, outside the index.
+pub const mtp_patch = "mtp_hyper_connection_mixer_patch.safetensors";
 
 /// exl3/linear.py CODEBOOK_IDS.
 pub const Codebook = enum(c_int) { inst3 = 0, mcg = 1, mul1 = 2 };
@@ -116,7 +132,7 @@ pub fn centredOffset(gpa: std.mem.Allocator, pack: *Pack, cfg: *const Config) !f
     return if (around_zero) 1.0 else 0.0;
 }
 
-fn element(t: Tensor, j: usize) !f64 {
+pub fn element(t: Tensor, j: usize) !f64 {
     return switch (t.dtype) {
         .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * j ..][0..2], .little)))),
         .bf16 => @floatCast(bf16ToF32(std.mem.readInt(u16, t.bytes[2 * j ..][0..2], .little))),
@@ -226,27 +242,28 @@ pub const Gdn = struct {
     out: Group,
 
     pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, cfg: *const Config, i: usize) !Gdn {
+        const w_at: names.Where = .{ .lm = i };
         var n: names.Name = .{};
         var n2: names.Name = .{};
-        const qkv = try pack.group(names.layer(&n, i, "linear_attn.in_proj_qkv"));
-        const z = try pack.group(names.layer(&n, i, "linear_attn.in_proj_z"));
-        const out = try pack.group(names.layer(&n, i, "linear_attn.out_proj"));
+        const qkv = try pack.group(names.layer(&n, w_at, "linear_attn.in_proj_qkv"));
+        const z = try pack.group(names.layer(&n, w_at, "linear_attn.in_proj_z"));
+        const out = try pack.group(names.layer(&n, w_at, "linear_attn.out_proj"));
         if (qkv.n() != cfg.convDim() or z.n() != cfg.nv * cfg.dv or out.k() != cfg.nv * cfg.dv or out.n() != cfg.hidden) return error.UnexpectedTensor;
         const parts = [_]Tensor{
-            try pack.expect(names.layer(&n, i, "linear_attn.in_proj_b.weight"), .f16, &.{ cfg.nv, cfg.hidden }),
-            try pack.expect(names.layer(&n2, i, "linear_attn.in_proj_a.weight"), .f16, &.{ cfg.nv, cfg.hidden }),
+            try pack.expect(names.layer(&n, w_at, "linear_attn.in_proj_b.weight"), .f16, &.{ cfg.nv, cfg.hidden }),
+            try pack.expect(names.layer(&n2, w_at, "linear_attn.in_proj_a.weight"), .f16, &.{ cfg.nv, cfg.hidden }),
         };
         const ba_bytes = try stackF16(gpa, &parts, cfg.hidden);
         defer gpa.free(ba_bytes);
         var ba = try F16.init(d, ba_bytes, 2 * cfg.nv, cfg.hidden);
         errdefer ba.deinit();
-        const conv_t = try pack.expect(names.layer(&n, i, "linear_attn.conv1d.weight"), .bf16, &.{ cfg.convDim(), 1, cfg.conv_kernel });
+        const conv_t = try pack.expect(names.layer(&n, w_at, "linear_attn.conv1d.weight"), .bf16, &.{ cfg.convDim(), 1, cfg.conv_kernel });
         var conv = try cuda.DeviceBuffer.fromHost(d, conv_t.bytes);
         errdefer conv.free();
         var gates: [2]cuda.DeviceBuffer = undefined;
         var made: usize = 0;
         errdefer for (gates[0..made]) |*g| g.free();
-        for ([_][]const u8{ names.layer(&n, i, "linear_attn.A_log"), names.layer(&n2, i, "linear_attn.dt_bias") }, &gates) |name, *g| {
+        for ([_][]const u8{ names.layer(&n, w_at, "linear_attn.A_log"), names.layer(&n2, w_at, "linear_attn.dt_bias") }, &gates) |name, *g| {
             const t = try pack.get(name);
             if (t.numel() != cfg.nv) return error.UnexpectedTensor;
             const v = try widen(gpa, t);
@@ -254,7 +271,7 @@ pub const Gdn = struct {
             g.* = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(v));
             made += 1;
         }
-        const norm_t = try pack.expect(names.layer(&n, i, "linear_attn.norm.weight"), .bf16, &.{cfg.dv});
+        const norm_t = try pack.expect(names.layer(&n, w_at, "linear_attn.norm.weight"), .bf16, &.{cfg.dv});
         return .{ .ba = ba, .conv = conv, .a_log = gates[0], .dt_bias = gates[1], .norm = try cuda.DeviceBuffer.fromHost(d, norm_t.bytes), .qkv = qkv, .z = z, .out = out };
     }
 
@@ -268,12 +285,12 @@ pub const Gdn = struct {
 };
 
 /// The router rows (exl3.py `moe`): [mlp.gate ; mlp.shared_expert_gate] as bf16 [experts + 1, hidden].
-pub fn router(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, cfg: *const Config, i: usize) !cuda.DeviceBuffer {
+pub fn router(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, cfg: *const Config, w_at: names.Where) !cuda.DeviceBuffer {
     var n: names.Name = .{};
     var n2: names.Name = .{};
     const parts = [_]Tensor{
-        try pack.get(names.layer(&n, i, "mlp.gate.weight")),
-        try pack.get(names.layer(&n2, i, "mlp.shared_expert_gate.weight")),
+        try pack.get(names.layer(&n, w_at, "mlp.gate.weight")),
+        try pack.get(names.layer(&n2, w_at, "mlp.shared_expert_gate.weight")),
     };
     const rows = cfg.experts + 1;
     const out = try gpa.alloc(u16, rows * cfg.hidden);
@@ -423,12 +440,13 @@ pub const Ple = struct {
     taps: usize,
 
     pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, cfg: *const Config, table: *const NgramTable, i: usize, offset: f32) !Ple {
+        const w_at: names.Where = .{ .lm = i };
         var n: names.Name = .{};
         const wide = cfg.wide();
-        const key_t = try pack.expect(names.layer(&n, i, "ple.key_proj.weight"), .f16, &.{ wide, cfg.hidden });
+        const key_t = try pack.expect(names.layer(&n, w_at, "ple.key_proj.weight"), .f16, &.{ wide, cfg.hidden });
         var key = try F16.init(d, key_t.bytes, wide, cfg.hidden);
         errdefer key.deinit();
-        const val_t = try pack.expect(names.layer(&n, i, "ple.value_proj.weight"), .f16, &.{ cfg.hidden, cfg.hidden });
+        const val_t = try pack.expect(names.layer(&n, w_at, "ple.value_proj.weight"), .f16, &.{ cfg.hidden, cfg.hidden });
         var value = try F16.init(d, val_t.bytes, cfg.hidden, cfg.hidden);
         errdefer value.deinit();
         var norms: [3]cuda.DeviceBuffer = undefined;
@@ -443,7 +461,7 @@ pub const Ple = struct {
             b.* = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(v));
             made += 1;
         }
-        const conv_t = try pack.get(names.layer(&n, i, "ple.conv1d.weight"));
+        const conv_t = try pack.get(names.layer(&n, w_at, "ple.conv1d.weight"));
         if (conv_t.rank != 3 or conv_t.shape[0] != wide or conv_t.shape[1] != 1) return error.UnexpectedTensor;
         const conv = try gpa.alloc(u16, conv_t.numel());
         defer gpa.free(conv);
@@ -483,20 +501,20 @@ pub const Attn = struct {
     iq_scale: cuda.DeviceBuffer,
     ik_scale: cuda.DeviceBuffer,
 
-    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, i: usize, offset: f32) !Attn {
+    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, w_at: names.Where, offset: f32) !Attn {
         var n: names.Name = .{};
         var a: Attn = undefined;
-        a.q = try pack.group(names.layer(&n, i, "self_attn.q_proj"));
-        a.k = try pack.group(names.layer(&n, i, "self_attn.k_proj"));
-        a.v = try pack.group(names.layer(&n, i, "self_attn.v_proj"));
-        a.iqk = try pack.group(names.layer(&n, i, "self_attn.indexer.index_qk_proj"));
-        a.o = try pack.group(names.layer(&n, i, "self_attn.o_proj"));
+        a.q = try pack.group(names.layer(&n, w_at, "self_attn.q_proj"));
+        a.k = try pack.group(names.layer(&n, w_at, "self_attn.k_proj"));
+        a.v = try pack.group(names.layer(&n, w_at, "self_attn.v_proj"));
+        a.iqk = try pack.group(names.layer(&n, w_at, "self_attn.indexer.index_qk_proj"));
+        a.o = try pack.group(names.layer(&n, w_at, "self_attn.o_proj"));
         const parts = [_][]const u8{ "self_attn.q_norm.weight", "self_attn.k_norm.weight", "self_attn.indexer.q_layernorm.weight", "self_attn.indexer.k_layernorm.weight" };
         var bufs: [4]cuda.DeviceBuffer = undefined;
         var made: usize = 0;
         errdefer for (bufs[0..made]) |*b| b.free();
         for (parts, &bufs) |p, *b| {
-            const t = try pack.get(n.of(names.lm ++ "layers.{d}.{s}", .{ i, p }));
+            const t = try pack.get(names.layerAny(&n, w_at, p));
             const v = try widen(gpa, t);
             defer gpa.free(v);
             for (v) |*x| x.* += offset;

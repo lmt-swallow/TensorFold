@@ -93,7 +93,7 @@ pub const Experts = struct {
     k2_d: [2]u32,
 
     /// Layer i's routed experts and its shared expert (exl3.py `expert_table`).
-    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *weights.Pack, cfg: *const Config, i: usize) !Experts {
+    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *weights.Pack, cfg: *const Config, i: names.Where) !Experts {
         const E = cfg.experts + 1;
         if (cfg.shared_width != cfg.moe_width) return error.UnsupportedShape; // one width I for the whole table
         const D = cfg.hidden;

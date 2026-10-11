@@ -66,7 +66,7 @@ pub const Layer = struct {
     experts: experts.Experts,
     ple: ?weights.Ple = null,
 
-    fn deinit(self: *Layer) void {
+    pub fn deinit(self: *Layer) void {
         self.attn_hc.deinit();
         self.mlp_hc.deinit();
         switch (self.mixer) {
@@ -96,6 +96,7 @@ pub const Model = struct {
     mixer: weights.Hc,
     head: ?Linear,
     offset: f32,
+    has_mtp: bool = false, // the streams keep an MTP cache (cuda_mtp.zig loads the head)
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, cfg: Config, layers: usize, with_head: bool) !*Model {
         const m = try gpa.create(Model);
@@ -146,7 +147,7 @@ pub const Model = struct {
                 l.mixer = .{ .gdn = .{ .w = w, .qkv = try linear(gpa, &m.xk, w.qkv), .z = try linear(gpa, &m.xk, w.z), .out = try linear(gpa, &m.xk, w.out), .li = lin } };
                 lin += 1;
             } else {
-                const w = try weights.Attn.load(gpa, d, &m.pack, i, m.offset);
+                const w = try weights.Attn.load(gpa, d, &m.pack, .{ .lm = i }, m.offset);
                 l.mixer = .{ .attn = .{
                     .w = w,
                     .parts = .{ try linear(gpa, &m.xk, w.q), try linear(gpa, &m.xk, w.k), try linear(gpa, &m.xk, w.v), try linear(gpa, &m.xk, w.iqk) },
@@ -155,8 +156,8 @@ pub const Model = struct {
                 } };
                 att += 1;
             }
-            l.router = try weights.router(gpa, d, &m.pack, &m.cfg, i);
-            l.experts = try experts.Experts.load(gpa, d, &m.pack, &m.cfg, i);
+            l.router = try weights.router(gpa, d, &m.pack, &m.cfg, .{ .lm = i });
+            l.experts = try experts.Experts.load(gpa, d, &m.pack, &m.cfg, .{ .lm = i });
             l.ple = if (cfg.ple_layer != null and cfg.ple_layer.? == i) try weights.Ple.load(gpa, d, &m.pack, &m.cfg, &m.table.?, i, m.offset) else null;
             m.layers[i] = l;
             made += 1;
@@ -208,6 +209,11 @@ pub const Stream = struct {
     rows: usize,
     proj: cuda.DeviceBuffer, // bf16 [lin, rows, PW]: each DeltaNet layer's projection rows
     ple_nrow: cuda.DeviceBuffer, // bf16 [rows, S * D]: the n-gram branch's normed rows
+    // the MTP head's own attention cache and its length (mtp.py: st.mtp_kc, mtp_pos, mtp_len, mtp_drafted)
+    mtp_caches: ?attn.Caches = null,
+    mtp_pos_dev: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0 },
+    mtp_len: usize = 0,
+    mtp_drafted: usize = 0,
     history: [ngram.max_n]i64 = @splat(0),
     prompt_history: [ngram.max_n]i64 = @splat(0), // the history after the prompt chunk being run
     last: ?struct { history: [ngram.max_n]i64, tokens: [64]i64, n: usize } = null,
@@ -236,10 +242,19 @@ pub const Stream = struct {
         s.ple_tail = try cuda.DeviceBuffer.alloc(d, (cfg.ple_kernel - 1) * cfg.ngram * cfg.wide() * 2);
         try s.ple_tail.fill8(0, null);
         if (m.ng) |*g| g.initialHistory(s.history[0 .. g.n - 1]);
+        if (m.has_mtp) {
+            s.mtp_caches = try attn.Caches.init(d, cfg, capacity);
+            s.mtp_pos_dev = try cuda.DeviceBuffer.alloc(d, 16);
+            try s.mtp_pos_dev.fill8(0, null);
+        }
         return s;
     }
 
     pub fn deinit(self: *Stream) void {
+        if (self.mtp_caches) |*c| {
+            c.deinit();
+            self.mtp_pos_dev.free();
+        }
         self.proj.free();
         self.ple_nrow.free();
         self.pos_dev.free();
@@ -262,10 +277,30 @@ pub const Stream = struct {
         return self.rec.ptr + (@as(usize, which) * lin + li) * stateBytes(cfg);
     }
 
+    /// state.py `set_mtp_len`: the MTP head's cache length, on the host and the device.
+    pub fn setMtpLen(self: *Stream, n: usize, stream: cuda.Stream) !void {
+        self.mtp_len = n;
+        const v: i32 = @intCast(n);
+        try self.mtp_pos_dev.uploadAsync(0, std.mem.asBytes(&v), stream.handle);
+    }
+
+    /// The main layers' attention: the stream's caches at its committed position.
+    pub fn mainAt(self: *const Stream, ai: usize) AttnAt {
+        return .{ .caches = &self.caches[ai], .pos_dev = self.pos_dev.ptr, .pos = self.pos };
+    }
+
+    /// The MTP head's attention: its own cache at its own length.
+    pub fn mtpAt(self: *const Stream) AttnAt {
+        return .{ .caches = &self.mtp_caches.?, .pos_dev = self.mtp_pos_dev.ptr, .pos = self.mtp_len };
+    }
+
     pub fn convPtr(self: *const Stream, cfg: *const Config, li: usize) Ptr {
         return self.conv.ptr + li * (cfg.conv_kernel - 1) * cfg.convDim() * 2;
     }
 };
+
+/// Where an attention layer reads and writes: its caches and the stream's position for it (forward.py `_caches`).
+pub const AttnAt = struct { caches: *const attn.Caches, pos_dev: Ptr, pos: usize };
 
 /// A decode window's buffers (state.py `Buffers`, decode).
 pub const Buffers = struct {
@@ -329,8 +364,8 @@ pub const Buffers = struct {
             .{ &b.ids, rows * 4 },
             .{ &b.pa, rows * aw * 2 },                     .{ &b.q, rows * cfg.heads * cfg.head_dim * 2 },
             .{ &b.iq, rows * cfg.index_heads * cfg.index_dim * 2 }, .{ &b.gated, rows * cfg.heads * cfg.head_dim * 2 },
-            .{ &b.xs_gated, rows * cfg.heads * cfg.head_dim / 32 * 4 }, .{ &b.xh, rows * kmax * 2 },
-            .{ &b.z, zmax },                               .{ &b.logits_router, rows * (cfg.experts + 1) * 4 },
+            .{ &b.xs_gated, rows * cfg.heads * cfg.head_dim / 32 * 4 }, .{ &b.xh, rows * @max(kmax, cfg.wide()) * 2 },
+            .{ &b.z, @max(zmax, 8 * rows * cfg.wide() * 4) }, // the MTP head's fc_hidden runs S rows a row                               .{ &b.logits_router, rows * (cfg.experts + 1) * 4 },
             .{ &b.pick, rows * slots * 4 },                .{ &b.wts, rows * slots * 4 },
             .{ &b.ple_dev, rows * ple_heads * ple_words * 2 }, .{ &b.ple_emb, rows * cfg.hidden * 2 },
             .{ &b.ple_keys, rows * wide * 2 },             .{ &b.ple_vals, rows * cfg.hidden * 2 },
@@ -395,7 +430,7 @@ pub const Forward = struct {
         }
     }
 
-    fn mm(f: *Forward, l: *const Linear, x: Ptr, R: usize, y: Ptr, b: *Buffers, stream: cuda.Stream) !void {
+    pub fn mm(f: *Forward, l: *const Linear, x: Ptr, R: usize, y: Ptr, b: *Buffers, stream: cuda.Stream) !void {
         _ = f;
         try l.run(x, .bf16, R, b.xh.ptr, b.z.ptr, y, .bf16, stream);
     }
@@ -430,10 +465,8 @@ pub const Forward = struct {
     /// forward.py `compute` for one stream: logits of the window's rows into b.logits (with the head loaded).
     pub fn compute(f: *Forward, st: *Stream, b: *Buffers, R: usize, probe: Probe, stream: cuda.Stream) !void {
         const m = f.m;
-        const cfg = &m.cfg;
         const g = f.g;
         const w = &b.w;
-        const lin = m.linearLayers();
         try g.embed(b.ids.ptr, m.embed.ptr, w.h.ptr, R, stream);
         var pending: Glue.Pending = .none;
         for (m.layers) |*layer| {
@@ -441,53 +474,82 @@ pub const Forward = struct {
                 try stream.synchronize();
                 try cb(probe.ctx, layer.index, b, R);
             }
-            if (layer.ple) |*p| {
-                if (pending != .none) {
-                    try g.hcWriteback(w.h.ptr, w.pss.ptr, R, pending, stream);
-                    pending = .none;
-                }
-                try f.pleBlock(p, st, b, R, stream);
-            }
-            // the attention hyper-connection
-            try hc_mod.block(g, w, &layer.attn_hc, cfg, R, pending, w.inj_a.ptr, stream);
-            switch (layer.mixer) {
-                .gdn => |*gl| {
-                    const proj = st.proj.ptr + gl.li * st.rows * cfg.projWidth() * 2;
-                    try f.stack(&.{ &gl.qkv, &gl.z }, &gl.w.ba, w.mixed.ptr, R, proj, cfg.projWidth(), b, stream);
-                    const cur = st.cur[gl.li];
-                    try gdn.chain(&m.gk, .{
-                        .p = proj,                .conv_state = st.convPtr(cfg, gl.li), .conv_w = gl.w.conv.ptr,
-                        .state_in = st.recPtr(cfg, lin, gl.li, cur), .a_log = gl.w.a_log.ptr, .dt_bias = gl.w.dt_bias.ptr,
-                        .norm_w = gl.w.norm.ptr,  .eps = cfg.eps,                         .rows = R,
-                        .out = w.gout.ptr,        .xs = w.gxs.ptr,                        .state_out = st.recPtr(cfg, lin, gl.li, 1 - cur),
-                        .scratch = &st.scratch[gl.li],
-                    }, stream);
-                    try f.mm(&gl.out, w.gout.ptr, R, w.branch.ptr, b, stream);
-                },
-                .attn => |*al| {
-                    const pw = al.w.projWidth();
-                    try f.stack(&.{ &al.parts[0], &al.parts[1], &al.parts[2], &al.parts[3] }, null, w.mixed.ptr, R, b.pa.ptr, pw, b, stream);
-                    try f.ak.block(b.pa.ptr, pw, st.pos_dev.ptr, st.pos, .{ al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, al.w.ik_scale.ptr }, m.inv.ptr, b.q.ptr, b.iq.ptr, &st.caches[al.ai], &b.attn, b.gated.ptr, b.xs_gated.ptr, R, stream);
-                    try f.mm(&al.o, b.gated.ptr, R, w.branch.ptr, b, stream);
-                },
-            }
-            // the MLP hyper-connection, then the experts
-            try hc_mod.block(g, w, &layer.mlp_hc, cfg, R, .{ .branch = .{ .branch = w.branch.ptr, .inject = w.inj_a.ptr } }, w.inj_m.ptr, stream);
-            try g.router(w.mixed.ptr, cfg.hidden, layer.router.ptr, cfg.experts + 1, b.logits_router.ptr, R, stream);
-            try g.selectRows(b.logits_router.ptr, cfg.experts, cfg.topk, b.pick.ptr, b.wts.ptr, R, stream);
-            _ = try experts.routed(&m.ek, &layer.experts, &b.moe, w.mixed.ptr, cfg.hidden, b.pick.ptr, R, stream);
+            const at: ?AttnAt = switch (layer.mixer) {
+                .attn => |*al| st.mainAt(al.ai),
+                .gdn => null,
+            };
+            try f.layerStep(layer, st, b, R, pending, at, stream);
             if (probe.layer_out) |cb| {
                 try stream.synchronize();
                 try cb(probe.ctx, layer.index, b, R);
             }
-            pending = .{ .moe = .{ .y = b.moe.y.ptr, .wts = b.wts.ptr, .inject = w.inj_m.ptr, .slots = cfg.slots() } };
+            pending = f.moePending(b);
         }
         // finish: the last write-back on a copy of the streams, the mixer, the head
         const head = if (m.head) |*h| h else return;
-        try b.streams.copyFrom(0, w.h.ptr, R * cfg.wide() * 2, stream.handle);
-        try g.hcWriteback(b.streams.ptr, w.pss.ptr, R, pending, stream);
-        try hc_mod.readoutOf(g, w, b.streams.ptr, &m.mixer, cfg, R, 0, stream);
+        try f.finish(&m.mixer, b, R, pending, stream);
         try f.mm(head, w.mixed.ptr, R, b.logits.ptr, b, stream);
+    }
+
+    /// The pending MoE write-back a layer leaves in `b`.
+    pub fn moePending(f: *Forward, b: *Buffers) Glue.Pending {
+        return .{ .moe = .{ .y = b.moe.y.ptr, .wts = b.wts.ptr, .inject = b.w.inj_m.ptr, .slots = f.m.cfg.slots() } };
+    }
+
+    /// forward.py `finish` without the head: b.streams = the streams with the last write-back, and the read-out of
+    /// `mixer` into b.w.mixed / xs_mixed.
+    pub fn finish(f: *Forward, mixer: *const weights.Hc, b: *Buffers, R: usize, pending: Glue.Pending, stream: cuda.Stream) !void {
+        const cfg = &f.m.cfg;
+        try b.streams.copyFrom(0, b.w.h.ptr, R * cfg.wide() * 2, stream.handle);
+        try f.g.hcWriteback(b.streams.ptr, b.w.pss.ptr, R, pending, stream);
+        try hc_mod.readoutOf(f.g, &b.w, b.streams.ptr, mixer, cfg, R, 0, stream);
+    }
+
+    /// forward.py `layer_forward` up to its experts for one stream: the n-gram branch, both hyper-connections,
+    /// DeltaNet or attention (at `at`), router and experts; the layer's write-back is left pending in `b`.
+    pub fn layerStep(f: *Forward, layer: *const Layer, st: *Stream, b: *Buffers, R: usize, pending_in: Glue.Pending, at: ?AttnAt, stream: cuda.Stream) !void {
+        const m = f.m;
+        const cfg = &m.cfg;
+        const g = f.g;
+        const w = &b.w;
+        const lin = m.linearLayers();
+        var pending = pending_in;
+        if (layer.ple) |*p| {
+            if (pending != .none) {
+                try g.hcWriteback(w.h.ptr, w.pss.ptr, R, pending, stream);
+                pending = .none;
+            }
+            try f.pleBlock(p, st, b, R, stream);
+        }
+        // the attention hyper-connection
+        try hc_mod.block(g, w, &layer.attn_hc, cfg, R, pending, w.inj_a.ptr, stream);
+        switch (layer.mixer) {
+            .gdn => |*gl| {
+                const proj = st.proj.ptr + gl.li * st.rows * cfg.projWidth() * 2;
+                try f.stack(&.{ &gl.qkv, &gl.z }, &gl.w.ba, w.mixed.ptr, R, proj, cfg.projWidth(), b, stream);
+                const cur = st.cur[gl.li];
+                try gdn.chain(&m.gk, .{
+                    .p = proj,                .conv_state = st.convPtr(cfg, gl.li), .conv_w = gl.w.conv.ptr,
+                    .state_in = st.recPtr(cfg, lin, gl.li, cur), .a_log = gl.w.a_log.ptr, .dt_bias = gl.w.dt_bias.ptr,
+                    .norm_w = gl.w.norm.ptr,  .eps = cfg.eps,                         .rows = R,
+                    .out = w.gout.ptr,        .xs = w.gxs.ptr,                        .state_out = st.recPtr(cfg, lin, gl.li, 1 - cur),
+                    .scratch = &st.scratch[gl.li],
+                }, stream);
+                try f.mm(&gl.out, w.gout.ptr, R, w.branch.ptr, b, stream);
+            },
+            .attn => |*al| {
+                const a = at orelse return error.NoAttentionCache;
+                const pw = al.w.projWidth();
+                try f.stack(&.{ &al.parts[0], &al.parts[1], &al.parts[2], &al.parts[3] }, null, w.mixed.ptr, R, b.pa.ptr, pw, b, stream);
+                try f.ak.block(b.pa.ptr, pw, a.pos_dev, a.pos, .{ al.w.q_scale.ptr, al.w.k_scale.ptr, al.w.iq_scale.ptr, al.w.ik_scale.ptr }, m.inv.ptr, b.q.ptr, b.iq.ptr, a.caches, &b.attn, b.gated.ptr, b.xs_gated.ptr, R, stream);
+                try f.mm(&al.o, b.gated.ptr, R, w.branch.ptr, b, stream);
+            },
+        }
+        // the MLP hyper-connection, then the experts
+        try hc_mod.block(g, w, &layer.mlp_hc, cfg, R, .{ .branch = .{ .branch = w.branch.ptr, .inject = w.inj_a.ptr } }, w.inj_m.ptr, stream);
+        try g.router(w.mixed.ptr, cfg.hidden, layer.router.ptr, cfg.experts + 1, b.logits_router.ptr, R, stream);
+        try g.selectRows(b.logits_router.ptr, cfg.experts, cfg.topk, b.pick.ptr, b.wts.ptr, R, stream);
+        _ = try experts.routed(&m.ek, &layer.experts, &b.moe, w.mixed.ptr, cfg.hidden, b.pick.ptr, R, stream);
     }
 
     /// forward.py `ple_block` for one stream.

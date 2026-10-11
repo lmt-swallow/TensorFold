@@ -43,6 +43,7 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_experts", .src = "qwen38fn/experts", .flags = &.{ "-O3", "-lineinfo" } }, // 0.6.6 cuda/exl3/experts.py, tensorfold_exl3_experts_v1
     .{ .name = "qwen38fn_gdn_io", .src = "qwen38fn/gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
     .{ .name = "qwen38fn_gdn_prefill", .src = "qwen38fn/gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // 0.6.6 cuda/kernels/gdn.py's gdn_prefill.cu, tensorfold_gdn_v2
+    .{ .name = "qwen38fn_qmm", .src = "qwen38fn/qmm", .flags = &.{"-O3"} }, // 0.6.6 cuda/kernels/qmm.py's qmm.cu, tensorfold_qmm_v5: the MTP draft head
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
 };
 

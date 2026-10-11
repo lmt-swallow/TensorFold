@@ -33,6 +33,28 @@ pub const Glue = struct {
         }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("BLOCK", 256) });
     }
 
+    /// exl3_mm.py `embed` with `copies` copies of each row (the MTP head embeds one).
+    pub fn embedCopies(g: Glue, ids: Ptr, table: Ptr, out: Ptr, rows: usize, copies: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_embed", .{ @intCast(rows), @intCast(g.hidden / 256), 1 }, &.{
+            aot.ptr("IDS", "*i32", ids), aot.ptr("T", "*bf16", table), aot.ptr("OUT", "*bf16", out),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(copies)), aot.ci("BLOCK", 256) });
+    }
+
+    /// glue.py `rmsnorm(x, w, eps)` (one norm over each row's d features): out [rows, d] bf16 and its 32-group sums.
+    pub fn rmsnorm(g: Glue, x: Ptr, x_stride: usize, w: Ptr, out: Ptr, xs: Ptr, eps: f32, rows: usize, d: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_rmsnorm", .{ @intCast(rows), 1, 1 }, &.{
+            aot.ptr("X", "*bf16", x), aot.ptr("W", "*fp32", w), aot.ptr("OUT", "*bf16", out), aot.ptr("XS", "*fp32", xs),
+            aot.float("eps", eps),    aot.int("x_stride", n32(x_stride)),
+        }, &.{ aot.ci("D", @intCast(d)), aot.ci("G", @intCast(d)), aot.ci("BLOCK", @intCast(std.math.ceilPowerOfTwoAssert(usize, d))) });
+    }
+
+    /// glue.py `add_streams`: out [rows, S * D] bf16 = e [rows, D] added to each of the S streams of hs [rows * S, D].
+    pub fn addStreams(g: Glue, e: Ptr, hs: Ptr, out: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_add_streams", .{ @intCast(rows), @intCast(g.hidden / 256), 1 }, &.{
+            aot.ptr("E", "*bf16", e), aot.ptr("HS", "*bf16", hs), aot.ptr("OUT", "*bf16", out),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("BLOCK", 256) });
+    }
+
     /// What a write-back adds to the streams (glue.py `hc_writeback` modes 0, 1, 2).
     pub const Pending = union(enum) {
         none,
