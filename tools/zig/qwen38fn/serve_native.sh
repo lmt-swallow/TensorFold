@@ -14,7 +14,7 @@ set -euo pipefail
 
 NODE=${NODE:-spark-616b}
 BIN=${BIN:-zig-out/native/bin/tensorfold-native}
-KERNELS=${KERNELS:-qfn-serve-kernels}
+KERNELS=${KERNELS:-qfn-serve-kernels-shared}
 MODEL=${MODEL:-Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5}
 IMAGE=${IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}
 PARALLEL=${PARALLEL:-4}
