@@ -46,6 +46,7 @@ const Digests = struct {
     failures: usize = 0,
     passes: usize = 0,
     unchanged: usize = 0,
+    split: ?P.Split = null, // the fixture's hcsplit settings (dump_prompt.py --split)
 
     fn deinit(h: *Digests) void {
         for (&h.cur) |*c| c.calls.deinit(h.gpa);
@@ -310,6 +311,12 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
     defer stream.deinit();
     var h: Digests = .{ .gpa = gpa, .d = d, .stream = stream, .trace = fx.parsed.value.object.get("trace").?.array.items, .steps = params.get("digests").?.object };
     defer h.deinit();
+    if (params.get("split")) |sv| if (sv == .object) {
+        h.split = .{
+            .pieces = @intCast(sv.object.get("pieces").?.integer), .min_rows = @intCast(sv.object.get("min_rows").?.integer),
+            .fronts = sv.object.get("fronts").?.bool,
+        };
+    };
 
     var hck = try glm.glue.Hc.load(d);
     defer hck.deinit();
@@ -406,30 +413,53 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
             r.st.pos = pos;
         }
         r.stream.mtp_len = mtp0;
-        cs[ri] = .{ .p = r.p.view(), .m = &r.model, .k = k, .lay = .{ .rank = ri, .world = 2, .cfg = cfg }, .st = &r.stream, .ids = ids[ri], .next = next[ri] };
+        cs[ri] = .{ .p = r.p.view(), .m = &r.model, .k = k, .lay = .{ .rank = ri, .world = 2, .cfg = cfg }, .st = &r.stream, .ids = ids[ri], .next = next[ri], .split = h.split };
         try h.begin(ri, step);
     }
     defer for (0..2) |ri| {
         gpa.free(raws[ri]);
         gpa.free(next[ri]);
     };
-    const n = cs[0].sites();
-    for (0..n + 1) |i| {
+    var plans: [2][]P.Op = undefined;
+    for (0..2) |ri| plans[ri] = try cs[ri].plan(gpa);
+    defer for (plans) |x| gpa.free(x);
+    // each rank runs its ops up to its next gather; the gathers then move both ranks' bytes (rank 0's first)
+    var at: [2]usize = .{ 0, 0 };
+    while (true) {
         for (ranks, 0..) |*r, ri| {
             h.on(ri, step);
-            if (i > 0) try h.call("gather", "ret", cs[ri].exchange(i - 1).gath);
-            try cs[ri].run(i, h.stream);
-            try compare(h, &cs[ri], r, i, pos, R, mtp0);
-        }
-        if (i < n) {
-            var parts: [2]Ptr = undefined;
-            var gaths: [2]Ptr = undefined;
-            for (0..2) |ri| {
-                const x = cs[ri].exchange(i);
-                parts[ri] = x.part;
-                gaths[ri] = x.gath;
+            while (at[ri] < plans[ri].len) : (at[ri] += 1) {
+                const op = plans[ri][at[ri]];
+                switch (op) {
+                    .gather => break,
+                    .wait => {},
+                    else => {
+                        try cs[ri].exec(op, h.stream);
+                        try compare(h, &cs[ri], r, op, pos, R, mtp0);
+                    },
+                }
             }
-            try hs.gather(&parts, &gaths, cs[0].exchange(i).bytes, h.d, h.stream);
+        }
+        if (at[0] == plans[0].len and at[1] == plans[1].len) break;
+        if (at[0] == plans[0].len or at[1] == plans[1].len) return error.RanksOutOfStep;
+        const x0 = plans[0][at[0]].gather;
+        const x1 = plans[1][at[1]].gather;
+        if (x0.bytes != x1.bytes) return error.RanksOutOfStep;
+        const xs = [2]@TypeOf(x0){ x0, x1 };
+        for (xs) |x| {
+            const dst: Buf = .{ .d = h.d, .ptr = x.recv, .len = 2 * x.bytes };
+            for (xs, 0..) |y, k2| try dst.copyFrom(k2 * x.bytes, y.send, x.bytes, h.stream.handle);
+        }
+        for (xs, 0..) |x, ri| {
+            if (x.copy) |cp| {
+                const dst: Buf = .{ .d = h.d, .ptr = cp.dst, .len = cp.bytes };
+                try dst.copyFrom(0, cp.src, cp.bytes, h.stream.handle);
+            } else if (x.recv == ranks[ri].p.b.gath.ptr or x.recv == ranks[ri].p.mb.gath.ptr) {
+                // the reference's all-gathers are traced (forward.py `gather`); the split's swaps are not
+                h.on(ri, step);
+                try h.call("gather", "ret", x.recv);
+            }
+            at[ri] += 1;
         }
     }
     // the chunk's states
@@ -457,52 +487,84 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
     if (h.failures == before) check.pass("BITEXACT glm53-prompt {s}: {d} rows at {d} (MTP {d} rows at {d}), both ranks equal to the reference", .{ step, R, pos, absorbed, mtp0 });
 }
 
-/// Segment i's traced calls (the reference's call order) against this rank's buffers.
-fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: usize, mtp0: usize) !void {
+/// An op's traced calls (the reference's call order) against this rank's buffers, right after the op.
+fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, op: P.Op, pos: usize, R: usize, mtp0: usize) !void {
     const p = &r.p;
     const b = &p.b;
-    const limit = c.lay.cfg.denseLimit();
-    switch (c.kind(i)) {
-        .mixer => |li| {
-            if (li == 0) {
-                try h.call("embed", "out", b.x.ptr);
-            } else try h.call("hc_post", "xout", b.x.ptr);
-            try h.call("hc_pre", "out", b.normed.ptr);
-            try h.also("post", b.post.ptr);
-            try h.also("comb", b.comb.ptr);
-            switch (c.m.layers[li].mixer) {
+    const cfg = c.lay.cfg;
+    const D = cfg.hidden;
+    const S = cfg.streams;
+    const limit = cfg.denseLimit();
+    switch (op) {
+        .embed => try h.call("embed", "out", b.x.ptr),
+        .zero_pad, .gather, .wait, .commit => {},
+        .hc_pre => |x| {
+            try h.call("hc_pre", "out", b.normed.ptr + x.lo * D * 2);
+            try h.also("post", b.post.ptr + x.lo * S * 4);
+            try h.also("comb", b.comb.ptr + x.lo * S * S * 4);
+        },
+        .hc_post => try h.call("hc_post", "xout", b.x.ptr),
+        .post_pair => |x| try h.call("hc_post_pair", "xout", b.x.ptr + x.lo * S * D * 2),
+        .mean => |x| try h.call("stream_mean", "out", b.hidden.ptr + x.lo * D * 2),
+        .front => |x| switch (x.site) {
+            .mixer => switch (c.m.layers[x.l].mixer) {
+                .kda => |k| {
+                    const LW = k.w.heads * glm.kda.dk;
+                    try h.call("mm", "out", b.kproj.ptr + x.lo * c.lay.kdaProj() * 2);
+                    try h.call("mm", "out", b.ka.ptr + x.lo * LW * 2);
+                    try h.call("mm", "out", b.kg.ptr + x.lo * LW * 2);
+                },
+                .dsa => |a| {
+                    const ds = &p.ds;
+                    try h.call("mm", "out", ds.dp.ptr + x.lo * (cfg.q_lora + cfg.kv_lora) * 2);
+                    try h.call("rmsnorm", "out", ds.qr.ptr + x.lo * cfg.q_lora * 2);
+                    try h.call("rmsnorm", "out", ds.lat.ptr + x.lo * cfg.kv_lora * 2);
+                    try h.call("mm", "out", ds.q.ptr + x.lo * a.w.heads * cfg.qk_dim * 2);
+                },
+            },
+            .ffn => switch (c.m.layers[x.l].ffn) {
+                .mlp => |w| {
+                    try h.call("mm", "out", b.gu.ptr + x.lo * 2 * w.width * 2);
+                    try h.call("swiglu", "out", b.act.ptr + x.lo * w.width * 2);
+                    try h.also("xs", b.xs_act.ptr + x.lo * w.width / 64 * 4);
+                },
+                .moe => |w| {
+                    const ms = &p.ms;
+                    try h.call("mm", "out", ms.sgu.ptr + x.lo * 2 * w.shared.width * 2);
+                    try h.call("swiglu", "out", ms.sact.ptr + x.lo * w.shared.width * 2);
+                    try h.call("mm", "out", ms.sy.ptr + x.lo * D * 4);
+                },
+            },
+        },
+        .rest => |x| switch (x.site) {
+            .mixer => switch (c.m.layers[x.l].mixer) {
                 .kda => {
-                    try h.call("mm", "out", b.kproj.ptr);
-                    try h.call("mm", "out", b.ka.ptr);
-                    try h.call("mm", "out", b.kg.ptr);
                     try h.call("chain", "ret", p.kscratch.layer(0).out);
                     try h.also("state_out", r.st.state(1 - r.st.cur, 0));
                     try h.call("_shift_conv", "conv", r.st.convOf(0));
                 },
-                .dsa => |x| try compareDsa(h, &p.ds, &r.caches[x.di], pos, R, limit),
-            }
-            try h.call("mm", "out", b.part.ptr);
+                .dsa => |a| try compareDsaRows(h, &p.ds, &r.caches[a.di], pos, R, limit),
+            },
+            .ffn => {
+                const ms = &p.ms;
+                try h.call("router", "out", ms.logits.ptr);
+                try h.call("select", "pick", ms.pick.ptr);
+                try h.also("wts", ms.wts.ptr);
+            },
         },
-        .ffn => |li| {
-            try h.call("hc_post", "xout", b.x.ptr);
-            try h.call("hc_pre", "out", b.normed.ptr);
-            switch (c.m.layers[li].ffn) {
-                .mlp => {
-                    try h.call("mm", "out", b.gu.ptr);
-                    try h.call("swiglu", "out", b.act.ptr);
-                    try h.also("xs", b.xs_act.ptr);
-                    try h.call("mm", "out", b.part.ptr);
-                },
-                .moe => try compareMoe(h, &p.ms, b.part.ptr),
-            }
+        .fill => |x| switch (x.site) {
+            .ffn => if (c.m.layers[x.l].ffn == .moe)
+                try h.call("combine_shared", "out", b.part.ptr + x.lo * D * 4)
+            else
+                try h.call("mm", "out", b.part.ptr + x.lo * D * 4),
+            .mixer => try h.call("mm", "out", b.part.ptr + x.lo * D * 4),
         },
         .tail => {
-            try h.call("hc_post", "xout", b.x.ptr);
-            try h.call("stream_mean", "out", b.hidden.ptr);
             try h.call("rmsnorm", "out", p.fnormed.ptr);
             try h.also("xs", p.fxs.ptr);
             if (c.head) try h.call("mm", "out", p.logits.ptr);
-            if (c.next.len == 0) return;
+        },
+        .mtp_front => {
             const mb = &p.mb;
             // the embedding's first row is zeroed after the call at a stream's first MTP position
             if (mtp0 > 0) try h.call("embed", "out", mb.me.ptr) else try h.next("embed");
@@ -513,7 +575,7 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: us
             try compareDsa(h, &p.ds, &r.mcache, mtp0, c.next.len, limit);
             try h.call("mm", "out", mb.part.ptr);
         },
-        .mtp_ffn => {
+        .mtp_mid => {
             const mb = &p.mb;
             try h.call("residual_add", "xout", mb.mx.ptr);
             try h.call("rmsnorm", "out", mb.normed.ptr);
@@ -528,12 +590,17 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: us
     }
 }
 
-/// A DSA block's calls up to (not including) o_proj (cuda_dsa.zig `dsaBlock`, forward.py `dsa_rows`).
+/// A DSA block's calls up to (not including) o_proj (cuda_dsa.zig `dsaBlock`, forward.py `dsa_front`, `dsa_rows`).
 fn compareDsa(h: *Digests, ds: *const A.Scratch, cache: *const A.Cache, pos: usize, R: usize, limit: usize) !void {
     try h.call("mm", "out", ds.dp.ptr);
     try h.call("rmsnorm", "out", ds.qr.ptr);
     try h.call("rmsnorm", "out", ds.lat.ptr);
     try h.call("mm", "out", ds.q.ptr);
+    try compareDsaRows(h, ds, cache, pos, R, limit);
+}
+
+/// forward.py `dsa_rows`' calls (cuda_dsa.zig `dsaRows`).
+fn compareDsaRows(h: *Digests, ds: *const A.Scratch, cache: *const A.Cache, pos: usize, R: usize, limit: usize) !void {
     try h.call("latent_write", "cache", cache.latent.ptr);
     try h.call("mm", "out", ds.ikr.ptr);
     try h.call("router", "out", ds.igr.ptr);

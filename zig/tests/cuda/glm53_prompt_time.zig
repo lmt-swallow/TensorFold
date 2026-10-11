@@ -1,9 +1,9 @@
 //! `glm53-prompt-time <aot-dir> <model-dir> [pos ...]`: the prompt path's speed on one rank (rank 0 of two), without
 //! the other rank or a fixture. The rank's whole model (45 layers, the MTP layer, the head), zero caches over
 //! `capacity` tokens, a 2,048-row chunk of fixed token ids at each position given (default 0 and 30,720; each chunk
-//! starts there, the caches before it zero) with its MTP absorb, and a gather that stands the rank's own partial in
-//! for the other rank's. Each chunk runs twice (the first warms up); the second's segments are timed one by one
-//! (the stream synchronized after each) and summed by kind. The bits are not checked. `aot-dir` holds Triton
+//! starts there, the caches before it zero) with its MTP absorb, and gathers that stand the rank's own bytes in for
+//! the other rank's. Each chunk runs twice (the first warms up); the second's ops are timed one by one (the stream
+//! synchronized after each) and summed by kind. TF_GLM_HC_SPLIT=1 plans the chunk row-split. The bits are not checked. `aot-dir` holds Triton
 //! variants of 2,048-row chunks at those positions (glm53/capture.sh prompt's covers 0 .. 34,816).
 const std = @import("std");
 const cuda = @import("cuda");
@@ -27,19 +27,9 @@ fn nowNs() i128 {
     return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
 }
 
-var bound: ?*const cuda.Driver = null;
-
-/// The other rank's partial: this rank's own (the bits differ from a real pair; the shapes and launches do not).
-fn selfGather(_: *anyopaque, x: P.Exchange, stream: cuda.Stream) anyerror!void {
-    const dst: Buf = .{ .d = bound.?, .ptr = x.gath, .len = 2 * x.bytes };
-    try dst.copyFrom(0, x.part, x.bytes, stream.handle);
-    try dst.copyFrom(x.bytes, x.part, x.bytes, stream.handle);
-}
-
 pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const usize) !void {
     const gpa = gpu.gpa;
     const d = gpu.d;
-    bound = d;
     var why: glm.config.Why = .{};
     const cfg = glm.config.read(gpa, gpu.io, model, &why) catch |e| {
         std.debug.print("FAIL glm53 config: {t}: {s}\n", .{ e, why.text() });
@@ -98,39 +88,52 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
     defer gpa.free(ids);
     var prng = std.Random.DefaultPrng.init(20261012);
     for (ids) |*x| x.* = prng.random().intRangeLessThan(u32, 1000, 150_000);
-    var dummy: u8 = 0;
-    const gather: P.Gather = .{ .ctx = &dummy, .run = selfGather };
-
-    const kinds = [_][]const u8{ "kda mixer", "dsa mixer", "dense mlp", "moe", "tail + mtp attention", "mtp moe", "mtp head + commit" };
+    // TF_GLM_HC_SPLIT=1: the chunk row-split as served (two pieces, the fronts during the swaps), its swaps local
+    const split: ?P.Split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| (if (std.mem.eql(u8, std.mem.span(v), "1")) P.Split{} else null) else null;
+    const kinds = [_][]const u8{ "hc glue", "kda front", "kda chain", "kda o_proj", "dsa front", "dsa rows", "dsa o_proj", "mlp", "moe route + experts", "moe shared", "moe sum", "gathers (local)", "tail", "mtp" };
     for (positions) |pos| {
         var ms: [kinds.len]f64 = @splat(0);
         var total: f64 = 0;
         for (0..2) |rep| {
             var ps: P.Stream = .{ .kda = &st, .caches = caches, .mtp_cache = &mcache, .pos = pos, .mtp_len = pos, .capacity = capacity, .pos_dev = pos_dev.ptr, .mtp_pos_dev = mpos_dev.ptr };
-            const c: P.Chunk = .{ .p = po.view(), .m = &m, .k = k, .lay = lay, .st = &ps, .ids = ids[0..P.chunk_rows], .next = ids[1 .. P.chunk_rows + 1] };
+            const c: P.Chunk = .{ .p = po.view(), .m = &m, .k = k, .lay = lay, .st = &ps, .ids = ids[0..P.chunk_rows], .next = ids[1 .. P.chunk_rows + 1], .split = split };
+            const ops = try c.plan(gpa);
+            defer gpa.free(ops);
             try stream.synchronize();
             const a = nowNs();
-            const n = c.sites();
-            for (0..n + 1) |i| {
+            for (ops) |op| {
                 const s0 = nowNs();
-                try c.run(i, stream);
-                if (i < n) try gather.run(gather.ctx, c.exchange(i), stream);
+                switch (op) {
+                    .gather => |x| {
+                        // the other rank's bytes: this rank's own (the bits differ from a pair; the launches do not)
+                        const dst: Buf = .{ .d = d, .ptr = x.recv, .len = 2 * x.bytes };
+                        try dst.copyFrom(0, x.send, x.bytes, stream.handle);
+                        try dst.copyFrom(x.bytes, x.send, x.bytes, stream.handle);
+                        if (x.copy) |cp| {
+                            const to: Buf = .{ .d = d, .ptr = cp.dst, .len = cp.bytes };
+                            try to.copyFrom(0, cp.src, cp.bytes, stream.handle);
+                        }
+                    },
+                    .wait => {},
+                    else => try c.exec(op, stream),
+                }
                 try stream.synchronize();
                 const dt = @as(f64, @floatFromInt(nowNs() - s0)) / 1e6;
-                if (rep == 1) {
-                    const slot: usize = switch (c.kind(i)) {
-                        .mixer => |li| if (m.layers[li].mixer == .kda) 0 else 1,
-                        .ffn => |li| if (m.layers[li].ffn == .mlp) 2 else 3,
-                        .tail => 4,
-                        .mtp_ffn => 5,
-                        .mtp_end => 6,
-                    };
-                    ms[slot] += dt;
-                }
+                if (rep == 0) continue;
+                const slot: usize = switch (op) {
+                    .embed, .zero_pad, .hc_pre, .hc_post, .post_pair, .mean => 0,
+                    .front => |x| if (x.site == .mixer) (if (m.layers[x.l].mixer == .kda) @as(usize, 1) else 4) else (if (m.layers[x.l].ffn == .mlp) @as(usize, 7) else 9),
+                    .rest => |x| if (x.site == .mixer) (if (m.layers[x.l].mixer == .kda) @as(usize, 2) else 5) else 8,
+                    .fill => |x| if (x.site == .mixer) (if (m.layers[x.l].mixer == .kda) @as(usize, 3) else 6) else (if (m.layers[x.l].ffn == .mlp) @as(usize, 7) else 10),
+                    .gather, .wait => 11,
+                    .tail => 12,
+                    .mtp_front, .mtp_mid, .mtp_end, .commit => 13,
+                };
+                ms[slot] += dt;
             }
             if (rep == 1) total = @as(f64, @floatFromInt(nowNs() - a)) / 1e6;
         }
-        std.debug.print("glm53-prompt-time: 2048 rows at {d}: {d:.1} ms ({d:.0} tok/s on one rank, its gathers local)\n", .{ pos, total, 2048.0 / (total / 1e3) });
+        std.debug.print("glm53-prompt-time: 2048 rows at {d}{s}: {d:.1} ms ({d:.0} tok/s on one rank, its gathers local, synchronized after every op)\n", .{ pos, if (split != null) " (row-split)" else "", total, 2048.0 / (total / 1e3) });
         for (kinds, ms) |name, v| std.debug.print("  {s:<22} {d:>8.1} ms  {d:>5.1}%\n", .{ name, v, 100 * v / total });
     }
     check.pass("glm53-prompt-time: {d} positions timed", .{positions.len});

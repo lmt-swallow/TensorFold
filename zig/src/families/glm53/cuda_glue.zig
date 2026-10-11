@@ -211,6 +211,21 @@ pub const Glue = struct {
         }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("WORLD", @intCast(world)), aot.ci("BLOCK", @intCast(block)) });
     }
 
+    /// glue.py `hc_post_pair` (TF_GLM_HC_SPLIT): hc_post of two ranks' fp32 partials [rows, D] held apart (rank 0's at
+    /// g0, rank 1's at g1): the same kernel reading rank 1's rows at their element distance from rank 0's, so the
+    /// sum (rank 0 first) and every bit are hc_post's.
+    pub fn hcPostPair(g: Glue, x: Ptr, xout: Ptr, g0: Ptr, g1: Ptr, post: Ptr, comb: Ptr, rows: usize, stream: cuda.Stream) !void {
+        if (rows == 0) return;
+        const block = @min(1024, g.hidden);
+        const dist = @as(i64, @intCast(g1)) - @as(i64, @intCast(g0));
+        if (@mod(dist, 4) != 0) return error.UnalignedPartials;
+        const rs: i32 = std.math.cast(i32, @divExact(dist, 4)) orelse return error.PartialsTooFarApart;
+        try g.set.run(stream, "_hc_post", .{ @intCast(rows), @intCast(g.hidden / block), 1 }, &.{
+            aot.ptr("X", "*bf16", x),       aot.ptr("XOUT", "*bf16", xout), aot.ptr("G", "*fp32", g0),
+            aot.ptr("POST", "*fp32", post), aot.ptr("COMB", "*fp32", comb), aot.int("RS", rs),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("WORLD", 2), aot.ci("BLOCK", @intCast(block)) });
+    }
+
     /// glue.py `residual_add` (the MTP layer): xout = bf16(x + bf16(the partials summed rank 0 first)).
     pub fn residualAdd(g: Glue, x: Ptr, xout: Ptr, gathered: Ptr, world: usize, rows: usize, stream: cuda.Stream) !void {
         const block = @min(1024, g.hidden);

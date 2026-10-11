@@ -32,7 +32,11 @@ params "digests" the per-step states: x_out (the streams after the last layer), 
 KDA state and conv window after the commit), latent / pk (layer 3's latent rows of the chunk and its pooled keys up
 to the chunk's end), mtp_latent (the MTP layer's latent rows the absorb wrote).
 
-  python3 -B /w/tools/zig/glm53/dump_prompt.py --tools /w/tools/zig --out /aot/out --model /model
+With --split the prompt buffers run hcsplit.HcSplit as served (each rank's hyper-connection glue on its own rows,
+the partials and normed rows swapped, the next block's front on own rows meanwhile, row pieces on a second stream):
+the trace then holds those calls, and params "split" its settings.
+
+  python3 -B /w/tools/zig/glm53/dump_prompt.py --tools /w/tools/zig --out /aot/out --model /model [--split]
 """
 
 from __future__ import annotations
@@ -151,12 +155,39 @@ class DigestTracer(ref.Tracer):
         setattr(module, name, traced)
 
 
+class PairComm(ref.RankComm):
+    """ref.RankComm with the two-rank ``exchange`` hcsplit's row split uses (``tensorfold.cuda.comm.NCCL``'s
+    send/receive group): each rank's sends cloned at its turn, the peer's copied into its receives on the current
+    stream, one rendezvous a call in the ranks' common call order (shared with the all-gathers)."""
+
+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
+        p, r = self.p, self.rank
+        if peer != 1 - r or len(sends) != len(recvs):
+            raise ValueError("exchange: one receive per send, from the other rank")
+        k = p.count[r]
+        p.count[r] += 1
+        torch.cuda.synchronize()
+        mine = [x.detach().contiguous().clone() for x in sends]
+        with p.cv:
+            p.parts[r][k] = mine
+            p._wait(r, lambda: k in p.parts[1 - r])
+            other = p.parts[1 - r].pop(k)
+        for dst, src in zip(recvs, other):
+            if dst.numel() != src.numel() or dst.dtype != src.dtype:
+                raise RuntimeError(f"exchange {k}: rank {r} receives {dst.numel()} {dst.dtype}, the other sends "
+                                   f"{src.numel()} {src.dtype}")
+            dst.copy_(src.view(dst.shape))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tools", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--only", default="", help="comma-separated scenarios to run (default: all, and l)")
+    ap.add_argument("--split", action="store_true",
+                    help="prompt chunks row-split between the ranks as served (TF_GLM_HC_SPLIT=1, "
+                         "TF_GLM_PREFILL_OVERLAP=2: hcsplit.HcSplit on the prompt buffers, exchanges between the pair)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -176,13 +207,14 @@ def main() -> int:
     if [l.kind for l in ws[0].layers] != ["kda", "dsa"] or ws[0].mtp is None:
         raise SystemExit(f"layers {LAYERS} must be a KDA and a DSA layer and the pack must hold the MTP layer")
     for r, w in enumerate(ws):
-        w.comm = pair.comm(r)
+        w.comm = PairComm(pair, r)
     (out / "weights.json").write_text(json.dumps({f"rank{r}": ref.weight_shas(w) for r, w in enumerate(ws)},
                                                  indent=1, sort_keys=True) + "\n")
     tr = DigestTracer()
     tr.wrap_all(((glue, ("embed", "hc_pre", "hc_post", "rmsnorm", "router", "select", "swiglu", "combine_shared",
                          "residual_add", "stream_mean")),
                  (F, ("mm", "gather", "_shift_conv", "dense_attention")), (M, ("mm",)),
+                 (glue, ("hc_post_pair",)),
                  (kda_mod, ("chain",)),
                  (latent, ("latent_write", "absorb_q", "sparse_onepass", "expand_v")),
                  (sparse, ("index_update", "select_tokens")),
@@ -200,6 +232,10 @@ def main() -> int:
         slots = F.Slots(w, 1, MAX_ROWS)
         st = F.State(w, capacity, MAX_ROWS, caches=caches, slots=slots)
         pb = F.Buffers(w, PREFILL_ROWS, capacity, prefill=True)
+        if a.split:
+            from tensorfold.families.glm5_next.cuda.hcsplit import HcSplit, SplitSettings
+
+            pb.split = HcSplit(w, pb, SplitSettings.from_env())
         return SimpleNamespace(w=w, st=st, pbuf=pb, last_hidden=None)
 
     def chunk(r: int, e, prompt: list[int], start: int, R: int, step: str) -> None:
@@ -265,7 +301,14 @@ def main() -> int:
         if name.endswith(("_x_out", "_latent", "_pk")) and \
                 digests[name] != digests["r1_" + name[3:]]:
             raise SystemExit(f"{name[3:]}: the ranks differ")
-    params = {"layers": LAYERS, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
+    if a.split:
+        from tensorfold.families.glm5_next.cuda.hcsplit import SplitSettings
+
+        st_ = SplitSettings.from_env()
+        split = {"pieces": st_.piece_count(), "min_rows": st_.min_rows, "fronts": st_.fronts, "overlap": st_.overlap}
+    else:
+        split = None
+    params = {"layers": LAYERS, "split": split, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
               "rows": MAX_ROWS, "prompt_rows": PREFILL_ROWS, "world": 2, "steps": steps, "digests": digests,
               "dense_limit": ws[0].cfg.dense_limit, "ring": F.index_ring(CAPACITY, max(MAX_ROWS, PREFILL_ROWS)),
               "long_ring": F.index_ring(LONG_CAPACITY, max(MAX_ROWS, PREFILL_ROWS)), "kv": ref.KV}

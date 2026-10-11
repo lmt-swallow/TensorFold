@@ -128,9 +128,11 @@ pub const Runner = struct {
     cand: Buf,
     players: []Pm.Layer, // the prompt path's view of the model (`pmodel`)
     pmodel: Pm.Model,
+    stage_part: Buf, // the prompt path's gather staging (prompt.Prompt)
+    stage_rows: Buf,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_part = undefined, .stage_rows = undefined };
         r.w = try M.Work.init(d, lay, rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -141,6 +143,10 @@ pub const Runner = struct {
         errdefer gpa.free(r.host);
         r.cand = try Buf.alloc(d, 6 * draft_k * 4);
         errdefer r.cand.free();
+        r.stage_part = try Buf.alloc(d, (prompt_rows + 2) * lay.cfg.hidden * 4);
+        errdefer r.stage_part.free();
+        r.stage_rows = try Buf.alloc(d, (prompt_rows + 2) * lay.cfg.hidden * 2);
+        errdefer r.stage_rows.free();
         r.players = try gpa.alloc(Pm.Layer, model.layers.len);
         r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
         return r;
@@ -153,6 +159,8 @@ pub const Runner = struct {
         r.gpa.free(r.host);
         r.cand.free();
         r.gpa.free(r.players);
+        r.stage_part.free();
+        r.stage_rows.free();
     }
 
     fn gatherFn(p: *anyopaque, part: Ptr, gath: Ptr, floats: usize, stream: cuda.Stream) anyerror!void {
@@ -164,9 +172,9 @@ pub const Runner = struct {
         return .{ .ctx = r, .run = gatherFn };
     }
 
-    fn promptGatherFn(p: *anyopaque, x: Pm.Exchange, stream: cuda.Stream) anyerror!void {
+    fn promptGatherFn(p: *anyopaque, send: Ptr, recv: Ptr, bytes: usize, stream: cuda.Stream) anyerror!void {
         const r: *Runner = @ptrCast(@alignCast(p));
-        try r.link.gather(r.link.ctx, x.part, x.gath, x.bytes / 4, stream);
+        try r.link.gather(r.link.ctx, send, recv, bytes / 4, stream);
     }
 
     fn mtpGather(r: *Runner) T.Gather {
@@ -245,6 +253,7 @@ pub const Runner = struct {
             .p = .{
                 .rows = prompt_rows, .b = &w.pb,  .temp = &w.temp,         .kscratch = &w.pscratch, .ds = &w.pds,
                 .ms = &w.pms,        .mb = &r.pmb, .fnormed = w.fnormed.ptr, .fxs = w.fxs.ptr,         .logits = w.logits.ptr,
+                .stage_part = r.stage_part.ptr, .stage_rows = r.stage_rows.ptr,
             },
             .m = &r.pmodel,
             .k = .{ .g = r.k.g, .kda = r.k.kk, .moe = r.k.mk, .mtp = r.tk },
@@ -253,7 +262,7 @@ pub const Runner = struct {
             .ids = prompt[start .. start + R],
             .next = prompt[start + 1 .. @min(start + R + 1, prompt.len)],
         };
-        try Pm.prefillChunk(&c, .{ .ctx = r, .run = promptGatherFn }, r.stream);
+        try Pm.prefillChunk(&c, r.gpa, .{ .ctx = r, .gather = promptGatherFn }, null, r.stream);
         try q.last.copyFrom(0, w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
         q.st.pos = ps.pos;
         q.mtp_len = ps.mtp_len;

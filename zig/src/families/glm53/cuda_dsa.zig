@@ -335,17 +335,40 @@ fn devicePos(s: *const Scratch, comptime kind: enum { dense, select }, slot: usi
 
 /// forward.py `dsa_front` and `dsa_rows` up to o_proj, then o_proj into call.part (forward.py `_dsa_latent`).
 pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, stream: cuda.Stream) !void {
+    try dsaFront(g, lay, a, s, call.normed, call.sk, 0, call.R, stream);
+    try dsaRows(g, lay, a, cache, s, call, stream);
+    try dsaOut(g, lay, a, s, call.part, call.sk, 0, call.R, stream);
+}
+
+/// forward.py `dsa_front` of rows lo .. hi of the normed rows [R, D] (`normed`: row 0's): the projection, the query and
+/// latent norms, the query expansion into the scratch's rows lo .. hi. Each row's bits are its own.
+pub fn dsaFront(g: Glue, lay: config.Layout, a: *const Dsa, s: *const Scratch, normed: Ptr, sk: Ptr, lo: usize, hi: usize, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const lw = c.kv_lora;
+    const n = hi - lo;
+    const dp = s.dp.ptr + lo * (c.q_lora + lw) * 2;
+    const qr = s.qr.ptr + lo * c.q_lora * 2;
+    try g.bmm(normed + lo * c.hidden * 2, c.hidden, a.proj.b16(), n, dp, false, sk, stream);
+    try g.rmsnorm(dp, c.q_lora + lw, a.q_norm.ptr, qr, c.q_lora, s.xs_qr.ptr + lo * c.q_lora / 64 * 4, c.eps, n, c.q_lora, stream);
+    try g.rmsnorm(dp + c.q_lora * 2, c.q_lora + lw, a.kv_norm.ptr, s.lat.ptr + lo * lw * 2, lw, s.xs_lat.ptr + lo * lw / 64 * 4, c.eps, n, lw, stream);
+    try g.bmm(qr, c.q_lora, a.q_b.b16(), n, s.q.ptr + lo * a.heads * c.qk_dim * 2, false, sk, stream);
+}
+
+/// forward.py o_proj of a DSA block's rows lo .. hi (its expanded read-out) into `part`'s rows (fp32 [R, D]).
+pub fn dsaOut(g: Glue, lay: config.Layout, a: *const Dsa, s: *const Scratch, part: Ptr, sk: Ptr, lo: usize, hi: usize, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const w = a.heads * c.v_dim;
+    try g.bmm(s.vn.ptr + lo * w * 2, w, a.o.b16(), hi - lo, part + lo * c.hidden * 4, true, sk, stream);
+}
+
+/// forward.py `dsa_rows` of a window whose fronts ran (`dsaFront` on every row): the latent rows written at their
+/// positions, the indexer's keys and pools, the absorbed query, the attention and the expanded read-out (s.vn).
+pub fn dsaRows(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, stream: cuda.Stream) !void {
     const c = lay.cfg;
     const R = call.R;
     const H = a.heads;
     const lw = c.kv_lora;
     const prefill = s.prefill;
-    // dsa_front: the projection, the query / latent norms, the query expansion
-    try g.bmm(call.normed, c.hidden, a.proj.b16(), R, s.dp.ptr, false, call.sk, stream);
-    try g.rmsnorm(s.dp.ptr, c.q_lora + lw, a.q_norm.ptr, s.qr.ptr, c.q_lora, s.xs_qr.ptr, c.eps, R, c.q_lora, stream);
-    try g.rmsnorm(s.dp.ptr + c.q_lora * 2, c.q_lora + lw, a.kv_norm.ptr, s.lat.ptr, lw, s.xs_lat.ptr, c.eps, R, lw, stream);
-    try g.bmm(s.qr.ptr, c.q_lora, a.q_b.b16(), R, s.q.ptr, false, call.sk, stream);
-    // dsa_rows: the latent row, the indexer, absorb, attention, expand
     try g.latWrite(s.lat.ptr, lw, cache.latent.ptr, cache.kv, call.pos_dev, R, lw, stream);
     const limit = c.denseLimit();
     const all_sparse = call.host_pos >= limit;
@@ -386,7 +409,6 @@ pub fn dsaBlock(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache,
         }
     }
     try g.expandV(s.ol.ptr, a.wv.ptr, s.vn.ptr, R, H, c.v_dim, lw, prefill, stream);
-    try g.bmm(s.vn.ptr, H * c.v_dim, a.o.b16(), R, call.part, true, call.sk, stream);
 }
 
 /// sparse.py `select_tokens` (no graph bucket): each row's attended tokens and their count into s.tokens / s.counts.
