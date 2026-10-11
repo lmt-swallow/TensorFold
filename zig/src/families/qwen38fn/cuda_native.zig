@@ -38,8 +38,9 @@ pub fn capacityFor(context: usize) usize {
     return std.mem.alignForward(usize, context + max_rows, 64);
 }
 
-/// Device bytes one stream's sequence takes at `capacity` positions (caches, DeltaNet states, window rows).
-pub fn streamBytes(cfg: *const config.Config, capacity: usize) usize {
+/// Device bytes one stream's sequence takes at `capacity` positions (caches, DeltaNet states, window rows; with the
+/// MTP head its attention cache and the prompt's last row).
+pub fn streamBytes(cfg: *const config.Config, capacity: usize, mtp: bool) usize {
     var lin: usize = 0;
     for (cfg.kinds[0..cfg.layers]) |k| lin += @intFromBool(k == .linear);
     const att = cfg.layers - lin;
@@ -47,7 +48,8 @@ pub fn streamBytes(cfg: *const config.Config, capacity: usize) usize {
     const cache = capacity * cfg.kv_heads * cfg.head_dim * 2 * 2 + capacity * cfg.index_dim * 2 + nb * cfg.index_dim * 2;
     const state = 2 * cfg.nv * cfg.dv * cfg.dk * 4 + (cfg.conv_kernel - 1) * cfg.convDim() * 2;
     const scratch = max_rows * (cfg.nk * cfg.dk * 4 + cfg.nv * cfg.dv * 2 + 2 * cfg.nv * 4) + max_rows * cfg.projWidth() * 2;
-    return att * cache + lin * (state + scratch) + (cfg.ple_kernel - 1) * cfg.ngram * cfg.wide() * 2 + max_rows * cfg.wide() * 2;
+    const head = if (mtp) cache + cfg.wide() * 2 else 0;
+    return head + att * cache + lin * (state + scratch) + (cfg.ple_kernel - 1) * cfg.ngram * cfg.wide() * 2 + max_rows * cfg.wide() * 2;
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
@@ -66,13 +68,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const sms: u32 = @intCast(try ctx.attribute(.multiprocessor_count));
     const l = try Lanes.init(gpa, ctx.d, m, set, capacity, sms);
     errdefer l.deinit();
+    if (o.drafts) try l.withHead();
     const own = try gpa.create(Owned);
     own.* = .{ .gpa = gpa, .io = io, .m = m, .set = set, .lanes = l };
     return .{
         .backend = l.backend(),
         .facts = l.facts(),
-        .rows = 1,
-        .stream_bytes = streamBytes(&m.cfg, capacity),
+        .rows = l.windowRows(),
+        .stream_bytes = streamBytes(&m.cfg, capacity, o.drafts),
         .ctx = own,
         .deinit = release,
     };
