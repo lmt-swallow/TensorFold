@@ -412,6 +412,30 @@ pub const Glue = struct {
             aot.ci("STEP", @intCast(step)), aot.ci("SEG", 0), aot.ci("VIS", 1), aot.ci("TOKS", 1),
         });
     }
+
+    /// sparse.py `select_split` without positions (top_pools of a prompt chunk's selection block of fewer than 64
+    /// rows over 8,192 scores or more): each of the R rows' 512 best of its np scores (row stride np), ascending,
+    /// ties to the lower pool, into out int64 [R, 512]: _select_rows' pools, across chunk programs.
+    pub fn selectSplitPools(g: Glue, s: Ptr, np: usize, scratch_buf: cuda.DeviceBuffer, out: Ptr, R: usize, stream: cuda.Stream) !void {
+        const scratch = scratch_buf.ptr;
+        const chs: usize = if (np <= 16384) 2048 else 4096;
+        const cp = std.math.ceilPowerOfTwoAssert(usize, cdiv(np, chs));
+        const tot = scratch;
+        const hist = scratch + R * 1024 * 4;
+        const gt = scratch + R * (1024 + cp * 256) * 4;
+        if (scratch_buf.len < splitScratchBytes(R, np)) return error.ScratchTooSmall;
+        const zero: cuda.DeviceBuffer = .{ .d = scratch_buf.d, .ptr = tot, .len = R * 1024 * 4 };
+        try zero.fill8(0, stream.handle);
+        // the positions, the segment table, the tokens and the counts are unread here: the scratch stands in
+        for (0..5) |step| try g.set.run(stream, "_select_split", .{ @intCast(R), @intCast(cp), 1 }, &.{
+            aot.ptr("S", "*fp32", s),  aot.int("s_stride", n32(np)), aot.int("NPC", n32(np)),  aot.ptr("POS", "*i32", scratch),
+            aot.ptr("SPR", "*i32", scratch), aot.ptr("TOT", "*i32", tot), aot.ptr("HIST", "*i32", hist), aot.ptr("GT", "*i32", gt),
+            aot.ptr("OUT", "*i64", out), aot.ptr("TOK", "*i32", scratch), aot.ptr("CNT", "*i32", scratch),
+        }, &.{
+            aot.ci("W", sparse_tokens), aot.ci("K", 512), aot.ci("PL", 4), aot.ci("CHS", @intCast(chs)), aot.ci("CP", @intCast(cp)),
+            aot.ci("STEP", @intCast(step)), aot.ci("SEG", 0), aot.ci("VIS", 0), aot.ci("TOKS", 0),
+        });
+    }
 };
 
 test "qmm.py's BF16 K slices for the rank's shapes" {

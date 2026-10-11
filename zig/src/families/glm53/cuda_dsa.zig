@@ -248,7 +248,12 @@ pub const Scratch = struct {
         s.pools = try a(d, rows * 512 * 8);
         s.tokens = try a(d, rows * glue_mod.sparse_tokens * 4);
         s.counts = try a(d, rows * 4);
-        s.split = try a(d, if (prefill) 16 else glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
+        // decode windows split rows over 8,192 scores or more; a prompt chunk its last selection block of fewer
+        // than 64 rows (sizes grow with the scores, but the chunk width steps at 16,384: both sides of it)
+        s.split = try a(d, if (prefill)
+            @max(glue_mod.splitScratchBytes(split_rows - 1, @max(np_max, 1024)), glue_mod.splitScratchBytes(split_rows - 1, std.math.clamp(np_max, 1024, 16384)))
+        else
+            glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
         s.at = try a(d, at_select + (rows / select_rows + 2) * 16);
         return s;
     }
@@ -361,12 +366,12 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, wts
             i += 1;
         }) {
             const n = @min(B, R - a);
-            // top_pools splits a block of fewer than 64 rows over 8,192 pools or more across chunk programs
-            // (select_split's pool form), which this port does not run yet: refused rather than selected otherwise
-            if (n < split_rows and NP >= split_from) return error.UnportedPromptSplitSelection;
             const at = if (a == 0) call.pos_dev else try devicePos(s, .select, i, call.host_pos + a, stream);
             try g.scores(s.qi.ptr + a * qrow, wts + a * w_stride * 2, w_stride, cache.pk.ptr, s.scores.ptr, at, n, NP, stream);
-            try g.selectRows(s.scores.ptr, s.pools.ptr, NP, 0, n, stream);
+            // top_pools: a block of fewer than 64 rows over 8,192 pools or more across chunk programs (the same pools)
+            if (n < split_rows and NP >= split_from) {
+                try g.selectSplitPools(s.scores.ptr, NP, s.split, s.pools.ptr, n, stream);
+            } else try g.selectRows(s.scores.ptr, s.pools.ptr, NP, 0, n, stream);
             try g.tokens(s.pools.ptr, at, s.tokens.ptr + a * glue_mod.sparse_tokens * 4, s.counts.ptr + a * 4, n, stream);
         }
         return;
