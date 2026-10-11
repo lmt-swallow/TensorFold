@@ -313,3 +313,159 @@ test "bf16 rounding is torch's" {
     try std.testing.expectEqual(@as(u16, 0x7FC0), f32ToBf16(std.math.nan(f32)));
     try std.testing.expectEqual(@as(u16, 0x7F80), f32ToBf16(std.math.inf(f32)));
 }
+
+/// The n-gram table of an EXL3 pack (exl3_pack.py `NgramTable`): int16 rows of one fp16 scale word and `dh` values
+/// of `bits` bits, split over shards, mapped read-only from ngram_embedding.safetensors.
+pub const NgramTable = struct {
+    file: core.safetensors.File,
+    shards: [][]const u8, // each shard's rows, row-major
+    starts: []usize, // first global row of each shard, then the total
+    words: usize, // int16 words a row
+    dh: usize,
+    bits: usize,
+    head_bias: []const u8, // fp16 [heads, dh]
+    head_offsets: []const u8, // int64 [heads]
+    head_sizes: []const u8,
+    multipliers: []const u8, // int64 [n]
+    gpa: std.mem.Allocator,
+
+    /// Layer `layer`'s table from `dir`/ngram_embedding.safetensors.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, layer: usize, shards: usize) !NgramTable {
+        var n: names.Name = .{};
+        const path = try std.fs.path.join(gpa, &.{ dir, "ngram_embedding.safetensors" });
+        defer gpa.free(path);
+        const base = n.of(names.lm ++ "layers.{d}.ple.ple_embedding.ngram_embedding.", .{layer});
+        var file = try core.safetensors.File.openPrefix(gpa, io, path, base);
+        errdefer file.close(io);
+        var t: NgramTable = undefined;
+        t.gpa = gpa;
+        t.shards = try gpa.alloc([]const u8, shards);
+        errdefer gpa.free(t.shards);
+        t.starts = try gpa.alloc(usize, shards + 1);
+        errdefer gpa.free(t.starts);
+        t.starts[0] = 0;
+        var nn: names.Name = .{};
+        var words: ?usize = null;
+        for (0..shards) |i| {
+            const s = file.get(nn.of("{s}shard_{d}.trellis", .{ base, i })) orelse return error.MissingTensor;
+            if (s.dtype != .i16 or s.rank != 2) return error.UnexpectedTensor;
+            if (words != null and words.? != s.shape[1]) return error.UnexpectedTensor;
+            words = s.shape[1];
+            t.shards[i] = s.bytes;
+            t.starts[i + 1] = t.starts[i] + s.shape[0];
+        }
+        t.words = words orelse return error.MissingTensor;
+        t.dh = 160;
+        t.bits = (t.words - 1) * 16 / t.dh;
+        if (t.bits < 2 or t.bits > 8 or 1 + t.dh * t.bits / 16 != t.words) return error.UnexpectedTensor;
+        const get = struct {
+            fn f(fl: *const core.safetensors.File, nm: *names.Name, b: []const u8, what: []const u8) ![]const u8 {
+                return (fl.get(nm.of("{s}{s}", .{ b, what })) orelse return error.MissingTensor).bytes;
+            }
+        }.f;
+        t.head_bias = try get(&file, &nn, base, "head_bias");
+        t.head_offsets = try get(&file, &nn, base, "head_offsets");
+        t.head_sizes = try get(&file, &nn, base, "head_vocab_sizes");
+        t.multipliers = try get(&file, &nn, base, "layer_multipliers");
+        t.file = file;
+        return t;
+    }
+
+    pub fn close(self: *NgramTable, io: std.Io) void {
+        self.gpa.free(self.shards);
+        self.gpa.free(self.starts);
+        self.file.close(io);
+    }
+
+    pub fn rows(self: *const NgramTable) usize {
+        return self.starts[self.starts.len - 1];
+    }
+
+    /// Rows `ids` (global) into `out` (ids.len * words int16, as bytes).
+    pub fn gather(self: *const NgramTable, ids: []const i64, out: []u8) !void {
+        const rb = 2 * self.words;
+        if (out.len != ids.len * rb) return error.BadShape;
+        for (ids, 0..) |id, i| {
+            if (id < 0 or @as(usize, @intCast(id)) >= self.rows()) return error.RowOutOfRange;
+            const r: usize = @intCast(id);
+            const shard = std.sort.upperBound(usize, self.starts, r, struct {
+                fn order(a: usize, b: usize) std.math.Order {
+                    return std.math.order(a, b);
+                }
+            }.order) - 1;
+            const at = (r - self.starts[shard]) * rb;
+            @memcpy(out[i * rb ..][0..rb], self.shards[shard][at..][0..rb]);
+        }
+    }
+
+    /// The pack's head offsets, sizes and multipliers equal the ones derived from the config (ngram.py `check`).
+    pub fn check(self: *const NgramTable, g: *const @import("ngram.zig").NGram) !void {
+        const heads = g.heads();
+        if (self.head_offsets.len != heads * 8 or self.head_sizes.len != heads * 8 or self.multipliers.len != g.n * 8) return error.NgramMismatch;
+        for (0..heads) |h| {
+            if (std.mem.readInt(i64, self.head_offsets[8 * h ..][0..8], .little) != g.offsets[h]) return error.NgramMismatch;
+            if (std.mem.readInt(i64, self.head_sizes[8 * h ..][0..8], .little) != g.sizes[h]) return error.NgramMismatch;
+        }
+        for (0..g.n) |i| if (std.mem.readInt(i64, self.multipliers[8 * i ..][0..8], .little) != g.multipliers[i]) return error.NgramMismatch;
+    }
+};
+
+/// A PLE layer's own tensors (exl3.py `ple_layer`): the key and value projections (fp16), the centred norms (fp32),
+/// the conv taps (bf16 [S * D, taps]) and the table's head biases (fp16).
+pub const Ple = struct {
+    key: F16,
+    value: F16,
+    norm_key: cuda.DeviceBuffer,
+    norm_query: cuda.DeviceBuffer,
+    norm_conv: cuda.DeviceBuffer,
+    conv: cuda.DeviceBuffer,
+    head_bias: cuda.DeviceBuffer,
+    taps: usize,
+
+    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *Pack, cfg: *const Config, table: *const NgramTable, i: usize, offset: f32) !Ple {
+        var n: names.Name = .{};
+        const wide = cfg.wide();
+        const key_t = try pack.expect(names.layer(&n, i, "ple.key_proj.weight"), .f16, &.{ wide, cfg.hidden });
+        var key = try F16.init(d, key_t.bytes, wide, cfg.hidden);
+        errdefer key.deinit();
+        const val_t = try pack.expect(names.layer(&n, i, "ple.value_proj.weight"), .f16, &.{ cfg.hidden, cfg.hidden });
+        var value = try F16.init(d, val_t.bytes, cfg.hidden, cfg.hidden);
+        errdefer value.deinit();
+        var norms: [3]cuda.DeviceBuffer = undefined;
+        var made: usize = 0;
+        errdefer for (norms[0..made]) |*b| b.free();
+        for ([_][]const u8{ "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight" }, &norms) |nm, *b| {
+            const t = try pack.get(n.of(names.lm ++ "layers.{d}.{s}", .{ i, nm }));
+            if (t.numel() != wide) return error.UnexpectedTensor;
+            const v = try widen(gpa, t);
+            defer gpa.free(v);
+            for (v) |*x| x.* += offset;
+            b.* = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(v));
+            made += 1;
+        }
+        const conv_t = try pack.get(names.layer(&n, i, "ple.conv1d.weight"));
+        if (conv_t.rank != 3 or conv_t.shape[0] != wide or conv_t.shape[1] != 1) return error.UnexpectedTensor;
+        const conv = try gpa.alloc(u16, conv_t.numel());
+        defer gpa.free(conv);
+        for (conv, 0..) |*c, j| c.* = switch (conv_t.dtype) {
+            .bf16 => std.mem.readInt(u16, conv_t.bytes[2 * j ..][0..2], .little),
+            else => f32ToBf16(@floatCast(try element(conv_t, j))), // `.to(torch.bfloat16)`
+        };
+        var conv_d = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(conv));
+        errdefer conv_d.free();
+        return .{
+            .key = key, .value = value, .norm_key = norms[0], .norm_query = norms[1], .norm_conv = norms[2], .conv = conv_d,
+            .head_bias = try cuda.DeviceBuffer.fromHost(d, table.head_bias), .taps = conv_t.shape[2],
+        };
+    }
+
+    pub fn deinit(self: *Ple) void {
+        self.key.deinit();
+        self.value.deinit();
+        self.norm_key.free();
+        self.norm_query.free();
+        self.norm_conv.free();
+        self.conv.free();
+        self.head_bias.free();
+    }
+};

@@ -9,6 +9,7 @@ pub const gdn = @import("cuda_gdn.zig");
 pub const experts = @import("cuda_experts.zig");
 pub const glue = @import("cuda_glue.zig");
 pub const hc = @import("cuda_hc.zig");
+pub const ngram = @import("ngram.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
