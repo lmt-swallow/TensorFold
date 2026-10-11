@@ -3,7 +3,8 @@ Spark for the Zig engine's fixtures. Imported by the dump_*.py scripts before an
 
 - STRICT: the environment the recipe's start.sh gives every rank with DENSE=bf16 KV=bf16 KDA_CHUNKED=0
   DRAFTER=mtp (scripts/config.sh of the v1.5 recipe, the image's patches 9f73cca659a1), set here before the
-  engine's modules read their switches at import;
+  engine's modules read their switches at import; KV: the DSA caches' format, TF_GLM53_REF_KV (bf16, the default,
+  or fp8: GLM-5.3-Flash-2's reference, the same setting with KV=fp8);
 - load_rank: one rank of a two-rank split with only the chosen layers' tensors read (weights.load itself, its layer
   list cut down), so a fixture needs a few GiB, not the 82 GiB a rank holds;
 - Pair: both ranks in one process, one thread each, taking turns; their all-gathers meet in host memory instead of
@@ -38,6 +39,10 @@ STRICT = {
 # the strict four are forced; the rest give way to the caller's environment (a pair capture may gather over NCCL,
 # TF_GLM_COMM=nccl, the same bits by the recipe's account)
 FORCED = ("TF_GLM_DENSE", "TF_GLM_KV", "TF_GLM_KDA_CHUNKED", "TF_GLM_LATENT")
+KV = os.environ.get("TF_GLM53_REF_KV", "bf16")
+if KV not in ("bf16", "fp8"):
+    raise SystemExit(f"TF_GLM53_REF_KV is bf16 or fp8, not {KV!r}")
+STRICT["TF_GLM_KV"] = KV
 for _k, _v in STRICT.items():
     if _k in FORCED:
         os.environ[_k] = _v
