@@ -28,7 +28,9 @@ The second prints the newest result against the baseline: each metric with its c
 change. Commit the baseline the comparison is against, not every run.
 
 Options: `--full` (the four concurrent needles at 256k instead of 64k: about 10 more minutes of prefill), `--only
-short,agent,long,concurrent` (a subset; `concurrent`'s sequential-sha check needs `short` in the same run), `--label`
+short,agent,long,concurrent` (a subset; `concurrent`'s sequential-sha check needs `short` in the same run), `--streams N`
+(`concurrent` sends N short requests at once instead of 4, the prompts in turn, as rows `concN-short/*`; the needles
+stay four), `--label`
 (free text kept in the result). On the node itself, drop `--host`; the result goes to `--out-dir` (default
 `results/bench/` beside the script's checkout).
 

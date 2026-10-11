@@ -307,18 +307,23 @@ def run_concurrent(jobs: list) -> tuple[list, float, float]:
     return res, t0, t1
 
 
-def scenario_concurrent(c: Client, needle_len: int, short_shas: dict) -> list:
+def scenario_concurrent(c: Client, needle_len: int, short_shas: dict, streams: int = 4) -> list:
+    """`streams` short requests at once (decode set a's prompts in turn: code, prose, structured, code, ...), then
+    four needles at once. The default of 4 is the goal configuration's; the ids name the stream count."""
     rows = []
-    jobs = SHORT_PROMPTS + [SHORT_PROMPTS[0]]
+    jobs = [SHORT_PROMPTS[i % len(SHORT_PROMPTS)] for i in range(streams)]
+    sc = f"conc{streams}-short"
     res, t0, t1 = run_concurrent([lambda p=p: c.chat(user(p), SHORT_TOKENS) for _, p in jobs])
     total = sum(r.get("tokens") or 0 for r in res)
     for i, ((name, _), r) in enumerate(zip(jobs, res)):
         seq = short_shas.get(f"short/{name}")
-        rows.append(row(f"conc4-short/{i}-{name}", "conc4-short", r,
+        rows.append(row(f"{sc}/{i}-{name}", sc, r,
                         same_as_sequential=(seq == r.get("token_sha")) if seq else None))
-    rows.append({"id": "conc4-short/aggregate", "scenario": "conc4-short", "sha": None, "wall_s": r3(t1 - t0),
-                 "tokens": total, "aggregate_tps": r3(total / (t1 - t0))})
-    log(f"conc4-short: {r3(total / (t1 - t0))} tok/s aggregate, per stream "
+    per = [r.get("decode_tps") for r in res if r.get("decode_tps")]
+    rows.append({"id": f"{sc}/aggregate", "scenario": sc, "sha": None, "wall_s": r3(t1 - t0),
+                 "tokens": total, "aggregate_tps": r3(total / (t1 - t0)),
+                 "decode_tps": r3(sum(per) / len(per)) if per else None})
+    log(f"{sc}: {r3(total / (t1 - t0))} tok/s aggregate, per stream "
         f"{[r3(r.get('decode_tps')) for r in res]}")
 
     msgs = [needle_messages(c, needle_len, 17391 + i, PHRASES[i]) for i in range(4)]
@@ -411,7 +416,7 @@ def run(a) -> dict:
         elif name == "long":
             rows = scenario_long(c, long_lengths)
         elif name == "concurrent":
-            rows = scenario_concurrent(c, needle_len, short_shas)
+            rows = scenario_concurrent(c, needle_len, short_shas, a.streams)
         else:
             raise SystemExit(f"unknown scenario {name}")
         t1 = time.time()
@@ -562,6 +567,8 @@ def main() -> None:
     p.add_argument("--model", default="dsv41")
     p.add_argument("--full", action="store_true", help="the concurrent needles at 256k instead of 64k")
     p.add_argument("--only", help="comma-separated scenarios: short,agent,long,concurrent")
+    p.add_argument("--streams", type=int, default=4,
+                   help="short requests the concurrent scenario sends at once (default 4, the goal configuration's)")
     p.add_argument("--label", default="", help="free text kept in the result (e.g. the commit)")
     p.add_argument("--host", help="run on this node over ssh and save the result here")
     p.add_argument("--rank1", default="10.0.1.2", help="rank 1's ssh address, for its error lines (from rank 0)")
