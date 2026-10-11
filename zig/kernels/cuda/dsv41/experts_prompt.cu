@@ -6,6 +6,7 @@
 // grouped_mma_kernel's bits).
 #include "experts_grouped.cuh"
 #include "experts_mmb.cuh"
+#include "experts_rowscp.cuh"
 
 namespace tf_exl3x {
 
@@ -22,6 +23,14 @@ TF_MMA(8, 8) TF_MMA(2, 10) TF_MMA(2, 16)
         const int*, float*, int, int, int, int, int, int, int, const int*);
 TF_ROWS(8, 8) TF_ROWS(2, 10) TF_ROWS(2, 16)
 #undef TF_ROWS
+
+// down with its loads ahead (TF_DS_PROMPT_DOWN=rowscp): grouped_rows_kernel<2, 8, 4, 1, LO, HI, 2, false>'s bits
+#define TF_RCP(LO_, HI_)                                                                                         \
+    template __global__ void __launch_bounds__(4 * 32) grouped_rows_cp_kernel<2, LO_, HI_>(                      \
+        const half*, const half*, const int64_t*, const int64_t*, const int*, const int*, const int*, const int*, \
+        const int*, float*, int, int, int, int, int, int, int, const int*);
+TF_RCP(8, 8) TF_RCP(2, 10) TF_RCP(2, 16)
+#undef TF_RCP
 
 // gate/up on grouped_mmb_kernel (the default; TF_DS_PROMPT_GU=mma takes grouped_mma_kernel): grouped_mma_kernel's
 // bits, the mma spread over every warp

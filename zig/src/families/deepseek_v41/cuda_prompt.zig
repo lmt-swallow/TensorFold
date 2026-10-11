@@ -99,6 +99,9 @@ pub const ExpertKernels = struct {
     rows: [3]cuda.Function,
     /// grouped_mmb_kernel<2, LO, HI, true, 4> (gate/up: grouped_mma's bits, the mma spread over every warp)
     mmb: [3]cuda.Function,
+    /// grouped_rows_cp_kernel<2, LO, HI> (down with its loads ahead, TF_DS_PROMPT_DOWN=rowscp)
+    rowscp: [3]cuda.Function,
+    down: Down = .rows,
     /// The kernel a prompt chunk's gate/up takes (TF_DS_PROMPT_GU), and TF_DS_PROMPT_CHECK=1: every layer also runs
     /// gate/up on grouped_mma (the reference) and fails unless the outputs are byte-equal.
     gu: Gu = .mmb,
@@ -121,10 +124,12 @@ pub const ExpertKernels = struct {
             var buf: [200]u8 = undefined;
             k.mma[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x18grouped_mma_kernelILi2ELi{d}ELi{d}ELb1ELi4EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiiS7_", .{ r[0], r[1] }));
             k.rows[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x19grouped_rows_kernelILi2ELi8ELi4ELi1ELi{d}ELi{d}ELi2ELb0EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiS7_", .{ r[0], r[1] }));
+            k.rowscp[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x22grouped_rows_cp_kernelILi2ELi{d}ELi{d}EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiS7_", .{ r[0], r[1] }));
             k.mmb[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x18grouped_mmb_kernelILi2ELi{d}ELi{d}ELb1ELi4EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiiS7_", .{ r[0], r[1] }));
         }
         k.gu = std.meta.stringToEnum(Gu, envOr("TF_DS_PROMPT_GU", "mmb")) orelse return error.BadShape;
         k.check = std.mem.eql(u8, envOr("TF_DS_PROMPT_CHECK", "0"), "1");
+        k.down = std.meta.stringToEnum(Down, envOr("TF_DS_PROMPT_DOWN", "rows")) orelse return error.BadShape;
         k.group_count = try ek.prep_mod.function("_ZN16tf_exl3x_experts18group_count_kernelEPKiPii");
         k.group_place = try ek.prep_mod.function("_ZN16tf_exl3x_experts18group_place_kernelEPKiS1_PiS2_S2_iiii");
         k.work_list = try ek.prep_mod.function("_ZN16tf_exl3x_experts16work_list_kernelEPKiS1_S1_iPiiiS2_ii");
@@ -179,6 +184,11 @@ pub const IndexKernels = struct {
         self.module.unload();
     }
 };
+
+/// down's prompt kernel: grouped_rows (the fork's) or grouped_rows_cp (the same programs, the loads several k tiles
+/// ahead through shared memory); the same bits in both: every output the same 4 chains of 18 k tiles from zero, added
+/// in order.
+pub const Down = enum { rows, rowscp };
 
 /// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).
 pub const Gu = enum { mma, mmb };
@@ -1709,28 +1719,12 @@ pub const Prompt = struct {
         }
         try self.moeMark(li, 5, stream);
         {
-            // down: grouped_rows over its work list (Z [1, 1, P, D])
-            const range = experts.rangeOf(ex.k2_d[0], ex.k2_d[1]);
-            var a: cuda.Args = .{};
-            a.add(s.xd.ptr);
-            a.add(s.xd.ptr);
-            a.add(ex.down_ptr.ptr);
-            a.add(ex.down_ptr.ptr);
-            a.add(ex.down_k2.ptr);
-            a.add(ex.down_k2.ptr);
-            a.add(s.ids.ptr);
-            a.add(s.count.ptr);
-            a.add(s.members.ptr);
-            a.add(s.z.ptr);
-            a.add(ci(I)); // K
-            a.add(ci(D)); // N
-            a.add(ci(P));
-            a.add(ci(cfg_d.sk));
-            a.add(ci(maxm));
-            a.add(ci(slots));
-            a.add(ci(len_d));
-            a.add(s.work_d.ptr);
-            try cuda.launch.launch(self.pk.rows[@intFromEnum(range)], .{ .grid = .{ .x = 1, .y = @intCast(D / 128), .z = @intCast(len_d * cfg_d.sk) }, .block = .{ .x = 128 } }, stream, &a);
+            // down: grouped_rows (or grouped_rows_cp) over its work list (Z [1, 1, P, D])
+            const range = @intFromEnum(experts.rangeOf(ex.k2_d[0], ex.k2_d[1]));
+            const alt = self.pk.down == .rowscp;
+            if (alt and self.pk.check) try self.downRows(self.pk.rows[range], ex, (try s.zcheck()).ptr, P, maxm, len_d, cfg_d, stream);
+            try self.downRows(if (alt) self.pk.rowscp[range] else self.pk.rows[range], ex, s.z.ptr, P, maxm, len_d, cfg_d, stream);
+            if (alt and self.pk.check) try s.compare(li, "down", P * D, stream);
         }
         try self.moeMark(li, 6, stream);
         {
@@ -1776,6 +1770,31 @@ pub const Prompt = struct {
         a.add(ci(len_gu)); // nexp: the list's pairs
         a.add(s.work_gu.ptr);
         try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = @intCast(ex.width / 64), .z = @intCast(len_gu * 2) }, .block = .{ .x = 256 } }, stream, &a);
+    }
+
+    /// down on `f` (grouped_rows_kernel's arguments, the fork's tile setting) into z [P, D].
+    fn downRows(self: *Prompt, f: cuda.Function, ex: *const experts.Experts, z: Ptr, P: usize, maxm: usize, len_d: usize, cfg: experts.Tiles, stream: cuda.Stream) !void {
+        const s = &self.scratch;
+        var a: cuda.Args = .{};
+        a.add(s.xd.ptr);
+        a.add(s.xd.ptr);
+        a.add(ex.down_ptr.ptr);
+        a.add(ex.down_ptr.ptr);
+        a.add(ex.down_k2.ptr);
+        a.add(ex.down_k2.ptr);
+        a.add(s.ids.ptr);
+        a.add(s.count.ptr);
+        a.add(s.members.ptr);
+        a.add(z);
+        a.add(ci(ex.width)); // K
+        a.add(ci(ex.dims)); // N
+        a.add(ci(P));
+        a.add(ci(cfg.sk));
+        a.add(ci(maxm));
+        a.add(ci(s.slots));
+        a.add(ci(len_d));
+        a.add(s.work_d.ptr);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = @intCast(ex.dims / 128), .z = @intCast(len_d * cfg.sk) }, .block = .{ .x = 128 } }, stream, &a);
     }
 
     // -- small launches ------------------------------------------------------------------------------------------
