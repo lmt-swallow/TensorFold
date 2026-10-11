@@ -1,8 +1,10 @@
 //! GLM-5.3-Flash (the EXL3 pack, two DGX Sparks over NCCL) behind the native family interface: rank 0 serves the
 //! lane core, rank 1 follows its steps (cuda_lanes.zig). The ranks' settings come from the environment (`--tp/--rank/
 //! --master/--master-port` export them: TF_TP_WORLD, TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT); the kernel set
-//! (TENSORFOLD_CUDA_KERNELS) must hold the reference's captured Triton kernels (tools/zig/glm53/capture.sh). Both
-//! ranks must run with the same --context and drafts setting.
+//! (TENSORFOLD_CUDA_KERNELS) must hold the reference's captured Triton kernels (tools/zig/glm53/capture.sh). Up to 4
+//! streams decode together, their DSA caches in one pool of TF_GLM_POOL positions (default: one stream's context;
+//! at least that, a multiple of 2,048), each stream an extent of it; every slot's other state (KDA states, rings, the
+//! head's rows) is made at load. Both ranks must run with the same --context, TF_GLM_POOL and drafts setting.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -17,6 +19,7 @@ const mtp = @import("cuda_mtp.zig");
 const M = @import("cuda_model.zig");
 const engine = @import("cuda_engine.zig");
 const lanesmod = @import("cuda_lanes.zig");
+const P = @import("cuda_pool.zig");
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3"};
@@ -35,6 +38,8 @@ pub const Loaded = struct {
     facts: lanes.Model,
     rows: u32,
     stream_bytes: usize,
+    pool_positions: usize = 0,
+    pool_bytes: usize = 0,
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
@@ -54,6 +59,7 @@ const Owned = struct {
     comm: cuda.comm.Comm,
     stream: cuda.Stream,
     runner: engine.Runner,
+    pool: P.Pool,
     lanes: *lanesmod.Lanes,
 };
 
@@ -72,22 +78,20 @@ pub fn isFollower() bool {
     return (envInt("TF_TP_RANK", 0) catch 0) != 0;
 }
 
-/// A sequence's positions for a context of `context` tokens: the context and a verify window, a multiple of 64.
+/// A stream's positions at most for a context of `context` tokens: the context and a verify window, a whole extent.
 pub fn capacityFor(context: usize) usize {
-    return std.mem.alignForward(usize, context + lanesmod.max_rows + 1, 64);
+    return P.Extents.size(context + lanesmod.max_rows + 1);
 }
 
-/// Device bytes one stream's sequence takes at `capacity` positions: the DSA layers' and the head's caches (latent
-/// rows, the index ring, pooled keys), the KDA layers' states (both parities), conv windows and window projections.
-pub fn streamBytes(lay: config.Layout, capacity: usize) usize {
-    const c = lay.cfg;
-    const ring = dsa.indexRing(capacity, engine.prompt_rows);
-    const cache = capacity * c.kv_lora * 2 + 2 * ring * c.index_dim * 2 + (capacity / 4 + 2) * c.index_dim * 2;
-    const nk = c.count(.kda);
-    const H = lay.size(.lin);
-    const kda_bytes = nk * (2 * H * kda.dv * kda.dk * 4 + 3 * 3 * H * kda.dk * 2 + engine.rows * lay.kdaProj() * 2);
-    return (c.count(.dsa) + 1) * cache + kda_bytes + 256 * c.hidden * 2 + engine.rows * c.hidden * 2;
+/// TF_GLM_POOL's positions for streams of `capacity` positions: unset, `capacity`; else a whole number at least it
+/// and a multiple of the extent alignment (error.BadPool otherwise).
+pub fn poolSetting(text: ?[]const u8, capacity: usize) error{BadPool}!usize {
+    const v = text orelse return capacity;
+    const pool = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return error.BadPool;
+    if (pool < capacity or pool % P.extent_align != 0) return error.BadPool;
+    return pool;
 }
+
 
 /// This rank's device bytes of weights (its share of the pack's text tensors and its head rows).
 pub fn weightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
@@ -162,12 +166,26 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const k: M.Kernels = .{ .g = .{ .set = &own.set, .hc = &own.hc, .hidden = own.cfg.hidden, .streams = own.cfg.streams }, .kk = &own.kk, .mk = &own.mk };
     own.runner = try engine.Runner.init(gpa, d, lay, k, &own.tk, &own.model, &own.head, .{ .ctx = own, .gather = gatherFn }, own.stream, capacity);
     errdefer own.runner.deinit();
-    own.lanes = try lanesmod.Lanes.init(gpa, d, lay, &own.runner, &own.comm, capacity, o.drafts);
+    const positions = poolSetting(getenv("TF_GLM_POOL"), capacity) catch {
+        std.log.err("TF_GLM_POOL is {s}: it takes a number of positions, at least a stream's {d}, a multiple of {d}", .{ getenv("TF_GLM_POOL").?, capacity, P.extent_align });
+        return error.BadEnvironment;
+    };
+    const planes = own.cfg.count(.dsa) + 1;
+    const kv = glue.Kv.parse(getenv("TF_GLM_KV") orelse "") catch {
+        std.log.err("TF_GLM_KV is {s}: bf16 or fp8", .{getenv("TF_GLM_KV").?});
+        return error.BadEnvironment;
+    };
+    own.pool = try P.Pool.init(gpa, d, &own.cfg, planes, positions, kv);
+    errdefer own.pool.deinit();
+    own.lanes = try lanesmod.Lanes.init(gpa, d, lay, &own.runner, &own.comm, &own.pool, capacity, o.drafts);
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = own.lanes.windowRows(),
-        .stream_bytes = streamBytes(lay, capacity),
+        // the pool and every slot are allocated by the load: a stream needs no more
+        .stream_bytes = 0,
+        .pool_positions = positions,
+        .pool_bytes = P.Pool.bytes(&own.cfg, planes, positions, kv),
         .ctx = own,
         .deinit = release,
     };
@@ -183,7 +201,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.SamplingNotSupported => "this engine decodes greedily for now: send temperature 0",
-        error.NoRoom => "every stream slot is busy: retry when one finishes",
+        error.NoRoom => "every stream slot is busy, or the pool shared by the running requests has no room for this one: retry when one finishes, or lower max_tokens",
         error.OutOfStep => "the two ranks planned different steps (check both ranks' --context and --no-drafts); restart both ranks",
         error.UnportedPromptSplitSelection => "this prompt's length needs the prompt path's split block selection, which is not ported yet",
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
@@ -195,6 +213,7 @@ fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
     own.lanes.stop();
     own.lanes.deinit();
+    own.pool.deinit();
     own.runner.deinit();
     own.stream.deinit();
     own.comm.deinit();
@@ -208,10 +227,19 @@ fn release(p: *anyopaque) void {
     own.gpa.destroy(own);
 }
 
-test "a sequence's capacity holds the context and a window, a multiple of 64" {
+test "a stream's capacity holds the context and a window, a whole extent" {
     for ([_]usize{ 4096, 16384, 1 << 20, 100000 }) |c| {
         const cap = capacityFor(c);
         try std.testing.expect(cap > c + lanesmod.max_rows);
-        try std.testing.expectEqual(@as(usize, 0), cap % 64);
+        try std.testing.expectEqual(@as(usize, 0), cap % P.extent_align);
     }
+}
+
+test "TF_GLM_POOL: a stream's capacity unless set; at least it, a multiple of the extent alignment" {
+    const m: usize = 1 << 20;
+    try std.testing.expectEqual(m, try poolSetting(null, m));
+    try std.testing.expectEqual(4 * m, try poolSetting("4194304", m));
+    try std.testing.expectError(error.BadPool, poolSetting("1046528", m));
+    try std.testing.expectError(error.BadPool, poolSetting("2097153", m));
+    try std.testing.expectError(error.BadPool, poolSetting("4M", m));
 }

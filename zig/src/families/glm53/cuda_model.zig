@@ -13,6 +13,7 @@ const weights = @import("cuda_weights.zig");
 const F = @import("cuda_forward.zig");
 const A = @import("cuda_dsa.zig");
 const M = @import("cuda_moe.zig");
+const P = @import("cuda_pool.zig");
 
 const Glue = glue_mod.Glue;
 const Ptr = cuda.abi.DevicePtr;
@@ -94,7 +95,17 @@ pub const State = struct {
     pos: usize = 0,
     pos_dev: Buf,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, capacity: usize, rows: usize, prompt_rows: usize) !State {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, capacity: usize, rows: usize, prompt_rows: usize, kv: A.Kv) !State {
+        return make(gpa, d, lay, layers, capacity, A.indexRing(capacity, @max(rows, prompt_rows)), rows, kv);
+    }
+
+    /// A stream slot's state whose DSA caches hold their rings of `ring` rows only: `bind` points them at a pool's
+    /// extent.
+    pub fn initSlot(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, ring: usize, rows: usize, kv: A.Kv) !State {
+        return make(gpa, d, lay, layers, null, ring, rows, kv);
+    }
+
+    fn make(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, capacity: ?usize, ring: usize, rows: usize, kv: A.Kv) !State {
         const c = lay.cfg;
         var nk: usize = 0;
         var nd: usize = 0;
@@ -121,10 +132,25 @@ pub const State = struct {
             gpa.free(caches);
         }
         for (caches) |*x| {
-            x.* = try A.Cache.init(d, c, capacity, A.indexRing(capacity, @max(rows, prompt_rows)));
+            x.* = if (capacity) |cap| try A.Cache.init(d, c, cap, ring, kv) else try A.Cache.rings(d, c, ring, kv);
             made += 1;
         }
         return .{ .gpa = gpa, .kda = ks, .caches = caches, .kda_index = index, .pos_dev = try Buf.alloc(d, 16) };
+    }
+
+    /// The DSA caches on the pool's extent [base, base + size) (plane i: the i-th DSA layer's).
+    pub fn bind(s: *State, pool: *const P.Pool, base: usize, size: usize) !void {
+        for (s.caches, 0..) |*x, i| try pool.bind(i, x, base, size);
+    }
+
+    /// A new sequence from position 0: the KDA states and conv windows zeroed (forward.py `Slots.reset`); the caches'
+    /// rows past the position are never read.
+    pub fn reset(s: *State, stream: cuda.Stream) !void {
+        try s.kda.rec.fill8(0, stream.handle);
+        try s.kda.conv.fill8(0, stream.handle);
+        s.kda.cur = 0;
+        s.kda.pos = 0;
+        s.pos = 0;
     }
 
     pub fn deinit(s: *State) void {

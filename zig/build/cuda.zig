@@ -113,6 +113,7 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     glm53.addImport("cuda", cuda);
     glm53.addImport("core", core);
     glm53.addImport("lanes", lanes);
+    glm53.addImport("dsv41", dsv41); // the pool's Extents (cuda_keep.zig) until they move to the core
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41, .qwen38fn = qwen38fn, .glm53 = glm53 };
 }
 

@@ -15,7 +15,9 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const config = @import("config.zig");
 const engine = @import("cuda_engine.zig");
+const P = @import("cuda_pool.zig");
 const copy_drafts = @import("copy_drafts.zig");
+const dsa = @import("cuda_dsa.zig");
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -36,8 +38,9 @@ pub const depth = copy_drafts.depth_most;
 /// Step opcodes; each record starts with one.
 pub const Op = enum(u8) { open = 1, fill = 2, verify = 3, keep = 4, draft = 5, release = 6, stop = 7 };
 
-/// A record's fixed header before a prompt's ids (u32 each).
-const open_header = 7;
+/// A record's fixed header before a prompt's ids (u32 each): the opcode, the slot, the flags, the extent's base and
+/// size (u32 each, positions), the prompt's length.
+const open_header = 15;
 
 /// The bytes a record takes at most for sequences of `capacity` positions (an `open` of a whole prompt).
 pub fn maxOpBytes(capacity: usize) usize {
@@ -45,7 +48,10 @@ pub fn maxOpBytes(capacity: usize) usize {
 }
 
 const Slot = struct {
-    seq: ?engine.Seq = null,
+    seq: ?engine.Seq = null, // made once, reused by one stream after another
+    busy: bool = false,
+    base: usize = 0, // the stream's extent of the pool
+    size: usize = 0,
     prompt: ?[]u32 = null, // the prompt pass under way: its ids
     start: usize = 0, // the next chunk's first row
     first: u32 = 0, // the reply's first token, once the pass ended
@@ -63,7 +69,9 @@ pub const Lanes = struct {
     lay: config.Layout,
     r: *engine.Runner,
     comm: *const cuda.comm.Comm,
-    capacity: usize,
+    capacity: usize, // a stream's positions at most (the context's)
+    pool: *P.Pool,
+    ring: usize, // each slot's index ring rows
     drafts: bool,
     slots: [max_streams]Slot = @splat(.{}),
     // rank 0: the stream each slot serves
@@ -76,19 +84,26 @@ pub const Lanes = struct {
     stepped: u64 = 0,
     broken: bool = false,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, r: *engine.Runner, comm: *const cuda.comm.Comm, capacity: usize, drafts: bool) !*Lanes {
+    /// Lanes over `pool`, each stream at most `capacity` positions; every slot's sequence made now (its KDA states,
+    /// rings and head buffers), so a stream waits for none.
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, r: *engine.Runner, comm: *const cuda.comm.Comm, pool: *P.Pool, capacity: usize, drafts: bool) !*Lanes {
         const self = try gpa.create(Lanes);
         errdefer gpa.destroy(self);
         const op_buf = try gpa.alloc(u8, maxOpBytes(capacity));
         errdefer gpa.free(op_buf);
         var send = try Buf.alloc(d, 16);
         errdefer send.free();
-        self.* = .{ .gpa = gpa, .d = d, .lay = lay, .r = r, .comm = comm, .capacity = capacity, .drafts = drafts, .op_buf = op_buf, .agree_send = send, .agree_recv = try Buf.alloc(d, 16 * lay.world) };
+        self.* = .{ .gpa = gpa, .d = d, .lay = lay, .r = r, .comm = comm, .capacity = capacity, .pool = pool, .ring = dsa.indexRing(capacity, engine.prompt_rows), .drafts = drafts, .op_buf = op_buf, .agree_send = send, .agree_recv = try Buf.alloc(d, 16 * lay.world) };
+        errdefer self.deinit();
+        for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
         return self;
     }
 
     pub fn deinit(self: *Lanes) void {
-        for (&self.slots) |*s| self.clear(s);
+        for (&self.slots) |*s| {
+            self.clear(s);
+            if (s.seq) |*q| q.deinit();
+        }
         self.agree_send.free();
         self.agree_recv.free();
         self.gpa.free(self.op_buf);
@@ -128,10 +143,20 @@ pub const Lanes = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// The slot free again: its extent back to the pool, its prompt freed; its sequence kept for the next stream.
     fn clear(self: *Lanes, s: *Slot) void {
         if (s.prompt) |p| self.gpa.free(p);
-        if (s.seq) |*q| q.deinit();
-        s.* = .{};
+        if (s.busy) self.pool.extents.give(s.base, s.size);
+        const seq = s.seq;
+        s.* = .{ .seq = seq };
+    }
+
+    /// Positions a stream of `prompt` tokens and up to `max_new` more takes (its windows' rows included), aligned;
+    /// null past a stream's capacity.
+    fn extentFor(self: *const Lanes, prompt: usize, max_new: usize) ?usize {
+        const need = prompt + max_new + max_rows + 1;
+        if (need > self.capacity) return null;
+        return P.Extents.size(need);
     }
 
     // -- the steps every rank runs ------------------------------------------------------------------------------
@@ -208,13 +233,18 @@ pub const Lanes = struct {
             .open => {
                 const slot = rd.byte() orelse return false;
                 const flags = rd.byte() orelse return false;
+                const base = rd.int() orelse return false;
+                const size = rd.int() orelse return false;
                 const n = rd.int() orelse return false;
-                return slot < max_streams and self.slots[slot].seq == null and flags <= 1 and n > 0 and rd.b.len == 4 * @as(usize, n);
+                if (slot >= max_streams or self.slots[slot].busy or flags > 1 or n == 0 or rd.b.len != 4 * @as(usize, n)) return false;
+                if (size > self.capacity or n + max_rows >= size) return false;
+                var ex = self.pool.extents;
+                return ex.takeAt(base, size);
             },
             .fill => {
                 const slot = rd.byte() orelse return false;
                 _ = rd.int() orelse return false;
-                return slot < max_streams and self.slots[slot].prompt != null and rd.b.len == 0;
+                return slot < max_streams and self.slots[slot].busy and self.slots[slot].prompt != null and rd.b.len == 0;
             },
             .release => {
                 const slot = rd.byte() orelse return false;
@@ -225,7 +255,7 @@ pub const Lanes = struct {
                 if (n > max_streams) return false;
                 for (0..n) |_| {
                     const slot = rd.byte() orelse return false;
-                    if (slot >= max_streams or self.slots[slot].seq == null or self.slots[slot].prompt != null) return false;
+                    if (slot >= max_streams or !self.slots[slot].busy or self.slots[slot].prompt != null) return false;
                     const rows = rd.byte() orelse return false;
                     if (rows > max_rows) return false;
                     switch (code) {
@@ -252,11 +282,20 @@ pub const Lanes = struct {
             .open => {
                 const s = &self.slots[rd.byte().?];
                 const flags = rd.byte().?;
+                const base: usize = rd.int().?;
+                const size: usize = rd.int().?;
                 const n = rd.int().?;
                 const ids = try self.gpa.alloc(u32, n);
                 errdefer self.gpa.free(ids);
                 for (ids) |*t| t.* = rd.int().?;
-                s.seq = try engine.Seq.init(self.gpa, self.d, self.lay, self.r.model.layers.len, self.capacity);
+                if (!self.pool.extents.takeAt(base, size)) return error.BadExtent;
+                errdefer self.pool.extents.give(base, size);
+                const q = &s.seq.?;
+                try q.bind(self.pool, base, size);
+                try q.reset(self.r.stream);
+                s.busy = true;
+                s.base = base;
+                s.size = size;
                 s.prompt = ids;
                 s.start = 0;
                 s.drafts = flags & 1 != 0;
@@ -371,15 +410,19 @@ pub const Lanes = struct {
     fn open(self: *Lanes, s: *lanes.Stream) !u8 {
         if (s.sampling) |sm| if (sm.temperature > 0) return error.SamplingNotSupported;
         const ids = s.prompt();
-        if (ids.len == 0 or ids.len + s.max_new + max_rows >= self.capacity) return error.PromptTooLong;
+        if (ids.len == 0) return error.PromptTooLong;
+        const size = self.extentFor(ids.len, s.max_new) orelse return error.PromptTooLong;
         const slot: u8 = for (self.owners, 0..) |o, i| {
             if (o == null) break @intCast(i);
         } else return error.NoRoom;
+        const base = self.pool.extents.first(size) orelse return error.NoRoom;
         const op = self.op_buf[0 .. open_header + 4 * ids.len];
         op[0] = @intFromEnum(Op.open);
         op[1] = slot;
         op[2] = @intFromBool(self.drafts);
-        std.mem.writeInt(u32, op[3..7], @intCast(ids.len), .little);
+        std.mem.writeInt(u32, op[3..7], @intCast(base), .little);
+        std.mem.writeInt(u32, op[7..11], @intCast(size), .little);
+        std.mem.writeInt(u32, op[11..15], @intCast(ids.len), .little);
         for (ids, 0..) |t, i| std.mem.writeInt(u32, op[open_header + 4 * i ..][0..4], t, .little);
         try self.both(op);
         self.owners[slot] = s;
@@ -569,22 +612,28 @@ test "records the follower parses: a verify of two windows, a short one refused"
 
 test "a follower runs only records whose slots hold what the step needs" {
     var cfg: config.Config = undefined;
-    var l: Lanes = .{ .gpa = std.testing.allocator, .d = undefined, .lay = .{ .rank = 1, .world = 2, .cfg = &cfg }, .r = undefined, .comm = undefined, .capacity = 4096, .drafts = true, .op_buf = &.{}, .agree_send = undefined, .agree_recv = undefined };
+    var pool: P.Pool = .{ .gpa = std.testing.allocator, .latent = &.{}, .pk = &.{}, .rows = 2 * P.extent_align, .kv = .bf16, .extents = P.Extents.init(2 * P.extent_align) };
+    var l: Lanes = .{ .gpa = std.testing.allocator, .d = undefined, .lay = .{ .rank = 1, .world = 2, .cfg = &cfg }, .r = undefined, .comm = undefined, .capacity = 2 * P.extent_align, .pool = &pool, .ring = 64, .drafts = true, .op_buf = &.{}, .agree_send = undefined, .agree_recv = undefined };
     var buf: [64]u8 = undefined;
-    // open: slot 0, drafts, two ids
+    // open: slot 0, drafts, the extent [2048, 4096), two ids
     var w: Writer = .{ .b = &buf };
     w.byte(@intFromEnum(Op.open));
     w.byte(0);
     w.byte(1);
+    w.int(P.extent_align);
+    w.int(P.extent_align);
     w.int(2);
     w.int(5);
     w.int(6);
     try std.testing.expect(l.runnable(w.done()));
-    // one id short, or a slot past the last
+    // one id short; a slot past the last; an extent that is taken
     try std.testing.expect(!l.runnable(w.done()[0 .. w.n - 1]));
     buf[1] = max_streams;
     try std.testing.expect(!l.runnable(w.done()));
-    // a verify names a slot without a sequence: refused
+    buf[1] = 0;
+    try std.testing.expect(pool.extents.takeAt(P.extent_align, P.extent_align));
+    try std.testing.expect(!l.runnable(w.done()));
+    // a verify names a slot no stream holds: refused
     var v: Writer = .{ .b = &buf };
     v.byte(@intFromEnum(Op.verify));
     v.byte(1);

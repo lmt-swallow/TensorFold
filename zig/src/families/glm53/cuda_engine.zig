@@ -16,6 +16,7 @@ const Mo = @import("cuda_moe.zig");
 const M = @import("cuda_model.zig");
 const T = @import("cuda_mtp.zig");
 const copy_drafts = @import("copy_drafts.zig");
+const P = @import("cuda_pool.zig");
 
 const Ptr = cuda.abi.DevicePtr;
 const Buf = cuda.DeviceBuffer;
@@ -48,18 +49,48 @@ pub const Seq = struct {
     mtp_drafted: usize = 0,
     fresh: bool = false, // the head's logits are its last absorbed row's (`absorb` ran a step; a chain may start)
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, capacity: usize) !Seq {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, capacity: usize, kv: A.Kv) !Seq {
         const c = lay.cfg;
         const D = c.hidden;
-        var st = try M.State.init(gpa, d, lay, layers, capacity, rows, prompt_rows);
+        var st = try M.State.init(gpa, d, lay, layers, capacity, rows, prompt_rows, kv);
         errdefer st.deinit();
-        var mcache = try A.Cache.init(d, c, capacity, A.indexRing(capacity, prompt_rows));
+        var mcache = try A.Cache.init(d, c, capacity, A.indexRing(capacity, prompt_rows), kv);
         errdefer mcache.deinit();
         var mpos = try Buf.alloc(d, 16);
         errdefer mpos.free();
         var backlog = try Buf.alloc(d, cap * D * 2);
         errdefer backlog.free();
         return .{ .gpa = gpa, .st = st, .mcache = mcache, .mpos = mpos, .backlog = backlog, .last = try Buf.alloc(d, rows * D * 2) };
+    }
+
+    /// A stream slot's sequence whose DSA caches (the backbone's and the head's) hold their rings of `ring` rows only;
+    /// `bind` points them at a pool's extent, `reset` starts a sequence.
+    pub fn initSlot(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, layers: usize, ring: usize, kv: A.Kv) !Seq {
+        const D = lay.cfg.hidden;
+        var st = try M.State.initSlot(gpa, d, lay, layers, ring, rows, kv);
+        errdefer st.deinit();
+        var mcache = try A.Cache.rings(d, lay.cfg, ring, kv);
+        errdefer mcache.deinit();
+        var mpos = try Buf.alloc(d, 16);
+        errdefer mpos.free();
+        var backlog = try Buf.alloc(d, cap * D * 2);
+        errdefer backlog.free();
+        return .{ .gpa = gpa, .st = st, .mcache = mcache, .mpos = mpos, .backlog = backlog, .last = try Buf.alloc(d, rows * D * 2) };
+    }
+
+    /// The caches on the pool's extent [base, base + size): plane i the i-th DSA layer's, the head's the last.
+    pub fn bind(q: *Seq, pool: *const P.Pool, base: usize, size: usize) !void {
+        try q.st.bind(pool, base, size);
+        try pool.bind(q.st.caches.len, &q.mcache, base, size);
+    }
+
+    /// A new sequence from position 0 (the head's too).
+    pub fn reset(q: *Seq, stream: cuda.Stream) !void {
+        try q.st.reset(stream);
+        q.m_next.clearRetainingCapacity();
+        q.mtp_len = 0;
+        q.mtp_drafted = 0;
+        q.fresh = false;
     }
 
     pub fn deinit(q: *Seq) void {
@@ -298,10 +329,10 @@ pub const Engine = struct {
     arms: std.ArrayList(u8) = .empty,
     keeps: std.ArrayList(usize) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Engine {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize, kv: A.Kv) !Engine {
         var r = try Runner.init(gpa, d, lay, k, tk, model, mtp, link, stream, capacity);
         errdefer r.deinit();
-        return .{ .r = r, .q = try Seq.init(gpa, d, lay, model.layers.len, capacity) };
+        return .{ .r = r, .q = try Seq.init(gpa, d, lay, model.layers.len, capacity, kv) };
     }
 
     pub fn deinit(e: *Engine) void {

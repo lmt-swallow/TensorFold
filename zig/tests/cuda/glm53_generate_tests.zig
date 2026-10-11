@@ -65,7 +65,7 @@ pub fn run(gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, master: []
     pack.dropCache();
     var link: Link = .{ .comm = &comm };
     const k: M.Kernels = .{ .g = .{ .set = &set, .hc = &hck, .hidden = cfg.hidden, .streams = cfg.streams }, .kk = &kk, .mk = &mk };
-    var e = try glm.engine.Engine.init(gpa, d, lay, k, &tk, &mdl, &mtp, .{ .ctx = &link, .gather = Link.gather }, stream, 8192);
+    var e = try glm.engine.Engine.init(gpa, d, lay, k, &tk, &mdl, &mtp, .{ .ctx = &link, .gather = Link.gather }, stream, 8192, .bf16);
     defer e.deinit();
     var nb: [64]u8 = undefined;
     const prompt_b = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_prompt_ids", .{rank}));

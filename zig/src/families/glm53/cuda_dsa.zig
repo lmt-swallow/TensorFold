@@ -136,10 +136,12 @@ pub const Dsa = struct {
     }
 };
 
-/// One stream's caches of one DSA layer (forward.py `Caches` bound to a stream at base 0): the latent rows
-/// [cap, kv_lora], the indexer's key and gate ring [ring, index_dim] bf16 (token t at t % ring) and the pooled keys
-/// [cap / 4 + 2, index_dim]; the latent rows and pooled keys in the format `kv` (TF_GLM_KV: bf16, or fp8's rows of
-/// `glue.Kv.rowBytes`); all zeroed, as the pool's planes are (a zero FP8 row reads as zeros).
+/// One stream's caches of one DSA layer (forward.py `Caches` bound to a stream): the latent rows [cap, kv_lora], the
+/// indexer's key and gate ring [ring, index_dim] bf16 (token t at t % ring) and the pooled keys [cap / 4 + 2,
+/// index_dim]; the latent rows and pooled keys in the format `kv` (TF_GLM_KV: bf16, or fp8's rows of
+/// `glue.Kv.rowBytes`). The latent and pooled-key rows are its own (`init`, zeroed: a zero FP8 row reads as zeros) or
+/// a pool's extent (`rebind`: Mia's `Arena.view`, the pooled keys' 2 pad rows overlapping the next extent's first);
+/// the rings are always its own.
 pub const Cache = struct {
     latent: Buf,
     ik: Buf,
@@ -148,18 +150,28 @@ pub const Cache = struct {
     capacity: usize,
     ring: usize,
     kv: Kv,
+    owned: bool = true, // latent and pk are this cache's allocations, not a pool's
 
     pub fn init(d: *const cuda.Driver, c: *const config.Config, capacity: usize, ring: usize, kv: Kv) !Cache {
-        var lat = try Buf.alloc(d, capacity * kv.rowBytes(c.kv_lora));
-        errdefer lat.free();
+        var s = try rings(d, c, ring, kv);
+        errdefer s.deinit();
+        s.owned = true;
+        s.latent = try Buf.alloc(d, capacity * kv.rowBytes(c.kv_lora));
+        s.pk = try Buf.alloc(d, (capacity / 4 + 2) * kv.rowBytes(c.index_dim));
+        for ([_]*Buf{ &s.latent, &s.pk }) |x| try x.fill8(0, null);
+        s.capacity = capacity;
+        return s;
+    }
+
+    /// The rings alone (zeroed); `rebind` points the latent and pooled-key rows at a pool's extent.
+    pub fn rings(d: *const cuda.Driver, c: *const config.Config, ring: usize, kv: Kv) !Cache {
         var ik = try Buf.alloc(d, ring * c.index_dim * 2);
         errdefer ik.free();
         var ig = try Buf.alloc(d, ring * c.index_dim * 2);
         errdefer ig.free();
-        var pk = try Buf.alloc(d, (capacity / 4 + 2) * kv.rowBytes(c.index_dim));
-        errdefer pk.free();
-        for ([_]*Buf{ &lat, &ik, &ig, &pk }) |b| try b.fill8(0, null);
-        return .{ .latent = lat, .ik = ik, .ig = ig, .pk = pk, .capacity = capacity, .ring = ring, .kv = kv };
+        for ([_]*Buf{ &ik, &ig }) |x| try x.fill8(0, null);
+        const none: Buf = .{ .d = d, .ptr = 0, .len = 0 };
+        return .{ .latent = none, .ik = ik, .ig = ig, .pk = none, .capacity = 0, .ring = ring, .kv = kv, .owned = false };
     }
 
     /// The device bytes `init` allocates for one layer's caches.
@@ -172,11 +184,25 @@ pub const Cache = struct {
         return pos * s.kv.rowBytes(c.kv_lora);
     }
 
-    pub fn deinit(s: *Cache) void {
+    /// The latent and pooled-key rows of a pool's extent of `capacity` positions (views; the pool owns them).
+    pub fn rebind(s: *Cache, latent: Buf, pk: Buf, capacity: usize) void {
+        s.dropOwned();
+        s.latent = latent;
+        s.pk = pk;
+        s.capacity = capacity;
+    }
+
+    fn dropOwned(s: *Cache) void {
+        if (!s.owned) return;
         s.latent.free();
+        s.pk.free();
+        s.owned = false;
+    }
+
+    pub fn deinit(s: *Cache) void {
+        s.dropOwned();
         s.ik.free();
         s.ig.free();
-        s.pk.free();
     }
 
     /// Pools the pooled-key plane holds (sparse.py's np_max: its rows less the 2 of pad).

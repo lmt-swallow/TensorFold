@@ -108,7 +108,7 @@ pub fn run(gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, master: []
     const rows = 16;
     const prompt_rows = 2048;
     const capacity = 8192;
-    var st = try M.State.init(gpa, d, lay, n_layers, capacity, rows, prompt_rows);
+    var st = try M.State.init(gpa, d, lay, n_layers, capacity, rows, prompt_rows, .bf16);
     defer st.deinit();
     var w = try M.Work.init(d, lay, rows, prompt_rows, capacity);
     defer w.deinit();
@@ -192,7 +192,7 @@ pub fn generate(gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, maste
     const rows = 16;
     const prompt_rows = 2048;
     const capacity = 8192;
-    var st = try M.State.init(gpa, d, lay, cfg.layers, capacity, rows, prompt_rows);
+    var st = try M.State.init(gpa, d, lay, cfg.layers, capacity, rows, prompt_rows, .bf16);
     defer st.deinit();
     var w = try M.Work.init(d, lay, rows, prompt_rows, capacity);
     defer w.deinit();
