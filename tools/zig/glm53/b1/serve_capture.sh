@@ -36,6 +36,13 @@ if s.count(anchor) != 1:
 s = s.replace(anchor, anchor + (
     f'RUN_ARGS+=(-v {work}:/aot -e PYTHONPATH=/shim -v {work}/shim:/shim:ro -e TRITON_CACHE_DIR=/aot/triton\n'
     f'          -e TF_DSV41_CAPTURE_DIR=/aot/rankX)\n'))
+# start.sh serves concurrent streams only with DFlash2 drafts (CC BY-NC-ND, never downloaded here): with DRAFTER=mtp
+# and PARALLEL > 1 the ranks run --parallel without a drafter (the MTP head is single-stream only, engine.mtp_head),
+# so the concurrent windows are a stream's pending row and its copy drafts
+check = '[[ "$DRAFTER" == dflash2 || "$PARALLEL" == 1 ]] || die'
+if s.count(check) != 1:
+    raise SystemExit("start.sh: the PARALLEL / DRAFTER check not found as expected")
+s = s.replace(check, '[[ "$DRAFTER" == dflash2 || "$PARALLEL" == 1 || -n "${CAPTURE:-}" ]] || die')
 p.write_text(s)
 EOF
 # both ranks record into /aot/rankX: a link to rank0 on the head, to rank1 on the worker
@@ -44,7 +51,7 @@ ssh -o BatchMode=yes "$WORKER" "ln -s rank1 '$WORK/rankX'"
 
 cd "$WORK/recipe"
 bash "$HERE/reference.sh" check >/dev/null
-RECIPE="$WORK/recipe" bash "$HERE/reference.sh" start
+CAPTURE=1 RECIPE="$WORK/recipe" bash "$HERE/reference.sh" start
 python3 -B "$TF/tools/zig/dsv41/capture_workload.py" --base "http://127.0.0.1:${PORT:-8888}/v1" --report "$WORK/workload.json" "$@"
 touch "$WORK/rank0/dump.now"; ssh -o BatchMode=yes "$WORKER" "touch '$WORK/rank1/dump.now'"
 sleep 5
