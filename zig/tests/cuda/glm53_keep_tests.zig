@@ -40,6 +40,37 @@ fn logitsRow(r: *E.Runner, t: *Trace) !void {
     try r.w.logits.download(0, t.logits.items[at..][0..n]);
 }
 
+/// B from `start` (the sequence holds the rows before it) to its end, then `steps` one-row windows.
+fn finishB(r: *E.Runner, q: *E.Seq, b: []const u32, start: usize, t: *Trace) !void {
+    var at = start;
+    while (at < b.len) at = try r.fill(q, b, at);
+    try logitsRow(r, t);
+    var tok = try r.first(q);
+    try t.tokens.append(r.gpa, tok);
+    var out: [1]u32 = undefined;
+    for (0..steps) |_| {
+        try r.window(q, &.{tok}, &out);
+        try logitsRow(r, t);
+        try r.commit(q, 1, 1);
+        tok = out[0];
+        try t.tokens.append(r.gpa, tok);
+    }
+}
+
+fn diffRows(r: *const E.Runner, rank: usize, what: []const u8, x: *const Trace, y: *const Trace) usize {
+    const row = r.host.len * 2;
+    var bad: usize = 0;
+    for (0..steps + 1) |i| {
+        const a = x.logits.items[i * row ..][0..row];
+        const b = y.logits.items[i * row ..][0..row];
+        if (!std.mem.eql(u8, a, b)) {
+            std.debug.print("FAIL glm53-keep rank {d}: {s} logits row {d} differ (first byte {d})\n", .{ rank, what, i, std.mem.indexOfDiff(u8, a, b).? });
+            bad += 1;
+        }
+    }
+    return bad;
+}
+
 /// A sequence's state as named digests: the KDA states (the current parity) and conv windows, every DSA cache's
 /// index rings, latent rows and pooled keys before `len` (and the head's), so a mismatch names its part.
 const Parts = struct {
@@ -134,7 +165,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     const capacity: usize = 8192;
     var r = try rk.runner(gpa, d, link, capacity);
     defer r.deinit();
-    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 3 * capacity, .bf16);
+    var pool = try P.Pool.init(gpa, d, cfg, cfg.count(.dsa) + 1, 4 * capacity, .bf16);
     defer pool.deinit();
     const ring = glm.dsa.indexRing(capacity, E.prompt_rows);
     var seqs: [3]E.Seq = undefined;
@@ -164,6 +195,21 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     // slot's state restored from the snapshot
     try seqs[0].bind(&pool, 0, capacity);
     try seqs[0].reset(stream);
+    // slot 2 first serves a whole other stream (B from 0, 16 steps) in extent 2, as a served slot does before it is
+    // reused: nothing it leaves may reach the continued prompt
+    {
+        try seqs[2].bind(&pool, 2 * capacity, capacity);
+        try seqs[2].reset(stream);
+        var at2: usize = 0;
+        while (at2 < b.len) at2 = try r.fill(&seqs[2], b, at2);
+        var tok = try r.first(&seqs[2]);
+        var o: [1]u32 = undefined;
+        for (0..steps) |_| {
+            try r.window(&seqs[2], &.{tok}, &o);
+            try r.commit(&seqs[2], 1, 1);
+            tok = o[0];
+        }
+    }
     try seqs[2].bind(&pool, 2 * capacity, capacity);
     try seqs[2].reset(stream);
     try K.copyRows(&pool, capacity, 2 * capacity, cut, stream);
@@ -177,15 +223,21 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
         std.debug.print("FAIL glm53-keep rank {d}: tokens {any}, fresh {any}\n", .{ rank, cont.tokens.items, fresh.tokens.items });
         bad += 1;
     }
-    const row = r.host.len * 2;
-    for (0..steps + 1) |i| {
-        const x = fresh.logits.items[i * row ..][0..row];
-        const y = cont.logits.items[i * row ..][0..row];
-        if (!std.mem.eql(u8, x, y)) {
-            std.debug.print("FAIL glm53-keep rank {d}: logits row {d} differ (first byte {d})\n", .{ rank, i, std.mem.indexOfDiff(u8, x, y).? });
-            bad += 1;
-        }
+    bad += diffRows(&r, rank, "continued", &fresh, &cont);
+    // slot 0, which served fresh B to its end in extent 0, moves to extent 3 and continues B there (a served slot
+    // taking a kept prompt's continuation after another stream): the same rows again
+    var moved: Trace = .{};
+    defer moved.deinit(gpa);
+    try seqs[0].bind(&pool, 3 * capacity, capacity);
+    try seqs[0].reset(stream);
+    try K.copyRows(&pool, capacity, 3 * capacity, cut, stream);
+    try snaps.restore(0, &seqs[0], cut, stream);
+    try finishB(&r, &seqs[0], b, cut, &moved);
+    if (!std.mem.eql(u32, fresh.tokens.items, moved.tokens.items)) {
+        std.debug.print("FAIL glm53-keep rank {d}: moved slot's tokens {any}, fresh {any}\n", .{ rank, moved.tokens.items, fresh.tokens.items });
+        bad += 1;
     }
+    bad += diffRows(&r, rank, "moved slot's", &fresh, &moved);
     try check.expect(bad == 0, "glm53-keep rank {d}: the continued prompt differs from the fresh one", .{rank});
     check.pass("BITEXACT glm53-keep rank {d}: a {d}-token prompt continued from a kept boundary at {d}: {d} tokens and {d} logits rows equal to its fresh prefill", .{ rank, b.len, cut, fresh.tokens.items.len, steps + 1 });
 }
