@@ -911,6 +911,9 @@ pub const Measure = struct {
 /// among the round's), the positions its drafter rings absorbed, its last drafts (the first `held` of them held).
 /// A prompt pass in parts: the position it stands at (a chunk boundary, or the prompt's end once done) and the
 /// admission's settings each part runs with.
+/// Beside the rounds, the SMs a prompt part runs on while other streams decode (TF_DS_PROMPT_SMS overrides it).
+pub const prompt_sms: u32 = 40;
+
 pub const Pass = struct {
     at: usize,
     cut: usize,
@@ -2087,6 +2090,8 @@ pub const Engine = struct {
     comm2: ?cuda.comm.Comm = null,
     /// TF_DS_PROMPT_SMS beside the rounds: the SM partition prompt parts run on while other streams decode.
     prompt_sms: ?cuda.green.Partition = null,
+    /// With `prompt_sms`: the primary-context stream the partition's parts gather on, and the events ordering it.
+    relay: ?struct { stream: cuda.Stream, go: cuda.Event, back: cuda.Event } = null,
     /// TF_DS_FILL_WITH_ROUND=1 beside the rounds: a part asked for while streams decode goes out with the next
     /// round's record and is issued right after the round's work (`Lanes.pending`).
     with_round: bool = false,
@@ -2224,6 +2229,7 @@ pub const Engine = struct {
         errdefer e.comm.deinit();
         e.comm2 = null;
         e.prompt_sms = null;
+        e.relay = null;
         e.with_round = false;
         e.ring = null;
         e.rdma_mod = null;
@@ -2234,8 +2240,9 @@ pub const Engine = struct {
             // the rounds' Engram reader: TF_DS_ENGRAM_ROUND_THREADS, else as many workers as the prompt's
             const main_threads: usize = if (getenv("TF_DS_ENGRAM_THREADS")) |t| std.fmt.parseInt(usize, t, 10) catch 32 else 32;
             const threads: usize = if (getenv("TF_DS_ENGRAM_ROUND_THREADS")) |t| std.fmt.parseInt(usize, t, 10) catch main_threads else main_threads;
-            // TF_DS_PROMPT_SMS=N: parts issued while other streams decode run on a partition of at least N SMs
-            const sms: u32 = if (getenv("TF_DS_PROMPT_SMS")) |v| std.fmt.parseInt(u32, v, 10) catch 0 else 0;
+            // parts issued while other streams decode run on a partition of at least TF_DS_PROMPT_SMS SMs
+            // (0: every SM; cuda_native `prefill_overlap` weighs it)
+            const sms: u32 = if (getenv("TF_DS_PROMPT_SMS")) |v| std.fmt.parseInt(u32, v, 10) catch prompt_sms else prompt_sms;
             var narrow: ?cuda.Stream = null;
             if (sms > 0) {
                 e.prompt_sms = cuda.green.Partition.init(ctx.d, ctx.device, sms) catch |err| blk: {
@@ -2244,6 +2251,7 @@ pub const Engine = struct {
                 };
                 if (e.prompt_sms) |*pp| {
                     narrow = try pp.stream();
+                    e.relay = .{ .stream = try cuda.Stream.init(ctx.d, true), .go = try cuda.Event.init(ctx.d, false), .back = try cuda.Event.init(ctx.d, false) };
                     std.log.info("deepseek_v41 rank {d}: prompt parts beside decoding streams run on {d} SMs (TF_DS_PROMPT_SMS)", .{ s.rank, pp.sms });
                 }
             }
@@ -2305,6 +2313,11 @@ pub const Engine = struct {
         e.agree_send.free();
         e.streams.deinit();
         if (e.prompt_sms) |*pp| pp.deinit();
+        if (e.relay) |*r| {
+            r.go.deinit();
+            r.back.deinit();
+            r.stream.deinit();
+        }
         e.freeDrafter();
         if (e.engram) |g| g.deinit();
         e.fwd.deinit();
@@ -2381,6 +2394,16 @@ pub const Engine = struct {
 
     fn promptGatherFn(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
         const e: *Engine = @ptrCast(@alignCast(ctx));
+        // NCCL launches in the primary context only: a part on the SM partition hands its gathers to a stream of
+        // the primary context, in order with the part on both sides
+        if (e.relay) |*r| if (stream.handle != r.stream.handle and e.prompt_sms != null and e.streams.side.?.narrow != null and stream.handle == e.streams.side.?.narrow.?.handle) {
+            try r.go.record(stream);
+            try r.stream.wait(r.go);
+            try e.comm2.?.allGather(partial, out, words, .f32, r.stream.handle);
+            try r.back.record(r.stream);
+            try stream.wait(r.back);
+            return;
+        };
         try e.comm2.?.allGather(partial, out, words, .f32, stream.handle);
     }
 
