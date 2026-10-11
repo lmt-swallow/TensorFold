@@ -81,6 +81,50 @@ pub const Kv = enum {
     fn flag(k: Kv) i64 {
         return @intFromBool(k == .fp8);
     }
+
+    /// kv8.py `quantize_rows` on the host: one bf16 row (`row`, bf16 bits) as an FP8 cache row (`out`, `rowBytes`
+    /// long): its scale 2^(ceil(log2 amax) - 8), the biased exponent held within 1 .. 254 (a zero row: 2^-126), each
+    /// value times the scale's exact reciprocal to e4m3 rounding to nearest even (|x| stays within 256: nothing
+    /// saturates), the fp32 scale little-endian, 12 zero bytes; the bytes `_lat_write` and `_pool_keys` store.
+    pub fn quantizeRow(row: []const u16, out: []u8) void {
+        std.debug.assert(out.len == row.len + pad);
+        var amax: f32 = 0;
+        for (row) |x| amax = @max(amax, @abs(fromBf16(x)));
+        const bits: u32 = @bitCast(amax);
+        const e0: i32 = @intCast(((bits >> 23) & 0xFF) + @intFromBool(bits & 0x7FFFFF != 0));
+        const e = std.math.clamp(e0 - 8, 1, 254);
+        const scale: f32 = @bitCast(@as(u32, @intCast(e)) << 23);
+        const inv: f32 = @bitCast(@as(u32, @intCast(254 - e)) << 23);
+        for (row, out[0..row.len]) |x, *o| o.* = e4m3(fromBf16(x) * inv);
+        @memcpy(out[row.len..][0..4], std.mem.asBytes(&scale));
+        @memset(out[row.len + 4 ..], 0);
+    }
+
+    fn fromBf16(x: u16) f32 {
+        return @bitCast(@as(u32, x) << 16);
+    }
+
+    /// fp32 -> e4m3fn (bias 7, 3 mantissa bits, subnormals from 2^-9), rounding to nearest even, saturating at 448.
+    fn e4m3(v: f32) u8 {
+        const sign: u8 = if (std.math.signbit(v)) 0x80 else 0;
+        const a: f64 = @abs(@as(f64, v));
+        if (a < 0x1p-6) return sign | @as(u8, @intCast(rne(a * 0x1p9)));    // subnormal (8: the smallest normal)
+        var exp: i32 = std.math.ilogb(a);
+        var m = rne((a / std.math.ldexp(@as(f64, 1), exp) - 1) * 8);
+        if (m == 8) {
+            m = 0;
+            exp += 1;
+        }
+        const code: u32 = @as(u32, @intCast(exp + 7)) << 3 | m;
+        return sign | @as(u8, @intCast(@min(code, 0x7E)));
+    }
+
+    fn rne(x: f64) u32 {
+        const f = @floor(x);
+        const d = x - f;
+        const n: u32 = @intFromFloat(f);
+        return if (d > 0.5 or (d == 0.5 and n % 2 == 1)) n + 1 else n;
+    }
 };
 
 /// sparse.py `split_scratch`: select_split's int32s for R rows of np scores.
@@ -670,4 +714,38 @@ test "kv8.py's cache rows" {
     // rows stay 16-byte aligned (kv8.parts)
     try std.testing.expectEqual(@as(usize, 0), Kv.fp8.rowBytes(512) % 16);
     try std.testing.expectEqual(@as(usize, 0), Kv.fp8.rowBytes(128) % 16);
+}
+
+fn bf16Bits(v: f32) u16 {
+    return @intCast(@as(u32, @bitCast(v)) >> 16);
+}
+
+test "kv8.py's quantize_rows on the host" {
+    // amax 3: scale 2^-6, codes of 64x: 1 -> 64 (0x68), -0.5 -> -32 (0xe0), 0, 3 -> 192 (0x74); 136 / 128 = 1.0625
+    // ties to even (128: 0x70), 152 / 128 = 1.1875 ties up (160: 0x72); 2^-12 x 64 = 2^-6, the smallest normal (0x08);
+    // 2^-15 x 64 = 2^-9, the smallest subnormal (0x01)
+    const vals = [_]f32{ 1.0, -0.5, 0.0, 3.0, 136.0 / 64.0, 152.0 / 64.0, 0x1p-12, 0x1p-15 };
+    var row: [8]u16 = undefined;
+    for (vals, &row) |v, *b| b.* = bf16Bits(v);
+    var out: [8 + Kv.pad]u8 = undefined;
+    Kv.quantizeRow(&row, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 0x68, 0xe0, 0x00, 0x74, 0x70, 0x72, 0x08, 0x01 }, out[0..8]);
+    try std.testing.expectEqual(@as(f32, 0x1p-6), std.mem.bytesToValue(f32, out[8..12]));
+    try std.testing.expectEqualSlices(u8, &@as([12]u8, @splat(0)), out[12..]);
+    // every code times the scale gives back a value within half a step of the row's (relative 2^-4 at most)
+    for (vals, out[0..8]) |v, c| {
+        const mag: f32 = blk: {
+            const e: i32 = (c >> 3) & 0xF;
+            const m: f32 = @floatFromInt(c & 7);
+            break :blk if (e == 0) m * 0x1p-9 else (1 + m / 8) * std.math.ldexp(@as(f32, 1), e - 7);
+        };
+        const back = (if (c & 0x80 != 0) -mag else mag) * 0x1p-6;
+        try std.testing.expect(@abs(back - v) <= @abs(v) / 16);
+    }
+    // a zero row: scale 2^-126, zero codes
+    const zeros: [4]u16 = @splat(0);
+    var zout: [4 + Kv.pad]u8 = undefined;
+    Kv.quantizeRow(&zeros, &zout);
+    try std.testing.expectEqual(@as(f32, 0x1p-126), std.mem.bytesToValue(f32, zout[4..8]));
+    try std.testing.expectEqualSlices(u8, &@as([4]u8, @splat(0)), zout[0..4]);
 }
