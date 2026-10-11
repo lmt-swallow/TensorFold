@@ -156,7 +156,7 @@ pub fn layer0(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !vo
     defer wts.free();
     var xk_moe = try qfn.experts.Kernels.load(d);
     defer xk_moe.deinit();
-    var experts = try qfn.experts.Experts.load(gpa, d, &pack, &cfg, .{ .lm = 0 });
+    var experts = try qfn.experts.Experts.load(gpa, d, &pack, &cfg, .{ .lm = 0 }, null);
     defer experts.deinit();
     var moe_scratch = try qfn.experts.Scratch.init(d, &experts, rows, slots);
     defer moe_scratch.deinit();

@@ -7,6 +7,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
+const upload = @import("cuda_upload.zig");
 const weights = @import("cuda_weights.zig");
 const names = @import("weights_map.zig");
 
@@ -93,7 +94,8 @@ pub const Experts = struct {
     k2_d: [2]u32,
 
     /// Layer i's routed experts and its shared expert (exl3.py `expert_table`).
-    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *weights.Pack, cfg: *const Config, i: names.Where) !Experts {
+    /// With `up`, the trellises' copies are queued on it (landed once it finishes); else each is uploaded here.
+    pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, pack: *weights.Pack, cfg: *const Config, i: names.Where, up: ?*upload.Uploader) !Experts {
         const E = cfg.experts + 1;
         if (cfg.shared_width != cfg.moe_width) return error.UnsupportedShape; // one width I for the whole table
         const D = cfg.hidden;
@@ -120,6 +122,7 @@ pub const Experts = struct {
         };
         var trellis = try cuda.DeviceBuffer.alloc(d, total);
         errdefer trellis.free();
+        if (up != null) for (groups) |g| upload.prefetch(g.trellis);
         const ptrs = try gpa.alloc(i64, 3 * E);
         defer gpa.free(ptrs);
         const k2s = try gpa.alloc(i32, 3 * E);
@@ -129,7 +132,7 @@ pub const Experts = struct {
         var k2_d: [2]u32 = .{ 16, 2 };
         for (0..E) |e| for (0..3) |j| {
             const g = groups[3 * e + j];
-            try trellis.upload(at, g.trellis);
+            if (up) |u| try u.put(trellis, at, g.trellis) else try trellis.upload(at, g.trellis);
             ptrs[j * E + e] = @intCast(trellis.ptr + at);
             const k2: u32 = @intCast(g.w16 / 8);
             k2s[j * E + e] = @intCast(k2);

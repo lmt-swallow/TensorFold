@@ -228,7 +228,7 @@ pub const Head = struct {
                 .ai = 0,
             } },
             .router = try weights.router(gpa, d, pack_, cfg, at),
-            .experts = try experts.Experts.load(gpa, d, pack_, cfg, at),
+            .experts = try experts.Experts.load(gpa, d, pack_, cfg, at, null),
         };
         h.mixer = try weights.Hc.load(gpa, d, pack_, cfg, names.mtp ++ "hyper_connection_mixer", false, m.offset);
         // the draft vocabulary, then its rows of the main head

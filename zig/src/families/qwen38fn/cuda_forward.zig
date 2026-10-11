@@ -13,6 +13,7 @@ const weights = @import("cuda_weights.zig");
 const glue_mod = @import("cuda_glue.zig");
 const hc_mod = @import("cuda_hc.zig");
 const gdn = @import("cuda_gdn.zig");
+const upload = @import("cuda_upload.zig");
 const experts = @import("cuda_experts.zig");
 const attn = @import("cuda_attn.zig");
 const ngram = @import("ngram.zig");
@@ -140,6 +141,9 @@ pub const Model = struct {
         // seconds each kind of weight took (the load's summary line)
         var spent: struct { hc: f64 = 0, mixer: f64 = 0, experts: f64 = 0, other: f64 = 0 } = .{};
         const t_start = now(io);
+        // the experts' trellises (most of the pack's bytes) through pinned staging halves
+        var up = try upload.Uploader.init(d, 256 << 20);
+        defer up.deinit();
         for (0..layers) |i| {
             var l: Layer = undefined;
             l.index = i;
@@ -163,7 +167,7 @@ pub const Model = struct {
             }
             spent.mixer += lap(io, &t);
             l.router = try weights.router(gpa, d, &m.pack, &m.cfg, .{ .lm = i });
-            l.experts = try experts.Experts.load(gpa, d, &m.pack, &m.cfg, .{ .lm = i });
+            l.experts = try experts.Experts.load(gpa, d, &m.pack, &m.cfg, .{ .lm = i }, &up);
             spent.experts += lap(io, &t);
             l.ple = if (cfg.ple_layer != null and cfg.ple_layer.? == i) try weights.Ple.load(gpa, d, &m.pack, &m.cfg, &m.table.?, i, m.offset) else null;
             spent.other += lap(io, &t);
@@ -171,6 +175,8 @@ pub const Model = struct {
             made += 1;
         }
         var t = now(io);
+        try up.finish();
+        spent.experts += lap(io, &t);
         m.mixer = try weights.Hc.load(gpa, d, &m.pack, &m.cfg, names.mixer, false, m.offset);
         errdefer m.mixer.deinit();
         m.head = if (with_head) try linear(gpa, &m.xk, try m.pack.group(names.head)) else null;
