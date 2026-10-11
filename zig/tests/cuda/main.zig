@@ -32,6 +32,7 @@ const qwen38fn_shared = @import("qwen38fn_shared_tests.zig");
 const glm53_kda = @import("glm53_kda_tests.zig");
 const glm53_moe = @import("glm53_moe_tests.zig");
 const glm53_dsa = @import("glm53_dsa_tests.zig");
+const glm53_prompt = @import("glm53_prompt_tests.zig");
 const dsv41_ptx_lift_tests = @import("dsv41_ptx_lift_tests.zig");
 
 const usage =
@@ -72,6 +73,7 @@ const usage =
     \\  qwen38fn-prompt <work-dir> <model-dir>  Qwen3.8-Flash-Next prompt path (2,048-row chunks, then decode windows) against 0.6.6's fixture (qwen38fn/capture_prompt.sh)
     \\  qwen38fn-mtp <work-dir> <model-dir>  Qwen3.8-Flash-Next MTP drafting (draft head, head calls, rounds) against 0.6.6's serial drafted decoder (qwen38fn/capture_mtp.sh)
     \\  qwen38fn-shared <kernel-set> <model-dir>  Qwen3.8-Flash-Next shared rounds: four streams' logits, drafts and tokens the same alone and in one forward a round
+    \\  glm53-prompt <work-dir> <model-dir>  GLM-5.3-Flash prompt path (chunks, head, MTP absorb, commit) over layers 0 and 3 and the MTP layer on both ranks against the Mia fork's fixture (glm53/capture.sh prompt)
     \\  glm53-dsa <work-dir> <model-dir> [isolated]  GLM-5.3-Flash DSA layer 3 (indexer, top-512 pools, latent attention; then its MoE) on both ranks, runs a and l, against the Mia fork's fixture (glm53/capture.sh dsa)
     \\  glm53-moe <work-dir> <model-dir> [isolated]  GLM-5.3-Flash MoE block (router, EXL3 experts decode / prompt, shared expert) on both ranks against the Mia fork's fixture (glm53/capture.sh moe)
     \\  glm53-kda <work-dir> <model-dir> [isolated]  GLM-5.3-Flash embeddings + layer 0 (KDA, dense MLP) on both ranks against the Mia fork's fixture (glm53/capture.sh kda)
@@ -158,6 +160,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "qwen38fn-layers")) return qwen38fn_layers.layers(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2 and !std.mem.eql(u8, rest[2], "isolated") and !std.mem.eql(u8, rest[2], "all")) try std.fmt.parseInt(usize, rest[2], 10) else null, for (rest) |r| {
         if (std.mem.eql(u8, r, "isolated")) break true;
     } else false);
+    if (std.mem.eql(u8, cmd, "glm53-prompt")) return glm53_prompt.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "glm53-dsa")) return glm53_dsa.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "glm53-moe")) return glm53_moe.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "glm53-kda")) return glm53_kda.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
