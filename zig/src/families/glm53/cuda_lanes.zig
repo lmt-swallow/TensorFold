@@ -566,3 +566,31 @@ test "records the follower parses: a verify of two windows, a short one refused"
     var short: Reader = .{ .b = buf[0..3] };
     try std.testing.expect(short.skip(4) == null);
 }
+
+test "a follower runs only records whose slots hold what the step needs" {
+    var cfg: config.Config = undefined;
+    var l: Lanes = .{ .gpa = std.testing.allocator, .d = undefined, .lay = .{ .rank = 1, .world = 2, .cfg = &cfg }, .r = undefined, .comm = undefined, .capacity = 4096, .drafts = true, .op_buf = &.{}, .agree_send = undefined, .agree_recv = undefined };
+    var buf: [64]u8 = undefined;
+    // open: slot 0, drafts, two ids
+    var w: Writer = .{ .b = &buf };
+    w.byte(@intFromEnum(Op.open));
+    w.byte(0);
+    w.byte(1);
+    w.int(2);
+    w.int(5);
+    w.int(6);
+    try std.testing.expect(l.runnable(w.done()));
+    // one id short, or a slot past the last
+    try std.testing.expect(!l.runnable(w.done()[0 .. w.n - 1]));
+    buf[1] = max_streams;
+    try std.testing.expect(!l.runnable(w.done()));
+    // a verify names a slot without a sequence: refused
+    var v: Writer = .{ .b = &buf };
+    v.byte(@intFromEnum(Op.verify));
+    v.byte(1);
+    v.byte(0);
+    v.byte(1);
+    v.int(9);
+    try std.testing.expect(!l.runnable(v.done()));
+    try std.testing.expect(!l.runnable(&.{99}));
+}
