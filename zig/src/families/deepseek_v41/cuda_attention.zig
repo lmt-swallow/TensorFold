@@ -966,7 +966,11 @@ pub const Attention = struct {
         const vis = self.tab[2 * r .. 3 * r];
         const first = self.tab[3 * r .. 4 * r];
         const target = self.tab[4 * r .. 5 * r];
-        const scratch_row: i64 = @intCast(c.rows - 1);
+        // The rows that complete a group are every `ratio`-th from `done0`; only they store (`target` holds their
+        // groups, compact), as the fork's eager kv-source update. Storing the others into a shared scratch row (the
+        // fork's graph windows) leaves that row's bytes to whichever concurrent store lands last.
+        const done0: usize = if (ratio > 0) (ratio - 1 - start % ratio) % ratio else 0;
+        const done: usize = if (ratio > 0 and n > done0) (n - done0 + ratio - 1) / ratio else 0;
         for (0..n) |i| {
             const pv: i64 = @intCast(start + i);
             pos[i] = pv;
@@ -976,7 +980,7 @@ pub const Attention = struct {
                 vis[i] = @divFloor(pv + 1, rt);
                 const g = @divFloor(pv, rt);
                 first[i] = g * rt;
-                target[i] = if (@mod(pv + 1, rt) == 0) g else scratch_row;
+                if (i >= done0 and (i - done0) % ratio == 0) target[(i - done0) / ratio] = g;
             }
         }
         try self.uploads.begin();
@@ -985,7 +989,7 @@ pub const Attention = struct {
         if (ratio > 0) {
             try self.uploads.put(self.vis, 0, std.mem.sliceAsBytes(vis[0..n]), stream);
             try self.uploads.put(self.first, 0, std.mem.sliceAsBytes(first[0..n]), stream);
-            try self.uploads.put(self.target, 0, std.mem.sliceAsBytes(target[0..n]), stream);
+            if (done > 0) try self.uploads.put(self.target, 0, std.mem.sliceAsBytes(target[0..done]), stream);
         }
         const at_pos = try rr.at(rope, 0, self.pos.ptr, n, stream);
         const at_first: RopeAt = if (ratio > 0 and dm.kv_source) try rr.at(rope, 1, self.first.ptr, n, stream) else undefined;
@@ -1034,11 +1038,11 @@ pub const Attention = struct {
                     try p.idx_wk.?.run(self.s.lat.ptr, .bf16, n, self.s.xh.ptr, self.s.z.ptr, self.s.kraw.ptr, .bf16, stream);
                     try self.rmsnorm(self.s.kraw.ptr, p.idx_k_norm, self.s.k.ptr, n, dm.idx_dim, stream);
                     try self.ropeHeads(self.s.k.ptr, at_first, n, 1, dm.idx_dim, false, stream);
-                    try self.fp4Store(self.s.k.ptr, dm.idx_dim, c.idxk_codes.ptr, c.idxk_scales.ptr, self.target.ptr, n, 32, false, stream);
+                    if (done > 0) try self.fp4Store(self.s.k.ptr + done0 * dm.idx_dim * 2, ratio * dm.idx_dim, dm.idx_dim, c.idxk_codes.ptr, c.idxk_scales.ptr, self.target.ptr, done, 32, false, stream);
                 }
                 try self.s.lat2.copyFrom(0, self.s.lat.ptr, n * dm.hd * 2, stream.handle);
                 try self.ropeHeads(self.s.lat2.ptr, at_first, n, 1, dm.hd, false, stream);
-                try self.fp4Store(self.s.lat2.ptr, dm.hd, c.comp_codes.ptr, c.comp_scales.ptr, self.target.ptr, n, 16, true, stream);
+                if (done > 0) try self.fp4Store(self.s.lat2.ptr + done0 * dm.hd * 2, ratio * dm.hd, dm.hd, c.comp_codes.ptr, c.comp_scales.ptr, self.target.ptr, done, 16, true, stream);
             }
             // -- the indexer: scores over the visible compressed entries, the top-k picks -------------------------
             if (dm.index_source) {
@@ -1179,10 +1183,11 @@ pub const Attention = struct {
         }, &.{ aot.ci("H", @intCast(h)), aot.ci("HD", @intCast(hd)), aot.ci("RD", @intCast(self.dims.rd)), aot.ci("INV", @intFromBool(inverse)), aot.ci("HB", @intCast(hb)), aot.ci("PDL", 1) });
     }
 
-    /// Rows x bf16 [n, d] packed as FP4 (E2M1 codes, E4M3 or E8M0 scales per `block`) into cache rows `rows`.
-    fn fp4Store(self: *Attention, x: Ptr, d: usize, codes: Ptr, scales: Ptr, rows: Ptr, n: usize, block: usize, e4m3: bool, stream: cuda.Stream) !void {
+    /// Rows x bf16 [n, d] at a row stride of `xs` elements packed as FP4 (E2M1 codes, E4M3 or E8M0 scales per
+    /// `block`) into cache rows `rows` [n].
+    fn fp4Store(self: *Attention, x: Ptr, xs: usize, d: usize, codes: Ptr, scales: Ptr, rows: Ptr, n: usize, block: usize, e4m3: bool, stream: cuda.Stream) !void {
         try self.set.run(stream, "_fp4_store", .{ @intCast(n), 1, 1 }, &.{
-            aot.ptr("X", "*bf16", x), aot.int("xs", @intCast(d)), aot.ptr("CODES", "*u8", codes), aot.ptr("SCALES", "*u8", scales), aot.ptr("ROWS", "*i64", rows),
+            aot.ptr("X", "*bf16", x), aot.int("xs", @intCast(xs)), aot.ptr("CODES", "*u8", codes), aot.ptr("SCALES", "*u8", scales), aot.ptr("ROWS", "*i64", rows),
         }, &.{ aot.ci("D", @intCast(d)), aot.ci("BLOCK", @intCast(block)), aot.ci("E4M3", @intFromBool(e4m3)), aot.ci("PDL", 1) });
     }
 
