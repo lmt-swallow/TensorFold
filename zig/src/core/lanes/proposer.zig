@@ -40,6 +40,14 @@ pub const Params = struct {
 };
 
 /// Continuations backed by enough matching context; silent for a while after a run of rejected proposals.
+///
+/// The index maps every `ngram` tokens of the context to the positions they end at. A proposal is the continuation
+/// of the earlier occurrence whose match with the context's end is longest (counted back to `max_extension`
+/// tokens; the latest of equal length), at most `max_draft` tokens and never past the context's end; empty when
+/// that match is shorter than `min_match`. Proposals depend on the context alone (and on the silence `observe`
+/// sets): a context that extends the last one is indexed by its new tokens only, and one that is shorter, or whose
+/// `ngram` tokens ending at the last indexed length differ, is indexed afresh; either way the proposal equals a
+/// fresh lookup's. A context that replaces the last with the same tokens at that point is taken as an extension.
 pub const SuffixLookup = struct {
     gpa: Allocator,
     params: Params,
@@ -177,6 +185,8 @@ pub const SuffixLookup = struct {
         return s.out.items;
     }
 
+    /// A judged proposal: `accepted` of its `proposed` tokens landed. After `window` judged proposals in a row that
+    /// landed none, the next `silence_rounds` calls to `propose` return nothing.
     pub fn observe(s: *SuffixLookup, proposed: i64, accepted: i64) !void {
         s.judged_tokens += proposed;
         s.accepted_tokens += accepted;
@@ -202,4 +212,86 @@ test "suffix lookup copies the continuation after a repeated n-gram" {
     const got = try s.propose(&ctx, 3);
     try std.testing.expectEqualSlices(u32, &.{ 4, 5, 9 }, got);
     try std.testing.expectEqual(@as(i64, 3), s.last_match);
+}
+
+/// What `propose` returns by its contract, from a plain scan of the whole context.
+fn scanPropose(params: Params, context: []const u32, max_draft: i64, out: *std.ArrayList(u32), gpa: Allocator) !i64 {
+    out.clearRetainingCapacity();
+    const n = params.ngram;
+    if (max_draft <= 0 or context.len < n + 1) return 0;
+    const len = context.len;
+    var best_end: usize = 0;
+    var best_len: i64 = 0;
+    var end = len - 1;
+    while (end >= n) : (end -= 1) {
+        if (std.mem.eql(u32, context[end - n .. end], context[len - n .. len])) {
+            var length: i64 = 0;
+            const limit = @min(params.max_extension, @as(i64, @intCast(end)));
+            while (length < limit and context[end - 1 - @as(usize, @intCast(length))] == context[len - 1 - @as(usize, @intCast(length))]) length += 1;
+            if (length > best_len) {
+                best_len = length;
+                best_end = end;
+            }
+        }
+        if (end == n) break;
+    }
+    if (best_len < params.min_match) return best_len;
+    try out.appendSlice(gpa, context[best_end..@min(len, best_end + @as(usize, @intCast(max_draft)))]);
+    return best_len;
+}
+
+test "suffix lookup proposes what a plain scan finds, as the context grows and when it is replaced" {
+    const gpa = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(11);
+    const r = rng.random();
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(gpa);
+    for (0..150) |_| {
+        const params: Params = .{ .ngram = r.intRangeAtMost(usize, 1, 4), .min_match = 4, .max_extension = r.intRangeAtMost(i64, 4, 12) };
+        var rolling = try SuffixLookup.init(gpa, params);
+        defer rolling.deinit();
+        var ctx: std.ArrayList(u32) = .empty;
+        defer ctx.deinit(gpa);
+        const symbols = r.intRangeAtMost(u32, 2, 5);
+        for (0..r.intRangeAtMost(usize, 1, 160)) |_| {
+            // mostly appends (accepted tokens); now and then a shorter context, or one whose last token changed
+            // (a new request): the cases the contract detects
+            const roll = r.uintLessThan(u32, 20);
+            if (roll == 0 and ctx.items.len > 2) {
+                ctx.shrinkRetainingCapacity(r.uintLessThan(usize, ctx.items.len));
+            } else {
+                if (roll == 1 and ctx.items.len > 0) ctx.items[ctx.items.len - 1] = symbols;
+                for (0..r.intRangeAtMost(usize, 1, 6)) |_| try ctx.append(gpa, r.uintLessThan(u32, symbols));
+            }
+            const max_draft = r.intRangeAtMost(i64, 0, 9);
+            const got = try rolling.propose(ctx.items, max_draft);
+            var fresh = try SuffixLookup.init(gpa, params);
+            defer fresh.deinit();
+            const again = try fresh.propose(ctx.items, max_draft);
+            try std.testing.expectEqualSlices(u32, again, got);
+            if (roll > 1) {
+                // an extension: also what a plain scan of the whole context gives
+                const match = try scanPropose(params, ctx.items, max_draft, &want, gpa);
+                try std.testing.expectEqualSlices(u32, want.items, got);
+                // a proposal's match length (with none, `last_match` may keep an earlier call's)
+                if (got.len > 0) try std.testing.expectEqual(match, rolling.last_match);
+            }
+        }
+    }
+}
+
+test "suffix lookup falls silent after a window of rejected proposals" {
+    const gpa = std.testing.allocator;
+    var s = try SuffixLookup.init(gpa, .{ .ngram = 2, .min_match = 2, .window = 2, .silence_rounds = 3 });
+    defer s.deinit();
+    const ctx = [_]u32{ 1, 2, 3, 4, 5, 9, 1, 2, 3 };
+    try s.observe(3, 0);
+    try std.testing.expect((try s.propose(&ctx, 3)).len > 0);
+    try s.observe(3, 1); // a landed token breaks the run
+    try s.observe(3, 0);
+    try std.testing.expect((try s.propose(&ctx, 3)).len > 0);
+    try s.observe(3, 0);
+    for (0..3) |_| try std.testing.expectEqual(@as(usize, 0), (try s.propose(&ctx, 3)).len);
+    try std.testing.expectEqual(@as(i64, 3), s.silenced_rounds);
+    try std.testing.expect((try s.propose(&ctx, 3)).len > 0);
 }
