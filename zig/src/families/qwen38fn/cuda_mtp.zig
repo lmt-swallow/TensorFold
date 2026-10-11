@@ -325,7 +325,7 @@ pub const Head = struct {
             r += q.next.len;
         }
         if (r == 0) return;
-        try mb.ids.upload(0, std.mem.sliceAsBytes(ids[0..r]));
+        try mb.ids.uploadAsync(0, std.mem.sliceAsBytes(ids[0..r]), stream.handle);
         try h.forwardSegs(f, segs[0..reqs.len], mb, sc, stream);
         for (reqs) |q| try q.st.setMtpLen(q.st.mtp_len + q.next.len, stream);
         // the chaining streams: each request's index, its logits row and its streams' row in mb.streams
@@ -362,7 +362,7 @@ pub const Head = struct {
                 ids[i] = @intCast(x.tok);
                 try sc.in.copyFrom(i * wide * 2, mb.streams.ptr + x.row * wide * 2, wide * 2, stream.handle);
             }
-            try mb.ids.upload(0, std.mem.sliceAsBytes(ids[0..nn]));
+            try mb.ids.uploadAsync(0, std.mem.sliceAsBytes(ids[0..nn]), stream.handle);
             try h.forwardSegs(f, segs[0..nn], mb, sc, stream);
             for (nxt[0..nn], 0..) |x, i| {
                 const st = reqs[x.q].st;
@@ -394,7 +394,7 @@ pub const Head = struct {
     /// with their next tokens; no draft logits are read.
     pub fn forwardPrompt(h: *Head, p: *prompt_mod.Prompt, st: *fwd.Stream, pb: *prompt_mod.Buffers, sc: *Scratch, next: []const i32, streams_in: Ptr, stream: cuda.Stream) !void {
         const n = next.len;
-        try pb.ids.upload(0, std.mem.sliceAsBytes(next));
+        try pb.ids.uploadAsync(0, std.mem.sliceAsBytes(next), stream.handle);
         try h.inputs(p.f, pb.ids.ptr, &pb.w, sc, streams_in, n, stream, .{ .p = p, .pb = pb }, null);
         try p.layerStep(&h.layer, st, pb, n, .none, st.mtpAt(), stream);
         try p.finish(&h.mixer, pb, n, p.moePending(pb), stream);

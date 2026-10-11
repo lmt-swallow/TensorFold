@@ -259,7 +259,7 @@ pub const Prompt = struct {
     pub fn stage(p: *Prompt, st: *fwd.Stream, b: *Buffers, tokens: []const i32, stream: cuda.Stream) !void {
         const R = tokens.len;
         if (R > b.rows) return error.WindowTooLarge;
-        try b.ids.upload(0, std.mem.sliceAsBytes(tokens));
+        try b.ids.uploadAsync(0, std.mem.sliceAsBytes(tokens), stream.handle);
         const m = p.f.m;
         if (m.ng) |*g| {
             const heads = g.heads();

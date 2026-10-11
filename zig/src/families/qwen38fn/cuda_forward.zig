@@ -501,7 +501,7 @@ pub const Forward = struct {
         const R = try segRows(segs);
         if (R != tokens.len) return error.BadSegments;
         if (R > b.rows) return error.WindowTooLarge;
-        try b.ids.upload(0, std.mem.sliceAsBytes(tokens));
+        try b.ids.uploadAsync(0, std.mem.sliceAsBytes(tokens), stream.handle);
         if (f.m.ng) |*g| {
             const heads = g.heads();
             const t = &f.m.table.?;
