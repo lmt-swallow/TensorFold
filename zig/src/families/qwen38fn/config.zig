@@ -55,6 +55,13 @@ pub const Config = struct {
     bits_x100: usize, // the pack's average bits per weight, x100 (305 for 3.05bpw)
     head_bits: usize,
     mtp_layers: usize,
+    ngram: usize, // ngram_size
+    heads_per_ngram: usize,
+    ngram_base: u64, // ngram_vocab_size_base
+    ngram_shards: usize, // split_ngram_parts
+    seed: u64,
+    ple_kernel: usize,
+    ple_eos: i64, // the text config's eos_token_id (the n-gram's segment break)
 
     /// Channels of the DeltaNet depthwise conv: q | k | v.
     pub fn convDim(c: *const Config) usize {
@@ -178,6 +185,20 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, why: *Why) !Config {
         .bits_x100 = @intFromFloat(@round(try float(q.object.get("bits") orelse .{ .integer = 0 }) * 100)),
         .head_bits = try intOr(q.object, "head_bits", 0),
         .mtp_layers = try intOr(t, "mtp_num_hidden_layers", 0),
+        .ngram = try intOr(t, "ngram_size", 3),
+        .heads_per_ngram = try intOr(t, "heads_per_ngram", 8),
+        .ngram_base = try intOr(t, "ngram_vocab_size_base", 20_000_000),
+        .ngram_shards = try intOr(t, "split_ngram_parts", 128),
+        .seed = try intOr(t, "seed", 1234),
+        .ple_kernel = try intOr(t, "ple_conv_kernel_size", 4),
+        .ple_eos = 0,
+    };
+    if (t.get("eos_token_id")) |v| switch (v) {
+        .integer => |x| c.ple_eos = x,
+        .array => |a| if (a.items.len > 0 and a.items[0] == .integer) {
+            c.ple_eos = a.items[0].integer;
+        },
+        else => {},
     };
     if (ple_ids) |v| if (v == .array) {
         if (v.array.items.len > 1) {
@@ -228,6 +249,8 @@ test "parse the 3.05bpw pack's config" {
     try std.testing.expectEqual(@as(usize, 5), c.head_bits);
     try std.testing.expectEqual(@as(usize, 64), c.rotary_dim);
     try std.testing.expectEqual(@as(usize, 262144), c.max_positions);
+    try std.testing.expectEqual(@as(i64, 248044), c.ple_eos);
+    try std.testing.expectEqual(@as(usize, 128), c.ngram_shards);
 }
 
 test "refuse a non-EXL3 pack and a YaRN rope before any allocation" {

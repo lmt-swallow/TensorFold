@@ -90,6 +90,7 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     const qwen38fn = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen38fn/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     qwen38fn.addImport("cuda", cuda);
     qwen38fn.addImport("core", core);
+    qwen38fn.addImport("dsv41", dsv41); // its EXL3 linear (0.6.6's kernel body) until that moves to the core
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41, .qwen38fn = qwen38fn };
 }
 

@@ -28,7 +28,7 @@ pub const Window = struct {
     proj: cuda.DeviceBuffer, // bf16 [rows, PW]: one DeltaNet layer's projection rows
     gout: cuda.DeviceBuffer, // bf16 [rows, nv * dv]
     gxs: cuda.DeviceBuffer,
-    tmp: cuda.DeviceBuffer, // bf16 [rows, widest projection part] (exl3_mm Scratch.tmp)
+    tmp: cuda.DeviceBuffer, // bf16 [rows, widest projection part: DeltaNet qkv, attention q with its gate] (exl3_mm Scratch.tmp)
 
     pub fn init(d: *const cuda.Driver, cfg: *const Config, rows: usize, part_floats: usize) !Window {
         var w: Window = undefined;
@@ -43,7 +43,7 @@ pub const Window = struct {
             .{ &w.mixed, rows * cfg.hidden * 2 },               .{ &w.xs_mixed, rows * cfg.hidden / 32 * 4 },
             .{ &w.branch, rows * cfg.hidden * 2 },              .{ &w.proj, rows * cfg.projWidth() * 2 },
             .{ &w.gout, rows * cfg.nv * cfg.dv * 2 },           .{ &w.gxs, rows * cfg.nv * cfg.dv / 32 * 4 },
-            .{ &w.tmp, rows * @max(cfg.convDim(), cfg.nv * cfg.dv) * 2 },
+            .{ &w.tmp, rows * @max(@max(cfg.convDim(), cfg.nv * cfg.dv), cfg.heads * 2 * cfg.head_dim) * 2 },
         };
         var made: usize = 0;
         errdefer for (sizes[0..made]) |s| s[0].free();
@@ -69,8 +69,13 @@ pub fn block(g: Glue, w: *Window, hc: *const weights.Hc, cfg: *const Config, row
 /// forward.py `_readout_plain` for an EXL3 pack (fp16 down and up, a decode window: the down projection's slices
 /// summed inside the activation).
 pub fn readout(g: Glue, w: *Window, hc: *const weights.Hc, cfg: *const Config, rows: usize, inject_out: Ptr, stream: cuda.Stream) !void {
+    return readoutOf(g, w, w.h.ptr, hc, cfg, rows, inject_out, stream);
+}
+
+/// `readout` of the streams at `h` (the head reads a copy of the window's streams).
+pub fn readoutOf(g: Glue, w: *Window, h: Ptr, hc: *const weights.Hc, cfg: *const Config, rows: usize, inject_out: Ptr, stream: cuda.Stream) !void {
     const wide = cfg.wide();
-    try g.hcNormed(w.h.ptr, w.pss.ptr, hc.scale.ptr, w.normed.ptr, w.xs_normed.ptr, cfg.eps, rows, stream);
+    try g.hcNormed(h, w.pss.ptr, hc.scale.ptr, w.normed.ptr, w.xs_normed.ptr, cfg.eps, rows, stream);
     try g.f16mm(&hc.down, w.normed.ptr, wide, rows, w.part.ptr, 0, true, stream);
     try g.hcReduceAct(w.part.ptr, hc.down.sk, hc.down.n, w.act.ptr, w.xs_act.ptr, inject_out, rows, stream);
     try g.f16Call(&hc.up, w.act.ptr, cfg.low, rows, w.up.ptr, wide, w.part.ptr, stream);
