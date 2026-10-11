@@ -420,6 +420,7 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
         gpa.free(raws[ri]);
         gpa.free(next[ri]);
     };
+    const split = cs[0].splits();
     var plans: [2][]P.Op = undefined;
     for (0..2) |ri| plans[ri] = try cs[ri].plan(gpa);
     defer for (plans) |x| gpa.free(x);
@@ -454,7 +455,7 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
             if (x.copy) |cp| {
                 const dst: Buf = .{ .d = h.d, .ptr = cp.dst, .len = cp.bytes };
                 try dst.copyFrom(0, cp.src, cp.bytes, h.stream.handle);
-            } else if (x.recv == ranks[ri].p.b.gath.ptr or x.recv == ranks[ri].p.mb.gath.ptr) {
+            } else if (x.recv == ranks[ri].p.mb.gath.ptr or (!split and x.recv == ranks[ri].p.b.gath.ptr)) {
                 // the reference's all-gathers are traced (forward.py `gather`); the split's swaps are not
                 h.on(ri, step);
                 try h.call("gather", "ret", x.recv);
