@@ -101,6 +101,7 @@ pub const Tier = struct {
         fork_pool: usize = 0,
         refs: u32 = 0, // aliases reading through this stream
         pending: bool = false, // closed by its owner, kept for its aliases
+        favored: bool = false, // its pools leave only after every other stream's could not (a prompt being filled)
     };
 
     /// `slab` (run_pools * block bytes a run, whole runs) and `map` (streams * layers * capacity / 4 entries) are the
@@ -661,10 +662,19 @@ pub const Tier = struct {
         }
     }
 
+    /// Whether a slot's pool may leave: written and named by no current fetch; in the first pass (`hot`) also
+    /// neither named in the last hot_windows windows nor a favored stream's.
     fn evictable(t: *const Tier, slot: usize, hot: bool) bool {
         const k = t.owner[slot];
         if (k == none or !t.persisted.isSet(k) or t.pin[slot] == t.gen) return false;
-        return !hot or t.used[slot] +% t.o.hot_windows <= t.window;
+        if (!hot) return true;
+        return t.used[slot] +% t.o.hot_windows <= t.window and !t.streams[k / t.pools / t.o.layers].favored;
+    }
+
+    /// Stream `s`'s pools stay ahead of every other stream's (a prompt being filled keeps its whole context, so its
+    /// chunks' selections read nothing), or no longer.
+    pub fn favor(t: *Tier, s: usize, on: bool) void {
+        t.streams[s].favored = on;
     }
 
     fn evict(t: *Tier, slot: usize) void {
@@ -1250,6 +1260,31 @@ test "load: a whole drawn cache, then windows and selections over it" {
         try t.commit(0, pos + 3);
         try t.check();
     }
+}
+
+test "a favored stream's pools stay while another stream's selections fill the slab" {
+    var prng = std.Random.DefaultPrng.init(0xfa7);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = 2, .layers = 1, .capacity = 16 * seg_positions, .recent_runs = 1, .hot_windows = 0, .depth = 16 };
+    const f = try Fixture.init(o, 17, 8);
+    defer f.deinit();
+    const t = &f.tier;
+    for (0..2) |s| try t.open(s, 1);
+    for (0..2) |s| {
+        var pos: usize = 0;
+        while (pos < 10 * seg_positions) : (pos += seg_positions) {
+            try f.write(rnd, s, pos, seg_positions);
+            try t.commit(s, pos + seg_positions);
+        }
+    }
+    // stream 0 favored and wholly resident; stream 1's selections over its whole context churn the rest
+    t.favor(0, true);
+    try t.ensureRange(0, 0, f.end[0]);
+    for (0..200) |_| try f.select(rnd, 1, 1, 256);
+    const reads = t.reads;
+    try t.ensureRange(0, 0, f.end[0]);
+    try testing.expectEqual(reads, t.reads);
+    try t.check();
 }
 
 test "prefetchRange brings a layer's whole context back" {

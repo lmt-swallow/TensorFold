@@ -211,6 +211,11 @@ pub const Tier = struct {
         try t.host.alias(src, dst, rows);
     }
 
+    /// kv_tier.Tier.favor: stream `s`'s pools stay ahead of the others' (on while its prompt is filled).
+    pub fn favor(t: *Tier, s: usize, on: bool) void {
+        t.host.favor(s, on);
+    }
+
     /// kv_tier.Tier.acquire: a free stream opened with `layers` layers.
     pub fn acquire(t: *Tier, layers: usize) !usize {
         return t.host.acquire(layers);
