@@ -98,10 +98,10 @@ pub fn layers(gpu: Gpu, work: []const u8, model: []const u8, n_layers: ?usize, i
     const probe: F.Probe = .{ .ctx = &ctx, .layer_in = Ctx.layerIn, .layer_out = Ctx.layerOut };
 
     // a warm-up the fixture ran unrecorded (dump_layers.py --warm): the same windows of 16 rows
-    const warm_bytes = try fx.bytes("warm_ids");
-    defer gpa.free(warm_bytes);
-    const warm_n: usize = @intCast(try fx.int("warm"));
+    const warm_n: usize = @intCast(fx.int("warm") catch 0); // fixtures from before --warm have neither
     if (warm_n > 0) {
+        const warm_bytes = try fx.bytes("warm_ids");
+        defer gpa.free(warm_bytes);
         const warm = std.mem.bytesAsSlice(i32, @as([]align(4) u8, @alignCast(warm_bytes)));
         var w0: usize = 0;
         while (w0 < warm_n) : (w0 += rows) {
