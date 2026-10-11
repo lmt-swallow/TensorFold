@@ -47,11 +47,12 @@ def count(url: str, text: str) -> int:
         return int(json.loads(r.read())["count"])
 
 
-def long_text(url: str, tokens: int, needle: bool) -> str:
-    """Filler of about `tokens` tokens, the needle in its middle when asked for."""
+def long_text(url: str, tokens: int, needle: bool, tag: str) -> str:
+    """Filler of about `tokens` tokens after an opening line of its own (`tag`: no two long prompts share a prefix,
+    so no kept prompt state shortens a prefill), the needle in its middle when asked for."""
     per = count(url, FILLER * 64) / 64
     n = int(tokens / per)
-    parts = [FILLER] * n
+    parts = [f"Document {tag}, filed for review. "] + [FILLER] * n
     if needle:
         parts.insert(n // 2, NEEDLE + " ")
     return "".join(parts)
@@ -78,11 +79,12 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8888")
     ap.add_argument("--out", required=True)
     ap.add_argument("--tokens", type=int, default=512)
+    ap.add_argument("--tag", default="1", help="the prefill prompts' own opening (a fresh one each run)")
     ap.add_argument("--only", help="one prompt (code, prose, structured, needle64k) and no prefill runs")
     a = ap.parse_args()
     prompts = dict(PROMPTS)
     if a.only != "code" and a.only not in PROMPTS:
-        prompts["needle64k"] = long_text(a.url, 64_000, True) + "\n\nWhat is the verification code for the archive?"
+        prompts["needle64k"] = long_text(a.url, 64_000, True, "N-64") + "\n\nWhat is the verification code for the archive?"
     if a.only:
         prompts = {a.only: prompts[a.only]}
     result: dict = {"url": a.url, "max_tokens": a.tokens, "prompts": {}, "prefill": {}}
@@ -99,15 +101,17 @@ def main() -> int:
         print(f"{name:11s} sha {runs[0]['sha']} same {same} serial {serial} tokens {len(runs[0]['ids'])} "
               f"prompt {runs[0]['prompt_tokens']} rounds {s.get('rounds')} tok/round {s.get('tokens_per_round')} "
               f"drafted {s.get('drafted')} accepted {s.get('accepted')} min_rows {s.get('min_rows')} "
-              f"prefill {s.get('prefill_s')} s, decode {dec:.1f} tok/s", flush=True)
+              f"prefill {s.get('prefill_s')} s (cached {s.get('cached')}), decode {dec:.1f} tok/s", flush=True)
     for k in (() if a.only else (32_000, 128_000)):
-        r = ask(a.url, long_text(a.url, k, False) + "\n\nSummarize the text in one sentence.", 1, True)
+        r = ask(a.url, long_text(a.url, k, False, f"P-{k}-{a.tag}") + "\n\nSummarize the text in one sentence.", 1, True)
         s = r["stats"]
         pre = s.get("prefill_s")
         rate = r["prompt_tokens"] / pre if pre else None
         result["prefill"][str(k)] = {"prompt_tokens": r["prompt_tokens"], "prefill_s": pre, "tok_s": rate,
+                                     "cached": s.get("cached"),
                                      "wall_s": r["wall_s"], "stats": s}
-        print(f"prefill {r['prompt_tokens']} tokens: {pre} s, {rate} tok/s (wall {r['wall_s']:.1f} s)", flush=True)
+        print(f"prefill {r['prompt_tokens']} tokens (cached {s.get('cached')}): {pre} s, {rate} tok/s "
+              f"(wall {r['wall_s']:.1f} s)", flush=True)
     with open(a.out, "w") as f:
         json.dump(result, f, indent=1)
     print("ALL DETERMINISTIC AND EXACT" if ok else "MISMATCH: see the table above")

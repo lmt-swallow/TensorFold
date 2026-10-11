@@ -53,7 +53,7 @@ def main() -> int:
 
     rec = ck.load_recorder(a.tools)
     from tensorfold.families.glm5_next.cuda import forward as F
-    from tensorfold.families.glm5_next.cuda.engine import Engine
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine as Engine
 
     eng = Engine(Path(a.model), rank=a.rank, master=a.master, port=a.port, world=2, drafter=None, context=8192,
                  graphs=False)
