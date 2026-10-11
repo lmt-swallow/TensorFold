@@ -133,9 +133,12 @@ pub const Runner = struct {
     pmodel: Pm.Model,
     stage_part: Buf, // the prompt path's gather staging (prompt.Prompt)
     stage_rows: Buf,
+    argmax_mod: cuda.Module,
+    argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu): each row's first largest
+    picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_part = undefined, .stage_rows = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_part = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined };
         r.w = try M.Work.init(d, lay, batch_rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -150,12 +153,19 @@ pub const Runner = struct {
         errdefer r.stage_part.free();
         r.stage_rows = try Buf.alloc(d, (prompt_rows + 2) * lay.cfg.hidden * 2);
         errdefer r.stage_rows.free();
+        r.argmax_mod = try cuda.Module.load(d, cuda.kernels.torch_argmax);
+        errdefer r.argmax_mod.unload();
+        r.argmax_fn = try r.argmax_mod.function("tf_argmax_rows_i32_kernel");
+        r.picks = try Buf.alloc(d, batch_rows * 4 + (1 + lay.world) * 2 * batch_rows * 4);
+        errdefer r.picks.free();
         r.players = try gpa.alloc(Pm.Layer, model.layers.len);
         r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
         return r;
     }
 
     pub fn deinit(r: *Runner) void {
+        r.picks.free();
+        r.argmax_mod.unload();
         r.w.deinit();
         r.mb.deinit();
         r.pmb.deinit();
@@ -232,6 +242,49 @@ pub const Runner = struct {
             p.* = 1.0 / z;
         }
         return all[0].id;
+    }
+
+    /// `sample` with k = 1 of rows a0 .. a0 + n of `logits` at once into `out`, the same token for every row whose
+    /// logits hold no NaN (the kernel takes a NaN as the largest, `sample` passes it over): each rank's first largest
+    /// value a row on the device (the lowest id of equals, -0 equal to +0), every rank's (value, id) a row in one
+    /// gather, the larger value, then the lower id.
+    pub fn greedyRows(r: *Runner, logits: Buf, a0: usize, n: usize, out: []u32) !void {
+        if (n == 0) return;
+        if (n > batch_rows) return error.WindowTooWide;
+        const nv = r.host.len;
+        var a: cuda.Args = .{};
+        a.add(logits.ptr + a0 * nv * 2);
+        a.add(r.picks.ptr);
+        for ([_]usize{ n, nv, nv }) |x| a.add(@as(i64, @intCast(x)));
+        a.add(@as(i32, 0)); // bf16
+        try cuda.launch.launch(r.argmax_fn, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, r.stream, &a);
+        var ids: [batch_rows]i32 = undefined;
+        try r.stream.synchronize();
+        try r.picks.download(0, std.mem.sliceAsBytes(ids[0..n]));
+        var mine: [2 * batch_rows]f32 = undefined;
+        for (ids[0..n], 0..) |id, row| {
+            if (id < 0) return error.BadLogits;
+            var v: u16 = undefined;
+            try logits.download(((a0 + row) * nv + @as(usize, @intCast(id))) * 2, std.mem.asBytes(&v));
+            mine[row] = @bitCast(@as(u32, v) << 16);
+            mine[n + row] = @bitCast(@as(u32, @intCast(r.lay.rank * nv + @as(usize, @intCast(id)))));
+        }
+        const send = batch_rows * 4;
+        const recv = send + 2 * batch_rows * 4;
+        try r.picks.upload(send, std.mem.sliceAsBytes(mine[0 .. 2 * n]));
+        try r.link.gather(r.link.ctx, r.picks.ptr + send, r.picks.ptr + recv, 2 * n, r.stream);
+        try r.stream.synchronize();
+        var every: [config.world * 2 * batch_rows]f32 = undefined;
+        const world = r.lay.world;
+        try r.picks.download(recv, std.mem.sliceAsBytes(every[0 .. world * 2 * n]));
+        for (out[0..n], 0..) |*o, row| {
+            var best: Cand = .{ .v = every[row], .id = @bitCast(every[n + row]) };
+            for (1..world) |rk| {
+                const c: Cand = .{ .v = every[rk * 2 * n + row], .id = @bitCast(every[rk * 2 * n + n + row]) };
+                if (better({}, c, best)) best = c;
+            }
+            o.* = best.id;
+        }
     }
 
     fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr) !void {
@@ -313,9 +366,11 @@ pub const Runner = struct {
             R += n;
         }
         try M.forwardSegs(r.k, r.lay, r.model, segs[0..wins.len], &r.w, R, r.gather(), r.stream);
+        var drawn: [batch_rows]u32 = undefined;
+        try r.greedyRows(r.w.logits, 0, R, &drawn);
         for (wins, segs[0..wins.len]) |w, sg| {
             try w.q.last.copyFrom(0, r.w.fnormed.ptr + sg.a0 * D * 2, sg.n * D * 2, r.stream.handle);
-            for (0..sg.n) |row| w.out[row] = try r.sample(r.w.logits, sg.a0 + row, 1, null);
+            @memcpy(w.out[0..sg.n], drawn[sg.a0..][0..sg.n]);
         }
     }
 
