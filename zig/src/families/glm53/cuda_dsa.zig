@@ -15,6 +15,7 @@ const config = @import("config.zig");
 const map = @import("weights_map.zig");
 const glue_mod = @import("cuda_glue.zig");
 const weights = @import("cuda_weights.zig");
+const tier_mod = @import("cuda_tier.zig");
 
 const Glue = glue_mod.Glue;
 pub const Kv = glue_mod.Kv;
@@ -136,6 +137,9 @@ pub const Dsa = struct {
     }
 };
 
+/// A cache's latent rows on the tier: stream `h`'s layer `layer`.
+pub const TierRef = struct { t: *tier_mod.Tier, h: usize, layer: usize };
+
 /// One stream's caches of one DSA layer (forward.py `Caches` bound to a stream): the latent rows [cap, kv_lora], the
 /// indexer's key and gate ring [ring, index_dim] bf16 (token t at t % ring) and the pooled keys [cap / 4 + 2,
 /// index_dim]; the latent rows and pooled keys in the format `kv` (TF_GLM_KV: bf16, or fp8's rows of
@@ -151,6 +155,9 @@ pub const Cache = struct {
     ring: usize,
     kv: Kv,
     owned: bool = true, // latent and pk are this cache's allocations, not a pool's
+    /// The latent rows on the tier (cuda_tier.zig: a slab of resident pools, the rest on NVMe) instead of `latent`:
+    /// the latent write, dense and sparse attention take their addresses from it, the kernels and bits unchanged.
+    tier: ?TierRef = null,
 
     pub fn init(d: *const cuda.Driver, c: *const config.Config, capacity: usize, ring: usize, kv: Kv) !Cache {
         var s = try rings(d, c, ring, kv);
@@ -399,7 +406,7 @@ pub fn dsaIndex(g: Glue, lay: config.Layout, a: *const Dsa, s: *const Scratch, n
 pub fn dsaAttend(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, r0: usize, stream: cuda.Stream) !void {
     const sel = s.selection(0);
     try dsaSelect(g, lay, a, cache, s, call, r0, sel, stream);
-    try dsaAttendRows(g, lay, a, cache, s, call, r0, sel, stream);
+    try dsaAttendRows(g, lay, a, cache, s, call, r0, sel, null, stream);
 }
 
 /// Where one stream's selected tokens [R, 2051] i32 and their counts [R] go.
@@ -413,14 +420,20 @@ pub fn dsaSelect(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache
     const lw = c.kv_lora;
     const ikw = c.index_dim + c.index_heads;
     const ikr = s.ikr.ptr + r0 * ikw * 2;
-    try g.latWrite(s.lat.ptr + r0 * lw * 2, lw, cache.latent.ptr, cache.kv, call.pos_dev, R, lw, stream);
+    const lat = s.lat.ptr + r0 * lw * 2;
+    if (cache.tier) |tr| {
+        // one piece, or two across a tier segment's end (a copy of rows: the same bytes)
+        for (try tr.t.writes(tr.h, tr.layer, call.host_pos, R, call.pos_dev)) |pc| if (pc) |p| {
+            try g.latWrite(lat + (p.pos - call.host_pos) * lw * 2, lw, p.base, cache.kv, p.pos_dev, p.rows, lw, stream);
+        };
+    } else try g.latWrite(lat, lw, cache.latent.ptr, cache.kv, call.pos_dev, R, lw, stream);
     try g.indexUpdate(ikr, ikw, s.igr.ptr + r0 * c.index_dim * 4, a.ln_w.ptr, a.ln_b.ptr, a.ape.ptr, cache.ik.ptr, cache.ig.ptr, cache.ring, cache.pk.ptr, cache.kv, call.pos_dev, R, stream);
     if (sparseRows(c, call.host_pos, R)) try selectTokens(g, s, cache, call, s.qi.ptr + r0 * c.index_heads * c.index_dim * 2, ikr + c.index_dim * 2, ikw, sel.tokens, sel.counts, stream);
 }
 
 /// One stream's attention over its rows [r0, r0 + call.R) after `dsaSelect`: dense up to the dense limit, past it
 /// over the selected tokens in `sel`, into the read-out rows from r0.
-pub fn dsaAttendRows(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, r0: usize, sel: Selection, stream: cuda.Stream) !void {
+pub fn dsaAttendRows(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const Cache, s: *const Scratch, call: Call, r0: usize, sel: Selection, resolved: ?tier_mod.Tier.Resolved, stream: cuda.Stream) !void {
     const c = lay.cfg;
     const R = call.R;
     const H = a.heads;
@@ -431,13 +444,15 @@ pub fn dsaAttendRows(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const C
     const all_sparse = call.host_pos >= limit;
     const sparse_rows = sparseRows(c, call.host_pos, R);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(c.qk_dim), -0.5));
+    // dense attention reads positions [0, pos + R) at one base: the tier's home block holds [0, 6,144)
+    const dense_base = if (cache.tier) |tr| tr.t.denseBase(tr.h, tr.layer) else cache.latent.ptr;
     if (!all_sparse) {
         // rows past the dense limit are recomputed sparsely below: the dense pass takes the rows before it
         const dense = if (sparse_rows) @min(R, limit -| call.host_pos) else R;
         const nch = @min(call.nch, s.nch);
         const hb = headBlock(R);
         if (dense <= s.part_rows) {
-            try g.denseAttention(qa, cache.latent.ptr, cache.kv, call.pos_dev, s.dense, ol, dense, H, lw, nch, hb, scale, stream);
+            try g.denseAttention(qa, dense_base, cache.kv, call.pos_dev, s.dense, ol, dense, H, lw, nch, hb, scale, stream);
         } else {
             var q0: usize = 0;
             var i: usize = 0;
@@ -447,15 +462,18 @@ pub fn dsaAttendRows(g: Glue, lay: config.Layout, a: *const Dsa, cache: *const C
             }) {
                 const q1 = @min(dense, q0 + s.part_rows);
                 const at = try devicePos(s, .dense, i, call.host_pos + q0, stream);
-                try g.denseAttention(qa + q0 * H * lw * 2, cache.latent.ptr, cache.kv, at, s.dense, ol + q0 * H * lw * 2, q1 - q0, H, lw, nch, hb, scale, stream);
+                try g.denseAttention(qa + q0 * H * lw * 2, dense_base, cache.kv, at, s.dense, ol + q0 * H * lw * 2, q1 - q0, H, lw, nch, hb, scale, stream);
             }
         }
     }
     if (sparse_rows) {
+        // on the tier: the selected pools made resident, the positions remapped to slab rows (sel kept); a round's
+        // streams may resolve together first (cuda_tier.resolveMany) and pass `resolved`
+        const sp: tier_mod.Tier.Resolved = if (resolved) |x| x else if (cache.tier) |tr| try tr.t.resolve(tr.h, tr.layer, sel.tokens, sel.counts, R, glue_mod.sparse_tokens, stream) else .{ .base = cache.latent.ptr, .tokens = sel.tokens };
         if (s.prefill) {
-            try g.sparseOnepass(qa, cache.latent.ptr, cache.kv, sel.tokens, sel.counts, ol, R, H, lw, glue_mod.sparse_tokens, scale, stream);
+            try g.sparseOnepass(qa, sp.base, cache.kv, sp.tokens, sel.counts, ol, R, H, lw, glue_mod.sparse_tokens, scale, stream);
         } else {
-            try g.sparseAttention(qa, cache.latent.ptr, cache.kv, sel.tokens, sel.counts, s.sparse, ol, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
+            try g.sparseAttention(qa, sp.base, cache.kv, sp.tokens, sel.counts, s.sparse, ol, R, H, lw, glue_mod.sparse_tokens, headBlock(R), scale, stream);
         }
     }
 }

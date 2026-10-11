@@ -297,7 +297,7 @@ pub fn forwardSegs(k: Kernels, lay: config.Layout, m: *const Model, segs: []cons
             try A.dsaIndex(k.g, lay, a, &w.ds, b.normed.ptr, b.sk.ptr, R, sparse, stream);
             // every stream's selection, then every stream's attention (a tier resolves all selections between)
             for (segs, 0..) |sg, i| try A.dsaSelect(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), stream);
-            for (segs, 0..) |sg, i| try A.dsaAttendRows(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), stream);
+            for (segs, 0..) |sg, i| try A.dsaAttendRows(k.g, lay, a, &sg.st.caches[li], &w.ds, segCall(b, sg), sg.a0, w.ds.selection(i), null, stream);
             try A.dsaExpand(k.g, lay, a, &w.ds, R, stream);
             try A.dsaOut(k.g, lay, a, &w.ds, b.part.ptr, b.sk.ptr, 0, R, stream);
         }
