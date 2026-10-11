@@ -5,6 +5,9 @@
 pub const config = @import("config.zig");
 pub const weights_map = @import("weights_map.zig");
 pub const weights = @import("cuda_weights.zig");
+pub const gdn = @import("cuda_gdn.zig");
+pub const glue = @import("cuda_glue.zig");
+pub const hc = @import("cuda_hc.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

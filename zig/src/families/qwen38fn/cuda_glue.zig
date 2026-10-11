@@ -1,0 +1,144 @@
+//! TensorFold 0.6.6's Flash Next Triton glue replayed from captured cubins (`cuda.aot.Set`): each call launches the
+//! kernel with the grid, runtime arguments, argument dtypes and constexprs of the Python wrapper it names, so the set
+//! picks the variant Triton compiled for that call and the bits are the reference's. A launch the capture never saw
+//! fails with error.MissingTritonVariant instead of running something else.
+//!
+//! Kernels (module: Python wrapper): exl3_mm: `embed` (_embed), F16 matrices (_f16_mm, _reduce); glue: hc_writeback,
+//! hc_normed, hc_reduce_act, hc_act, hc_mix; forward: shift_windows; tensorfold.cuda.moe: router, select_rows
+//! (_topk_rows).
+const std = @import("std");
+const cuda = @import("cuda");
+const aot = cuda.aot;
+const F16 = @import("cuda_weights.zig").F16;
+
+const Ptr = cuda.abi.DevicePtr;
+
+/// exl3_mm.py ROWS: most rows one F16 or EXL3 call takes.
+pub const call_rows = 128;
+
+pub const Glue = struct {
+    set: *const aot.Set,
+    hidden: usize, // D
+    streams: usize, // S
+    low: usize,
+
+    fn n32(v: usize) i32 {
+        return @intCast(v);
+    }
+
+    /// exl3_mm.py `embed`: out [rows, S * D] bf16 = the bf16 table row of ids[r] (int32), repeated per stream.
+    pub fn embed(g: Glue, ids: Ptr, table: Ptr, out: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_embed", .{ @intCast(rows), @intCast(g.hidden / 256), 1 }, &.{
+            aot.ptr("IDS", "*i32", ids), aot.ptr("T", "*bf16", table), aot.ptr("OUT", "*bf16", out),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("BLOCK", 256) });
+    }
+
+    /// What a write-back adds to the streams (glue.py `hc_writeback` modes 0, 1, 2).
+    pub const Pending = union(enum) {
+        none,
+        branch: struct { branch: Ptr, inject: Ptr }, // bf16 [rows, D], bf16 [rows, S]
+        moe: struct { y: Ptr, wts: Ptr, inject: Ptr, slots: usize }, // fp32 [rows, slots, D], fp32 [rows, slots], bf16 [rows, S]
+    };
+
+    /// glue.py `hc_writeback(h, h, pss, S, mode, ...)`: the pending branch added into the streams h (in place), and
+    /// each stream's per-256 sums of squares into pss fp32 [rows, D / 256, S].
+    pub fn hcWriteback(g: Glue, h: Ptr, pss: Ptr, rows: usize, pending: Pending, stream: cuda.Stream) !void {
+        const mode: i64, const br: aot.Arg, const inj: aot.Arg, const y: aot.Arg, const wts: aot.Arg, const top: i64, const slots: i64 = switch (pending) {
+            .none => .{ 0, aot.ptr("BR", "*bf16", h), aot.ptr("INJ", "*bf16", h), aot.ptr("Y", "*bf16", h), aot.ptr("WTS", "*bf16", h), 1, 1 },
+            .branch => |b| .{ 1, aot.ptr("BR", "*bf16", b.branch), aot.ptr("INJ", "*bf16", b.inject), aot.ptr("Y", "*bf16", h), aot.ptr("WTS", "*bf16", h), 1, 1 },
+            .moe => |m| .{ 2, aot.ptr("BR", "*bf16", h), aot.ptr("INJ", "*bf16", m.inject), aot.ptr("Y", "*fp32", m.y), aot.ptr("WTS", "*fp32", m.wts), @intCast(m.slots - 1), @intCast(m.slots) },
+        };
+        try g.set.run(stream, "_hc_writeback", .{ @intCast(rows), @intCast(g.hidden / 256), 1 }, &.{
+            aot.ptr("H", "*bf16", h), aot.ptr("HOUT", "*bf16", h), aot.ptr("PSS", "*fp32", pss), br, inj, y, wts,
+            aot.int("RS", n32(rows * g.hidden)),
+        }, &.{
+            aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("MODE", mode), aot.ci("TOPK", top),
+            aot.ci("SLOTS", slots),          aot.ci("BLOCK", 256),               aot.ci("WORLD", 1),
+        });
+    }
+
+    /// glue.py `hc_normed`: normed [rows, S * D] bf16 = h * rinv_stream * scale, and its 32-group sums xs.
+    pub fn hcNormed(g: Glue, h: Ptr, pss: Ptr, scale: Ptr, normed: Ptr, xs: Ptr, eps: f32, rows: usize, stream: cuda.Stream) !void {
+        const wide = g.streams * g.hidden;
+        try g.set.run(stream, "_hc_normed", .{ @intCast(rows), @intCast(wide / 512), 1 }, &.{
+            aot.ptr("H", "*bf16", h),           aot.ptr("PSS", "*fp32", pss), aot.ptr("SCALE", "*fp32", scale),
+            aot.ptr("NORMED", "*bf16", normed), aot.ptr("XS", "*fp32", xs),   aot.float("eps", eps),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("NC", @intCast(g.hidden / 256)), aot.ci("BLOCK", 512) });
+    }
+
+    /// glue.py `hc_reduce_act`: the down projection's slices part fp32 [sk, rows, ndn] summed in order, then act
+    /// [rows, low] bf16, its group sums, and (when `inject` is not 0) the inject gates bf16 [rows, S].
+    pub fn hcReduceAct(g: Glue, part: Ptr, sk: usize, ndn: usize, act: Ptr, xs: Ptr, inject: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_hc_reduce_act", .{ @intCast(rows), 1, 1 }, &.{
+            aot.ptr("PART", "*fp32", part), aot.ptr("ACT", "*bf16", act), aot.ptr("XS", "*fp32", xs),
+            aot.ptr("INJ", "*bf16", if (inject != 0) inject else act), aot.int("M", n32(rows)),
+        }, &.{
+            aot.ci("SK", @intCast(sk)),                                 aot.ci("S", @intCast(g.streams)), aot.ci("LOW", @intCast(g.low)),
+            aot.ci("LOWP", @intCast(std.math.ceilPowerOfTwoAssert(usize, g.low))), aot.ci("HAS_INJ", @intFromBool(inject != 0)), aot.ci("NDN", @intCast(ndn)),
+        });
+    }
+
+    /// glue.py `hc_mix`: mixed [rows, D] bf16 = the streams' sigmoid(up)-weighted normed rows averaged, and its sums.
+    pub fn hcMix(g: Glue, up: Ptr, normed: Ptr, mixed: Ptr, xs: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_hc_mix", .{ @intCast(rows), @intCast(g.hidden / 256), 1 }, &.{
+            aot.ptr("UP", "*bf16", up), aot.ptr("NORMED", "*bf16", normed), aot.ptr("MIXED", "*bf16", mixed), aot.ptr("XS", "*fp32", xs),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("BLOCK", 256) });
+    }
+
+    /// exl3_mm.py `F16._launch`: x [m, K] bf16 (row stride x_stride) times w^T into out: fp32 slices [sk, m, n] when
+    /// `slices`, else bf16 rows of stride o_stride (only when sk == 1).
+    pub fn f16mm(g: Glue, w: *const F16, x: Ptr, x_stride: usize, m: usize, out: Ptr, o_stride: usize, slices: bool, stream: cuda.Stream) !void {
+        if (m > call_rows or (!slices and w.sk != 1)) return error.BadShape;
+        try g.set.run(stream, "_f16_mm", .{ @intCast((m + 15) / 16), @intCast((w.n + 63) / 64), @intCast(w.sk) }, &.{
+            aot.ptr("X", "*bf16", x),                aot.ptr("W", "*fp16", w.w.ptr), aot.ptr("OUT", if (slices) "*fp32" else "*bf16", out),
+            aot.int("M", n32(m)),                    aot.int("N", n32(w.n)),         aot.int("x_stride", n32(x_stride)),
+            aot.int("o_stride", n32(if (slices) w.n else o_stride)),
+        }, &.{
+            aot.ci("K", @intCast(w.k)), aot.ci("KS", @intCast(w.k / w.sk)), aot.ci("BM", 16), aot.ci("BN", 64), aot.ci("BK", 64),
+            aot.ci("F32", @intFromBool(slices)),
+        });
+    }
+
+    /// exl3_mm.py `_reduce`: out [m, n] bf16 (row stride o_stride) = the sum of the sk slices, in order.
+    pub fn reduce(g: Glue, part: Ptr, sk: usize, m: usize, n: usize, out: Ptr, o_stride: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_reduce", .{ @intCast(m), @intCast((n + 255) / 256), 1 }, &.{
+            aot.ptr("P", "*fp32", part), aot.ptr("OUT", "*bf16", out), aot.int("M", n32(m)), aot.int("N", n32(n)), aot.int("o_stride", n32(o_stride)),
+        }, &.{ aot.ci("SK", @intCast(sk)), aot.ci("BLOCK", 256) });
+    }
+
+    /// exl3_mm.py `F16.__call__` for m <= 128 rows: out [m, n] bf16 (row stride o_stride); `part` holds sk * m * n fp32.
+    pub fn f16Call(g: Glue, w: *const F16, x: Ptr, x_stride: usize, m: usize, out: Ptr, o_stride: usize, part: Ptr, stream: cuda.Stream) !void {
+        if (w.sk == 1) return g.f16mm(w, x, x_stride, m, out, o_stride, false, stream);
+        try g.f16mm(w, x, x_stride, m, part, 0, true, stream);
+        try g.reduce(part, w.sk, m, w.n, out, o_stride, stream);
+    }
+
+    /// forward.py `shift_windows(old, new, keep, channels)` for `layers` layers: rows j < T of each layer's window
+    /// become rows keep + j of [old (T rows); new rows].
+    pub fn shiftWindows(g: Glue, old: Ptr, old_l: usize, new: Ptr, new_l: usize, new_row: usize, keep: usize, layers: usize, channels: usize, t: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_shift_windows", .{ @intCast(layers), @intCast((channels + 255) / 256), 1 }, &.{
+            aot.ptr("OLD", "*bf16", old), aot.ptr("NEW", "*bf16", new), aot.int("keep", n32(keep)),
+            aot.int("OLD_L", n32(old_l)), aot.int("NEW_L", n32(new_l)),  aot.int("NEW_ROW", n32(new_row)),
+        }, &.{ aot.ci("C", @intCast(channels)), aot.ci("T", @intCast(t)), aot.ci("TP", @intCast(std.math.ceilPowerOfTwoAssert(usize, t))), aot.ci("BLOCK", 256) });
+    }
+
+    /// tensorfold.cuda.moe `router`: out [m, ne] fp32 = x [m, D] bf16 (row stride x_stride) . rows [ne, D] bf16.
+    pub fn router(g: Glue, x: Ptr, x_stride: usize, rows: Ptr, ne: usize, out: Ptr, m: usize, stream: cuda.Stream) !void {
+        const bm: usize = if (m <= 16) 16 else if (m <= 32) 32 else if (m <= 64) 64 else 128;
+        const be: usize, const bk: usize = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
+        try g.set.run(stream, "_router", .{ @intCast((m + bm - 1) / bm), @intCast((ne + be - 1) / be), 1 }, &.{
+            aot.ptr("X", "*bf16", x), aot.ptr("W", "*bf16", rows), aot.ptr("OUT", "*fp32", out), aot.int("M", n32(m)), aot.int("x_stride", n32(x_stride)),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("NE", @intCast(ne)), aot.ci("BM", @intCast(bm)), aot.ci("BLOCK_E", @intCast(be)), aot.ci("BK", @intCast(bk)) });
+    }
+
+    /// tensorfold.cuda.moe `select_rows`: each row's top-k experts (pick int32, weights fp32), the shared expert last.
+    pub fn selectRows(g: Glue, logits: Ptr, experts: usize, topk: usize, pick: Ptr, wts: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.set.run(stream, "_topk_rows", .{ @intCast(rows), 1, 1 }, &.{
+            aot.ptr("L", "*fp32", logits), aot.ptr("PICK", "*i32", pick), aot.ptr("WTS", "*fp32", wts),
+        }, &.{
+            aot.ci("NE", @intCast(experts)),                                                       aot.ci("NL", @intCast(experts + 1)), aot.ci("TOPK", @intCast(topk)),
+            aot.ci("SLOTS", @intCast(topk + 1)),                                                   aot.ci("BLOCK", @intCast(std.math.ceilPowerOfTwoAssert(usize, experts + 1))),
+            aot.ci("SLOTP", @intCast(std.math.ceilPowerOfTwoAssert(usize, topk + 1))),
+        });
+    }
+};
