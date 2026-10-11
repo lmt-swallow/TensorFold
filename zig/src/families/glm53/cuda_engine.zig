@@ -28,9 +28,9 @@ pub const draft_k = 20 + margin;
 /// drafter_choice.py: backlog rows the MTP head may owe before it absorbs them.
 const cap = 256;
 pub const rows = 16; // TF_GLM_MAX_ROWS: the widest verify window
-/// multi.py MAX_WINDOW: rows of every stream's windows together in one shared forward (below the MoE's 64-row prompt
-/// path, so every row takes the decode kernels it takes alone).
-pub const batch_rows = 32;
+/// Rows of every stream's windows together in one shared forward: the widest window the captured kernel set serves
+/// (16 rows; multi.py MAX_WINDOW is 32, below the MoE's 64-row prompt path, which needs the 32-row variants captured).
+pub const batch_rows = 16;
 pub const prompt_rows = 2048; // decode.PREFILL_ROWS
 
 /// How a rank reaches the other: the all-gather of fp32 partials and of the samples' candidates.

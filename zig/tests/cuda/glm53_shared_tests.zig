@@ -1,10 +1,10 @@
 //! `glm53-shared <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir> [layers]`: four streams' windows in one
 //! forward (cuda_model.zig `forwardSegs`) against each stream's windows alone, on both Sparks (master "local": both
-//! ranks on this GPU, the first `layers` layers). The streams' prompts are
-//! prefixes of the forward fixture's (some past the dense limit, some within it); every round each stream verifies a
-//! window of its pending token and a few forced tokens (widths changing round to round, up to 32 rows in all) and
-//! keeps one row. Every row's logits and sample must be the same in the shared forward as alone, and alone as on the
-//! single-stream path the fixtures check (cuda_model.zig `forward`).
+//! ranks on this GPU, the first `layers` layers). The streams' prompts are prefixes of the forward fixture's (some
+//! past the dense limit, some within it); every round each stream verifies a window of its pending token and a few
+//! forced tokens (widths changing round to round, up to `E.batch_rows` rows in all) and keeps one row. Every row's
+//! logits and sample must be the same in the shared forward as alone, and alone as on the single-stream path the
+//! fixtures check (cuda_model.zig `forward`).
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm53");
@@ -20,8 +20,8 @@ const P = glm.pool;
 
 const streams = 4;
 const rounds = 6;
-/// Each stream's window rows by round (the pending token and forced tokens), at most 32 rows a round in all.
-const widths = [rounds][streams]usize{ .{ 1, 1, 1, 1 }, .{ 1, 3, 8, 4 }, .{ 16, 8, 4, 4 }, .{ 2, 16, 1, 13 }, .{ 8, 8, 8, 8 }, .{ 1, 16, 1, 1 } };
+/// Each stream's window rows by round (the pending token and forced tokens), at most `E.batch_rows` (16) rows a round in all.
+const widths = [rounds][streams]usize{ .{ 1, 1, 1, 1 }, .{ 1, 3, 8, 4 }, .{ 8, 4, 2, 2 }, .{ 2, 11, 1, 2 }, .{ 4, 4, 4, 4 }, .{ 1, 13, 1, 1 } };
 /// The prompts' lengths: past the dense limit (2,051) and within it.
 const lengths = [streams]usize{ 3000, 2100, 1200, 333 };
 
