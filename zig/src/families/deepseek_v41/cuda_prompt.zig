@@ -44,7 +44,6 @@ const linear_rows: usize = 128; // model.py mm: the row-invariant linear up to h
 const exact_rows: usize = 64; // experts.EXACT_ROWS: the experts' prompt path from here
 const prompt_bias_scale: f32 = 0.08838834764831845; // prefill.py HAD_SCALE
 const score_bytes_limit: usize = 1 << 26; // the indexer's score matrix a row block (model.py rb)
-const index_segment: usize = 1 << 16; // index keys a dequantized segment (IndexKernels: 16 MiB of bf16 keys)
 const topk_prune_bn: usize = 64;
 
 /// prompt_glue.cu.
@@ -145,15 +144,14 @@ pub const ExpertKernels = struct {
 };
 
 /// index_score.cu: the prompt indexer's scores with `_index_score_rows`' bits at the mma rate (TF_DS_INDEX_SCORE=mma,
-/// the default; `triton` takes the captured kernel), the keys dequantized to bf16 once a call. TF_DS_INDEX_CHECK=1
+/// the default; `triton` takes the captured kernel), the packed keys dequantized as each tile is staged. TF_DS_INDEX_CHECK=1
 /// runs the captured kernel beside it on every row block and fails unless scores, keys and tile maxima are
 /// byte-equal.
 pub const IndexKernels = struct {
     module: cuda.Module,
-    keys_bf16: cuda.Function,
     score: cuda.Function,
     keys: cuda.Function,
-    /// rows a program (TF_DS_INDEX_RB: 4 or 8)
+    /// rows a program, one warp a row (TF_DS_INDEX_RB: 8 or 16)
     rb: usize,
     use: bool,
     check: bool,
@@ -165,14 +163,13 @@ pub const IndexKernels = struct {
         var module = try cuda.Module.load(d, cuda.kernels.dsv41_index_score);
         errdefer module.unload();
         const mode = envOr("TF_DS_INDEX_SCORE", "mma");
-        const rb = std.fmt.parseInt(usize, envOr("TF_DS_INDEX_RB", "8"), 10) catch return error.BadShape;
-        if (rb != 4 and rb != 8) return error.BadShape;
+        const rb = std.fmt.parseInt(usize, envOr("TF_DS_INDEX_RB", "16"), 10) catch return error.BadShape;
+        if (rb != 8 and rb != 16) return error.BadShape;
         if (!std.mem.eql(u8, mode, "mma") and !std.mem.eql(u8, mode, "triton")) return error.BadShape;
         return .{
             .module = module,
-            .keys_bf16 = try module.function("tf_dsv41_index_keys_bf16"),
-            .score = try module.function(if (rb == 4) "tf_dsv41_index_score_rows4" else "tf_dsv41_index_score_rows8"),
-            .keys = try module.function(if (rb == 4) "tf_dsv41_index_keys_rows4" else "tf_dsv41_index_keys_rows8"),
+            .score = try module.function(if (rb == 8) "tf_dsv41_index_score_rows8" else "tf_dsv41_index_score_rows16"),
+            .keys = try module.function(if (rb == 8) "tf_dsv41_index_keys_rows8" else "tf_dsv41_index_keys_rows16"),
             .rb = rb,
             .use = std.mem.eql(u8, mode, "mma"),
             .check = std.mem.eql(u8, envOr("TF_DS_INDEX_CHECK", "0"), "1"),
@@ -540,10 +537,6 @@ pub const Prompt = struct {
     glue: Glue,
     pk: ExpertKernels,
     ix: IndexKernels,
-    /// bf16 [index_segment, 128]: a segment of a layer's index keys (IndexKernels), made on first use
-    kbf: ?cuda.DeviceBuffer = null,
-    /// `kbf` holds the current `index` call's keys whole (one segment), so its later row blocks skip the dequantization
-    kbf_whole: bool = false,
     gemm: Gemm32,
     rows: usize, // the chunk rows this holds buffers for (at most max_chunk)
     rr: attention.RopeRows, // a chunk's rope rows (the device path's: its positions, its groups', the indexer's)
@@ -669,8 +662,6 @@ pub const Prompt = struct {
         errdefer self.pk.deinit();
         self.ix = try IndexKernels.load(d);
         errdefer self.ix.deinit();
-        self.kbf = null;
-        self.kbf_whole = false;
         self.gemm = try Gemm32.init(d);
         errdefer self.gemm.deinit();
         // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
@@ -848,7 +839,6 @@ pub const Prompt = struct {
         self.gemm.deinit();
         self.pk.deinit();
         self.ix.deinit();
-        if (self.kbf) |*b| b.free();
         self.glue.deinit();
         self.rr.deinit();
         self.gpa.free(self.ids_h);
@@ -1427,8 +1417,6 @@ pub const Prompt = struct {
         const cb = @max(1, c.cand_block);
         const ccols = (n_comp_end + cb - 1) / cb;
         const fast = self.ix.use and n > decode_rows and c.idx_heads == 32 and c.idx_dim == 128;
-        if (fast and self.kbf == null) self.kbf = try cuda.DeviceBuffer.alloc(self.d, index_segment * c.idx_dim * 2);
-        self.kbf_whole = false;
         var r0: usize = 0;
         while (r0 < n) : (r0 += step) {
             const r1 = @min(n, r0 + step);
@@ -1503,43 +1491,26 @@ pub const Prompt = struct {
     }
 
     /// `_index_score_rows` on the row block at `q` through index_score.cu: scores (or keyed, the keys and tile maxima)
-    /// into `score` / `tmax`, the layer's index keys dequantized into `kbf` a segment of `index_segment` keys at a time.
+    /// into `score` / `tmax`, from the layer's packed index keys.
     fn indexScoreMma(self: *Prompt, li: usize, q: Ptr, wt: Ptr, vr: Ptr, rows: usize, n: usize, nt: usize, keyed: bool, stream: cuda.Stream) !void {
-        const c = self.fwd.cfg;
         const caches = self.fwd.cachesOf(li);
         const tiles = @max(1, self.ix.tiles);
-        const seg_tiles = index_segment / 64;
-        var t0: usize = 0;
-        while (t0 < nt) : (t0 += seg_tiles) {
-            const t1 = @min(nt, t0 + seg_tiles);
-            const keys = @min(n, t1 * 64) - t0 * 64;
-            if (!self.kbf_whole) {
-                var a: cuda.Args = .{};
-                a.add(caches.idxk_codes.ptr + t0 * 64 * c.idx_dim / 2);
-                a.add(caches.idxk_scales.ptr + t0 * 64 * c.idx_dim / 32);
-                a.add(self.kbf.?.ptr);
-                a.add(@as(c_int, @intCast(keys)));
-                try cuda.launch.launch(self.ix.keys_bf16, .{ .grid = .{ .x = @intCast((keys * c.idx_dim / 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
-            }
-            var a: cuda.Args = .{};
-            a.add(q);
-            a.add(self.kbf.?.ptr);
-            a.add(wt);
-            a.add(vr);
-            a.add(self.score.ptr);
-            a.add(@as(c_int, @intCast(n)));
-            a.add(@as(c_int, @intCast(rows)));
-            if (keyed) a.add(self.tmax.ptr);
-            a.add(@as(c_int, @intCast(nt)));
-            a.add(@as(c_int, @intCast(tiles)));
-            a.add(@as(c_int, @intCast(t0)));
-            a.add(@as(c_int, @intCast(t1)));
-            if (keyed) a.add(@as(c_int, 1));
-            const rb = self.ix.rb;
-            const grid: cuda.launch.Dim3 = .{ .x = @intCast((rows + rb - 1) / rb), .y = @intCast((t1 - t0 + tiles - 1) / tiles) };
-            try cuda.launch.launch(if (keyed) self.ix.keys else self.ix.score, .{ .grid = grid, .block = .{ .x = @intCast(64 * rb) } }, stream, &a);
-        }
-        self.kbf_whole = nt <= seg_tiles;
+        const rb = self.ix.rb;
+        var a: cuda.Args = .{};
+        a.add(q);
+        a.add(caches.idxk_codes.ptr);
+        a.add(caches.idxk_scales.ptr);
+        a.add(wt);
+        a.add(vr);
+        a.add(self.score.ptr);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(rows)));
+        if (keyed) a.add(self.tmax.ptr);
+        a.add(@as(c_int, @intCast(nt)));
+        a.add(@as(c_int, @intCast(tiles)));
+        if (keyed) a.add(@as(c_int, 1));
+        const grid: cuda.launch.Dim3 = .{ .x = @intCast((rows + rb - 1) / rb), .y = @intCast((nt + tiles - 1) / tiles) };
+        try cuda.launch.launch(if (keyed) self.ix.keys else self.ix.score, .{ .grid = grid, .block = .{ .x = @intCast(32 * rb) } }, stream, &a);
     }
 
     /// TF_DS_INDEX_CHECK: the captured kernel's output (just written) against index_score.cu's on the same block,
