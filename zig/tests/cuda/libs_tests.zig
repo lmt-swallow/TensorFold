@@ -143,3 +143,67 @@ pub fn comm(gpu: Gpu, rank: u32, world: u32, master: []const u8, port: u16) !voi
     }
     std.debug.print("RESULT comm rank {d} of {d}: all-gather of {d} f32 in rank order and the control link round trip\n", .{ rank, world, count * world });
 }
+
+/// Two ranks, two communicators (`Comm.sibling`) on two streams: the latency of a round-sized all-gather (`small`
+/// f32 a rank) on the first while the second stream runs (a) nothing, (b) back-to-back prompt-sized all-gathers
+/// (`big` f32 a rank) on the second communicator, (c) device-wide memsets (no collective), (d) the same big gathers
+/// as pieces of `piece` f32 (each a gather of its own). Prints each phase's median and p90 in microseconds.
+pub fn commOverlap(gpu: Gpu, rank: u32, world: u32, master: []const u8, port: u16) !void {
+    const d = gpu.d;
+    var ip: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, master, '.');
+    for (&ip) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadAddress, 10);
+    var c1 = try cuda.comm.Comm.init(rank, world, ip, port, 120_000);
+    defer c1.deinit();
+    var c2 = try c1.sibling();
+    defer c2.deinit();
+    const small: usize = 16 * 4096;
+    const big: usize = 2048 * 4096;
+    const piece: usize = 64 * 4096;
+    var s_send = try cuda.DeviceBuffer.alloc(d, small * 4);
+    defer s_send.free();
+    var s_recv = try cuda.DeviceBuffer.alloc(d, small * 4 * world);
+    defer s_recv.free();
+    var b_send = try cuda.DeviceBuffer.alloc(d, big * 4);
+    defer b_send.free();
+    var b_recv = try cuda.DeviceBuffer.alloc(d, big * 4 * world);
+    defer b_recv.free();
+    var hog = try cuda.DeviceBuffer.alloc(d, 1 << 30);
+    defer hog.free();
+    var sa = try cuda.Stream.init(d, true);
+    defer sa.deinit();
+    var sb = try cuda.Stream.initUrgent(d, true);
+    defer sb.deinit();
+    const reps = 200;
+    const phases = [_][]const u8{ "alone", "big gathers beside", "memsets beside", "big gathers in pieces beside" };
+    for (phases, 0..) |name, ph| {
+        // the beside work, enqueued at once (the same on every rank)
+        switch (ph) {
+            1 => for (0..60) |_| try c2.allGather(b_send.ptr, b_recv.ptr, big, .f32, sa.handle),
+            2 => for (0..200) |_| try d.check(d.api.cuMemsetD32Async(hog.ptr, 7, hog.len / 4, sa.handle), "cuMemsetD32Async"),
+            3 => for (0..60) |_| {
+                var at: usize = 0;
+                while (at < big) : (at += piece) try c2.allGather(b_send.ptr + at * 4, b_recv.ptr + at * 4 * world, piece, .f32, sa.handle);
+            },
+            else => {},
+        }
+        var us: [reps]f64 = undefined;
+        for (&us) |*u| {
+            const t0 = nowNsOverlap();
+            try c1.allGather(s_send.ptr, s_recv.ptr, small, .f32, sb.handle);
+            try sb.synchronize();
+            u.* = @as(f64, @floatFromInt(nowNsOverlap() - t0)) / 1e3;
+        }
+        const t1 = nowNsOverlap();
+        try sa.synchronize();
+        const tail_ms = @as(f64, @floatFromInt(nowNsOverlap() - t1)) / 1e6;
+        std.mem.sort(f64, &us, {}, std.sort.asc(f64));
+        std.debug.print("RESULT comm-overlap rank {d}: small gather {s}: p50 {d:.0} us, p90 {d:.0} us, max {d:.0} us; the beside work ran {d:.0} ms past the last\n", .{ rank, name, us[reps / 2], us[reps * 9 / 10], us[reps - 1], tail_ms });
+    }
+}
+
+fn nowNsOverlap() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+}
