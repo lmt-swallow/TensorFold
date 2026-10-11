@@ -31,7 +31,7 @@ const Ptr = cuda.abi.DevicePtr;
 const Forward = forward.Forward;
 const Gather = forward.Gather;
 
-pub const Error = error{ TooManyRows, BadShape, OutOfMemory, NoCandidateSource } || cuda.Error || exl3.Error || experts.Error || cuda.cublaslt.Error;
+pub const Error = error{ TooManyRows, BadShape, OutOfMemory, NoCandidateSource, PromptKernelMismatch } || cuda.Error || exl3.Error || experts.Error || cuda.cublaslt.Error;
 
 /// The widest chunk a `Prompt` holds buffers for (TF_DS_PREFILL_CHUNK at most this).
 pub const max_chunk: usize = 4096;
@@ -86,12 +86,18 @@ pub const Glue = struct {
     }
 };
 
-/// experts_prompt.cu: grouped_mma_kernel<2, LO, HI, true, 4> and grouped_rows_kernel<2, 8, 4, 1, LO, HI, 2, false>
-/// by K2 range, with the grouping kernels of the experts fatbin.
+/// experts_prompt.cu: grouped_mma_kernel<2, LO, HI, true, 4>, grouped_mmb_kernel<2, LO, HI, true, 4> and
+/// grouped_rows_kernel<2, 8, 4, 1, LO, HI, 2, false> by K2 range, with the grouping kernels of the experts fatbin.
 pub const ExpertKernels = struct {
     module: cuda.Module,
     mma: [3]cuda.Function,
     rows: [3]cuda.Function,
+    /// grouped_mmb_kernel<2, LO, HI, true, 4> (gate/up: grouped_mma's bits, the mma spread over every warp)
+    mmb: [3]cuda.Function,
+    /// The kernel a prompt chunk's gate/up takes (TF_DS_PROMPT_GU), and TF_DS_PROMPT_CHECK=1: every layer also runs
+    /// gate/up on grouped_mma (the reference) and fails unless the outputs are byte-equal.
+    gu: Gu = .mmb,
+    check: bool = false,
     group_count: cuda.Function,
     group_place: cuda.Function,
     work_list: cuda.Function,
@@ -110,7 +116,10 @@ pub const ExpertKernels = struct {
             var buf: [200]u8 = undefined;
             k.mma[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x18grouped_mma_kernelILi2ELi{d}ELi{d}ELb1ELi4EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiiS7_", .{ r[0], r[1] }));
             k.rows[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x19grouped_rows_kernelILi2ELi8ELi4ELi1ELi{d}ELi{d}ELi2ELb0EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiS7_", .{ r[0], r[1] }));
+            k.mmb[i] = try module.function(try symbol(&buf, "_ZN8tf_exl3x18grouped_mmb_kernelILi2ELi{d}ELi{d}ELb1ELi4EEEvPK6__halfS3_PKlS5_PKiS7_S7_S7_S7_PfiiiiiiiiS7_", .{ r[0], r[1] }));
         }
+        k.gu = std.meta.stringToEnum(Gu, envOr("TF_DS_PROMPT_GU", "mmb")) orelse return error.BadShape;
+        k.check = std.mem.eql(u8, envOr("TF_DS_PROMPT_CHECK", "0"), "1");
         k.group_count = try ek.prep_mod.function("_ZN16tf_exl3x_experts18group_count_kernelEPKiPii");
         k.group_place = try ek.prep_mod.function("_ZN16tf_exl3x_experts18group_place_kernelEPKiS1_PiS2_S2_iiii");
         k.work_list = try ek.prep_mod.function("_ZN16tf_exl3x_experts16work_list_kernelEPKiS1_S1_iPiiiS2_ii");
@@ -124,6 +133,18 @@ pub const ExpertKernels = struct {
         self.module.unload();
     }
 };
+
+/// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).
+pub const Gu = enum { mma, mmb };
+
+fn ci(v: usize) c_int {
+    return @intCast(v);
+}
+
+fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
+    const v = std.mem.span(std.c.getenv(name) orelse return default);
+    return if (v.len == 0) default else v;
+}
 
 fn symbol(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]const u8 {
     const text = try std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args);
@@ -150,6 +171,7 @@ pub const PromptScratch = struct {
     work_d: cuda.DeviceBuffer, // int32 [len_d, 2]
     len_gu: usize,
     len_d: usize,
+    zc: ?cuda.DeviceBuffer = null,
 
     pub fn init(d: *const cuda.Driver, ex: *const experts.Experts, rows: usize, slots: usize) !PromptScratch {
         const D = ex.dims;
@@ -159,6 +181,7 @@ pub const PromptScratch = struct {
         const maxm = @max(32, (rows + 31) / 32 * 32);
         const zrow = @max(2 * I + D / 2, D);
         var s: PromptScratch = undefined;
+        s.zc = null;
         s.rows = rows;
         s.slots = slots;
         s.maxu = maxu;
@@ -181,6 +204,33 @@ pub const PromptScratch = struct {
 
     pub fn deinit(self: *PromptScratch) void {
         inline for (.{ "xg", "xu", "xd", "z", "no_y", "counts", "ids", "count", "members", "work_gu", "work_d" }) |f| @field(self, f).free();
+        if (self.zc) |*b| b.free();
+    }
+
+    /// TF_DS_PROMPT_CHECK: the reference kernels' output, z's size (made on first use).
+    fn zcheck(self: *PromptScratch) !cuda.DeviceBuffer {
+        if (self.zc == null) self.zc = try cuda.DeviceBuffer.alloc(self.z.d, self.z.len);
+        return self.zc.?;
+    }
+
+    /// TF_DS_PROMPT_CHECK: the first `words` 32-bit words of z and of the reference output byte-equal, else
+    /// error.PromptKernelMismatch (logged with the count of differing words).
+    fn compare(self: *PromptScratch, li: usize, what: []const u8, words: usize, stream: cuda.Stream) !void {
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const a = try gpa.alloc(u32, words);
+        defer gpa.free(a);
+        const b = try gpa.alloc(u32, words);
+        defer gpa.free(b);
+        try self.z.download(0, std.mem.sliceAsBytes(a));
+        try self.zc.?.download(0, std.mem.sliceAsBytes(b));
+        var bad: usize = 0;
+        for (a, b) |x, y| bad += @intFromBool(x != y);
+        if (bad != 0) {
+            std.log.err("deepseek_v41: layer {d} {s}: {d} of {d} words differ from the reference kernel", .{ li, what, bad, words });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("deepseek_v41: layer {d} {s}: {d} words byte-equal to the reference kernel", .{ li, what, words });
     }
 };
 
@@ -1421,7 +1471,8 @@ pub const Prompt = struct {
     }
 
     /// experts.py routed() for a prompt chunk (the fork's defaults): member lists and work lists on the device, the
-    /// rotated inputs, gate/up on grouped_mma (splits folded), the epilogue, down on grouped_rows, the combine.
+    /// rotated inputs, gate/up on grouped_mmb (grouped_mma's bits; splits folded), the epilogue, down on grouped_rows,
+    /// the combine.
     fn routedPrompt(self: *Prompt, li: usize, ex: *const experts.Experts, x: Ptr, R: usize, limit: f32, stream: cuda.Stream) !void {
         const s = &self.scratch;
         const D = ex.dims;
@@ -1432,11 +1483,6 @@ pub const Prompt = struct {
         const maxu = s.maxu;
         const maxm = @max(32, (R + 31) / 32 * 32);
         if (R > s.rows or maxm > s.maxm) return error.TooManyRows;
-        const ci = struct {
-            fn f(v: usize) c_int {
-                return @intCast(v);
-            }
-        }.f;
         {
             var a: cuda.Args = .{};
             a.add(self.pick.ptr);
@@ -1495,29 +1541,15 @@ pub const Prompt = struct {
         const cfg_gu = s_cfg(D, I, true);
         const cfg_d = s_cfg(I, D, false);
         {
-            // gate/up: grouped_mma over the work list, the splits folded (Z [2, P, I])
-            const range = experts.rangeOf(ex.k2_gu[0], ex.k2_gu[1]);
-            var a: cuda.Args = .{};
-            a.add(s.xg.ptr);
-            a.add(s.xu.ptr);
-            a.add(ex.gate_ptr.ptr);
-            a.add(ex.up_ptr.ptr);
-            a.add(ex.gate_k2.ptr);
-            a.add(ex.up_k2.ptr);
-            a.add(s.ids.ptr);
-            a.add(s.count.ptr);
-            a.add(s.members.ptr);
-            a.add(s.z.ptr);
-            a.add(ci(D)); // K
-            a.add(ci(I)); // N
-            a.add(ci(P));
-            a.add(ci(cfg_gu.sk)); // SK
-            a.add(ci(cfg_gu.warps)); // WK
-            a.add(ci(maxm));
-            a.add(ci(slots));
-            a.add(ci(len_gu)); // nexp: the list's pairs
-            a.add(s.work_gu.ptr);
-            try cuda.launch.launch(self.pk.mma[@intFromEnum(range)], .{ .grid = .{ .x = 1, .y = @intCast(I / 64), .z = @intCast(len_gu * 2) }, .block = .{ .x = 256 } }, stream, &a);
+            // gate/up: grouped_mma (or grouped_mmb) over the work list, the splits folded (Z [2, P, I])
+            const range = @intFromEnum(experts.rangeOf(ex.k2_gu[0], ex.k2_gu[1]));
+            const f = switch (self.pk.gu) {
+                .mma => self.pk.mma[range],
+                .mmb => self.pk.mmb[range],
+            };
+            if (self.pk.check) try self.gateUp(self.pk.mma[range], ex, (try s.zcheck()).ptr, P, maxm, len_gu, cfg_gu, stream);
+            try self.gateUp(f, ex, s.z.ptr, P, maxm, len_gu, cfg_gu, stream);
+            if (self.pk.check) try s.compare(li, "gate/up", 2 * P * I, stream);
         }
         try self.moeMark(li, 4, stream);
         {
@@ -1579,6 +1611,32 @@ pub const Prompt = struct {
             a.add(ci(0)); // store_y
             try cuda.launch.launch(self.pk.down_combine, .{ .grid = .{ .x = @intCast(R), .y = @intCast(D / 128) }, .block = .{ .x = @intCast(32 * slots) } }, stream, &a);
         }
+    }
+
+    /// gate/up on `f` (grouped_mma_kernel's or grouped_mmb_kernel's arguments) into z [2, P, I].
+    fn gateUp(self: *Prompt, f: cuda.Function, ex: *const experts.Experts, z: Ptr, P: usize, maxm: usize, len_gu: usize, cfg: experts.Tiles, stream: cuda.Stream) !void {
+        const s = &self.scratch;
+        var a: cuda.Args = .{};
+        a.add(s.xg.ptr);
+        a.add(s.xu.ptr);
+        a.add(ex.gate_ptr.ptr);
+        a.add(ex.up_ptr.ptr);
+        a.add(ex.gate_k2.ptr);
+        a.add(ex.up_k2.ptr);
+        a.add(s.ids.ptr);
+        a.add(s.count.ptr);
+        a.add(s.members.ptr);
+        a.add(z);
+        a.add(ci(ex.dims)); // K
+        a.add(ci(ex.width)); // N
+        a.add(ci(P));
+        a.add(ci(cfg.sk)); // SK
+        a.add(ci(cfg.warps)); // WK
+        a.add(ci(maxm));
+        a.add(ci(s.slots));
+        a.add(ci(len_gu)); // nexp: the list's pairs
+        a.add(s.work_gu.ptr);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = @intCast(ex.width / 64), .z = @intCast(len_gu * 2) }, .block = .{ .x = 256 } }, stream, &a);
     }
 
     // -- small launches ------------------------------------------------------------------------------------------
