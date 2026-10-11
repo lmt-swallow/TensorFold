@@ -297,8 +297,9 @@ def main() -> int:
 
     pair.run(rank_run)
     for name in [n for n in digests if n.startswith("r0_")]:
-        # the KDA state and conv window are each rank's heads; the streams and the latent caches both ranks hold alike
-        if name.endswith(("_x_out", "_latent", "_pk")) and \
+        # the KDA state and conv window are each rank's heads; the latent caches both ranks hold alike, and the streams
+        # too unless the chunk ran row-split (each rank's streams then current on its own rows only)
+        if name.endswith(("_latent", "_pk") if a.split else ("_x_out", "_latent", "_pk")) and \
                 digests[name] != digests["r1_" + name[3:]]:
             raise SystemExit(f"{name[3:]}: the ranks differ")
     if a.split:
