@@ -549,10 +549,9 @@ pub const Forward = struct {
     }
 
     fn copyRows(b: *Buffers, out: Ptr, width: usize, at: usize, n: usize, R: usize, stream: cuda.Stream) !void {
-        for (0..R) |r| {
-            const dst: cuda.DeviceBuffer = .{ .d = b.w.tmp.d, .ptr = out + (r * width + at) * 2, .len = n * 2 };
-            try dst.copyFrom(0, b.w.tmp.ptr + r * n * 2, n * 2, stream.handle);
-        }
+        // the part's R rows (n wide, packed in tmp) into their columns of out's rows: one pitched copy
+        const dst: cuda.DeviceBuffer = .{ .d = b.w.tmp.d, .ptr = out, .len = R * width * 2 };
+        try dst.copyRows(at * 2, width * 2, b.w.tmp.ptr, n * 2, n * 2, R, stream.handle);
     }
 
     /// forward.py `compute` for one stream: logits of the window's rows into b.logits (with the head loaded).
