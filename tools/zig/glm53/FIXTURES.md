@@ -20,6 +20,8 @@ The per-file lists, including `extensions/`, are on the node in `~/glm53fx/<name
 | dsa | 0e37decbe600f775db1814efde54b351b5b3af2cd8654b89b53cd0b2df7c74a5 | 0629630da3ee75cb7fea3c428e22acc9a7b1901f14490b0691356b23376df7c6 | 9,352 | 27,323,757,831 |
 | prompt | 6de84c196a37c63b7ee388ce89ab84b01227a40c0ec883c1e68b22f0f3d15abc | a9bf2a9eba48c73cc0026624cf86cfdc7eec217e6b23ea750da53f7388be7636 | 545 | 69,726,853 |
 | prompt-split | 8ab5f7b79207d7d5dac545e15b86aeb77be2170e9a1c7b0e3aea19c9ba7d8ec5 | d52519797653b5ba652b4966a3d3113a621ca0c4b404feb5835c593bfe5ead51 | 547 | 80,824,687 |
+| dsa-fp8 | 2080c8c25f1ce387aba2f27aad14aaa163e761e272c9304a4daf88c028513cc2 | 4f5659072eeb6c281e32bbf91f1cfefcfc742ecba16e39cd9a3f01361ab6ff77 | 9,352 | 25,650,449,036 |
+| prompt-fp8 | c494f68fc7b188dfc1c3968c61f8d3ec254fdd6574e62a5159092f1e5b78cd59 | 8c2badc17609ebafc0a0f5b2b8cbde5e55517c75e4945d1e7bf9879b00599031 | 327 | 44,021,584 |
 
 The Triton kernels each capture launched: hc 8, kda 33, moe 26, dsa 127, prompt 222. The prompt fixture holds
 sha256 digests of each traced call's outputs instead of the arrays (dump_prompt.py), hence its size. In every fixture both ranks' streams
@@ -28,3 +30,9 @@ were byte-equal at every step.
 `tf-cuda-test glm53-kda`, `glm53-moe` and `glm53-dsa` match these fixtures byte for byte, on both ranks: 418, 166 and
 1,154 comparisons, plus every loaded tensor's sha256. `glm53-prompt` matches the prompt fixture (79 chunks, 15,272
 digests) and prompt-split (`capture.sh prompt <dir> --split`, the reference's row split as served: 20,167 digests).
+
+`dsa-fp8` and `prompt-fp8` are the same dumps on FP8 DSA caches (`KV=fp8 bash capture.sh dsa|prompt`, the
+GLM-5.3-Flash-2 reference, 2026-10-12 on spark-9e43). `prompt-fp8` was captured before the t/u/v scenarios were
+added, so it holds 45 chunks. Their FP8 variants are `_lat_write`, `_pool_keys`, `_dense_chunks`, `_sparse_chunks`
+(dsa only), `_sparse_onepass`, `_scores_rows` and `_scores`. `tf-cuda-test glm53-dsa-fp8` matches 1,154
+comparisons, and `glm53-prompt-fp8` matches 45 chunks and 8,586 digests.
