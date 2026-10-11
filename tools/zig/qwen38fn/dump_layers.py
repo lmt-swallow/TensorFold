@@ -128,6 +128,9 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--trace", default="1,3", help="layers whose calls are traced (comma list; H: the head)")
     ap.add_argument("--layers", type=int, default=0, help="load only the first N layers (0: all)")
+    ap.add_argument("--warm", type=int, default=0,
+                    help="first decode this many tokens (the prompt repeated) in 16-row windows, unrecorded, so the "
+                         "recorded windows run at depth (past 2,048 keys the indexer selects blocks)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -184,6 +187,8 @@ def main() -> int:
 
     def boundary(layer, w_, segs, b_, R, pending, **kw):
         i = cur_window["i"]
+        if i < 0:                                   # a warm-up window: not recorded
+            return layer_forward(layer, w_, segs, b_, R, pending, **kw)
         arrays[f"w{i}_L{layer.index}_h"] = b_.h[:R].detach().clone()
         tr.active = str(layer.index) if str(layer.index) in traced else None
         try:
@@ -212,6 +217,8 @@ def main() -> int:
 
     def staged(table, sc, row_ids, at=0):
         i = cur_window["i"]
+        if i < 0:
+            return stage_ple(table, sc, row_ids, at=at)
         arrays[f"w{i}_ple_ids"] = torch.from_numpy(np.ascontiguousarray(row_ids).astype(np.int64))
         arrays[f"w{i}_ple_rows"] = torch.from_numpy(np.ascontiguousarray(table.gather(row_ids)))
         return stage_ple(table, sc, row_ids, at=at)
@@ -219,8 +226,16 @@ def main() -> int:
     exl3_pack.stage_ple = staged
 
     params = {"hidden": c.hidden, "streams": c.streams, "layers": c.layers, "vocab": c.vocab, "rows": rows,
-              "windows": len(WINDOWS), "capacity": 4096, "eps": c.eps, "trace": sorted(traced)}
-    pos = 0
+              "windows": len(WINDOWS), "capacity": 4096, "eps": c.eps, "trace": sorted(traced), "warm": a.warm}
+    warm = (ids * (a.warm // max(1, len(ids)) + 1))[:a.warm]
+    arrays["warm_ids"] = torch.tensor(warm or [0], dtype=torch.int32)
+    cur_window["i"] = -1
+    for w0 in range(0, len(warm), rows):
+        F.forward(w, st, b, warm[w0:w0 + rows])
+        F.commit(w, st, b, len(warm[w0:w0 + rows]), len(warm[w0:w0 + rows]))
+    torch.cuda.synchronize()
+    ids = warm + ids                                # the recorded windows continue the same stream
+    pos = len(warm)
     for i, (R, keep) in enumerate(WINDOWS):
         cur_window["i"] = i
         tr.window = i
