@@ -42,7 +42,8 @@ pub const prompt_rows: u32 = @intCast(lanesmod.default_chunk);
 /// 64k prompt).
 pub const prefill_interleave: u32 = 1;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
+/// `prefill_overlap`: prompt passes in parts run beside the rounds (TENSORFOLD_PREFILL_OVERLAP=1; `Settings.overlap`).
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, prefill_overlap: bool = false };
 
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
@@ -138,6 +139,7 @@ pub fn weightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     var s = try settings(gpa, kernels, o.context);
     s.drafts = o.drafts;
+    s.overlap = o.prefill_overlap;
     if (processAge()) |age| std.log.info("deepseek_v41 rank {d}: the engine's load begins {d:.1} s after the process started", .{ s.rank, age });
     if (s.world != 2) {
         std.log.err("deepseek_v41 serves on two ranks: start rank 0 and rank 1 with --tp 2 (TF_TP_WORLD=2)", .{});

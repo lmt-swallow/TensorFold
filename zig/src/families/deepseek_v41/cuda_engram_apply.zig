@@ -75,6 +75,9 @@ pub const Engram = struct {
     /// Host times (cuda_lanes.zig `FillProfile` reads and clears them): rounds' direct reads, their waits for the
     /// read-ahead to idle, the prompt's waits for a read-ahead batch, the last batch's read.
     prof: Prof = .{},
+    /// The rounds' own reader, staging and device buffers and weights (`enableRounds`); null: rounds share the
+    /// prompt's, after its read-ahead idles.
+    side: ?*RoundSide = null,
 
     pub const Prof = struct {
         read_ns: i128 = 0,
@@ -176,6 +179,7 @@ pub const Engram = struct {
         self.stop = std.atomic.Value(bool).init(false);
         self.thread = null;
         self.prof = .{};
+        self.side = null;
         self.sets[0] = try Batch.init(gpa, d, nl, max_rows * per);
         errdefer self.sets[0].deinit(gpa);
         self.sets[1] = try Batch.init(gpa, d, nl, max_rows * per);
@@ -183,6 +187,7 @@ pub const Engram = struct {
     }
 
     pub fn deinit(self: *Engram) void {
+        if (self.side) |x| x.deinit(self.gpa);
         if (self.thread) |t| {
             self.stop.store(true, .release);
             t.join();
@@ -203,6 +208,14 @@ pub const Engram = struct {
         self.tables.close();
         self.gpa.free(self.token_map);
         self.gpa.destroy(self);
+    }
+
+    /// Rounds (`roundHook`) read their rows with a reader of `threads` workers, staging and device buffers of their
+    /// own and run the weights `w` (whose split-K counters no prompt call uses), so a round runs beside a prompt's
+    /// chunk on another stream; the prompt's calls run `self.w`. The same bits: the same kernels on the same rows.
+    pub fn enableRounds(self: *Engram, w: *const weights.Weights, threads: usize) !void {
+        if (self.side != null) return;
+        self.side = try RoundSide.init(self.gpa, self.d, w, self.cfg.engram_layers.len, (self.cols[1] - self.cols[0]), (hcmod.hc_streams + 1) * self.cfg.dim, self.xh.len, self.z.len, threads);
     }
 
     /// The `Forward.engram` hook running `apply` on `history`.
@@ -249,7 +262,9 @@ pub const Engram = struct {
         }
         if (n < 1 or n > self.max_rows or (mm == null and n > decode_rows)) return error.TooManyRows;
         if (layer >= self.w.layers.len) return error.NotEngramLayer;
-        const l = &self.w.layers[layer];
+        // a round with the rounds' own buffers runs the rounds' weights (their split-K counters)
+        const w = if (!ahead and self.side != null) self.side.?.w else self.w;
+        const l = &w.layers[layer];
         const wkv: *const exl3.Linear = if (l.engram_wkv) |*x| x else return error.NotEngramLayer;
         const qk = l.engram_qk orelse return error.NotEngramLayer;
         const slot = self.cfg.engram_layers.indexOf(@intCast(layer)) orelse return error.NotEngramLayer;
@@ -270,36 +285,42 @@ pub const Engram = struct {
             self.idx_h[p * per + c] = self.hashes_h[(p * nl + slot) * cols + lo + c];
         };
         // the rows: a prefetched batch's (read ahead into its own pinned buffers), else read now into this layer's
-        // pinned staging (its previous copy to the device has run); then to the device
+        // pinned staging (its previous copy to the device has run); then to the device. A round with the rounds'
+        // own reader and buffers (`enableRounds`) reads beside the read-ahead and leaves the prompt's buffers alone.
+        const side: ?*RoundSide = if (ahead) null else self.side;
         const taken = if (ahead) try self.takeAhead(slot, spans, n, per, stream) else null;
         const st = if (taken) |batch| batch else blk: {
             const t0 = nowNs();
-            try self.idleAhead();
+            if (side == null) try self.idleAhead();
             self.prof.idle_ns += nowNs() - t0;
             defer self.prof.read_ns += nowNs() - t0;
-            const st = &self.staging[slot];
-            if (self.pending[slot]) try self.uploaded[slot].synchronize();
-            self.pending[slot] = false;
-            try self.reader.gather(table, self.idx_h[0 .. n * per], st.codes(n * per), st.scales(n * per));
+            const staging = if (side) |x| x.staging else self.staging;
+            const uploaded = if (side) |x| x.uploaded else self.uploaded;
+            const pending = if (side) |x| x.pending else self.pending;
+            const st = &staging[slot];
+            if (pending[slot]) try uploaded[slot].synchronize();
+            pending[slot] = false;
+            try (if (side) |x| x.reader else self.reader).gather(table, self.idx_h[0 .. n * per], st.codes(n * per), st.scales(n * per));
             try st.upload(n * per, stream);
-            try self.uploaded[slot].record(stream);
-            self.pending[slot] = true;
+            try uploaded[slot].record(stream);
+            pending[slot] = true;
             break :blk st;
         };
-        try self.kernels.decode(stream, st.dev_w.ptr, st.dev_s.ptr, self.e.ptr, n * per);
+        const b: Bufs = if (side) |x| x.bufs else .{ .e = self.e, .xh = self.xh, .z = self.z, .partial = self.partial, .gathered = self.gathered, .kv = self.kv };
+        try self.kernels.decode(stream, st.dev_w.ptr, st.dev_s.ptr, b.e.ptr, n * per);
         // this rank's partial, every rank's in rank order, their sum to bf16, the gate
         if (mm) |f| {
-            try f.call(f.ctx, wkv, self.e.ptr, n, self.partial.ptr, stream);
+            try f.call(f.ctx, wkv, b.e.ptr, n, b.partial.ptr, stream);
         } else {
-            try wkv.run(self.e.ptr, .bf16, n, self.xh.ptr, self.z.ptr, self.partial.ptr, .f32, stream);
+            try wkv.run(b.e.ptr, .bf16, n, b.xh.ptr, b.z.ptr, b.partial.ptr, .f32, stream);
         }
         if (self.probe) |p| {
             var nb: [32]u8 = undefined;
-            try p.call(p.ctx, try std.fmt.bufPrint(&nb, "L{d}.p_engram.r0", .{layer}), self.partial.ptr, n * kvw * 4, stream);
+            try p.call(p.ctx, try std.fmt.bufPrint(&nb, "L{d}.p_engram.r0", .{layer}), b.partial.ptr, n * kvw * 4, stream);
         }
-        try gather.run(self.partial.ptr, n * kvw, self.gathered.ptr, stream);
-        try self.kernels.sumToBf16(stream, self.gathered.ptr, @intCast(self.w.world), n * kvw, self.kv.ptr);
-        try self.hc.engramGate(stream, h, self.kv.ptr, qk.ptr(), h, @intCast(n));
+        try gather.run(b.partial.ptr, n * kvw, b.gathered.ptr, stream);
+        try self.kernels.sumToBf16(stream, b.gathered.ptr, @intCast(self.w.world), n * kvw, b.kv.ptr);
+        try self.hc.engramGate(stream, h, b.kv.ptr, qk.ptr(), h, @intCast(n));
     }
 
     // -- read-ahead ------------------------------------------------------------------------------------------------
@@ -415,6 +436,73 @@ pub const Engram = struct {
         }
     }
 
+};
+
+/// A call's device buffers: the decoded rows, the decode linear's scratch, the partial, the gathered partials, kv.
+const Bufs = struct { e: cuda.DeviceBuffer, xh: cuda.DeviceBuffer, z: cuda.DeviceBuffer, partial: cuda.DeviceBuffer, gathered: cuda.DeviceBuffer, kv: cuda.DeviceBuffer };
+
+/// The rounds' own reader, a staging pair and its upload's event an Engram layer, and device buffers for
+/// `decode_rows` rows (`Engram.enableRounds`).
+const RoundSide = struct {
+    w: *const weights.Weights,
+    reader: *rows_mod.Reader,
+    staging: []rows_mod.Staging,
+    uploaded: []cuda.Event,
+    pending: []bool,
+    bufs: Bufs,
+
+    fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, layers: usize, per: usize, kvw: usize, xh_bytes: usize, z_bytes: usize, threads: usize) !*RoundSide {
+        const x = try gpa.create(RoundSide);
+        errdefer gpa.destroy(x);
+        x.w = w;
+        x.reader = try rows_mod.Reader.init(gpa, threads);
+        errdefer x.reader.deinit();
+        x.staging = try gpa.alloc(rows_mod.Staging, layers);
+        errdefer gpa.free(x.staging);
+        x.uploaded = try gpa.alloc(cuda.Event, layers);
+        errdefer gpa.free(x.uploaded);
+        x.pending = try gpa.alloc(bool, layers);
+        errdefer gpa.free(x.pending);
+        @memset(x.pending, false);
+        var made: usize = 0;
+        errdefer for (0..made) |i| {
+            x.staging[i].deinit();
+            x.uploaded[i].deinit();
+        };
+        while (made < layers) : (made += 1) {
+            x.staging[made] = try rows_mod.Staging.init(d, decode_rows * per);
+            x.uploaded[made] = cuda.Event.init(d, false) catch |err| {
+                x.staging[made].deinit();
+                return err;
+            };
+        }
+        const r = decode_rows;
+        var e = try cuda.DeviceBuffer.alloc(d, r * per * rows_mod.row_w * 2);
+        errdefer e.free();
+        var xh = try cuda.DeviceBuffer.alloc(d, xh_bytes);
+        errdefer xh.free();
+        var z = try cuda.DeviceBuffer.alloc(d, z_bytes);
+        errdefer z.free();
+        var partial = try cuda.DeviceBuffer.alloc(d, r * kvw * 4);
+        errdefer partial.free();
+        var gathered = try cuda.DeviceBuffer.alloc(d, w.world * r * kvw * 4);
+        errdefer gathered.free();
+        const kv = try cuda.DeviceBuffer.alloc(d, r * kvw * 2);
+        x.bufs = .{ .e = e, .xh = xh, .z = z, .partial = partial, .gathered = gathered, .kv = kv };
+        return x;
+    }
+
+    fn deinit(x: *RoundSide, gpa: std.mem.Allocator) void {
+        x.reader.deinit();
+        for (x.uploaded, x.pending) |ev, p| if (p) ev.synchronize() catch {};
+        inline for (.{ "e", "xh", "z", "partial", "gathered", "kv" }) |f| @field(x.bufs, f).free();
+        for (x.staging) |*st| st.deinit();
+        for (x.uploaded) |*ev| ev.deinit();
+        gpa.free(x.staging);
+        gpa.free(x.uploaded);
+        gpa.free(x.pending);
+        gpa.destroy(x);
+    }
 };
 
 /// A read-ahead batch's buffers: a pinned staging pair and its upload's event a layer, the row ids of every layer

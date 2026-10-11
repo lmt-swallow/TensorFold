@@ -696,6 +696,9 @@ pub const RoundRunner = struct {
     captures: usize,
     /// Rounds run eager (no graph for their key: graphs off, or past the recorded keys' budget).
     eager: usize = 0,
+    /// Rounds run eager while set (the same launches as their graphs'): a graph's branches run on streams of the
+    /// driver's own, which may share a hardware queue with another stream's long queue of work and wait behind it.
+    eager_now: bool = false,
     /// Called before each graph launch (tests' gather supplies; the communicator needs none).
     launch_hook: ?GraphLaunch = null,
     /// Keys at buckets up to this one are kept once recorded (`Streams.warm` records them at load). Each key's
@@ -1093,7 +1096,7 @@ pub const RoundRunner = struct {
 
     /// Whether rounds replay graphs now: on, no probe (its callbacks run per launch), the device selection.
     fn graphed(self: *const RoundRunner) bool {
-        return self.graphs and self.probe == null and !self.glue.hostSelect();
+        return self.graphs and !self.eager_now and self.probe == null and !self.glue.hostSelect();
     }
 
     /// Records the graphs of rounds of each row count in `rows` (1 .. self.rows) at each bucket of `buckets` the runner

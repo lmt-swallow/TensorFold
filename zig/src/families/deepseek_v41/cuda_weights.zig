@@ -78,6 +78,81 @@ pub const Weights = struct {
     }
 };
 
+/// `w` with split-K counters of its own for every EXL3 layer (the head's and each block's, the experts' aside: their
+/// counters are their scratch's), the rest shared: a forward over it may run beside one over `w` on another stream
+/// (two launches of one layer at once must not share its counters). The same bits as `w`'s. `freeCounters` frees it.
+pub fn withOwnCounters(gpa: std.mem.Allocator, w: *const Weights) !Weights {
+    var out = w.*;
+    out.layers = try gpa.dupe(Layer, w.layers);
+    var done: usize = 0;
+    errdefer {
+        for (out.layers[0..done]) |*l| freeLayerCounters(l);
+        gpa.free(out.layers);
+    }
+    try ownCounters(&out.head);
+    errdefer out.head.counters.free();
+    for (out.layers) |*l| {
+        try ownLayerCounters(l);
+        done += 1;
+    }
+    return out;
+}
+
+/// Frees what `withOwnCounters` made (its counters and its layer list).
+pub fn freeCounters(gpa: std.mem.Allocator, w: *Weights) void {
+    for (w.layers) |*l| freeLayerCounters(l);
+    w.head.counters.free();
+    gpa.free(w.layers);
+}
+
+fn ownCounters(l: *exl3.Linear) !void {
+    var fresh = try cuda.DeviceBuffer.alloc(l.counters.d, l.counters.len);
+    errdefer fresh.free();
+    try fresh.fill32(0, null);
+    l.counters = fresh;
+}
+
+const layer_linears = .{ "wq_a", "wq_b", "wkv", "wo_b" };
+const layer_options = .{ "comp_wkv", "comp_wgate", "idx_wq_b", "idx_wk", "engram_wkv" };
+
+fn ownLayerCounters(l: *Layer) !void {
+    var n: usize = 0;
+    errdefer freeFirst(l, n);
+    inline for (layer_linears) |f| {
+        try ownCounters(&@field(l, f));
+        n += 1;
+    }
+    for (l.wo_a[0..l.wo_a_count]) |*x| {
+        try ownCounters(x);
+        n += 1;
+    }
+    inline for (layer_options) |f| if (@field(l, f)) |*x| {
+        try ownCounters(x);
+        n += 1;
+    };
+}
+
+fn freeLayerCounters(l: *Layer) void {
+    freeFirst(l, std.math.maxInt(usize));
+}
+
+/// The first `n` counters `ownLayerCounters` made, in its order.
+fn freeFirst(l: *Layer, n: usize) void {
+    var i: usize = 0;
+    inline for (layer_linears) |f| {
+        if (i < n) @field(l, f).counters.free();
+        i += 1;
+    }
+    for (l.wo_a[0..l.wo_a_count]) |*x| {
+        if (i < n) x.counters.free();
+        i += 1;
+    }
+    inline for (layer_options) |f| if (@field(l, f)) |*x| {
+        if (i < n) x.counters.free();
+        i += 1;
+    };
+}
+
 /// Loads the backbone layers [0, n_layers_wanted) (all of them when null) for `rank` of `world`.
 pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const Config, rc: *const RankCache, kernels: *const exl3.Kernels, rank: usize, world: usize, cb: exl3.Codebook, n_layers_wanted: ?usize) Error!Weights {
     var w: Weights = .{ .gpa = gpa, .cfg = cfg, .rank = rank, .world = world, .embed = undefined, .norm = undefined, .head = undefined, .vocab = map.vocabRange(cfg, rank, world), .layers = &.{} };

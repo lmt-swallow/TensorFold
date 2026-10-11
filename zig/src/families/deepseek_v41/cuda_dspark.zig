@@ -217,6 +217,9 @@ pub const Wide = struct {
     }
 };
 
+/// An absorber's copies of main_proj and every stage's wkv (their own split-K counters) and its stages over them.
+const AbsorbOwned = struct { lins: []exl3.Linear, stages: []Stage };
+
 /// What a draft returns: the block's drafts and their confidences (the head's logits, one a draft).
 pub const Drafts = struct { tokens: [16]u32, conf: [16]f32, len: usize };
 
@@ -389,6 +392,8 @@ pub const Drafter = struct {
     main_y: cuda.DeviceBuffer,
     abs_kv: cuda.DeviceBuffer,
     abs_rows: usize,
+    /// An `absorber`'s own layer copies (null in a drafter `init` made).
+    owned: ?*AbsorbOwned = null,
     // host
     host_out: []i64,
     host_xc: []u16,
@@ -440,6 +445,7 @@ pub const Drafter = struct {
         self.captures = 0;
         self.launch_hook = null;
         self.counting = null;
+        self.owned = null;
         self.uploads = try attention.Uploads.init(d, attention.Uploads.room(2, max_absorb * 8) + attention.Uploads.room(5, n * n * 8) + attention.Uploads.room(Markov.np, 8));
         errdefer self.uploads.deinit();
         self.hc = hc_mod.Hc.init(set, @intCast(dims.d), dims.hc_iters, dims.eps, dims.hc_eps);
@@ -602,6 +608,76 @@ pub const Drafter = struct {
         self.gk.deinit();
         self.l2.deinit();
         self.gpa.destroy(self);
+    }
+
+    /// A drafter for a prompt's absorbs (`absorb`) beside this one's passes and absorbs on another stream: it shares
+    /// this one's weights, kernels and prompt GEMM (`enableWide`, which only `absorb` uses) and owns what an absorb
+    /// writes: its tables and their staging, its RoPE rows, its activations and the split-K counters of main_proj
+    /// and every stage's wkv (copies of those layers). Only `absorb` may be called on it; the same bits as this
+    /// one's `absorb`. `deinitAbsorber` frees it (before this one).
+    pub fn absorber(self: *const Drafter) !*Drafter {
+        const gpa = self.gpa;
+        const d = self.d;
+        const dm = self.dims;
+        const rows = @max(dm.ring, 128);
+        const a = try gpa.create(Drafter);
+        errdefer gpa.destroy(a);
+        a.* = self.*;
+        const own = try gpa.create(AbsorbOwned);
+        errdefer gpa.destroy(own);
+        own.* = .{ .lins = try gpa.alloc(exl3.Linear, 1 + self.stages.len), .stages = try gpa.alloc(Stage, self.stages.len) };
+        errdefer {
+            gpa.free(own.lins);
+            gpa.free(own.stages);
+        }
+        own.lins[0] = self.head.main_proj.*;
+        for (self.stages, own.stages, own.lins[1..]) |st, *o, *l| {
+            l.* = st.wkv.*;
+            o.* = st;
+            o.wkv = l;
+        }
+        var made: usize = 0;
+        errdefer for (own.lins[0..made]) |*l| l.counters.free();
+        for (own.lins) |*l| {
+            l.counters = try cuda.DeviceBuffer.alloc(d, l.counters.len);
+            made += 1;
+            try l.counters.fill32(0, null);
+        }
+        a.head.main_proj = &own.lins[0];
+        a.stages = own.stages;
+        a.owned = own;
+        a.uploads = try attention.Uploads.init(d, attention.Uploads.room(2, rows * 8));
+        errdefer a.uploads.deinit();
+        a.rr = try attention.RopeRows.init(gpa, d, self.glue, rows, 2, dm.rd / 2);
+        errdefer a.rr.deinit();
+        var zw: usize = a.head.main_proj.scratchWords(128);
+        for (a.stages) |st| zw = @max(zw, st.wkv.scratchWords(128));
+        const sizes = .{
+            .{ "xh", 128 * a.head.main_proj.k * 2 }, .{ "z", @max(16, zw * 4) },   .{ "abs_pos", rows * 8 },          .{ "abs_slots", rows * 8 },
+            .{ "main_x", rows * dm.d * 2 },          .{ "main_y", rows * dm.d * 2 }, .{ "abs_kv", rows * dm.hd * 2 },
+        };
+        var bufs: usize = 0;
+        errdefer inline for (sizes, 0..) |f, i| if (i < bufs) @field(a, f[0]).free();
+        inline for (sizes) |f| {
+            @field(a, f[0]) = try cuda.DeviceBuffer.alloc(d, f[1]);
+            bufs += 1;
+        }
+        a.abs_rows = rows;
+        return a;
+    }
+
+    /// Frees a drafter `absorber` made (what it owns; the weights, kernels and prompt GEMM stay its source's).
+    pub fn deinitAbsorber(a: *Drafter) void {
+        inline for (.{ "xh", "z", "abs_pos", "abs_slots", "main_x", "main_y", "abs_kv" }) |f| @field(a, f).free();
+        a.rr.deinit();
+        a.uploads.deinit();
+        if (a.owned) |own| {
+            for (own.lins) |*l| l.counters.free();
+            a.gpa.free(own.lins);
+            a.gpa.free(own.stages);
+            a.gpa.destroy(own);
+        }
+        a.gpa.destroy(a);
     }
 
     /// Absorbs past 128 rows (a prompt chunk's last `ring` rows) through the prompt GEMM, as the fork's `mm` runs
