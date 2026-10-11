@@ -515,28 +515,36 @@ pub const Cancel = struct {
     check: *const fn (ctx: *anyopaque) bool,
 };
 
-/// decode.py `prefill` (chunk loop, no kept points): the prompt in chunks of the prompt buffers' rows; after each
-/// chunk's forward its last row's streams into `last` (bf16 [S * D], the head's first absorb reads them) and, with a
-/// head, the head absorbing the chunk's rows that have a next token in the prompt; then the commit. The last chunk's
-/// logits end in pb.logits.
+/// decode.py `prefill` (chunk loop, no kept points): the prompt in chunks of the prompt buffers' rows (prefillChunk
+/// each). The last chunk's logits end in pb.logits.
 pub fn prefill(h: ?*Head, p: *prompt_mod.Prompt, st: *fwd.Stream, pb: *prompt_mod.Buffers, scp: ?*Scratch, tokens: []const i32, last: cuda.DeviceBuffer, cancel: ?Cancel, stream: cuda.Stream) !void {
-    const wide = p.f.m.cfg.wide();
     var start: usize = 0;
     while (start < tokens.len) {
         if (cancel) |c| if (c.check(c.ctx)) return error.Cancelled;
-        const end = @min(start + pb.rows, tokens.len);
-        const R = end - start;
-        try p.stage(st, pb, tokens[start..end], stream);
-        try p.compute(st, pb, R, end == tokens.len, .{}, stream);
-        try last.copyFrom(0, pb.streams.ptr + (R - 1) * wide * 2, wide * 2, stream.handle);
-        if (h) |head| {
-            const next = tokens[start + 1 .. @min(end + 1, tokens.len)];
-            if (next.len > 0) {
-                try head.forwardPrompt(p, st, pb, scp.?, next, pb.streams.ptr, stream);
-                try st.setMtpLen(st.mtp_len + next.len, stream);
-            }
-        }
-        try p.commit(st, pb, R, stream);
-        start = end;
+        start = try prefillChunk(h, p, st, pb, scp, tokens, start, last, stream);
     }
+}
+
+/// One chunk of decode.py `prefill` from row `start` of the prompt `tokens`: its forward, its last row's streams into
+/// `last` (bf16 [S * D], the head's first absorb reads the prompt's), with a head the head absorbing the chunk's rows
+/// that have a next token in the prompt, then the commit; the next chunk's start returned. A chunk reads nothing the
+/// prompt buffers kept from an earlier one, so other streams' windows and chunks may run between two chunks. The
+/// prompt's last chunk leaves its logits in pb.logits.
+pub fn prefillChunk(h: ?*Head, p: *prompt_mod.Prompt, st: *fwd.Stream, pb: *prompt_mod.Buffers, scp: ?*Scratch, tokens: []const i32, start: usize, last: cuda.DeviceBuffer, stream: cuda.Stream) !usize {
+    const wide = p.f.m.cfg.wide();
+    if (start >= tokens.len) return error.BadChunk;
+    const end = @min(start + pb.rows, tokens.len);
+    const R = end - start;
+    try p.stage(st, pb, tokens[start..end], stream);
+    try p.compute(st, pb, R, end == tokens.len, .{}, stream);
+    try last.copyFrom(0, pb.streams.ptr + (R - 1) * wide * 2, wide * 2, stream.handle);
+    if (h) |head| {
+        const next = tokens[start + 1 .. @min(end + 1, tokens.len)];
+        if (next.len > 0) {
+            try head.forwardPrompt(p, st, pb, scp.?, next, pb.streams.ptr, stream);
+            try st.setMtpLen(st.mtp_len + next.len, stream);
+        }
+    }
+    try p.commit(st, pb, R, stream);
+    return end;
 }

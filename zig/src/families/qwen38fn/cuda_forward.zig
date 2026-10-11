@@ -294,6 +294,24 @@ pub const Stream = struct {
         self.gpa.free(self.caches);
     }
 
+    /// state.py `reset`: an empty sequence in the same buffers (position 0, zero DeltaNet states and conv windows,
+    /// zero n-gram tail, the initial n-gram history, an empty head cache). The attention caches keep their old rows:
+    /// a row is read only below its stream's position, so a reset stream computes what a new one does.
+    pub fn reset(self: *Stream, m: *const Model, stream: cuda.Stream) !void {
+        try self.conv.fill8(0, stream.handle);
+        try self.rec.fill8(0, stream.handle);
+        @memset(self.cur, 0);
+        try self.ple_tail.fill8(0, stream.handle);
+        self.history = @splat(0);
+        self.prompt_history = @splat(0);
+        if (m.ng) |*g| g.initialHistory(self.history[0 .. g.n - 1]);
+        self.last = null;
+        self.pos = 0;
+        try self.pos_dev.fill8(0, stream.handle);
+        self.mtp_drafted = 0;
+        if (self.mtp_caches != null) try self.setMtpLen(0, stream);
+    }
+
     fn stateBytes(cfg: *const Config) usize {
         return cfg.nv * cfg.dv * cfg.dk * 4;
     }
