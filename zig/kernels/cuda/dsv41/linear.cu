@@ -181,6 +181,56 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
     }
 }
 
+// The prompt GEMM's two preparations in one launch (blocks 0 .. rot_blocks - 1: rot_in_kernel's programs; the rest:
+// unpack_kernel's tiles, four a block), so the rows' rotation (DRAM-bound) runs beside the weights' decode. Every
+// value is computed by the same code as those kernels': xh rows from rot_in_kernel's warp program (its rows read
+// x_stride elements apart instead of K, for a column block of a wider matrix), W_q tiles from unpack_kernel's lane
+// decode; the tile is staged in shared memory and stored as 16-byte rows instead of 2-byte values (the same bytes).
+// grid (rot_blocks + ceil(K / 16 * N / 16 / 4)), 128 threads; rot_blocks = ceil(K / 512) * M.
+template <int K2, int CB>
+__device__ __forceinline__ void prep(const void* __restrict__ x, int x_dtype, int x_stride, const half* __restrict__ suh,
+                                     half* __restrict__ xh, int K, int rot_blocks, const uint32_t* __restrict__ T,
+                                     half* __restrict__ W, int N, int64_t stride_k, int64_t stride_nb) {
+    __shared__ __align__(16) unsigned short tile[4][16 * 16];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if ((int)blockIdx.x < rot_blocks) {
+        const int xb = (K / 128 + 3) / 4;
+        const int blk = (blockIdx.x % xb) * 4 + warp, row = blockIdx.x / xb;
+        if (blk * 128 >= K) return;
+        const int k = blk * 128 + 4 * lane;
+        float v[4], sc[4];
+        load4(x, x_dtype, (size_t)row * x_stride + k, v);
+        load4(suh, F16, k, sc);
+        rot128_in(v, sc, lane);
+        store4(xh, F16, (size_t)row * K + k, v);
+        return;
+    }
+    const int t = ((int)blockIdx.x - rot_blocks) * 4 + warp, nts = N / 16;
+    if (t >= (K / 16) * nts) return;
+    const int kt = t / nts, nt = t % nts;
+    uint32_t w[lane_words<K2>()];
+    ldg_lane_words<K2>(T + kt * stride_k + (nt >> 3) * stride_nb + (nt & 7) * tile_words<K2>(), lane, w);
+    uint32_t b[2][2];
+    decode_lane<K2, CB>(w, lane, b[0], b[1]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t v = b[j >> 2][(j >> 1) & 1];
+        tile[warp][value_row(lane, j) * 16 + value_col(lane, j)] = (j & 1) ? (unsigned short)(v >> 16) : (unsigned short)(v & 0xffffu);
+    }
+    __syncwarp();
+    const int r = lane >> 1, c8 = (lane & 1) * 8;
+    *reinterpret_cast<uint4*>(W + (size_t)(kt * 16 + r) * N + nt * 16 + c8) = *reinterpret_cast<const uint4*>(&tile[warp][r * 16 + c8]);
+}
+
+#define TF_PREP(K2_, CB_)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(128) tf_exl3_prep_##K2_##_##CB_(                                    \
+        const void* x, int x_dtype, int x_stride, const half* suh, half* xh, int K, int rot_blocks, const uint32_t* T, \
+        half* W, int N, int64_t stride_k, int64_t stride_nb) {                                                       \
+        prep<K2_, CB_>(x, x_dtype, x_stride, suh, xh, K, rot_blocks, T, W, N, stride_k, stride_nb);                  \
+    }
+TF_EXL3_ALL(TF_PREP)
+#undef TF_PREP
+
 #define TF_INST(K2_, CB_)                                                                                            \
     template __global__ void __launch_bounds__(2 * 32) linear_kernel<K2_, CB_, 2>(                                  \
         const half*, const uint32_t*, long long, long long, const half*, const half*, void*, int, float*, int*,     \

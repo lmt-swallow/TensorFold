@@ -289,6 +289,31 @@ pub const HcFuse = struct {
     }
 };
 
+/// The prompt GEMM's preparation: TF_DS_GEMM_PREP=fused runs linear.cu `prep` (rot_in's rows and unpack's W_q in one
+/// launch, the weights stored 16 bytes a lane) and lets wo_a read o's column blocks and write u's in place (row
+/// strides) instead of copy_cols; the default `split` keeps rot_in, unpack and copy_cols. Only where the values are
+/// placed changes. TF_DS_GEMM_PREP_CHECK=1 compares xh, W_q and every strided output with the split path's.
+pub const GemmPrep = struct {
+    fused: bool,
+    check: bool,
+
+    pub fn load() !GemmPrep {
+        const mode = envOr("TF_DS_GEMM_PREP", "split");
+        if (!std.mem.eql(u8, mode, "fused") and !std.mem.eql(u8, mode, "split")) return error.BadShape;
+        return .{ .fused = std.mem.eql(u8, mode, "fused"), .check = std.mem.eql(u8, envOr("TF_DS_GEMM_PREP_CHECK", "0"), "1") };
+    }
+};
+
+/// Byte equality for a TF_DS_*_CHECK comparison: error.PromptKernelMismatch (logged with the count) when they differ.
+fn checkEqual(what: []const u8, want: []const u8, got: []const u8) !void {
+    var bad: usize = 0;
+    for (want, got) |a, b| bad += @intFromBool(a != b);
+    if (bad != 0) {
+        std.log.err("deepseek_v41: prompt GEMM prep: {s}: {d} of {d} bytes differ from the split path", .{ what, bad, want.len });
+        return error.PromptKernelMismatch;
+    }
+}
+
 /// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).
 pub const Gu = enum { mma, mmb };
 
@@ -696,6 +721,7 @@ pub const Prompt = struct {
     ix: IndexKernels,
     sa: AttnKernels,
     hcf: HcFuse,
+    gp: GemmPrep,
     gemm: Gemm32,
     rows: usize, // the chunk rows this holds buffers for (at most max_chunk)
     rr: attention.RopeRows, // a chunk's rope rows (the device path's: its positions, its groups', the indexer's)
@@ -839,6 +865,8 @@ pub const Prompt = struct {
             .cuda => "hc_fused.cu + _hc_finish (TF_DS_HC=cuda)",
         }, if (self.hcf.check) ", checked against the split kernels (TF_DS_HC_CHECK=1)" else "" });
         self.hc_ref = null;
+        self.gp = try GemmPrep.load();
+        std.log.info("deepseek_v41 rank {d}: prompt GEMM prep: {s}{s}", .{ fwd.w.rank, if (self.gp.fused) "linear.cu prep, strided wo_a rows (TF_DS_GEMM_PREP=fused)" else "rot_in, unpack, copy_cols (TF_DS_GEMM_PREP=split)", if (self.gp.check) ", checked against the split path (TF_DS_GEMM_PREP_CHECK=1)" else "" });
         self.gemm = try Gemm32.init(d);
         errdefer self.gemm.deinit();
         // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
@@ -1319,9 +1347,20 @@ pub const Prompt = struct {
     /// y [m, N] (y_dtype) = x [m, K] bf16 @ W: the row-invariant linear up to 128 rows, the prompt GEMM beyond
     /// (model.py `mm`).
     fn mm(self: *Prompt, lin: *const exl3.Linear, x: Ptr, m: usize, y: Ptr, y_dtype: exl3.DType, stream: cuda.Stream) !void {
-        if (m <= linear_rows) return lin.run(x, .bf16, m, self.xh.ptr, self.z.ptr, y, y_dtype, stream);
+        return self.mmStrided(lin, x, lin.k, m, y, lin.n, y_dtype, stream);
+    }
+
+    /// `mm` on rows x_stride elements apart (a column block of a wider matrix) into rows y_stride elements apart;
+    /// strides other than (K, N) only at prompt rows with TF_DS_GEMM_PREP=fused.
+    fn mmStrided(self: *Prompt, lin: *const exl3.Linear, x: Ptr, x_stride: usize, m: usize, y: Ptr, y_stride: usize, y_dtype: exl3.DType, stream: cuda.Stream) !void {
         const K = lin.k;
         const N = lin.n;
+        if (m <= linear_rows) {
+            std.debug.assert(x_stride == K and y_stride == N);
+            return lin.run(x, .bf16, m, self.xh.ptr, self.z.ptr, y, y_dtype, stream);
+        }
+        if (self.gp.fused) return self.mmFused(lin, x, x_stride, m, y, y_stride, y_dtype, stream);
+        std.debug.assert(x_stride == K and y_stride == N);
         {
             // rot_in: xh [m, K] fp16 = the rows rotated by suh (linear.cu rot_in_kernel)
             var a: cuda.Args = .{};
@@ -1351,6 +1390,108 @@ pub const Prompt = struct {
             aot.ptr("SVH", "*fp16", lin.svh.ptr),   aot.ptr("BIAS", "*fp16", lin.svh.ptr), aot.ptr("OUT", if (y_dtype == .f32) "*fp32" else "*bf16", y),
             aot.int("M", @intCast(m)),              aot.int("o_stride", @intCast(N)),
         }, &.{ aot.ci("K", @intCast(K)), aot.ci("N", @intCast(N)), aot.ci("BM", 128), aot.ci("BK", 32), aot.ci("GROUP", 8), aot.ci("HAS_BIAS", 0), aot.cf("SCALE", prompt_bias_scale) });
+    }
+
+    /// TF_DS_GEMM_PREP=fused: linear.cu `prep` (rot_in's rows read x_stride apart and the unpacked W_q in one launch),
+    /// then `_gemm` writing rows y_stride apart. TF_DS_GEMM_PREP_CHECK=1: xh, W_q and the output against the split
+    /// path's (copy_cols, rot_in, unpack, `_gemm` into contiguous rows), byte for byte.
+    fn mmFused(self: *Prompt, lin: *const exl3.Linear, x: Ptr, x_stride: usize, m: usize, y: Ptr, y_stride: usize, y_dtype: exl3.DType, stream: cuda.Stream) !void {
+        const K = lin.k;
+        const N = lin.n;
+        {
+            const s = lin.strides();
+            const f = try self.kernels.prep(lin.k2, lin.cb);
+            const rot_blocks: usize = ((K / 128 + 3) / 4) * m;
+            const unpack_blocks: usize = ((K / 16) * (N / 16) + 3) / 4;
+            var a: cuda.Args = .{};
+            a.add(x);
+            a.add(@intFromEnum(exl3.DType.bf16));
+            a.add(ci(x_stride));
+            a.add(lin.suh.ptr);
+            a.add(self.xh.ptr);
+            a.add(ci(K));
+            a.add(ci(rot_blocks));
+            a.add(lin.words.ptr);
+            a.add(self.wq.ptr);
+            a.add(ci(N));
+            a.add(s.k);
+            a.add(s.nb);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rot_blocks + unpack_blocks) }, .block = .{ .x = 128 } }, stream, &a);
+        }
+        if (self.gp.check) try self.prepCheck(lin, x, x_stride, m, stream);
+        try self.promptGemm(lin, m, y, y_stride, y_dtype, stream);
+        if (self.gp.check and y_stride != N) {
+            // the split path's output: contiguous rows (x32 as scratch), compared with y's column block
+            try self.promptGemm(lin, m, self.x32.ptr, N, y_dtype, stream);
+            const el: usize = if (y_dtype == .f32) 4 else 2;
+            try stream.synchronize();
+            const gpa = std.heap.page_allocator;
+            const want = try gpa.alloc(u8, m * N * el);
+            defer gpa.free(want);
+            const got = try gpa.alloc(u8, m * N * el);
+            defer gpa.free(got);
+            try self.x32.download(0, want);
+            for (0..m) |r| try (cuda.DeviceBuffer{ .d = self.d, .ptr = y + r * y_stride * el, .len = N * el }).download(0, got[r * N * el ..][0 .. N * el]);
+            try checkEqual("the strided _gemm output", want, got);
+        }
+    }
+
+    fn promptGemm(self: *Prompt, lin: *const exl3.Linear, m: usize, y: Ptr, y_stride: usize, y_dtype: exl3.DType, stream: cuda.Stream) !void {
+        const N = lin.n;
+        const bm: usize = 128;
+        const grid: u32 = @intCast(((m + bm - 1) / bm) * (N / 128));
+        try self.fwd.set.run(stream, "_gemm", .{ grid, 1, 1 }, &.{
+            aot.ptr("X", "*fp16", self.xh.ptr),     aot.ptr("W", "*fp16", self.wq.ptr),   aot.ptr("H", "*bf16", self.had.ptr),
+            aot.ptr("SVH", "*fp16", lin.svh.ptr),   aot.ptr("BIAS", "*fp16", lin.svh.ptr), aot.ptr("OUT", if (y_dtype == .f32) "*fp32" else "*bf16", y),
+            aot.int("M", @intCast(m)),              aot.int("o_stride", @intCast(y_stride)),
+        }, &.{ aot.ci("K", @intCast(lin.k)), aot.ci("N", @intCast(N)), aot.ci("BM", 128), aot.ci("BK", 32), aot.ci("GROUP", 8), aot.ci("HAS_BIAS", 0), aot.cf("SCALE", prompt_bias_scale) });
+    }
+
+    /// TF_DS_GEMM_PREP_CHECK: the fused prep's xh and W_q (just written) against copy_cols + rot_in + unpack's; the
+    /// split path's values are left in xh and W_q.
+    fn prepCheck(self: *Prompt, lin: *const exl3.Linear, x: Ptr, x_stride: usize, m: usize, stream: cuda.Stream) !void {
+        const K = lin.k;
+        const N = lin.n;
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const xh_got = try gpa.alloc(u8, m * K * 2);
+        defer gpa.free(xh_got);
+        const wq_got = try gpa.alloc(u8, K * N * 2);
+        defer gpa.free(wq_got);
+        try self.xh.download(0, xh_got);
+        try self.wq.download(0, wq_got);
+        var src = x;
+        if (x_stride != K) {
+            try self.copyCols(x, x_stride, self.x32.ptr, K, m, K, stream);
+            src = self.x32.ptr;
+        }
+        {
+            var a: cuda.Args = .{};
+            a.add(src);
+            a.add(@intFromEnum(exl3.DType.bf16));
+            a.add(lin.suh.ptr);
+            a.add(self.xh.ptr);
+            a.add(ci(K));
+            try cuda.launch.launch(lin.rot_in, .{ .grid = .{ .x = @intCast((K / 128 + 3) / 4), .y = @intCast(m) }, .block = .{ .x = 128 } }, stream, &a);
+        }
+        {
+            const s = lin.strides();
+            const f = try self.kernels.unpack(lin.k2, lin.cb);
+            var a: cuda.Args = .{};
+            a.add(lin.words.ptr);
+            a.add(self.wq.ptr);
+            a.add(ci(N));
+            a.add(s.k);
+            a.add(s.nb);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(N / 16), .y = @intCast(K / 16) }, .block = .{ .x = 32 } }, stream, &a);
+        }
+        try stream.synchronize();
+        const want = try gpa.alloc(u8, @max(m * K, K * N) * 2);
+        defer gpa.free(want);
+        try self.xh.download(0, want[0 .. m * K * 2]);
+        try checkEqual("xh", want[0 .. m * K * 2], xh_got);
+        try self.wq.download(0, want[0 .. K * N * 2]);
+        try checkEqual("W_q", want[0 .. K * N * 2], wq_got);
     }
 
     /// `mm` to fp32 for a hook (Engram's projection at the chunk's rows).
@@ -1478,6 +1619,11 @@ pub const Prompt = struct {
         const o_cols = heads * hd;
         const g_cols = o_cols / dims.groups;
         for (0..dims.groups) |g| {
+            if (self.gp.fused and n > linear_rows) {
+                // o's column block read and u's written in place (the GEMM prep's row stride, _gemm's o_stride)
+                try self.mmStrided(p.wo_a[g], self.o.ptr + g * g_cols * 2, o_cols, n, self.u.ptr + g * c.o_rank * 2, dims.groups * c.o_rank, .bf16, stream);
+                continue;
+            }
             try self.copyCols(self.o.ptr + g * g_cols * 2, o_cols, self.og.ptr, g_cols, n, g_cols, stream);
             try self.mm(p.wo_a[g], self.og.ptr, n, self.ug.ptr, .bf16, stream);
             try self.copyCols(self.ug.ptr, c.o_rank, self.u.ptr + g * c.o_rank * 2, dims.groups * c.o_rank, n, c.o_rank, stream);

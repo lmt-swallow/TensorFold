@@ -82,6 +82,13 @@ pub const Kernels = struct {
         return self.module.function(name);
     }
 
+    /// tf_exl3_prep_<K2>_<CB>: rot_in_kernel's rows and unpack_kernel's W_q in one launch (linear.cu `prep`).
+    pub fn prep(self: *const Kernels, k2: u32, cb: Codebook) !cuda.Function {
+        var buf: [64]u8 = undefined;
+        const name = try symbol(&buf, "tf_exl3_prep_{d}_{d}", .{ k2, @intFromEnum(cb) });
+        return self.module.function(name);
+    }
+
     /// unpack_kernel<K2, CB>: W_q [K, N] fp16 from the words.
     pub fn unpack(self: *const Kernels, k2: u32, cb: Codebook) !cuda.Function {
         var buf: [160]u8 = undefined;
