@@ -184,6 +184,7 @@ pub const Hc = struct {
     sel: Select,
     sco: Own,
     one: Own,
+    one_split: Own, // TF_GLM_ONEPASS=2: onepass.cu's head-split scoring (every warp half the dots)
 
     /// hc_fused.cu from this many rows (GB10: 1.18x the captured pair at 2,048 rows, 0.97x at 777, slower below).
     const fused_min_rows = 1024;
@@ -205,7 +206,9 @@ pub const Hc = struct {
         errdefer sel.deinit();
         var sco = try Own.load(d, cuda.kernels.glm53_scores, "_ZN15tf_glm53_scores13scores_kernelEPK13__nv_bfloat16S2_iS2_PfPKiiiff", "tf_glm53_scores_smem", "TF_GLM_SCORES");
         errdefer sco.deinit();
-        const one = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass14onepass_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS");
+        var one = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass14onepass_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS");
+        errdefer one.deinit();
+        const one_split = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass20onepass_split_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS");
         return .{
             .d = d,
             .module = module,
@@ -218,10 +221,12 @@ pub const Hc = struct {
             .sel = sel,
             .sco = sco,
             .one = one,
+            .one_split = one_split,
         };
     }
 
     pub fn deinit(self: *Hc) void {
+        self.one_split.deinit();
         self.one.deinit();
         self.sco.deinit();
         self.sel.deinit();
@@ -808,7 +813,7 @@ pub const Glue = struct {
 
     /// latent.py `sparse_onepass` (prompt rows): one online softmax a row over its selected tokens, straight to out.
     pub fn sparseOnepass(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
-        const own = &g.hc.one;
+        const own = if (std.mem.eql(u8, envOr("TF_GLM_ONEPASS", "1"), "2")) &g.hc.one_split else &g.hc.one;
         if (!own.use or kv != .bf16 or H != 32 or lw != 512) return g.sparseOnepassCaptured(qa, cache, kv, tok, counts, out, R, H, lw, w, scale, stream);
         // onepass.cu: the captured kernel's arithmetic, its duplicated dots left out, the tiles gathered by cp.async
         var args: cuda.Args = .{};

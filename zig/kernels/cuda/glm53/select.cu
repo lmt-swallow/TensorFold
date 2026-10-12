@@ -11,6 +11,11 @@
 // into the row's output. When the threshold bin holds more candidates than shared memory does (many equal or nearly
 // equal scores), the block falls back to a radix select over the row (three more counting passes) and one pass in
 // index order that writes the picks: the same output, more reads.
+//
+// Checked by tf-cuda-test glm53-select (the definition computed on the host, and the captured `_select_rows` /
+// `select_split` where the Triton set holds the variant, over rows of distinct values, few values, zeros, -inf
+// tails, one value, signed zeros and threshold bins filled to the candidate capacity and one past it, np 1,024 to
+// 150,016) and by glm53-prompt's fixtures under TF_GLM_PROMPT_CHECK=1 (every call against the captured kernels).
 #include <stdint.h>
 
 namespace tf_glm53_select {

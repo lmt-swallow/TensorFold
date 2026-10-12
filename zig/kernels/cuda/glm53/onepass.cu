@@ -10,6 +10,11 @@
 // warps each computed the 32-key tile's dots (warps 4-7 duplicates of 0-3); here warps 0-3 compute them once and
 // every warp shares the probabilities through shared memory. The next tile's rows arrive by cp.async while the
 // current one is used, where the captured kernel staged them through registers.
+//
+// The arithmetic was read from the captured cubin's PTX and SASS (its only fused multiply-adds are l's fma.rn).
+// Checked by tf-cuda-test glm53-onepass (byte for byte against the captured `_sparse_onepass`: rows with no tokens,
+// a few, a partial last tile, 2,048 to 2,051, latents whose tiles' maxima move; TF_GLM_ONEPASS=2 the head-split
+// variant) and by glm53-prompt's fixtures under TF_GLM_PROMPT_CHECK=1.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -80,11 +85,13 @@ __device__ __forceinline__ void load_tile(uint32_t kv, const __nv_bfloat16* lc, 
 }
 
 // Prompt rows r (grid x): QA [R, 32, 512] bf16, LC the latent cache [tokens, 512] bf16, TOK [R, W] token ids, CNT [R]
-// counts (rows with 0 left alone), OUT [R, 32, 512] bf16.
-__global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* __restrict__ QA,
-                                                           const __nv_bfloat16* __restrict__ LC,
-                                                           const int* __restrict__ TOK, const int* __restrict__ CNT,
-                                                           __nv_bfloat16* __restrict__ OUT, int W, float scale) {
+// counts (rows with 0 left alone), OUT [R, 32, 512] bf16. The scores' dots: SPLIT false, warps 0-3 each take key
+// block `warp` for both head tiles (warps 4-7 wait); SPLIT true, warp w takes key block w % 4 for head tile w / 4
+// (every warp half the dots). Either way each score is the same m16n8k16 chain and each sum the same order.
+template <bool SPLIT>
+__device__ __forceinline__ void onepass_body(const __nv_bfloat16* __restrict__ QA, const __nv_bfloat16* __restrict__ LC,
+                                             const int* __restrict__ TOK, const int* __restrict__ CNT,
+                                             __nv_bfloat16* __restrict__ OUT, int W, float scale) {
     extern __shared__ __align__(128) unsigned char smem[];
     Shared& s = *reinterpret_cast<Shared*>(smem);
     const int r = blockIdx.x;
@@ -93,6 +100,10 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int which = lane >> 3, row8 = lane & 7;
+    const int kb = SPLIT ? (warp & 3) : warp;       // this warp's key block (scores)
+    const int mlo = SPLIT ? (warp >> 2) : 0;        // its head tiles mlo .. mhi - 1
+    const int mhi = SPLIT ? mlo + 1 : 2;
+    const bool scorer = SPLIT || warp < 4;
     const int* tok = TOK + (int64_t)r * W;
     const uint32_t sq = (uint32_t)__cvta_generic_to_shared(s.q);
     const uint32_t skv[2] = {(uint32_t)__cvta_generic_to_shared(s.kv[0]), (uint32_t)__cvta_generic_to_shared(s.kv[1])};
@@ -106,7 +117,8 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
     load_tile(skv[0], LC, tok, 0, n);
     if (threadIdx.x < kHeads) s.l[threadIdx.x] = 0.0f;
 
-    // warps 0-3: each head's running max m (heads g, g + 8, 16 + g, 24 + g of this lane)
+    // the scoring warps: each head's running max m (heads g, g + 8, 16 + g, 24 + g of this lane; a SPLIT warp keeps
+    // its tile's two)
     float m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
     // every warp: o of heads (g, g + 8) [tile 0], (16 + g, 24 + g) [tile 1] x its 64 latent columns (8 n tiles)
     float o[2][8][4];
@@ -123,21 +135,22 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
         __syncthreads();  // tile cur arrived; the previous tile's readers are done with tile cur ^ 1, p and alpha
         if (t0 + kKeys < n) load_tile(skv[cur ^ 1], LC, tok, t0 + kKeys, n);
         const uint32_t kv = skv[cur];
-        // keys warp * 8 + 2t, + 1 of this lane (warps 0-3)
-        const bool v0 = t0 + warp * 8 + 2 * t < n, v1 = t0 + warp * 8 + 2 * t + 1 < n;
+        // keys kb * 8 + 2t, + 1 of this lane (the scoring warps)
+        const bool v0 = t0 + kb * 8 + 2 * t < n, v1 = t0 + kb * 8 + 2 * t + 1 < n;
         float sc[2][4];
-        if (warp < 4) {
-            // the scores: q . k of keys warp * 8 .. + 7, the 512 dims in 32 k16 steps from zero
+        if (scorer) {
+            // the scores: q . k of keys kb * 8 .. + 7, the 512 dims in 32 k16 steps from zero
             float acc[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
 #pragma unroll 4
             for (int ks = 0; ks < kLw / 16; ks += 2) {
                 uint32_t b[4];  // steps ks (lo, hi), ks + 1 (lo, hi)
-                ldsm_x4(b, kv + swz(warp * 8 + row8, ks * 2 + which));
+                ldsm_x4(b, kv + swz(kb * 8 + row8, ks * 2 + which));
 #pragma unroll
                 for (int hs = 0; hs < 2; ++hs) {
                     const int step = ks + hs;
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
+                        if (mt < mlo || mt >= mhi) continue;
                         uint32_t a[4];
                         ldsm_x4(a, sq + swz(mt * 16 + (which & 1) * 8 + row8, step * 2 + (which >> 1)));
                         mma(acc[mt], a, b[2 * hs], b[2 * hs + 1]);
@@ -155,10 +168,11 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int mt = i >> 1, hi = i & 1;
+                if (mt < mlo || mt >= mhi) continue;
                 float x = fmaxf(sc[mt][2 * hi], sc[mt][2 * hi + 1]);
                 x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFFu, x, 2));
                 x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFFu, x, 1));
-                if (t == 0) s.red[warp * kHeads + mt * 16 + hi * 8 + g] = x;
+                if (t == 0) s.red[kb * kHeads + mt * 16 + hi * 8 + g] = x;
             }
         }
         __syncthreads();
@@ -167,10 +181,11 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
             s.tm[h] = fmaxf(fmaxf(s.red[h], s.red[2 * kHeads + h]), fmaxf(s.red[kHeads + h], s.red[3 * kHeads + h]));
         }
         __syncthreads();
-        if (warp < 4) {
+        if (scorer) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int mt = i >> 1, hi = i & 1;
+                if (mt < mlo || mt >= mhi) continue;
                 const int h = mt * 16 + hi * 8 + g;
                 const float tile_m = s.tm[h];
                 const bool active = tile_m != -INFINITY;
@@ -181,13 +196,13 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
                 const float p0 = (v0 && active) ? e0 : 0.0f;
                 const float p1 = (v1 && active) ? e1 : 0.0f;
                 m[i] = next_m;
-                *reinterpret_cast<__nv_bfloat162*>(&s.p[h * kKeys + warp * 8 + 2 * t]) = __floats2bfloat162_rn(p0, p1);
-                if (warp == 0 && t == 0) s.alpha[h] = al;
+                *reinterpret_cast<__nv_bfloat162*>(&s.p[h * kKeys + kb * 8 + 2 * t]) = __floats2bfloat162_rn(p0, p1);
+                if (kb == 0 && t == 0) s.alpha[h] = al;
                 // this warp's key sum of head h: the lane's p0 + p1, then xor 2, xor 1
                 float x = __fadd_rn(p0, p1);
                 x = __fadd_rn(x, __shfl_xor_sync(0xFFFFFFFFu, x, 2));
                 x = __fadd_rn(x, __shfl_xor_sync(0xFFFFFFFFu, x, 1));
-                if (t == 0) s.red[warp * kHeads + h] = x;
+                if (t == 0) s.red[kb * kHeads + h] = x;
             }
         }
         __syncthreads();
@@ -251,6 +266,20 @@ __global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* 
                 __floats2bfloat162_rn(div_full(o[mt][nt][2], l1), div_full(o[mt][nt][3], l1));
         }
     }
+}
+
+__global__ void __launch_bounds__(kThreads) onepass_kernel(const __nv_bfloat16* __restrict__ QA,
+                                                           const __nv_bfloat16* __restrict__ LC,
+                                                           const int* __restrict__ TOK, const int* __restrict__ CNT,
+                                                           __nv_bfloat16* __restrict__ OUT, int W, float scale) {
+    onepass_body<false>(QA, LC, TOK, CNT, OUT, W, scale);
+}
+
+__global__ void __launch_bounds__(kThreads) onepass_split_kernel(const __nv_bfloat16* __restrict__ QA,
+                                                                 const __nv_bfloat16* __restrict__ LC,
+                                                                 const int* __restrict__ TOK, const int* __restrict__ CNT,
+                                                                 __nv_bfloat16* __restrict__ OUT, int W, float scale) {
+    onepass_body<true>(QA, LC, TOK, CNT, OUT, W, scale);
 }
 
 }  // namespace tf_glm53_onepass

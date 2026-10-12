@@ -279,9 +279,12 @@ pub fn runOnepass(gpu: Gpu, aot_dir: []const u8) !void {
     try o2.fill8(0x5A, null);
     const scale: f32 = @floatCast(std.math.pow(f64, 256.0, -0.5));
     hc.one.check = false;
+    hc.one_split.check = false;
     hc.one.use = true;
+    hc.one_split.use = true; // TF_GLM_ONEPASS=2 tests the head-split variant
     try g.sparseOnepass(bq.ptr, bc.ptr, .bf16, bt.ptr, bn.ptr, o1.ptr, R, H, LW, W, scale, stream);
     hc.one.use = false;
+    hc.one_split.use = false;
     try g.sparseOnepass(bq.ptr, bc.ptr, .bf16, bt.ptr, bn.ptr, o2.ptr, R, H, LW, W, scale, stream);
     try stream.synchronize();
     const a = try gpa.alloc(u8, R * H * LW * 2);

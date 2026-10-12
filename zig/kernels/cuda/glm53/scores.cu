@@ -8,6 +8,11 @@
 // captured `_scores`). Every output element is a function of its row, its pool and that fixed arithmetic, so this
 // kernel's other tiling (128 pools and 32 rows a block, the pool keys' fragments kept in registers across the rows)
 // writes the captured kernel's bytes.
+//
+// The arithmetic was read from the captured cubin's PTX (and its SASS: no fused multiply-adds other than the
+// explicit fma.rn chain). Checked by tf-cuda-test glm53-scores (byte for byte against the captured `_scores` at RB 4
+// and 8, block positions 2,051 to 600,000, 37 to 512 rows, 2,048 to 150,016 pools) and by glm53-prompt's fixtures
+// under TF_GLM_PROMPT_CHECK=1.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
