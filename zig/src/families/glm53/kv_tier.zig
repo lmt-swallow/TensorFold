@@ -887,6 +887,17 @@ pub const Tier = struct {
 /// Block reads and writes on the backing file: Linux AIO on O_DIRECT where the kernel and file system allow it (the
 /// engine runs in Docker, whose default seccomp profile refuses io_uring but not AIO), else positional calls.
 /// `add` queues (submitting when the queue is full), `finish` returns once every queued transfer landed.
+///
+/// Ordering the tier relies on (the slab is mapped pinned memory the GPU writes and reads):
+/// - The drive's DMA never touches the slab: each transfer goes through a lane's bounce buffer and the CPU copies
+///   between it and the slab (a write's copy when it is submitted, a read's when it completes). The CPU's view of
+///   the slab is coherent with the GPU's; the drive's need not be.
+/// - A latent write lands before the copy that writes its pool out: cuda_tier.commit synchronizes the stream
+///   that queued the latent writes before kv_tier.commit runs (engine: tierSettle; tests: the same call).
+/// - A slot is reused (evicted, moved, read into) only by a host call that runs after every device call reading
+///   it finished: resolve synchronizes its stream before fetch, and beginWindow is called after the stream's
+///   earlier calls finished (the engine synchronizes in tierBegin). `finish` returns only when every transfer
+///   and its copy completed, and every public call starts and ends with one.
 extern "c" fn flock(fd: c_int, op: c_int) c_int;
 const lock_ex = 2;
 const lock_nb = 4;
@@ -928,9 +939,13 @@ pub const Io = struct {
         cbs: []Iocb,
         ptrs: []*Iocb,
         free: []u32,
+        item: []u32 = &.{}, // per control block: the request it carries
+        bounce: []align(block) u8 = &.{}, // per control block: max_req bytes the drive reads or writes
         bad: bool = false,
     };
 
+    /// A request's bytes at most (larger ones are split): a lane's bounce holds depth of them.
+    const max_req = 64 << 10;
 
     /// `lanes` AIO contexts of `depth` transfers each (the measured NVMe: QD 64 on one thread reads 1.0M 4 KiB
     /// blocks a second, four threads 2.2M).
@@ -962,6 +977,19 @@ pub const Io = struct {
                     gpa.free(l.ptrs);
                     return e;
                 };
+                l.item = gpa.alloc(u32, io.depth) catch |e| {
+                    gpa.free(l.cbs);
+                    gpa.free(l.ptrs);
+                    gpa.free(l.free);
+                    return e;
+                };
+                l.bounce = gpa.alignedAlloc(u8, .fromByteUnits(block), io.depth * max_req) catch |e| {
+                    gpa.free(l.cbs);
+                    gpa.free(l.ptrs);
+                    gpa.free(l.free);
+                    gpa.free(l.item);
+                    return e;
+                };
                 made += 1;
                 if (linux.errno(linux.syscall2(.io_setup, io.depth, @intFromPtr(&l.ctx))) != .SUCCESS) l.ctx = 0;
             }
@@ -977,6 +1005,8 @@ pub const Io = struct {
             io.gpa.free(l.cbs);
             io.gpa.free(l.ptrs);
             io.gpa.free(l.free);
+            io.gpa.free(l.item);
+            io.gpa.free(l.bounce);
         }
         io.gpa.free(io.lanes);
     }
@@ -989,7 +1019,11 @@ pub const Io = struct {
     }
 
     pub fn add(io: *Io, op: Op, buf: []u8, off: u64) Error!void {
-        try io.queue.append(io.gpa, .{ .op = op, .buf = buf, .off = off });
+        var at: usize = 0;
+        while (at < buf.len) : (at += max_req) {
+            const n = @min(max_req, buf.len - at);
+            try io.queue.append(io.gpa, .{ .op = op, .buf = buf[at..][0..n], .off = off + at });
+        }
         if (io.queue.items.len >= io.depth * 64) try io.finish();
     }
 
@@ -1041,11 +1075,16 @@ pub const Io = struct {
                 const q = items[next];
                 nfree -= 1;
                 const c = l.free[nfree];
+                l.item[c] = @intCast(next);
+                // the drive's DMA touches only the lane's bounce; the CPU copies between it and the slab (whose
+                // latest bytes may be the GPU's, coherent with the CPU but not necessarily with the drive)
+                const bounce = l.bounce[c * max_req ..][0..q.buf.len];
+                if (q.op == .write) @memcpy(bounce, q.buf);
                 l.cbs[c] = .{
                     .data = (@as(u64, c) << 32) | q.buf.len,
                     .lio_opcode = if (q.op == .read) 0 else 1,
                     .fildes = @intCast(io.fd),
-                    .buf = @intFromPtr(q.buf.ptr),
+                    .buf = @intFromPtr(bounce.ptr),
                     .nbytes = q.buf.len,
                     .offset = @intCast(q.off),
                 };
@@ -1079,7 +1118,13 @@ pub const Io = struct {
                 return;
             }
             for (ev[0..@intCast(got)]) |e| {
-                if (e.res != @as(i64, @intCast(e.data & 0xFFFF_FFFF))) l.bad = true;
+                const c: u32 = @intCast(e.data >> 32);
+                if (e.res != @as(i64, @intCast(e.data & 0xFFFF_FFFF))) {
+                    l.bad = true;
+                } else {
+                    const q = items[l.item[c]];
+                    if (q.op == .read) @memcpy(q.buf, l.bounce[c * max_req ..][0..q.buf.len]);
+                }
                 l.free[nfree] = @intCast(e.data >> 32);
                 nfree += 1;
                 inflight -= 1;
