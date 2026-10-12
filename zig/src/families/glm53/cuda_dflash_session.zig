@@ -56,13 +56,21 @@ pub const Session = struct {
     /// Direct/optimized target cache parity must pass before this path is used by serving.
     pub fn fill(s: *Session, prompt: []const u32, start: usize) !usize {
         const r = s.runner;
-        if (start >= prompt.len or s.context.logical.end != start) return error.BadDflashSession;
+        if (!s.context.valid or start >= prompt.len or s.context.logical.end != start) return error.BadDflashSession;
+        errdefer s.context.valid = false;
         const rows = @min(E.prompt_rows, prompt.len - start);
         const hook = try s.taps.begin(rows);
         const end = try r.fillTargetHook(s.sequence, prompt, start, hook);
         try s.appendTaps(rows);
         if (s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
         return end;
+    }
+
+    /// Sample the prompt's last target row without adding an MTP backlog entry.
+    pub fn first(s: *Session) !u32 {
+        if (!s.context.valid or s.context.logical.end == 0 or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        errdefer s.context.valid = false;
+        return s.runner.sample(s.runner.w.logits, 0, 1, null);
     }
 
     fn gather(raw: *anyopaque, send: Ptr, recv: Ptr, floats: usize, stream: cuda.Stream) !void {
@@ -73,7 +81,8 @@ pub const Session = struct {
     /// Return confidence-prefix candidates. Speculative KV writes never advance committed context.
     pub fn draft(s: *Session, pending: u32) ![]u32 {
         const r = s.runner;
-        if (s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        if (!s.context.valid or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        errdefer s.context.valid = false;
         var ids: [8]u32 = undefined;
         @memset(&ids, s.model.mask);
         ids[0] = pending;
@@ -120,7 +129,8 @@ pub const Session = struct {
     /// `out` receives emitted greedy samples; the final sample remains pending for the next call.
     pub fn verify(s: *Session, pending: u32, drafts: []const u32, room: usize, out: []u32) !usize {
         const r = s.runner;
-        if (drafts.len >= E.rows or room == 0 or out.len < @min(1 + drafts.len, room) or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        if (!s.context.valid or drafts.len >= E.rows or room == 0 or out.len < @min(1 + drafts.len, room) or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        errdefer s.context.valid = false;
         var ids: [E.rows]u32 = undefined;
         ids[0] = pending;
         @memcpy(ids[1..][0..drafts.len], drafts);
