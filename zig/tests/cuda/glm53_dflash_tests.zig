@@ -26,6 +26,14 @@ fn projection(m: *const glm.dflash_weights.Model, head: *const Head, call: usize
 }
 
 pub fn run(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8) !void {
+    return replay(gpu, work, target, draft, false);
+}
+
+pub fn connected(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8) !void {
+    return replay(gpu, work, target, draft, true);
+}
+
+fn replay(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8, pipeline: bool) !void {
     const a = gpu.gpa;
     const aot_dir = try std.fs.path.join(a, &.{ work, "aot" });
     defer a.free(aot_dir);
@@ -48,6 +56,11 @@ pub fn run(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const 
     defer pack.close();
     var scratch = try glm.dflash_buffers.Scratch.init(gpu.d);
     defer scratch.deinit();
+    const dk: glm.dflash_kernels.Kernels = .{ .set = &set };
+    var lt = try cuda.cublaslt.Library.open();
+    defer lt.close();
+    var hp = try cuda.cublaslt.Linear.init(&lt, 7, 256, 4096, .bf16, 32 << 20);
+    defer hp.deinit();
     const trace = h.fx.parsed.value.object.get("trace").?.array.items;
     for (0..2) |rank| {
         var model = try glm.dflash_weights.Model.open(a, gpu.io, gpu.d, draft, rank);
@@ -55,10 +68,18 @@ pub fn run(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const 
         const lay: glm.config.Layout = .{ .rank = rank, .world = 2, .cfg = &cfg };
         var head = try Head.load(.{ .gpa = a, .d = gpu.d, .pack = &pack, .lay = lay });
         defer head.deinit();
+        var context = try glm.dflash_buffers.Context.init(gpu.d, 4096);
+        defer context.deinit();
+        var embedding = try (glm.weights.Loader{ .gpa = a, .d = gpu.d, .pack = &pack, .lay = lay }).share("model.language_model.embed_tokens.weight");
+        defer embedding.free();
         for (0..9) |step| {
             try h.begin(rank, step);
             var sb: [16]u8 = undefined;
             const name = try std.fmt.bufPrint(&sb, "s{d}", .{step});
+            if (pipeline) {
+                try connectedStep(&h, &context, &model, &head, scratch, dk, kernels, glue, embedding, &hp, step);
+                continue;
+            }
             var count: usize = 0;
             for (trace) |call| {
                 const o = call.object;
@@ -85,5 +106,153 @@ pub fn run(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const 
         }
     }
     try check.expect(h.failures == 0, "DFlash2 projection replay: {d} failures", .{h.failures});
-    check.pass("DFlash2 all 666 rank/step projections equal the captured BF16/FP32 outputs", .{});
+    if (pipeline) check.pass("DFlash2 connected nine-step rank outputs and rings equal the captured fixture", .{}) else check.pass("DFlash2 all 666 rank/step projections equal the captured BF16/FP32 outputs", .{});
+}
+
+/// Each native rank partial is checked before combining it with the recorded peer partial.
+/// Both ranks execute this gate; real communication and target acceptance remain separate gates.
+const Gather = struct {
+    h: *hs.Harness,
+    seqs: [10]i64,
+    at: usize = 0,
+    step: usize,
+
+    fn run(raw: *anyopaque, part: cuda.abi.DevicePtr, gathered: cuda.abi.DevicePtr, floats: usize, stream: cuda.Stream) !void {
+        const self: *Gather = @ptrCast(@alignCast(raw));
+        if (self.at >= self.seqs.len or floats != 8 * 4096) return error.BadDflashTrace;
+        const h = self.h;
+        const seq = self.seqs[self.at];
+        self.at += 1;
+        try h.same(try h.arrayName(seq, "_mm", "ret"), part);
+        const own: cuda.DeviceBuffer = .{ .d = h.gpu.d, .ptr = part, .len = floats * 4 };
+        const out: cuda.DeviceBuffer = .{ .d = h.gpu.d, .ptr = gathered, .len = 2 * floats * 4 };
+        try out.copyFrom(h.rank * floats * 4, own.ptr, floats * 4, stream.handle);
+        var name: [128]u8 = undefined;
+        const peer_name = try std.fmt.bufPrint(&name, "r{d}_s{d}_{d:0>3}__mm_ret", .{ 1 - h.rank, self.step, @as(u64, @intCast(seq)) });
+        const peer = try h.fx.bytes(peer_name);
+        defer h.gpu.gpa.free(peer);
+        if (peer.len != floats * 4) return error.BadDflashTrace;
+        try out.upload((1 - h.rank) * floats * 4, peer);
+    }
+};
+
+fn feedCall(h: *hs.Harness, seq: i64, function: []const u8, argument: []const u8) !cuda.DeviceBuffer {
+    const bytes = try h.fx.bytes(try h.arrayName(seq, function, argument));
+    defer h.gpu.gpa.free(bytes);
+    return cuda.DeviceBuffer.fromHost(h.gpu.d, bytes);
+}
+
+fn connectedStep(h: *hs.Harness, context: *glm.dflash_buffers.Context, model: *const glm.dflash_weights.Model, head: *const Head, scratch: glm.dflash_buffers.Scratch, dk: glm.dflash_kernels.Kernels, qk: glm.dflash_projections.Kernels, glue: glm.glue.Glue, embedding: cuda.DeviceBuffer, hp: *const cuda.cublaslt.Linear, step: usize) !void {
+    const a = h.gpu.gpa;
+    var gathers: Gather = .{ .h = h, .seqs = undefined, .step = step };
+    var ng: usize = 0;
+    var tap_seq: ?i64 = null;
+    var block_seq: ?i64 = null;
+    var head_seq: ?i64 = null;
+    const trace = h.fx.parsed.value.object.get("trace").?.array.items;
+    var sb: [16]u8 = undefined;
+    const step_name = try std.fmt.bufPrint(&sb, "s{d}", .{step});
+    for (trace) |call| {
+        const o = call.object;
+        if (o.get("rank").?.integer != h.rank or !std.mem.eql(u8, o.get("step").?.string, step_name)) continue;
+        const seq = o.get("seq").?.integer;
+        const fn_ = o.get("fn").?.string;
+        if (std.mem.endsWith(u8, fn_, "._prep")) {
+            if (o.get("args").?.object.get("heads").?.integer == 0 and tap_seq == null) tap_seq = seq;
+            if (o.get("args").?.object.get("heads").?.integer == 16 and block_seq == null) block_seq = seq;
+        }
+        if (std.mem.endsWith(u8, fn_, "._mm")) {
+            const ret = o.get("ret").?.object;
+            if (std.mem.eql(u8, ret.get("dtype").?.string, "torch.float32")) {
+                if (ng == gathers.seqs.len) return error.BadDflashTrace;
+                gathers.seqs[ng] = seq;
+                ng += 1;
+            }
+            if (ret.get("shape").?.array.items[1].integer == 77440) head_seq = seq;
+        }
+    }
+    if (ng != 10 or tap_seq == null or block_seq == null or head_seq == null) return error.BadDflashTrace;
+    // The first projection's input is the committed tap tile, not an intermediate replay input.
+    var taps = try feedCall(h, 0, "_mm", "x_in");
+    defer taps.free();
+    var tc = try feedCall(h, tap_seq.?, "_prep", "cos_in");
+    defer tc.free();
+    var ts = try feedCall(h, tap_seq.?, "_prep", "sin_in");
+    defer ts.free();
+    const rows: usize = @intCast(h.fx.parsed.value.object.get("params").?.object.get("tap_rows").?.array.items[step].integer);
+    try glm.dflash_forward.addTaps(context, model, scratch, dk, qk, glue, taps, tc, ts, rows, 1e-5, h.stream);
+    const committed = context.logical.end;
+    var bc = try feedCall(h, block_seq.?, "_prep", "cos_in");
+    defer bc.free();
+    var bs = try feedCall(h, block_seq.?, "_prep", "sin_in");
+    defer bs.free();
+    var ids: [8]i32 = undefined;
+    @memset(&ids, 154856);
+    ids[0] = @intCast(try h.fx.int("pending"));
+    try scratch.get("ids").upload(0, std.mem.sliceAsBytes(&ids));
+    try glm.dflash_forward.block(context, model, head, scratch, dk, qk, glue, embedding.ptr, bc.ptr, bs.ptr, 1e-5, .{ .ctx = &gathers, .run = Gather.run }, hp, h.stream);
+    try check.expect(gathers.at == 10 and context.logical.end == committed, "DFlash2 block preserves committed position and consumes ten rank partials", .{});
+    try h.same(try h.arrayName(head_seq.?, "_mm", "ret"), scratch.get("logits").ptr);
+    for (0..5) |i| {
+        var name: [64]u8 = undefined;
+        try h.same(try std.fmt.bufPrint(&name, "r{d}_s{d}_k{d}", .{ h.rank, step, i }), context.keys[i].ptr);
+        try h.same(try std.fmt.bufPrint(&name, "r{d}_s{d}_v{d}", .{ h.rank, step, i }), context.values[i].ptr);
+    }
+    try h.stream.synchronize();
+    const projected_bytes = try h.fx.bytes(try std.fmt.bufPrint(&sb, "r{d}_s{d}_projection", .{ h.rank, step }));
+    defer a.free(projected_bytes);
+    var native: [7 * 256]u16 = undefined;
+    try scratch.get("projected").download(0, std.mem.sliceAsBytes(&native));
+    try check.expect(projected_bytes.len == native.len * 8, "DFlash2 captured projection dtype", .{});
+    var expanded: [7 * 256]f32 = undefined;
+    for (native, 0..) |bits, i| {
+        const want: f64 = @bitCast(std.mem.readInt(u64, projected_bytes[i * 8 ..][0..8], .little));
+        const got: f32 = @bitCast(@as(u32, bits) << 16);
+        expanded[i] = got;
+        try check.expect(@as(f64, got) == want, "DFlash2 BF16 hidden projection matches captured value", .{});
+    }
+    try checkCandidates(h, model, scratch.get("logits"), &expanded, head_seq.?, step);
+}
+
+fn checkCandidates(h: *hs.Harness, model: *const glm.dflash_weights.Model, logits: cuda.DeviceBuffer, projected: []const f32, head_seq: i64, step: usize) !void {
+    const D = glm.dflash2;
+    const a = h.gpu.gpa;
+    const own = try a.alloc(u16, 7 * 77440);
+    defer a.free(own);
+    try logits.download(0, std.mem.sliceAsBytes(own));
+    var name: [128]u8 = undefined;
+    const peer_raw = try h.fx.bytes(try std.fmt.bufPrint(&name, "r{d}_s{d}_{d:0>3}__mm_ret", .{ 1 - h.rank, step, @as(u64, @intCast(head_seq)) }));
+    defer a.free(peer_raw);
+    const peer = try a.alloc(u16, own.len);
+    defer a.free(peer);
+    if (peer_raw.len != peer.len * 2) return error.BadDflashTrace;
+    @memcpy(std.mem.sliceAsBytes(peer), peer_raw);
+    var candidates: [7 * 16]D.Candidate = undefined;
+    const token_raw = try h.fx.bytes(try std.fmt.bufPrint(&name, "r{d}_s{d}_tokens", .{ h.rank, step }));
+    defer a.free(token_raw);
+    const value_raw = try h.fx.bytes(try std.fmt.bufPrint(&name, "r{d}_s{d}_values", .{ h.rank, step }));
+    defer a.free(value_raw);
+    if (token_raw.len != candidates.len * 8 or value_raw.len != candidates.len * 8) return error.BadDflashTrace;
+    for (0..7) |row| {
+        const local = try D.topCandidates(a, own[row * 77440 ..][0..77440], @intCast(h.rank * 77440), 16);
+        defer a.free(local);
+        const remote = try D.topCandidates(a, peer[row * 77440 ..][0..77440], @intCast((1 - h.rank) * 77440), 16);
+        defer a.free(remote);
+        var merged: [32]D.Candidate = undefined;
+        @memcpy(merged[0..16], local);
+        @memcpy(merged[16..32], remote);
+        std.mem.sort(D.Candidate, &merged, {}, D.candidateBefore);
+        @memcpy(candidates[row * 16 ..][0..16], merged[0..16]);
+    }
+    for (candidates, 0..) |candidate, i| {
+        const token = std.mem.readInt(i64, token_raw[i * 8 ..][0..8], .little);
+        const value: f64 = @bitCast(std.mem.readInt(u64, value_raw[i * 8 ..][0..8], .little));
+        try check.expect(candidate.token == token and candidate.logit == value, "DFlash2 merged candidate ID/value equals reference", .{});
+    }
+    const chain = try D.selectGreedy(a, &candidates, 16, projected, 256, model.predecessor, model.successor, @intCast(try h.fx.int("pending")), 0.3);
+    defer a.free(chain);
+    const raw_chain = try h.fx.bytes(try std.fmt.bufPrint(&name, "r{d}_s{d}_chain", .{ h.rank, step }));
+    defer a.free(raw_chain);
+    try check.expect(raw_chain.len == chain.len * 4, "DFlash2 confidence chain length equals reference", .{});
+    for (chain, 0..) |token, i| try check.expect(token == std.mem.readInt(u32, raw_chain[i * 4 ..][0..4], .little), "DFlash2 selected chain equals reference", .{});
 }
