@@ -1,8 +1,10 @@
 // A row's k best (value, id) of a bf16 logits row, the order decode.py `sample_rows` keeps them in (cuda_engine.zig
 // `Runner.sample`): the larger value first, of equal values the lower id. Each thread keeps its own k best of a
 // strided slice, then pairs of lists merge in a fixed tree; the k best of a row under a total order do not depend on
-// how the row was split, so the output is `sample`'s host scan's for every row without a NaN (the host never takes a
-// NaN; here a NaN compares as not better and enters only while fewer than k values were seen, as on the host).
+// how the row was split, so the output equals `sample`'s host scan for every row without a NaN. A NaN is not a total
+// order's value: the host takes the row's first k values unconditionally and sorts them with a comparator a NaN
+// leaves unordered, while here a NaN is never better and enters a thread's list only while it holds fewer than k, so
+// a row with a NaN may come out in another order or set (TF_GLM_TOPK_CHECK=1 compares both and stops on a difference).
 #include <cuda_bf16.h>
 #include <stdint.h>
 
