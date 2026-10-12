@@ -53,6 +53,9 @@ pub const Options = struct {
     /// Map blocks (one an open stream-layer: capacity / 4 i32 and their file region) held at once; 0: every
     /// stream-layer at once (streams * layers). The map and file grow with this, not with `streams`.
     blocks: usize = 0,
+    /// Keep each slot's last `trace_depth` events (what put bytes in it, for which pool, in which window): a
+    /// mismatch then names its history (`history`). Off in serving.
+    trace: bool = false,
     /// Windows a selected pool stays out of the first eviction pass.
     hot_windows: u32 = 2,
     /// Reads and writes in flight at most a lane (Linux AIO), and lanes (threads) a large batch spreads over.
@@ -71,6 +74,11 @@ pub const Piece = struct {
     pos: usize,
     rows: usize,
 };
+
+/// What happened to a slot (trace).
+pub const EvKind = enum(u8) { none, file_read, copy_in, move_in, move_out, gpu_write, file_write, evict, drop, load, alias_copy, place_empty };
+pub const Ev = struct { kind: EvKind = .none, key: u32 = 0, window: u32 = 0, gen: u32 = 0 };
+pub const trace_depth = 8;
 
 pub const Tier = struct {
     gpa: std.mem.Allocator,
@@ -96,6 +104,7 @@ pub const Tier = struct {
     window: u32 = 1,
     gen: u32 = 1,
     io: Io,
+    trace_ev: []Ev = &.{}, // [slots * trace_depth], a ring a slot (Options.trace)
     reads: u64 = 0, // pools read from the file so far (statistics)
     writes: u64 = 0,
 
@@ -173,12 +182,18 @@ pub const Tier = struct {
         t.streams = try gpa.alloc(Stream, o.streams);
         errdefer gpa.free(t.streams);
         @memset(t.streams, .{});
+        t.trace_ev = &.{};
+        if (o.trace) {
+            t.trace_ev = try gpa.alloc(Ev, nslots * trace_depth);
+            @memset(t.trace_ev, .{});
+        }
         t.io = try Io.open(gpa, path, o.depth, o.lanes);
         return t;
     }
 
     pub fn deinit(t: *Tier) void {
         t.io.close();
+        if (t.trace_ev.len > 0) t.gpa.free(t.trace_ev);
         t.gpa.free(t.streams);
         t.persisted.deinit(t.gpa);
         t.ref.deinit(t.gpa);
@@ -314,6 +329,7 @@ pub const Tier = struct {
         const slot = t.map[k];
         if (slot >= 0) {
             const u: usize = @intCast(slot);
+            t.note(u, .drop, @intCast(k));
             t.disown(u);
             if (t.runs[u / run_pools].kind == .loose) t.free_slots.append(t.gpa, @intCast(u)) catch {};
         } else if (t.persisted.isSet(k)) t.away[k / t.pools] -= 1;
@@ -516,6 +532,7 @@ pub const Tier = struct {
                     // a stretch contiguous in the slab and the file
                     var n: usize = 1;
                     while (p + n < hi and !t.persisted.isSet(k + n) and t.map[k + n] == slot + @as(i32, @intCast(n))) n += 1;
+                    for (0..n) |i| t.note(@as(usize, @intCast(slot)) + i, .file_write, @intCast(k + i));
                     try t.io.add(.write, t.slab[@as(usize, @intCast(slot)) * block ..][0 .. n * block], fileOffset(k));
                     for (0..n) |i| t.persisted.set(k + i);
                     t.writes += n;
@@ -626,6 +643,7 @@ pub const Tier = struct {
         if (sd < 0) return error.BadShape;
         const ks = t.keyOf(src, l, p);
         const ss = t.map[ks];
+        t.note(@intCast(sd), .alias_copy, kd);
         if (ss >= 0) {
             @memcpy(t.slotBytes(@intCast(sd)), t.slotBytes(@intCast(ss)));
         } else if (t.persisted.isSet(ks)) {
@@ -671,6 +689,34 @@ pub const Tier = struct {
 
     // -- slots and runs --------------------------------------------------------------------------------------------
 
+    fn note(t: *Tier, slot: usize, kind: EvKind, k: u32) void {
+        if (t.trace_ev.len == 0) return;
+        const ring = t.trace_ev[slot * trace_depth ..][0..trace_depth];
+        std.mem.copyBackwards(Ev, ring[1..], ring[0 .. trace_depth - 1]);
+        ring[0] = .{ .kind = kind, .key = k, .window = t.window, .gen = t.gen };
+    }
+
+    /// A slot's last events, newest first (Options.trace).
+    pub fn history(t: *const Tier, slot: usize) []const Ev {
+        if (t.trace_ev.len == 0) return &.{};
+        return t.trace_ev[slot * trace_depth ..][0..trace_depth];
+    }
+
+    /// The slot holding stream `s`'s layer `l`'s pool `pool` (through an alias's chain), or null.
+    pub fn slotOf(t: *const Tier, s: usize, l: usize, pool: usize) ?usize {
+        const m = t.map[t.keyOf(s, l, pool)];
+        return if (m >= 0) @intCast(m) else null;
+    }
+
+    /// Records the device's latent write of rows pos .. pos + R - 1 into their slots (trace).
+    pub fn noteWindow(t: *Tier, s: usize, l: usize, pos: usize, R: usize) void {
+        if (t.trace_ev.len == 0) return;
+        for (pos / pool_rows..(pos + R - 1) / pool_rows + 1) |p| {
+            const k = t.key(s, l, p);
+            if (t.map[k] >= 0) t.note(@intCast(t.map[k]), .gpu_write, k);
+        }
+    }
+
     fn own(t: *Tier, slot: usize, k: u32) void {
         if (t.owner[slot] == none) t.runs[slot / run_pools].held += 1;
         t.owner[slot] = k;
@@ -695,6 +741,7 @@ pub const Tier = struct {
             t.own(slot, k);
             t.map[k] = @intCast(slot);
             t.touch(slot);
+            t.note(slot, .file_read, k);
             try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
         }
         t.reads += keys.len;
@@ -712,9 +759,12 @@ pub const Tier = struct {
             if (old >= 0) {
                 const u: u32 = @intCast(old);
                 @memcpy(t.slotBytes(slot), t.slotBytes(u));
+                t.note(slot, .copy_in, k);
+                t.note(u, .move_out, k);
                 t.disown(u);
                 try t.free_slots.append(t.gpa, u);
             } else if (t.persisted.isSet(k)) {
+                t.note(slot, .file_read, k);
                 try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
                 t.away[k / t.pools] -= 1;
                 t.reads += 1;
@@ -754,6 +804,7 @@ pub const Tier = struct {
     }
 
     fn evict(t: *Tier, slot: usize) void {
+        t.note(slot, .evict, t.owner[slot]);
         t.away[t.owner[slot] / t.pools] += 1;
         t.map[t.owner[slot]] = -1;
         t.disown(slot);
@@ -847,6 +898,8 @@ pub const Tier = struct {
                 return e;
             };
             @memcpy(t.slotBytes(dst), t.slotBytes(slot));
+            t.note(dst, .move_in, k);
+            t.note(slot, .move_out, k);
             t.own(dst, k);
             t.map[k] = @intCast(dst);
             t.pin[dst] = t.pin[slot];

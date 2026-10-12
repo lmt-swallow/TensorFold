@@ -112,6 +112,7 @@ pub const Tier = struct {
     /// device position of row 0), a second (past a segment's end) at a position the tier holds.
     pub fn writes(t: *Tier, s: usize, l: usize, pos: usize, R: usize, pos_dev: Ptr) ![2]?Piece {
         const p = try t.host.writeRuns(s, l, pos, R);
+        t.host.noteWindow(s, l, pos, R);
         var out: [2]?Piece = .{ null, null };
         for (p, 0..) |x, i| if (x) |q| {
             var at = pos_dev;
