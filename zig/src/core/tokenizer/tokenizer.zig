@@ -113,8 +113,12 @@ pub const Tokenizer = struct {
     }
 
     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
+    /// The returned ids are the only allocation made with `a`: the pre-tokenizer's spans, the byte-level pieces and the
+    /// BPE symbols and queues (about 130 times the text's bytes for English text: several lists a pre-token, each at
+    /// least a cache line) live in an arena of their own on the page allocator, returned before `encode` does, so a
+    /// caller's arena (a request's) does not keep them.
     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
         var valid = text;
@@ -329,6 +333,29 @@ test "byte-level BPE with merges, added tokens and decode" {
     try std.testing.expectEqualStrings("ab abc", skipped);
     try std.testing.expectEqual(@as(?u32, 7), t.specialTokenId("<|end|>"));
     try std.testing.expectEqual(@as(usize, 1), t.flagged_specials.len);
+}
+
+test "encode allocates only the returned ids with the caller's allocator" {
+    const json =
+        \\{"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+    ;
+    var t = try parse(std.testing.allocator, json);
+    defer t.deinit();
+    // 4,000 pre-tokens: the workspace is far larger than the ids
+    const text = try std.testing.allocator.alloc(u8, 3 * 4000);
+    defer std.testing.allocator.free(text);
+    for (0..4000) |i| @memcpy(text[3 * i ..][0..3], " ab");
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const a = counting.allocator();
+    const ids = try t.encode(a, text);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 4000), ids.len);
+    for (ids) |id| try std.testing.expectEqual(@as(u32, 5), id);
+    try std.testing.expectEqual(@as(usize, 1), counting.allocations);
+    try std.testing.expectEqual(ids.len * @sizeOf(u32), counting.allocated_bytes);
 }
 
 test "sentencepiece-style BPE with byte fallback" {
