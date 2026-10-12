@@ -25,6 +25,11 @@ const Buf = cuda.DeviceBuffer;
 /// tensorfold/cuda/geometry.py MLA_PROMPT_ATT_ROWS and MLA_SELECT_ROWS.
 pub const prompt_att_rows = 512;
 pub const select_rows = 512;
+/// Rows a prompt chunk's pool selection scores at a time. sparse.py's `_select_prompt` takes blocks of select_rows; a
+/// row's scores, pools and tokens depend on that row alone (`_scores` keeps rows apart, the selection is per row), so
+/// smaller blocks give the same bytes and shrink the scores scratch: [block, pools] fp32 is 512 MiB at 512 rows and a
+/// 1M context (262,144 pools), 128 MiB at 128 rows.
+pub const select_block = 128;
 /// sparse.py PROMPT_ROWS (windows from this many rows take the prompt selection), SPLIT_FROM, SPLIT_ROWS,
 /// ROW_SCORE_G; latent.py CHUNK.
 const prompt_select_from = 64;
@@ -298,7 +303,7 @@ pub const Scratch = struct {
         s.sparse_bufs = .{ try a(d, ns * lw * 4), try a(d, ns * 4), try a(d, ns * 4) };
         s.sparse = .{ .po = s.sparse_bufs[0].ptr, .pm = s.sparse_bufs[1].ptr, .pl = s.sparse_bufs[2].ptr };
         const np_max = capacity / 4;
-        s.scores = try a(d, @min(rows, select_rows) * @max(np_max, 1024) * 4);
+        s.scores = try a(d, @min(rows, select_block) * @max(np_max, 1024) * 4);
         s.pools = try a(d, rows * 512 * 8);
         // a decode window's streams' selections each in a block of `seg_rows` rows (16-byte aligned starts)
         const sel_rows = if (prefill) rows else @max(rows, max_segs * seg_rows);
@@ -310,7 +315,7 @@ pub const Scratch = struct {
             @max(glue_mod.splitScratchBytes(split_rows - 1, @max(np_max, 1024)), glue_mod.splitScratchBytes(split_rows - 1, std.math.clamp(np_max, 1024, 16384)))
         else
             glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
-        s.at = try a(d, at_select + (rows / select_rows + 2) * 16);
+        s.at = try a(d, at_select + (rows / select_block + 2) * 16);
         return s;
     }
 
@@ -494,9 +499,9 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi:
     const np_max = cache.poolRows();
     const qrow = 32 * 128 * 2;
     if (R >= prompt_select_from) {
-        // _select_prompt: blocks of up to 512 rows scoring the chunk's pool_count pools
+        // _select_prompt's selection, in blocks of select_block rows scoring the chunk's pool_count pools
         const NP = poolCount(call.host_pos, R, np_max);
-        const B = @min(R, select_rows);
+        const B = @min(R, select_block);
         var a: usize = 0;
         var i: usize = 0;
         while (a < R) : ({
