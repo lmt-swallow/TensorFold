@@ -187,6 +187,46 @@ pub const IndexKernels = struct {
 /// bits in both: every output the same 4 chains of 18 k tiles from zero, added in order.
 pub const Down = enum { rows, rowscp };
 
+/// sparse_attn.cu: the prompt path's sparse attention with `_sparse_attn_part`'s bits, each key block staged once for
+/// both head blocks of a row (TF_DS_SPARSE_ATTN=mma; the default `triton` keeps the captured kernel, which GB10 still
+/// runs faster: 3.1-3.3 against 3.4-3.7 ms a 2,048-row call with picks).
+/// TF_DS_ATTN_CHECK=1 runs the captured kernel beside it on every call and fails unless the outputs are byte-equal.
+/// TF_DS_ATTN_ORDER (0-2) picks the order of the four warps' block sums (sparse_attn.cu sum4; the captured kernel's
+/// is 0, the default).
+pub const AttnKernels = struct {
+    module: cuda.Module,
+    attn: cuda.Function,
+    use: bool,
+    check: bool,
+
+    /// TF_DS_SPARSE_ATTN=ws: the warp-specialized kernel (384 threads, smem_ws)
+    ws: bool = false,
+
+    /// sparse_attn.cu's dynamic shared memory: the row's queries, a key block, p, the reductions
+    pub const smem: u32 = 2 * 32 * 520 * 2 + 2 * 16 * 40 * 2 + 2 * 4 * 16 * 4 + 32 * 4 + 32 * 8;
+    /// the warp-specialized kernel's: the queries, two key blocks, p, the reductions, the keys' validity
+    pub const smem_ws: u32 = 32 * 512 * 2 + 2 * 32 * 512 * 2 + 2 * 16 * 32 * 2 + 2 * 4 * 16 * 4 + 2 * 32 * 4;
+
+    pub fn load(d: *const cuda.Driver) !AttnKernels {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var module = try cuda.Module.load(d, cuda.kernels.dsv41_sparse_attn);
+        errdefer module.unload();
+        const mode = envOr("TF_DS_SPARSE_ATTN", "triton");
+        if (!std.mem.eql(u8, mode, "mma") and !std.mem.eql(u8, mode, "ws") and !std.mem.eql(u8, mode, "triton")) return error.BadShape;
+        const ws = std.mem.eql(u8, mode, "ws");
+        const order = envOr("TF_DS_ATTN_ORDER", "0");
+        var buf: [40]u8 = undefined;
+        const name = try symbol(&buf, "tf_dsv41_sparse_attn{s}", .{order});
+        const f = try module.function(if (ws) "tf_dsv41_sparse_attn_ws" else name);
+        try f.allowDynamicShared(if (ws) smem_ws else smem);
+        return .{ .module = module, .attn = f, .ws = ws, .use = ws or std.mem.eql(u8, mode, "mma"), .check = std.mem.eql(u8, envOr("TF_DS_ATTN_CHECK", "0"), "1") };
+    }
+
+    pub fn deinit(self: *AttnKernels) void {
+        self.module.unload();
+    }
+};
+
 /// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).
 pub const Gu = enum { mma, mmb };
 
@@ -537,6 +577,7 @@ pub const Prompt = struct {
     glue: Glue,
     pk: ExpertKernels,
     ix: IndexKernels,
+    sa: AttnKernels,
     gemm: Gemm32,
     rows: usize, // the chunk rows this holds buffers for (at most max_chunk)
     rr: attention.RopeRows, // a chunk's rope rows (the device path's: its positions, its groups', the indexer's)
@@ -664,6 +705,8 @@ pub const Prompt = struct {
         errdefer self.pk.deinit();
         self.ix = try IndexKernels.load(d);
         errdefer self.ix.deinit();
+        self.sa = try AttnKernels.load(d);
+        errdefer self.sa.deinit();
         self.gemm = try Gemm32.init(d);
         errdefer self.gemm.deinit();
         // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
@@ -841,6 +884,7 @@ pub const Prompt = struct {
         self.gemm.deinit();
         self.pk.deinit();
         self.ix.deinit();
+        self.sa.deinit();
         self.glue.deinit();
         self.rr.deinit();
         self.gpa.free(self.ids_h);
@@ -1200,7 +1244,13 @@ pub const Prompt = struct {
         const wlo_v: [1]i64 = .{@intCast(lo)};
         try self.wlo.uploadAsync(0, std.mem.sliceAsBytes(&wlo_v), stream.handle);
         const srcp = if (ratio > 0) fwd.planes[fwd.source[li]] else null;
-        try fwd.set.run(stream, "_sparse_attn_part", .{ @intCast(n), @intCast(heads / 16), 1 }, &.{
+        const comp_codes: Ptr = if (has) srcp.?.comp_codes.ptr else self.wsrc.ptr;
+        const comp_scales: Ptr = if (has) srcp.?.comp_scales.ptr else self.wsrc.ptr;
+        // window-only calls (no picks) stay on the captured kernel: GB10 runs them faster there
+        const fast = self.sa.use and has and hd == 512 and heads == 32 and c.window == 128;
+        if (fast and !self.sa.check) {
+            try self.sparseAttnMma(n, comp_codes, comp_scales, has, p.sink, scale, n_pad, nblk, stream);
+        } else try fwd.set.run(stream, "_sparse_attn_part", .{ @intCast(n), @intCast(heads / 16), 1 }, &.{
             aot.ptr("Q", "*bf16", self.q.ptr),       aot.ptr("WSRC", "*bf16", self.wsrc.ptr),
             aot.ptr("WLO", "*i64", self.wlo.ptr),    aot.ptr("COMP", if (has) "*u8" else "*bf16", if (has) srcp.?.comp_codes.ptr else self.wsrc.ptr),
             aot.ptr("CSC", if (has) "*u8" else "*bf16", if (has) srcp.?.comp_scales.ptr else self.wsrc.ptr), aot.ptr("IDX", "*i64", if (has) self.cidx.ptr else self.pos.ptr),
@@ -1216,6 +1266,7 @@ pub const Prompt = struct {
             aot.ci("SPLITS", 1), aot.ci("NBLK", @intCast(nblk)), aot.ci("FINAL", 1), aot.ci("HAS_BASE", 0),
             aot.ci("PDL", 1), aot.ci("WPF", 0),
         });
+        if (fast and self.sa.check) try self.attnCheck(li, n, comp_codes, comp_scales, has, p.sink, scale, n_pad, nblk, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.wsrc.r0", .{li}), self.wsrc.ptr, (before + n) * hd * 2, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o_raw.r0", .{li}), self.o.ptr, n * heads * hd * 2, stream);
         try self.ropeHeads(self.o.ptr, at_pos, n, heads, hd, true, stream);
@@ -1239,6 +1290,55 @@ pub const Prompt = struct {
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.u.r0", .{li}), self.u.ptr, n * dims.groups * c.o_rank * 2, stream);
         try self.mm(p.wo_b, self.u.ptr, n, self.out.ptr, .f32, stream);
         return self.out.ptr;
+    }
+
+    /// `_sparse_attn_part` (prompt rows, one split) through sparse_attn.cu into `o`.
+    fn sparseAttnMma(self: *Prompt, n: usize, comp: Ptr, csc: Ptr, has: bool, sink: Ptr, scale: f32, n_idx: usize, nblk: usize, stream: cuda.Stream) !void {
+        var a: cuda.Args = .{};
+        a.add(self.q.ptr);
+        a.add(self.wsrc.ptr);
+        a.add(self.wlo.ptr);
+        a.add(comp);
+        a.add(csc);
+        a.add(if (has) self.cidx.ptr else self.pos.ptr);
+        a.add(self.pos.ptr);
+        a.add(sink);
+        a.add(self.o.ptr);
+        a.add(scale);
+        a.add(@as(c_int, @intCast(n_idx)));
+        a.add(@as(c_int, @intCast(nblk)));
+        a.add(@as(c_int, @intFromBool(has)));
+        const block: u32 = if (self.sa.ws) 384 else 256;
+        const shared: u32 = if (self.sa.ws) AttnKernels.smem_ws else AttnKernels.smem;
+        try cuda.launch.launch(self.sa.attn, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = block }, .shared = shared }, stream, &a);
+    }
+
+    /// TF_DS_ATTN_CHECK: the captured kernel's `o` (just written) against sparse_attn.cu's, byte for byte; sparse_attn.cu's
+    /// stays.
+    fn attnCheck(self: *Prompt, li: usize, n: usize, comp: Ptr, csc: Ptr, has: bool, sink: Ptr, scale: f32, n_idx: usize, nblk: usize, stream: cuda.Stream) !void {
+        const c = self.fwd.cfg;
+        const bytes = n * self.dimsOf(li).heads * c.head_dim * 2;
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try self.o.download(0, want);
+        try self.sparseAttnMma(n, comp, csc, has, sink, scale, n_idx, nblk, stream);
+        try stream.synchronize();
+        try self.o.download(0, got);
+        var bad: usize = 0;
+        var first: usize = bytes;
+        for (want, got, 0..) |x, y, i| if (x != y) {
+            bad += 1;
+            if (first == bytes) first = i;
+        };
+        if (bad != 0) {
+            std.log.err("deepseek_v41: layer {d} sparse attention ({d} rows, {d} blocks, picks {}): {d} of {d} bytes differ from _sparse_attn_part, the first at {d}", .{ li, n, nblk, has, bad, bytes, first });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("deepseek_v41: layer {d} sparse attention ({d} rows, {d} blocks, picks {}): byte-equal to _sparse_attn_part", .{ li, n, nblk, has });
     }
 
     /// model.py attention_k at 16 rows or fewer (ring mode, as a decode window: the window keys from the ring, no
