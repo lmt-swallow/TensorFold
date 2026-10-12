@@ -7,7 +7,8 @@ pub const Kernels = struct {
     set: *aot.Set,
 
     pub fn conv(k: Kernels, x: Ptr, dyn: Ptr, base: Ptr, residual: ?Ptr, out: Ptr, branch: u1, rows: usize, stream: cuda.Stream) !void {
-        if (rows == 0 or rows > 64) return error.BadDflashRows;
+        // One noncausal block only: adjacent streams must never share the previous-row convolution.
+        if (rows != 8) return error.BadDflashRows;
         try k.set.run(stream, "_dconv_kernel", .{ @intCast(rows), 4, 1 }, &.{
             aot.ptr("X", "*bf16", x),       aot.ptr("DYN", "*bf16", dyn),
             aot.ptr("BASE", "*bf16", base), aot.ptr("RES", "*bf16", residual orelse x),

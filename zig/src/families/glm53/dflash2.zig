@@ -132,3 +132,33 @@ test "supported draft geometry rejects incompatible layers and vocabulary before
     try std.testing.expectError(error.UnsupportedDflashConfig, wrong.validate(2));
     try std.testing.expectError(error.UnsupportedDflashConfig, parsed.value.validate(4));
 }
+
+/// glm5_next/qmm.py's fixed shape rule. Changing K splits changes proposal bits.
+pub fn splitK(n: usize, k: usize) usize {
+    if (n == 12576 and k == 4096) return 4;
+    if (n == 4096 and k == 4096) return 2;
+    if (n == 2048 and k == 4096) return 4;
+    if (n == 8192 and (k == 1536 or k == 512)) return 4;
+    if (n == 4096 and k == 8192) return 8;
+    const tiles = (n + 63) / 64;
+    const groups = k / 64;
+    var sk: usize = 1;
+    while (sk < 8 and tiles * sk < 192 and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
+    return sk;
+}
+
+test "projection K slices cover real DFlash shapes without changing head arithmetic" {
+    const cases = [_][3]usize{
+        .{ 4096, 20480, 4 }, // tap fc
+        .{ 1024, 4096, 8 }, // dynamic conv / committed KV
+        .{ 3072, 4096, 4 }, // QKV
+        .{ 4096, 2048, 4 }, // attention output
+        .{ 12288, 4096, 1 }, // gate/up
+        .{ 4096, 6144, 4 }, // MLP output
+        .{ 77440, 4096, 1 }, // shared target draft head
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c[2], splitK(c[0], c[1]));
+        try std.testing.expectEqual(@as(usize, 0), (c[1] / 64) % c[2]);
+    }
+}

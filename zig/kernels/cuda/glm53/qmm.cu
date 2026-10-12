@@ -262,3 +262,9 @@ template __global__ void __launch_bounds__(1 * 4 * 32) tf_glm53_qmm::qmm_kernel<
     int, int, int, int, int, int);
 template __global__ void tf_glm53_qmm::reduce_kernel<false>(const float*, void*, long long, int);
 __device__ const unsigned long long tf_glm53_qmm_smem = tf_glm53_qmm::Tile<64, 16, 64, 1, 4, 4>::SMEM;
+
+// DFlash2 row-parallel projections retain FP32 partials until the rank-ordered gather.
+template __global__ void __launch_bounds__(1 * 4 * 32) tf_glm53_qmm::qmm_kernel<64, 16, 64, 1, 4, 4, true, false, false>(
+    const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, float*, int,
+    int, int, int, int, int, int);
+template __global__ void tf_glm53_qmm::reduce_kernel<true>(const float*, void*, long long, int);
