@@ -33,11 +33,15 @@ pub const home_runs = 3;
 pub const home_positions = home_runs * seg_positions;
 pub const home_pools = home_positions / pool_rows;
 /// Streams a chain of aliases reads through at most (a stream and its ancestors; cuda_tier's remap takes as many).
-pub const max_chain = 4;
+pub const max_chain = 8;
 
 pub const Error = error{ TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory, NoStream, ChainTooDeep };
 
 pub const Options = struct {
+    pub fn mapBlocks(o: Options) usize {
+        return if (o.blocks != 0) o.blocks else o.streams * o.layers;
+    }
+
     streams: usize,
     layers: usize,
     /// Positions a stream holds at most (a multiple of seg_positions).
@@ -46,6 +50,9 @@ pub const Options = struct {
     row_bytes: usize = 1024,
     /// Segments past the home block kept linear behind the newest one written.
     recent_runs: usize = 32,
+    /// Map blocks (one an open stream-layer: capacity / 4 i32 and their file region) held at once; 0: every
+    /// stream-layer at once (streams * layers). The map and file grow with this, not with `streams`.
+    blocks: usize = 0,
     /// Windows a selected pool stays out of the first eviction pass.
     hot_windows: u32 = 2,
     /// Reads and writes in flight at most a lane (Linux AIO), and lanes (threads) a large batch spreads over.
@@ -75,6 +82,8 @@ pub const Tier = struct {
     runs: []Run,
     seg_run: []u32, // [streams, layers, segs]: the linear run holding a segment
     home: []u32, // [streams, layers]: the home block's first run
+    block_of: []u32, // [streams, layers]: the map block an open stream-layer holds
+    block_user: []u32, // [blocks]: the stream-layer (s * layers + l) holding a block, none if free
     away: []u32, // [streams, layers]: written pools not resident (0: every selection is resident, fetch reads nothing)
     owner: []u32, // [slots]: the key (map index) a slot holds
     pin: []u32, // [slots]: the fetch call that last named it
@@ -111,7 +120,7 @@ pub const Tier = struct {
         const run_bytes = run_pools * block;
         if (slab.len % run_bytes != 0 or slab.len == 0) return error.BadShape;
         const pools = o.capacity / pool_rows;
-        const keys = o.streams * o.layers * pools;
+        const keys = o.mapBlocks() * pools;
         if (map.len != keys or keys >= none) return error.BadShape;
         const nslots = slab.len / block;
         if (nslots * pool_rows >= std.math.maxInt(i32)) return error.BadShape;
@@ -138,9 +147,15 @@ pub const Tier = struct {
         t.home = try gpa.alloc(u32, o.streams * o.layers);
         errdefer gpa.free(t.home);
         @memset(t.home, none);
-        t.away = try gpa.alloc(u32, o.streams * o.layers);
+        t.away = try gpa.alloc(u32, o.mapBlocks());
         errdefer gpa.free(t.away);
         @memset(t.away, 0);
+        t.block_of = try gpa.alloc(u32, o.streams * o.layers);
+        errdefer gpa.free(t.block_of);
+        @memset(t.block_of, none);
+        t.block_user = try gpa.alloc(u32, o.mapBlocks());
+        errdefer gpa.free(t.block_user);
+        @memset(t.block_user, none);
         t.owner = try gpa.alloc(u32, nslots);
         errdefer gpa.free(t.owner);
         @memset(t.owner, none);
@@ -171,6 +186,8 @@ pub const Tier = struct {
         t.gpa.free(t.owner);
         t.gpa.free(t.home);
         t.gpa.free(t.away);
+        t.gpa.free(t.block_of);
+        t.gpa.free(t.block_user);
         t.gpa.free(t.seg_run);
         t.gpa.free(t.runs);
         t.free_slots.deinit(t.gpa);
@@ -178,7 +195,12 @@ pub const Tier = struct {
 
     /// The map index of stream `s`'s layer `l`'s pool 0 (`map[mapBase(s, l) + position / 4]`).
     pub fn mapBase(t: *const Tier, s: usize, l: usize) usize {
-        return (s * t.o.layers + l) * t.pools;
+        return @as(usize, t.block_of[s * t.o.layers + l]) * t.pools;
+    }
+
+    /// The map block (and away count) of stream `s`'s layer `l`.
+    fn blockOf(t: *const Tier, s: usize, l: usize) usize {
+        return t.block_of[s * t.o.layers + l];
     }
 
     fn key(t: *const Tier, s: usize, l: usize, pool: usize) u32 {
@@ -226,13 +248,22 @@ pub const Tier = struct {
         if (layers == 0 or layers > t.o.layers) return error.BadShape;
         if (t.streams[s].pending) return error.NoStream;
         if (t.streams[s].open) t.close(s);
-        t.streams[s].layers = layers;
+        // map blocks first (every key of the stream names one), then the home runs
+        var free_n: usize = 0;
+        for (t.block_user) |u| free_n += @intFromBool(u == none);
+        if (free_n < layers) return error.NoStream;
+        for (0..layers) |l| {
+            const b = std.mem.indexOfScalar(u32, t.block_user, none).?;
+            t.block_user[b] = @intCast(s * t.o.layers + l);
+            t.block_of[s * t.o.layers + l] = @intCast(b);
+        }
+        t.streams[s] = .{ .open = true, .layers = layers };
+        errdefer t.free(s);
         for (0..layers) |l| {
             const r = try t.takeRuns(home_runs);
             t.home[s * t.o.layers + l] = r;
             for (0..home_runs) |i| try t.placeLinear(s, l, i, r + @as(u32, @intCast(i)));
         }
-        t.streams[s] = .{ .open = true, .layers = layers };
     }
 
     /// A free stream (neither open nor kept for aliases) opened with `layers` layers.
@@ -298,7 +329,10 @@ pub const Tier = struct {
                 r.* = none;
             }
             t.home[s * t.o.layers + l] = none;
-            t.away[s * t.o.layers + l] = 0;
+            const b = t.blockOf(s, l);
+            t.away[b] = 0;
+            t.block_user[b] = none;
+            t.block_of[s * t.o.layers + l] = none;
         }
         t.streams[s] = .{};
     }
@@ -411,7 +445,7 @@ pub const Tier = struct {
     pub fn resident(t: *const Tier, s: usize, l: usize) bool {
         var h = s;
         while (true) {
-            if (t.away[h * t.o.layers + l] != 0) return false;
+            if (t.away[t.blockOf(h, l)] != 0) return false;
             h = t.streams[h].parent orelse return true;
         }
     }
@@ -539,6 +573,15 @@ pub const Tier = struct {
         st.dirty_lo = @max(st.dirty_lo, full);
     }
 
+    /// Streams an alias of `s` would read through (itself and `s`'s chain): alias refuses more than max_chain, so a
+    /// caller checks before it commits to continuing a kept prompt and prefills instead.
+    pub fn aliasDepth(t: *const Tier, s: usize) usize {
+        var depth: usize = 1;
+        var h: ?u32 = @intCast(s);
+        while (h) |x| : (h = t.streams[x].parent) depth += 1;
+        return depth;
+    }
+
     /// Stream `dst` (just opened, nothing written, `src`'s layers) starts as `src`'s first `rows` positions (a kept
     /// prompt continued): its home block and the pool at `rows` (when partial) are copied, the pools between are
     /// read through `src`, which stays (pending once closed) while `dst` lives. `dst` writes from `rows` on. A chain
@@ -551,10 +594,7 @@ pub const Tier = struct {
         try t.io.finish();
         const full = rows / pool_rows;
         if (full > home_pools) {
-            var depth: usize = 1;
-            var h: ?u32 = @intCast(src);
-            while (h) |x| : (h = t.streams[x].parent) depth += 1;
-            if (depth > max_chain) return error.ChainTooDeep;
+            if (t.aliasDepth(src) > max_chain) return error.ChainTooDeep;
             ds.parent = @intCast(src);
             ds.fork_pool = full;
             ss.refs += 1;
@@ -668,7 +708,7 @@ pub const Tier = struct {
         const k = t.owner[slot];
         if (k == none or !t.persisted.isSet(k) or t.pin[slot] == t.gen) return false;
         if (!hot) return true;
-        return t.used[slot] +% t.o.hot_windows <= t.window and !t.streams[k / t.pools / t.o.layers].favored;
+        return t.used[slot] +% t.o.hot_windows <= t.window and !t.streams[t.block_user[k / t.pools] / t.o.layers].favored;
     }
 
     /// Stream `s`'s pools stay ahead of every other stream's (a prompt being filled keeps its whole context, so its
@@ -1014,12 +1054,16 @@ const Fixture = struct {
     end: []usize, // a stream's positions written
 
     fn init(o: Options, runs: usize, seed: u64) !*Fixture {
+        return initBlocks(o, runs, seed, o.mapBlocks());
+    }
+
+    fn initBlocks(o: Options, runs: usize, seed: u64, blocks: usize) !*Fixture {
         const gpa = testing.allocator;
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
         f.slab = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * block);
         @memset(f.slab, 0xAA);
-        f.map = try gpa.alloc(i32, o.streams * o.layers * o.capacity / pool_rows);
+        f.map = try gpa.alloc(i32, blocks * o.capacity / pool_rows);
         // TF_TIER_TEST_DIR: a directory on the NVMe's file system (O_DIRECT and AIO; /tmp may be tmpfs)
         const dir = if (std.c.getenv("TF_TIER_TEST_DIR")) |e| std.mem.span(e) else "/tmp";
         const name = try std.fmt.bufPrint(&f.path_buf, "{s}/kv_tier_test_{d}_{x}.bin\x00", .{ dir, std.c.getpid(), seed });
@@ -1052,7 +1096,7 @@ const Fixture = struct {
         const t = &f.tier;
         const rb = t.o.row_bytes;
         try t.beginWindow(s, pos, R);
-        for (0..t.o.layers) |l| {
+        for (0..t.streams[s].layers) |l| {
             const pieces = try t.writeRuns(s, l, pos, R);
             var covered: usize = 0;
             for (pieces) |pc| if (pc) |p| {
@@ -1080,7 +1124,7 @@ const Fixture = struct {
         defer gpa.free(orig);
         const counts = try gpa.alloc(i32, R);
         defer gpa.free(counts);
-        const l = rnd.uintLessThan(usize, t.o.layers);
+        const l = rnd.uintLessThan(usize, t.streams[s].layers);
         const vis = f.end[s];
         for (0..R) |r| {
             const c = rnd.uintAtMost(usize, W);
@@ -1285,6 +1329,75 @@ test "a favored stream's pools stay while another stream's selections fill the s
     try t.ensureRange(0, 0, f.end[0]);
     try testing.expectEqual(reads, t.reads);
     try t.check();
+}
+
+test "map blocks: streams beyond the blocks wait, a closed stream's block (and file region) serves the next" {
+    var prng = std.Random.DefaultPrng.init(0xb10c);
+    const rnd = prng.random();
+    // 6 streams of 2 layers share 5 blocks: two backbone-like streams (2 layers) and a head-like one (1 layer)
+    const o: Options = .{ .streams = 6, .layers = 2, .capacity = 8 * seg_positions, .recent_runs = 1, .depth = 16, .blocks = 5 };
+    const gpa = testing.allocator;
+    const f = try Fixture.initBlocks(o, 30, 9, o.mapBlocks());
+    defer f.deinit();
+    const t = &f.tier;
+    var round: usize = 0;
+    while (round < 6) : (round += 1) {
+        const a = try t.acquire(2);
+        const b = try t.acquire(2);
+        const m = try t.acquire(1);
+        try testing.expectError(error.NoStream, t.acquire(1));
+        for ([_]usize{ a, b, m }) |s| {
+            var pos: usize = 0;
+            const n = 1 + rnd.uintLessThan(usize, 5 * seg_positions);
+            while (pos < n) {
+                const R = @min(n - pos, 1 + rnd.uintLessThan(usize, seg_positions));
+                try f.write(rnd, s, pos, R);
+                pos += R;
+                try t.commit(s, pos);
+            }
+            for (0..3) |_| try f.select(rnd, s, 4, 512);
+        }
+        try t.check();
+        for ([_]usize{ a, b, m }) |s| t.close(s);
+        // the fixture's whole-cache copy of a stream starts over with it
+        for (f.ref) |r| @memset(r, 0);
+        _ = gpa;
+    }
+}
+
+test "a chain of max_chain streams reads through every level; one more is refused" {
+    var prng = std.Random.DefaultPrng.init(0xc4a1);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = max_chain + 2, .layers = 1, .capacity = 8 * seg_positions, .recent_runs = 1, .depth = 16 };
+    const f = try Fixture.init(o, 60, 10);
+    defer f.deinit();
+    const t = &f.tier;
+    var prev = try t.acquire(1);
+    var pos: usize = 0;
+    while (pos < home_positions + 64) : (pos += 64) {
+        try f.write(rnd, prev, pos, 64);
+        try t.commit(prev, pos + 64);
+    }
+    // each next stream continues the last at its end and writes 300 more rows
+    var level: usize = 1;
+    while (true) : (level += 1) {
+        const next = try t.acquire(1);
+        if (t.aliasDepth(prev) > max_chain) {
+            try testing.expectError(error.ChainTooDeep, t.alias(prev, next, pos));
+            break;
+        }
+        try t.alias(prev, next, pos);
+        @memcpy(f.ref[next][0 .. pos * o.row_bytes], f.ref[prev][0 .. pos * o.row_bytes]);
+        const end = pos + 300;
+        while (pos < end) : (pos += 60) {
+            try f.write(rnd, next, pos, 60);
+            try t.commit(next, pos + 60);
+        }
+        for (0..4) |_| try f.select(rnd, next, 4, 512);
+        try t.check();
+        prev = next;
+    }
+    try testing.expectEqual(@as(usize, max_chain), level);
 }
 
 test "prefetchRange brings a layer's whole context back" {

@@ -37,7 +37,7 @@ pub const Tier = struct {
     at: cuda.HostBuffer, // second pieces' first positions (i32 16 bytes apart, mapped: Triton specializes pointers on 16-byte alignment), a ring
     at_dev: Ptr,
     at_next: usize = 0,
-    chains: cuda.HostBuffer, // the remap's chains (tier.cu: 10 int64 each, 128 bytes apart, mapped), a ring
+    chains: cuda.HostBuffer, // the remap's chains (tier.cu: 2 + 2 max_chain int64 each, 256 bytes apart, mapped), a ring
     chains_dev: Ptr,
     chain_next: usize = 0,
     module: cuda.Module,
@@ -54,7 +54,7 @@ pub const Tier = struct {
         t.slab = try cuda.HostBuffer.allocMapped(d, slab_bytes);
         errdefer t.slab.free();
         t.slab_dev = try t.slab.device();
-        t.map = try cuda.HostBuffer.allocMapped(d, o.streams * o.layers * o.capacity / kv.pool_rows * 4);
+        t.map = try cuda.HostBuffer.allocMapped(d, o.mapBlocks() * o.capacity / kv.pool_rows * 4);
         errdefer t.map.free();
         t.map_dev = try t.map.device();
         t.toks = try cuda.HostBuffer.alloc(d, rows * w * 4);
@@ -67,7 +67,7 @@ pub const Tier = struct {
         errdefer t.at.free();
         t.at_dev = try t.at.device();
         t.chain_next = 0;
-        t.chains = try cuda.HostBuffer.allocMapped(d, ring * 128);
+        t.chains = try cuda.HostBuffer.allocMapped(d, ring * 256);
         errdefer t.chains.free();
         t.chains_dev = try t.chains.device();
         t.module = try cuda.Module.load(d, cuda.kernels.glm53_tier);
@@ -190,18 +190,18 @@ pub const Tier = struct {
         const n = t.host.chain(x.h, &links);
         const k = t.chain_next % ring;
         t.chain_next += 1;
-        const c = t.chains.slice(i64)[k * 16 ..][0..10];
+        const c = t.chains.slice(i64)[k * 32 ..][0 .. 2 + 2 * kv.max_chain];
         c[0] = @intCast(n);
         c[1] = kv.home_pools;
         for (0..kv.max_chain) |i| {
             c[2 + i] = if (i < n) @intCast(links[i].fork_pool) else 0;
-            c[6 + i] = if (i < n) @intCast(t.map_dev + t.host.mapBase(links[i].s, x.layer) * 4) else 0;
+            c[2 + kv.max_chain + i] = if (i < n) @intCast(t.map_dev + t.host.mapBase(links[i].s, x.layer) * 4) else 0;
         }
         var args: cuda.Args = .{};
         args.add(x.tokens);
         args.add(dst);
         args.add(x.counts);
-        args.add(t.chains_dev + k * 128);
+        args.add(t.chains_dev + k * 256);
         args.add(@as(i32, @intCast(w)));
         try cuda.launch.launch(t.remap_fn, .{ .grid = .{ .x = @intCast(x.R) }, .block = .{ .x = 256 } }, stream, &args);
     }

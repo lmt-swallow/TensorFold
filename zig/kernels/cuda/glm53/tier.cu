@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-// chain: n, home_pools, fork[4], map[4] (int64 each): level 0 is the stream, level i + 1 serves pools in
+// chain: n, home_pools, fork[8], map[8] (int64 each; kv_tier.max_chain): level 0 is the stream, level i + 1 serves pools in
 // [home_pools, fork[i]) of level i.
 extern "C" __global__ void tf_glm53_tier_remap(const int32_t *tokens, int32_t *out, const int32_t *counts, const int64_t *chain, int w) {
     const int r = blockIdx.x;
@@ -19,7 +19,7 @@ extern "C" __global__ void tf_glm53_tier_remap(const int32_t *tokens, int32_t *o
         const int64_t q = p >> 2;
         int lvl = 0;
         while (lvl + 1 < levels && q >= home && q < chain[2 + lvl]) lvl++;
-        const int32_t *map = reinterpret_cast<const int32_t *>(chain[6 + lvl]);
+        const int32_t *map = reinterpret_cast<const int32_t *>(chain[10 + lvl]);
         dst[i] = map[q] * 4 + (p & 3);
     }
 }
