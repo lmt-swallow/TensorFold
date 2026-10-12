@@ -10,6 +10,8 @@
 //! TF_DS_FIXTURE_CONE=1 compares cold full/cone state instead of timing. TF_DS_FIXTURE_TP2=1 uses real NCCL
 //! gathers and requires explicit TF_TP_MASTER/TF_TP_PORT; launch both ranks with identical arguments except rank.
 //! TF_DS_FIXTURE_DSPARK=1 additionally checks the original per-chunk absorption and final draft rings.
+//! TF_DS_FIXTURE_FUTURE=1 checks 512 greedy outputs and draft/accept traces after both passes;
+//! TF_DS_FIXTURE_ORACLE_OUT names the rank-specific JSON output and its .input.json input export.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
@@ -234,8 +236,11 @@ fn digests(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequen
 }
 
 /// Compare actual cache/logit bytes under selfGather or opt-in real TP2 NCCL. This tests the suffix property,
-/// Optional DSpark checks absorbed rings and valid last-absorb inputs; no pool/KEEP/future-decode/Python parity.
+/// Optional DSpark checks absorbed rings and valid last-absorb inputs; future checks extend this through 512 outputs.
 fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, chunk: usize, stream: cuda.Stream, tp2: bool) !void {
+    const future = std.mem.eql(u8, getenv("TF_DS_FIXTURE_FUTURE") orelse "0", "1");
+    if (future and (seq.spark == null or getenv("TF_DS_FIXTURE_ORACLE_OUT") == null)) return error.BadConeFixture;
+    const input_sha = if (future) try exportOracleInput(gpu, ids) else @as([64]u8, @splat(0));
     const halo: usize = 144 + 20 * 127;
     const cut = (ids.len -| halo) / chunk * chunk;
     if (cut == 0) return error.ConeFixtureNeedsLongerPrompt;
@@ -259,7 +264,7 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
     if (seq.dc) |c| {
         for (c.rings) |ring| try buffers.append(gpu.gpa, ring);
         const tail = ids.len % chunk;
-        const valid = @min(if (tail == 0) chunk else tail, 144);
+        const valid: usize = @min(if (tail == 0) chunk else tail, 144);
         const cols = fwd.cfg.dspark_taps.len * fwd.cfg.dim;
         try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = seq.taps.ptr + ((if (tail == 0) chunk else tail) - valid) * cols * 2, .len = valid * cols * 2 });
         const sp = seq.spark.?;
@@ -271,8 +276,12 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
         errdefer gpu.gpa.free(bytes);
         try want.append(gpu.gpa, bytes);
     }
+    var full_future: ?Future = if (future) try future512(gpu, seq, gather) else null;
+    defer if (full_future) |*value| value.trace.deinit(gpu.gpa);
     try clearConeCaches(fwd, stream);
     try clearDraftCaches(seq, stream);
+    seq.verify_start = 0;
+    seq.tap_rows = 0;
     try prefillCone(seq, gather, ids, chunk, cut);
     try stream.synchronize();
     // The head may use a different scratch address after the second pass.
@@ -289,7 +298,28 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
     try check.expect(seq.pos == ids.len, "cone position", .{});
     if (seq.dc) |c| try check.expect(c.absorbed == ids.len, "cone absorbed position", .{});
     for (seq.hist[0..ids.len], ids) |got, expected| try check.expect(got == expected, "cone history", .{});
-    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; {s}, Engram={s}, DSpark={s}; no KEEP/futuredecode/Python parity", .{ ids.len, cut, halo, chunk, if (tp2) "real TP2 NCCL" else "selfGather", if (seq.engram != null) "on" else "off", if (seq.spark != null) "on" else "off" });
+    if (future) {
+        var cone_future = try future512(gpu, seq, gather);
+        defer cone_future.trace.deinit(gpu.gpa);
+        const full = &full_future.?;
+        try check.expect(std.mem.eql(u32, &full.output, &cone_future.output), "cone all512 greedy output IDs", .{});
+        try check.expect(full.trace.items.len == cone_future.trace.items.len, "cone round count", .{});
+        for (full.trace.items, cone_future.trace.items, 0..) |expected, actual, round| {
+            try check.expect(std.meta.eql(expected, actual), "cone proposal/accept trace round {d}", .{round});
+        }
+        const out = try std.json.Stringify.valueAlloc(gpu.gpa, .{
+            .rank = seq.spark.?.dims.rank,
+            .input_ids = ids,
+            .input_ids_sha256 = input_sha[0..],
+            .settings = .{ .replay = 0, .chunk = chunk, .drafts = 5, .adaptive = 0, .stop_eos = false },
+            .full = .{ .output_ids = full.output[0..], .rounds = full.trace.items },
+            .cone = .{ .output_ids = cone_future.output[0..], .rounds = cone_future.trace.items },
+        }, .{});
+        defer gpu.gpa.free(out);
+        try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = getenv("TF_DS_FIXTURE_ORACLE_OUT").?, .data = out });
+        check.pass("cone all512 output IDs and full proposal/accept traces equal; raw input/output IDs saved; Python parity pending", .{});
+    }
+    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; {s}, Engram={s}, DSpark={s}; no KEEP/Python parity", .{ ids.len, cut, halo, chunk, if (tp2) "real TP2 NCCL" else "selfGather", if (seq.engram != null) "on" else "off", if (seq.spark != null) "on" else "off" });
 }
 
 fn clearConeCaches(fwd: *dsv41.forward.Forward, stream: cuda.Stream) !void {
@@ -338,6 +368,71 @@ fn prefillCone(seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, i
         start = end;
     }
     seq.pos = ids.len;
+}
+
+/// Export exact synthetic IDs before either prefill so failures still retain the oracle input.
+fn exportOracleInput(gpu: Gpu, ids: []const i64) ![64]u8 {
+    const raw = try std.json.Stringify.valueAlloc(gpu.gpa, ids, .{});
+    defer gpu.gpa.free(raw);
+    var sum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &sum, .{});
+    const hex = std.fmt.bytesToHex(sum, .lower);
+    const doc = try std.json.Stringify.valueAlloc(gpu.gpa, .{ .input_ids = ids, .input_ids_sha256 = hex[0..] }, .{});
+    defer gpu.gpa.free(doc);
+    const path = try std.fmt.allocPrint(gpu.gpa, "{s}.input.json", .{getenv("TF_DS_FIXTURE_ORACLE_OUT").?});
+    defer gpu.gpa.free(path);
+    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = path, .data = doc });
+    return hex;
+}
+
+const FutureRound = struct {
+    position: usize,
+    proposed: [5]u32 = @splat(0),
+    confidence_bits: [5]u32 = @splat(0),
+    targets: [6]u32 = @splat(0),
+    width: usize,
+    accepted: usize,
+};
+const Future = struct { output: [512]u32, trace: std.ArrayList(FutureRound) = .empty };
+
+/// Fixed-five, greedy, no-EOS execution matching reference90b engine.py's non-adaptive _spec loop.
+fn future512(gpu: Gpu, seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather) !Future {
+    var out: Future = .{ .output = undefined };
+    errdefer out.trace.deinit(gpu.gpa);
+    out.output[0] = try seq.argmax();
+    var count: usize = 1;
+    while (count < out.output.len) {
+        const at = seq.pos;
+        const token = out.output[count - 1];
+        try seq.draft(0, 0, token, at, 5);
+        const proposed = seq.drafts;
+        if (proposed.len != 5) return error.BadConeFixture;
+        const width = @min(@as(usize, 5), out.output.len - count);
+        var window: [6]i64 = undefined;
+        window[0] = token;
+        for (proposed.tokens[0..width], 0..) |id, i| window[i + 1] = id;
+        try seq.verify(gather, window[0 .. width + 1]);
+        var row: FutureRound = .{ .position = at, .width = width, .accepted = 0 };
+        @memcpy(&row.proposed, proposed.tokens[0..5]);
+        for (proposed.conf[0..5], &row.confidence_bits) |value, *bits| bits.* = @bitCast(value);
+        try seq.argmaxRows(row.targets[0 .. width + 1]);
+        while (row.accepted < width and proposed.tokens[row.accepted] == row.targets[row.accepted]) row.accepted += 1;
+        try seq.keep(at, row.accepted + 1);
+        // Absorb only verified retained rows, including the pending target token, before the next draft.
+        try seq.draft(at, row.accepted + 1, row.targets[row.accepted], seq.pos, 0);
+        try out.trace.append(gpu.gpa, row);
+        for (proposed.tokens[0..row.accepted]) |id| {
+            if (count == out.output.len) break;
+            out.output[count] = id;
+            count += 1;
+        }
+        if (count < out.output.len) {
+            out.output[count] = row.targets[row.accepted];
+            count += 1;
+        }
+    }
+    try seq.stream.synchronize();
+    return out;
 }
 
 fn clearDraftCaches(seq: *dsv41.serve_lanes.Sequence, stream: cuda.Stream) !void {
