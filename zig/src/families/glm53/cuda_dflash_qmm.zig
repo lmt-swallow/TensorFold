@@ -11,6 +11,7 @@ pub const Kernels = struct {
     reduce_bf16: cuda.Function,
     reduce_fp32: cuda.Function,
     sum: cuda.Function,
+    rotary_fn: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -23,6 +24,7 @@ pub const Kernels = struct {
         var k: Kernels = .{
             .module = m,
             .sum = try m.function("tf_glm53_dflash_sum"),
+            .rotary_fn = try m.function("tf_glm53_dflash_rotary"),
             .bf16 = try m.function("_ZN12tf_glm53_qmm10qmm_kernelILi64ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii"),
             .fp32 = try m.function("_ZN12tf_glm53_qmm10qmm_kernelILi64ELi16ELi64ELi1ELi4ELi4ELb1ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii"),
             .shared = @intCast(shared),
@@ -36,6 +38,19 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.module.unload();
+    }
+
+    /// Ordinary FP32 pow/reciprocal/phase/cos/sin, matching the reference expression.
+    /// Table-byte parity is a separate gate from target greedy verification.
+    pub fn rotary(k: Kernels, cos: Ptr, sin: Ptr, start: usize, rows: usize, theta: f32, stream: cuda.Stream) !void {
+        if (rows == 0 or rows > 64 or start > 1048576 or rows > 1048576 - start or theta != 10000) return error.BadDflashRotary;
+        var args: cuda.Args = .{};
+        args.add(cos);
+        args.add(sin);
+        args.add(@as(c_int, @intCast(start)));
+        args.add(@as(c_int, @intCast(rows)));
+        args.add(theta);
+        try cuda.launch.launch(k.rotary_fn, .{ .grid = .{ .x = @intCast((rows * 64 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &args);
     }
 
     /// gathered [2,count] FP32, rank zero first; out [count] BF16.

@@ -274,3 +274,15 @@ extern "C" __global__ void tf_glm53_dflash_sum(const float* gathered, __nv_bfloa
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = __float2bfloat16_rn(__fadd_rn(gathered[i], gathered[count + i]));
 }
+
+// PyTorch's DFlash2 rotary expression, with ordinary libdevice functions and explicit FP32 products.
+extern "C" __global__ void tf_glm53_dflash_rotary(float* cos_out, float* sin_out, int start, int rows, float theta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * 64) return;
+    const int d = i % 64;
+    const float exponent = __fmul_rn(static_cast<float>(d), 1.0f / 64.0f);
+    const float inv = __fdiv_rn(1.0f, powf(theta, exponent));
+    const float phase = __fmul_rn(static_cast<float>(start + i / 64), inv);
+    cos_out[i] = cosf(phase);
+    sin_out[i] = sinf(phase);
+}

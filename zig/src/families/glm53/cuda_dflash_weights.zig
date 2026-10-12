@@ -39,6 +39,9 @@ pub const Layer = struct {
 
 pub const Model = struct {
     a: std.mem.Allocator,
+    eps: f32,
+    theta: f32,
+    mask: u32,
     fc: T.DraftHead,
     hidden_norm: Buf,
     norm: Buf,
@@ -65,6 +68,9 @@ pub const Model = struct {
         try l.validate();
         var m: Model = undefined;
         m.a = a;
+        m.eps = c.rms_norm_eps;
+        m.theta = c.rope_parameters.rope_theta;
+        m.mask = c.dflash_config.mask_token_id;
         var p = try l.matrix("fc.weight", c.hidden_size, 5 * c.hidden_size, .whole);
         defer p.deinit(a);
         m.fc = try upload(d, &p);
