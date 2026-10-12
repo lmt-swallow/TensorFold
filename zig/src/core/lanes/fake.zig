@@ -32,6 +32,9 @@ pub const Fake = struct {
     lanes: std.AutoHashMapUnmanaged(*Stream, Lane) = .empty,
     drawn: std.ArrayList(u32) = .empty, // handle -> token
     rounds: u64 = 0,
+    draft_calls: usize = 0,
+    first_draft_depth: ?u32 = null,
+    max_draft_depth: u32 = 0,
     cycle_after: ?usize = null,
     probe_prompt: usize = 0,
     pattern: []const u32 = &.{ 11, 12, 13 },
@@ -245,6 +248,9 @@ pub const Fake = struct {
     fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const x = self(ptr);
         for (requests) |r| {
+            x.draft_calls += 1;
+            if (x.first_draft_depth == null) x.first_draft_depth = r.depth;
+            x.max_draft_depth = @max(x.max_draft_depth, r.depth);
             const l = x.lane(r.stream);
             // the head reads the last verify's kept rows (a shared round drafts before its rollback)
             var guess: std.ArrayList(u32) = .empty;

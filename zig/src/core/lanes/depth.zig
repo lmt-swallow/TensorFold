@@ -57,6 +57,7 @@ pub const Rule = struct {
     mtp_step_ms: f64,
     plain_guard: bool,
     node_probabilities: bool,
+    backend_draft_depth: bool = false,
     batch_rows: u32,
     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
@@ -128,6 +129,10 @@ pub const Rule = struct {
 
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
+        if (r.backend_draft_depth) {
+            if (who.finished or who.forced) return 0;
+            return @min(@as(i64, r.most_drafts), @min(@max(0, who.draft_room - 1), @max(0, @as(i64, r.batch_rows) - 1)));
+        }
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
         const p = try r.rates(who);
@@ -190,6 +195,10 @@ pub const Rule = struct {
 
     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, out: []i64) !void {
+        if (r.backend_draft_depth) {
+            for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
+            return;
+        }
         if (r.node_probabilities) {
             for (whos, out) |*w, *o| {
                 const inner = try r.headDepth(w, null, probe);
@@ -307,4 +316,34 @@ test "depth picks the most tokens a ms and probes deeper" {
     defer if (st) |*s| s.deinit(gpa);
     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+}
+
+test "backend depth respects room and row caps without estimating probabilities" {
+    const gpa = std.testing.allocator;
+    const empty: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .prior = &.{0.1}, .most_drafts = 7, .family_costs = &empty, .shared_costs = &empty, .mtp_step_ms = 0, .plain_guard = false, .node_probabilities = false, .backend_draft_depth = true, .batch_rows = 8 };
+    defer rule.deinit();
+    var state: ?State = null;
+    var who: Who = .{ .state = &state, .draft_room = 0, .finished = false, .forced = false };
+    for (0..12) |room| {
+        who.draft_room = @intCast(room);
+        try std.testing.expectEqual(@as(i64, @intCast(@min(7, room -| 1))), try rule.depth(who));
+    }
+    const NoCopy = struct {
+        fn copy(_: *anyopaque, _: *const Who) bool {
+            return false;
+        }
+    };
+    var out: [1]i64 = undefined;
+    var whos = [_]Who{who};
+    try rule.budgets(&whos, .{ .ptr = &state, .copy = NoCopy.copy }, &out);
+    try std.testing.expectEqual(@as(i64, 7), out[0]);
+    try std.testing.expect(state == null);
+    rule.batch_rows = 3;
+    try std.testing.expectEqual(@as(i64, 2), try rule.depth(who));
+    who.forced = true;
+    try std.testing.expectEqual(@as(i64, 0), try rule.depth(who));
+    who.forced = false;
+    who.finished = true;
+    try std.testing.expectEqual(@as(i64, 0), try rule.depth(who));
 }

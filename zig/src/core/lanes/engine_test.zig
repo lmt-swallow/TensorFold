@@ -280,3 +280,58 @@ test "without prefill_part a stream's pass runs whole at its first part" {
     while (engine.activeCount() > 0) try engine.step();
     try std.testing.expectEqual(@as(usize, 8), s.emitted().len);
 }
+
+test "backend depth preserves greedy output across room boundaries and slot reuse" {
+    for ([_]u32{ 1, 2, 3, 9, 40 }) |room| {
+        var cfg = try Config.init(gpa, .{ .exact_width = 8, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .backend_draft_depth = true, .hidden_rows = true, .batch_rows = 8, .max_streams = 1, .draft_streams = true }, 8, 7);
+        defer cfg.deinit(gpa);
+        cfg.max_copy = 0;
+        var target: fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        var clock: fake.FixedClock = .{};
+        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+        defer engine.deinit();
+        const expected = try run(&.{.{ .prompt = &.{ 1, 2, 3 }, .max_new = room, .drafts = false }});
+        defer free(expected);
+        for (0..2) |_| {
+            target.first_draft_depth = null;
+            var s = try sm.Stream.init(gpa, .{ .id = "reuse", .prompt = &.{ 1, 2, 3 }, .max_new = room, .eos = &.{96}, .drafts = true });
+            defer s.deinit(gpa);
+            try engine.addStream(&s);
+            try std.testing.expectEqual(@as(u32, @min(7, room -| 2)), target.first_draft_depth.?);
+            while (engine.activeCount() > 0) try engine.step();
+            try std.testing.expectEqualSlices(u32, expected[0], s.emitted());
+            try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+        }
+        if (room == 40) try std.testing.expectEqual(@as(u32, 7), target.max_draft_depth);
+        var cancelled = try sm.Stream.init(gpa, .{ .id = "cancel", .prompt = &.{ 1, 2, 3 }, .max_new = room, .eos = &.{96}, .drafts = true });
+        defer cancelled.deinit(gpa);
+        try engine.addStream(&cancelled);
+        engine.discard(&cancelled);
+        const calls = target.draft_calls;
+        try engine.step();
+        try std.testing.expectEqual(calls, target.draft_calls);
+        try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+    }
+}
+
+test "backend depth releases a first-token EOS without another round" {
+    var cfg = try Config.init(gpa, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .backend_draft_depth = true, .max_streams = 1, .batch_rows = 8 }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    const expected = try run(&.{.{ .prompt = &.{ 1, 2, 3 }, .max_new = 1, .drafts = false }});
+    defer free(expected);
+    var s = try sm.Stream.init(gpa, .{ .id = "eos", .prompt = &.{ 1, 2, 3 }, .max_new = 40, .eos = expected[0], .drafts = true });
+    defer s.deinit(gpa);
+    try engine.addStream(&s);
+    try std.testing.expect(s.finished);
+    try std.testing.expectEqualSlices(u32, expected[0], s.emitted());
+    const calls = target.draft_calls;
+    try engine.step();
+    try std.testing.expectEqual(calls, target.draft_calls);
+    try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+}

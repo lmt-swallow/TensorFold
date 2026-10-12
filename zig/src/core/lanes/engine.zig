@@ -57,6 +57,7 @@ pub const Engine = struct {
                 .mtp_step_ms = cfg.mtp_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
+                .backend_draft_depth = cfg.backend_draft_depth,
                 .batch_rows = cfg.batch_rows,
             },
         };
@@ -131,7 +132,10 @@ pub const Engine = struct {
         var asked: ?u32 = null;
         if (e.cfg.family_mtp and s.drafts) {
             // the head reads the prompt's last row and the first token, and drafts the one after it
-            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            var who = win.who(s);
+            // The first sampled token has not consumed its output room yet.
+            if (e.cfg.backend_draft_depth) who.draft_room -= 1;
+            const d: u32 = @intCast(try e.rule.depth(who));
             asked = d;
             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
             s.dropHeld(e.gpa);
