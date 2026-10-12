@@ -7,6 +7,8 @@
 //! TF_DS_PREFILL_CHUNK sets the chunk rows (default 2048). TF_DS_COMPARE_CHUNK=<rows> then prefills run 0's ids
 //! from cleared caches at both chunk sizes and checks that the last row's logits and every layer's ring and planes
 //! are byte-equal between them (PASS/FAIL): the prompt path's rows do not depend on how the prompt is chunked.
+//! TF_DS_FIXTURE_CONE=1 compares cold full/cone state instead of timing. TF_DS_FIXTURE_TP2=1 uses real NCCL
+//! gathers and requires explicit TF_TP_MASTER/TF_TP_PORT; launch both ranks with identical arguments except rank.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
@@ -26,6 +28,11 @@ fn selfGather(_: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.
     const dst: cuda.DeviceBuffer = .{ .d = d, .ptr = out, .len = 2 * words * 4 };
     try dst.copyFrom(0, partial, words * 4, stream.handle);
     try dst.copyFrom(words * 4, partial, words * 4, stream.handle);
+}
+
+fn tpGather(ctx: *anyopaque, partial: Ptr, words: usize, out: Ptr, stream: cuda.Stream) anyerror!void {
+    const comm: *cuda.comm.Comm = @ptrCast(@alignCast(ctx));
+    try comm.allGather(partial, out, words, .f32, stream.handle);
 }
 
 var bound: ?*const cuda.Driver = null;
@@ -93,7 +100,19 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
     defer seq.deinit(gpa);
     if (!std.mem.eql(u8, getenv("TF_DS_PROFILE") orelse "1", "0")) try seq.pr.enableProfile();
     const replay = std.mem.eql(u8, getenv("TF_DS_REPLAY") orelse "0", "1");
-    const gather: dsv41.forward.Gather = .{ .ctx = &seq, .call = selfGather };
+    const tp2 = std.mem.eql(u8, getenv("TF_DS_FIXTURE_TP2") orelse "0", "1");
+    var comm: ?cuda.comm.Comm = null;
+    defer if (comm) |*c| c.deinit();
+    if (tp2) {
+        if (!std.mem.eql(u8, getenv("TF_DS_FIXTURE_CONE") orelse "0", "1")) return error.BadConeFixture;
+        var master: [4]u8 = undefined;
+        var parts = std.mem.splitScalar(u8, getenv("TF_TP_MASTER") orelse return error.BadConeFixture, '.');
+        for (&master) |*part| part.* = try std.fmt.parseInt(u8, parts.next() orelse return error.BadConeFixture, 10);
+        if (parts.next() != null) return error.BadConeFixture;
+        const port = try std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse return error.BadConeFixture, 10);
+        comm = try cuda.comm.Comm.init(@intCast(rank), world, master, port, 60000);
+    }
+    const gather: dsv41.forward.Gather = if (comm) |*c| .{ .ctx = c, .call = tpGather } else .{ .ctx = &seq, .call = selfGather };
     const ids = try gpa.alloc(i64, tokens);
     defer gpa.free(ids);
     // Fixture-only dependency-cone experiment; no serving option or production dispatch changes.
@@ -112,7 +131,7 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
         if (!cfg.isKvSource(20)) return error.BadConeFixture;
         var prng = std.Random.DefaultPrng.init(0x5eed);
         for (ids) |*id| id.* = prng.random().intRangeLessThan(i64, 3, @intCast(cfg.vocab - 1024));
-        return coneFixture(gpu, &fwd, &seq, gather, ids, chunk, stream);
+        return coneFixture(gpu, &fwd, &seq, gather, ids, chunk, stream, tp2);
     }
     for (0..runs) |r| {
         // a fresh draw a run: the Engram rows of one run are not in the page cache for the next
@@ -194,9 +213,9 @@ fn digests(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequen
     return out;
 }
 
-/// Compare actual cache/logit bytes under one-rank selfGather. This tests the suffix property,
-/// not real TP2 state, DSpark, kept prefixes, or independent Python-reference parity.
-fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, chunk: usize, stream: cuda.Stream) !void {
+/// Compare actual cache/logit bytes under selfGather or opt-in real TP2 NCCL. This tests the suffix property,
+/// not DSpark, pool extents, kept prefixes, future decode, or independent Python-reference parity.
+fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, chunk: usize, stream: cuda.Stream, tp2: bool) !void {
     const halo: usize = 144 + 20 * 127;
     const cut = (ids.len -| halo) / chunk * chunk;
     if (cut == 0) return error.ConeFixtureNeedsLongerPrompt;
@@ -210,6 +229,7 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
     try clearConeCaches(fwd, stream);
     try seq.prefill(gather, ids, chunk, false);
     try stream.synchronize();
+    const baseline_meta = .{ seq.pos, seq.held, seq.verify_rows, seq.verify_start, seq.tap_rows };
     try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = seq.logits, .len = fwd.cfg.vocab * 4 });
     for (fwd.rings) |r| try buffers.append(gpu.gpa, r);
     for (fwd.planes) |pl| if (pl) |x| {
@@ -232,9 +252,11 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
         var name: [64]u8 = undefined;
         try check.sameBytes(try std.fmt.bufPrint(&label, "cone {s}", .{digestName(fwd, i, &name)}), got, expected);
     }
+    const cone_meta = .{ seq.pos, seq.held, seq.verify_rows, seq.verify_start, seq.tap_rows };
+    inline for (baseline_meta, cone_meta) |expected, actual| try check.expect(expected == actual, "cone sequence metadata", .{});
     try check.expect(seq.pos == ids.len, "cone position", .{});
     for (seq.hist[0..ids.len], ids) |got, expected| try check.expect(got == expected, "cone history", .{});
-    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; selfGather, no DSpark/KEEP/Python parity", .{ ids.len, cut, halo, chunk });
+    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; {s}, Engram={s}, no DSpark/KEEP/Python parity", .{ ids.len, cut, halo, chunk, if (tp2) "real TP2 NCCL" else "selfGather", if (seq.engram != null) "on" else "off" });
 }
 
 fn clearConeCaches(fwd: *dsv41.forward.Forward, stream: cuda.Stream) !void {
