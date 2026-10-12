@@ -272,6 +272,8 @@ pub const Settings = struct {
     pool: usize = 0,
     /// CED bounded replay (TF_DS_REPLAY=1): a prompt's layers from n_layers / 2 run only its last `window` rows.
     replay: bool = false,
+    /// Opt-in exact suffix cone for eligible cold admissions; other admissions execute full prefill.
+    exact_cone: bool = false,
     /// The drafts a stream's window holds at most (TF_DS_DRAFTS), 1 to the checkpoint's DSpark block; 0: the block.
     /// A deeper window would need a deeper drafter block, whose kernels' row-count variants (the MoE gate's
     /// `_rowmm_parts` RB) the captured kernel sets do not hold.
@@ -291,6 +293,14 @@ pub const Settings = struct {
 /// The drafts a window holds at most for a checkpoint block of `block` and a TF_DS_DRAFTS of `most` (0: unset).
 pub fn draftsFor(block: usize, most: usize) usize {
     return if (most == 0) block else most;
+}
+
+/// Original-chunk boundary leaving a conservative exact suffix for the 20 upper window layers and 144 ring rows.
+/// Null selects full prefill when no whole prefix chunk can be omitted.
+pub fn exactConeBoundary(prompt_len: usize) ?usize {
+    const halo: usize = 144 + 20 * 127;
+    const cut = (prompt_len -| halo) / default_chunk * default_chunk;
+    return if (cut > 0) cut else null;
 }
 
 /// engine.py prefill_steps' `replay`: with bounded replay, the first position the upper layers run (the prompt's
@@ -581,7 +591,7 @@ pub const Extents = kept_prompts.Extents;
 
 /// The admission step's record: the opcode, the slot (u8), the flags (u8: bit 0 Engram on, bit 1 DSpark taps
 /// absorbed, bit 2 CED bounded replay, bit 3 the prompt continues a kept prompt, bit 4 that continuation checked
-/// against a prefill from 0 (TF_DS_KEEP_CHECK), bit 5 kept prompts on, bit 6 the prompt filled in parts), the chunk
+/// against a prefill from 0 (TF_DS_KEEP_CHECK), bit 5 kept prompts on, bit 6 the prompt filled in parts, bit 7 exact cold suffix cone), the chunk
 /// rows (u32), the extent's base and size (u64 each), the kept prompt's id (u32) and boundary (u64), the window
 /// book's fingerprint before the step (u64), the prompt's length (u32), its ids (i64 each). Every rank places the
 /// extent the same way (cuda_keep.zig `Book.place`: the record's base is rank 0's) and fills it through the prompt
@@ -592,6 +602,7 @@ pub const Admit = struct {
     engram: bool,
     drafts: bool,
     replay: bool = false,
+    exact_cone: bool = false,
     chunk: usize,
     base: usize,
     size: usize,
@@ -609,7 +620,7 @@ pub const Admit = struct {
         buf[1] = @intCast(a.slot);
         buf[2] = @as(u8, @intFromBool(a.engram)) | @as(u8, @intFromBool(a.drafts)) << 1 | @as(u8, @intFromBool(a.replay)) << 2 |
             @as(u8, @intFromBool(a.reuse != null)) << 3 | @as(u8, @intFromBool(a.check)) << 4 | @as(u8, @intFromBool(a.keep)) << 5 |
-            @as(u8, @intFromBool(a.parts)) << 6;
+            @as(u8, @intFromBool(a.parts)) << 6 | @as(u8, @intFromBool(a.exact_cone)) << 7;
         std.mem.writeInt(u32, buf[3..7], @intCast(a.chunk), .little);
         std.mem.writeInt(u64, buf[7..15], @intCast(a.base), .little);
         std.mem.writeInt(u64, buf[15..23], @intCast(a.size), .little);
@@ -622,7 +633,7 @@ pub const Admit = struct {
     }
 
     pub fn parse(op: []const u8) error{BadRecord}!Admit {
-        if (op.len < header or op[0] != @intFromEnum(Op.admit) or op[2] > 127) return error.BadRecord;
+        if (op.len < header or op[0] != @intFromEnum(Op.admit)) return error.BadRecord;
         const n = std.mem.readInt(u32, op[43..47], .little);
         if (op.len != header + 8 * @as(usize, n)) return error.BadRecord;
         return .{
@@ -630,6 +641,7 @@ pub const Admit = struct {
             .engram = op[2] & 1 != 0,
             .drafts = op[2] & 2 != 0,
             .replay = op[2] & 4 != 0,
+            .exact_cone = op[2] & 128 != 0,
             .reuse = if (op[2] & 8 != 0) .{ .eid = std.mem.readInt(u32, op[23..27], .little), .cut = @intCast(std.mem.readInt(u64, op[27..35], .little)) } else null,
             .check = op[2] & 16 != 0,
             .keep = op[2] & 32 != 0,
@@ -946,6 +958,8 @@ pub const Pass = struct {
     cut: usize,
     chunk: usize,
     replay: bool,
+    /// Fixed at cold admission; upper-layer computation begins here, independently of prefix reuse.
+    cone: ?usize = null,
     check: bool,
     marks: ?kept_prompts.Points,
     t0: i128,
@@ -1289,7 +1303,7 @@ pub const Streams = struct {
     /// cannot see a cancel).
     pub fn admit(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool) !void {
         if (!self.admits(slot, base, size, ids.len, chunk)) return error.PositionMismatch;
-        _ = try self.admitKept(gather, slot, base, size, ids, chunk, replay, null, false);
+        _ = try self.admitKept(gather, slot, base, size, ids, chunk, replay, null, false, null);
     }
 
     /// Kept prompts are on for admissions with bounded replay `replay` (the snapshots' layout).
@@ -1360,8 +1374,8 @@ pub const Streams = struct {
     /// from the boundary are a fresh prefill's own; the ring snapshots taken at the prompt's boundaries
     /// (`Book.marksFor`). With `check`, the continued prompt is then prefilled again from 0 and the two compared
     /// (logged: the last row's logits and the caches the prompt wrote). Returns the placement.
-    pub fn admitKept(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool) !kept_prompts.How {
-        const how = try self.begin(slot, base, size, ids, chunk, replay, reuse, check);
+    pub fn admitKept(self: *Streams, gather: forward.Gather, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool, cone: ?usize) !kept_prompts.How {
+        const how = try self.begin(slot, base, size, ids, chunk, replay, reuse, check, cone);
         _ = try self.fillPart(gather, slot, ids, std.math.maxInt(u32));
         if (self.side != null) try self.joinPass(gather, slot, ids);
         return how;
@@ -1369,8 +1383,9 @@ pub const Streams = struct {
 
     /// `admitKept` up to its first chunk: the extent placed and the kept prompt's rows and slot state restored, the
     /// pass standing at the boundary (`Lane.pass`); `fillPart` runs its chunks. Returns the placement.
-    pub fn begin(self: *Streams, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool) !kept_prompts.How {
+    pub fn begin(self: *Streams, slot: usize, base: usize, size: usize, ids: []const i64, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, check: bool, cone: ?usize) !kept_prompts.How {
         if (!self.admitsKept(slot, base, size, ids, chunk, replay, reuse)) return error.PositionMismatch;
+        if (cone != null and cone != self.coneCut(ids.len, chunk, replay, reuse, false)) return error.PositionMismatch;
         const lane = &self.lanes[slot];
         // the kept prompt's snapshots to the boundary become the stream's too (it may be forgotten placing)
         var inherited: kept_prompts.Marks = .{};
@@ -1412,7 +1427,7 @@ pub const Streams = struct {
         self.settle();
         if (reuse != null) self.keep_stats[@intFromEnum(placed.how)] += 1;
         const marks: ?kept_prompts.Points = if (self.keeping(replay) and chunk == self.book.chunk) self.book.marksFor(ids.len) else null;
-        lane.pass = .{ .at = cut, .cut = cut, .chunk = chunk, .replay = replay, .check = check and reuse != null, .marks = marks, .t0 = nowNs() };
+        lane.pass = .{ .at = cut, .cut = cut, .chunk = chunk, .replay = replay, .cone = cone, .check = check and reuse != null, .marks = marks, .t0 = nowNs() };
         try self.fillStart(slot, ids, cut, chunk, replay);
         return placed.how;
     }
@@ -1474,6 +1489,24 @@ pub const Streams = struct {
         return false;
     }
 
+    /// The exact-cone boundary for a cold, isolated pass in the qualified model/kernel domain.
+    /// Ineligible requests use full prefill; this does not admit partial snapshots or kept-prefix reuse.
+    pub fn coneCut(self: *const Streams, n: usize, chunk: usize, replay: bool, reuse: ?kept_prompts.Reuse, parts: bool) ?usize {
+        if (replay or reuse != null or parts or self.book.set.on or self.side != null or !self.idle() or chunk != default_chunk) return null;
+        const cfg = self.cfg;
+        if (cfg.n_layers != 40 or self.base.w.layers.len != 40 or self.base.world != 2 or cfg.window != 128 or
+            self.pr.pk.gu != .mmb or self.pr.pk.down != .rowscp or !cfg.isKvSource(20)) return null;
+        for (20..40) |li| if (cfg.ratio(li) != 1 or (li > 20 and cfg.isKvSource(li)) or cfg.isEngram(li)) return null;
+        if (self.spark) |dr| if (dr.stages.len != 3 or dr.dims.window != 128 or dr.dims.ring != 144 or dr.dims.block != 5 or
+            !std.mem.eql(i64, cfg.dspark_taps.slice(), &.{ 37, 38, 39 })) return null;
+        return exactConeBoundary(n);
+    }
+
+    fn passFloor(self: *const Streams, slot: usize, n: usize, replay: bool) ?usize {
+        if (self.lanes[slot].pass) |p| if (p.cone) |cut| return cut;
+        return replayFrom(replay, n, self.cfg.window);
+    }
+
     /// Whether the last part issued beside the rounds has run (with `ahead`: the one before it; true without a
     /// pass beside them).
     pub fn partDone(self: *const Streams) !bool {
@@ -1502,6 +1535,7 @@ pub const Streams = struct {
     /// a kept prompt's continuation checked.
     fn endPass(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, p: Pass) !void {
         self.lanes[slot].pass = null;
+        if (p.cone) |cut| std.log.info("deepseek_v41 rank {d}: exact cone completed, prompt {d}, upper-layer cut {d}, original chunk {d}", .{ self.base.w.rank, ids.len, cut, p.chunk });
         self.logits = self.prompt_logits;
         if (ids.len - p.cut > max_rows or self.pr.trace != null) {
             try self.pstream().synchronize();
@@ -1529,7 +1563,7 @@ pub const Streams = struct {
         if (self.engram) |g| {
             g.history = lane.hist[0..ids.len];
             try g.resetAhead();
-            try g.prefetch(lane.hist[0..ids.len], from, chunkEnd(from, ids.len, chunk, replayFrom(replay, ids.len, self.cfg.window)) - from);
+            try g.prefetch(lane.hist[0..ids.len], from, chunkEnd(from, ids.len, chunk, self.passFloor(slot, ids.len, replay)) - from);
         }
     }
 
@@ -1545,7 +1579,7 @@ pub const Streams = struct {
         var s: usize = from;
         var ran: u32 = 0;
         while (s < ids.len and ran < chunks) : (ran += 1) {
-            const from_row = replayFrom(replay, ids.len, self.cfg.window);
+            const from_row = self.passFloor(slot, ids.len, replay);
             const e = chunkEnd(s, ids.len, chunk, from_row);
             const last = e == ids.len;
             // the next chunk's Engram rows read while this one runs (engine.py prefill_steps' `ahead`)
@@ -1583,7 +1617,7 @@ pub const Streams = struct {
     fn fillPiece(self: *Streams, gather: forward.Gather, slot: usize, ids: []const i64, p: *Pass) !void {
         const lane = &self.lanes[slot];
         const s = p.at;
-        const from_row = replayFrom(p.replay, ids.len, self.cfg.window);
+        const from_row = p.cone orelse replayFrom(p.replay, ids.len, self.cfg.window);
         const e = chunkEnd(s, ids.len, p.chunk, from_row);
         const last = e == ids.len;
         const o: prompt.Options = .{
@@ -2145,6 +2179,7 @@ pub const Engine = struct {
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, s: Settings) !*Engine {
         if (s.world != 2) return error.WorldNotTwo;
+        if (s.exact_cone and s.replay) return error.IncompatiblePrefillModes;
         if (s.slots < 1 or s.slots > max_slots) return error.BadSlots;
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
@@ -2518,10 +2553,11 @@ pub const Engine = struct {
                 const a = try Admit.parse(op);
                 if (a.len() > e.ids_buf.len) return error.PromptTooLong;
                 const ids = a.idsInto(e.ids_buf);
+                const cone: ?usize = if (a.exact_cone) e.streams.coneCut(ids.len, a.chunk, a.replay, a.reuse, a.parts) orelse return error.OutOfStep else null;
                 const how = if (a.parts)
-                    try e.streams.begin(a.slot, a.base, a.size, ids, a.chunk, a.replay, a.reuse, a.check)
+                    try e.streams.begin(a.slot, a.base, a.size, ids, a.chunk, a.replay, a.reuse, a.check, cone)
                 else
-                    try e.streams.admitKept(e.promptGather(), a.slot, a.base, a.size, ids, a.chunk, a.replay, a.reuse, a.check);
+                    try e.streams.admitKept(e.promptGather(), a.slot, a.base, a.size, ids, a.chunk, a.replay, a.reuse, a.check, cone);
                 if (a.reuse) |r| if (e.settings.rank == 0) std.log.info("deepseek_v41: kept prompt {d}: continued at {d} of {d} ({s}); {d} kept prompts", .{ r.eid, r.cut, a.len(), @tagName(how), e.streams.book.n });
             },
             .rounds => {
@@ -2636,6 +2672,7 @@ pub const Engine = struct {
                 const a = Admit.parse(op) catch return false;
                 if (a.engram != (e.engram != null) or a.drafts != (e.drafter != null) or a.len() > e.ids_buf.len) return false;
                 if (a.keep != st.book.set.on or a.check != (st.book.set.check and a.reuse != null) or a.book != st.fingerprint()) return false;
+                if (a.exact_cone and (!e.settings.exact_cone or st.coneCut(a.len(), a.chunk, a.replay, a.reuse, a.parts) == null)) return false;
                 return st.admitsKept(a.slot, a.base, a.size, a.idsInto(e.ids_buf), a.chunk, a.replay, a.reuse);
             },
             .rounds => {
@@ -3395,8 +3432,20 @@ pub const Lanes = struct {
         const ids = e.ids_buf[0..ptoks.len];
         for (ids, ptoks) |*id, t| id.* = t;
         const op = Admit.encode(e.op_buf, .{
-            .slot = free, .engram = e.engram != null, .drafts = e.drafter != null, .replay = e.settings.replay, .chunk = e.chunk, .base = placed.base, .size = size,
-            .reuse = reuse, .check = st.book.set.check and reuse != null, .keep = st.book.set.on, .parts = parts, .book = st.fingerprint(), .ids = &.{},
+            .slot = free,
+            .engram = e.engram != null,
+            .drafts = e.drafter != null,
+            .replay = e.settings.replay,
+            .exact_cone = e.settings.exact_cone and st.coneCut(ids.len, e.chunk, e.settings.replay, reuse, parts) != null,
+            .chunk = e.chunk,
+            .base = placed.base,
+            .size = size,
+            .reuse = reuse,
+            .check = st.book.set.check and reuse != null,
+            .keep = st.book.set.on,
+            .parts = parts,
+            .book = st.fingerprint(),
+            .ids = &.{},
         }, ids);
         try e.both(op);
         s.cached = if (reuse) |r| @intCast(r.cut) else 0;
@@ -3631,6 +3680,99 @@ test "deferred keeps are moot only when every kept stream absorbs exactly its ke
     try std.testing.expect(!ln.keepsMoot(&.{absorb2}));
 }
 
+test "exact cone boundary preserves conservative halo and original chunk alignment" {
+    var prng = std.Random.DefaultPrng.init(0xc0ae);
+    const r = prng.random();
+    try std.testing.expectEqual(@as(?usize, null), exactConeBoundary(2684 + default_chunk - 1));
+    try std.testing.expectEqual(@as(?usize, default_chunk), exactConeBoundary(2684 + default_chunk));
+    for (0..4000) |_| {
+        const n = r.intRangeAtMost(usize, 0, 1 << 20);
+        if (exactConeBoundary(n)) |cut| {
+            try std.testing.expect(cut % default_chunk == 0);
+            try std.testing.expect(n - cut >= 2684 and n - cut < 2684 + default_chunk);
+            var at: usize = 0;
+            while (at < n) {
+                const end = chunkEnd(at, n, default_chunk, cut);
+                try std.testing.expectEqual(@min(n, at + default_chunk), end);
+                at = end;
+            }
+        } else try std.testing.expect(n < 2684 + default_chunk);
+    }
+}
+
+test "exact cone eligibility excludes reused published overlapping or unqualified state" {
+    var cfg: Config = std.mem.zeroes(Config);
+    cfg.n_layers = 40;
+    cfg.window = 128;
+    cfg.compress_ratios.len = 40;
+    @memset(cfg.compress_ratios.items[0..40], 1);
+    cfg.kv_sources.len = 1;
+    cfg.kv_sources.items[0] = 20;
+    var layers: [40]weights.Layer = undefined;
+    var w: weights.Weights = undefined;
+    w.layers = &layers;
+    var base: forward.Forward = undefined;
+    base.w = &w;
+    base.world = 2;
+    var ls: [2]Lane = @splat(.{});
+    var st: Streams = undefined;
+    st.cfg = &cfg;
+    st.base = &base;
+    st.book.set.on = false;
+    st.side = null;
+    st.spark = null;
+    st.lanes = &ls;
+    st.pr.pk.gu = .mmb;
+    st.pr.pk.down = .rowscp;
+    const n = 65536;
+    try std.testing.expectEqual(@as(?usize, 61440), st.coneCut(n, default_chunk, false, null, false));
+    try std.testing.expect(st.coneCut(n, 1024, false, null, false) == null);
+    try std.testing.expect(st.coneCut(n, default_chunk, true, null, false) == null);
+    try std.testing.expect(st.coneCut(n, default_chunk, false, .{ .eid = 1, .cut = 2048 }, false) == null);
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, true) == null);
+    st.book.set.on = true;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    st.book.set.on = false;
+    ls[1].busy = true;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    ls[1].busy = false;
+    st.pr.pk.gu = .mma;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    st.pr.pk.gu = .mmb;
+    st.pr.pk.down = .rows;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    st.pr.pk.down = .rowscp;
+    cfg.engram_layers.len = 1;
+    cfg.engram_layers.items[0] = 30;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    cfg.engram_layers.len = 0;
+    cfg.kv_sources.items[1] = 24;
+    cfg.kv_sources.len = 2;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    cfg.kv_sources.len = 1;
+    cfg.compress_ratios.items[20] = 2;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    cfg.compress_ratios.items[20] = 1;
+    var stages: [3]dspark.Stage = undefined;
+    var dr: dspark.Drafter = undefined;
+    dr.stages = &stages;
+    dr.dims.window = 128;
+    dr.dims.ring = 144;
+    dr.dims.block = 5;
+    st.spark = &dr;
+    cfg.dspark_taps.len = 3;
+    @memcpy(cfg.dspark_taps.items[0..3], &[_]i64{ 37, 38, 39 });
+    try std.testing.expectEqual(@as(?usize, 61440), st.coneCut(n, default_chunk, false, null, false));
+    dr.dims.ring = 128;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    dr.dims.ring = 144;
+    cfg.dspark_taps.items[0] = 36;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+    cfg.dspark_taps.items[0] = 37;
+    base.world = 1;
+    try std.testing.expect(st.coneCut(n, default_chunk, false, null, false) == null);
+}
+
 test "bounded replay starts the upper layers at the prompt's last window rows, at 0 for a prompt within the window" {
     try std.testing.expectEqual(@as(?usize, null), replayFrom(false, 600, 128));
     try std.testing.expectEqual(@as(?usize, 472), replayFrom(true, 600, 128));
@@ -3846,10 +3988,10 @@ test "admission, free, fill, join, round, drafts, keeps and measure records pars
         const n = r.intRangeAtMost(usize, 0, ids.len);
         for (ids[0..n]) |*id| id.* = r.int(i64);
         const reuse: ?kept_prompts.Reuse = if (r.boolean()) .{ .eid = r.int(u32), .cut = r.int(u40) } else null;
-        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .reuse = reuse, .check = r.boolean(), .keep = r.boolean(), .parts = r.boolean(), .book = r.int(u64), .ids = &.{} };
+        const a: Admit = .{ .slot = r.intRangeLessThan(usize, 0, max_slots), .engram = r.boolean(), .drafts = r.boolean(), .replay = r.boolean(), .exact_cone = r.boolean(), .chunk = r.intRangeAtMost(usize, 1, prompt.max_chunk), .base = r.int(u40), .size = r.int(u40), .reuse = reuse, .check = r.boolean(), .keep = r.boolean(), .parts = r.boolean(), .book = r.int(u64), .ids = &.{} };
         const op = Admit.encode(&buf, a, ids[0..n]);
         const p = try Admit.parse(op);
-        try std.testing.expect(p.slot == a.slot and p.engram == a.engram and p.drafts == a.drafts and p.replay == a.replay and p.chunk == a.chunk and p.base == a.base and p.size == a.size);
+        try std.testing.expect(p.slot == a.slot and p.engram == a.engram and p.drafts == a.drafts and p.replay == a.replay and p.exact_cone == a.exact_cone and p.chunk == a.chunk and p.base == a.base and p.size == a.size);
         try std.testing.expect(std.meta.eql(p.reuse, a.reuse) and p.check == a.check and p.keep == a.keep and p.parts == a.parts and p.book == a.book);
 
         const fill: Fill = .{ .slot = a.slot, .chunks = r.intRangeAtMost(u32, 1, std.math.maxInt(u32)), .at = r.int(u40) };

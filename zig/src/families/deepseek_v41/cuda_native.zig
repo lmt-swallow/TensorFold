@@ -120,7 +120,14 @@ pub fn settings(gpa: std.mem.Allocator, kernels_dir: []const u8, context: usize)
         std.log.err("TF_DS_MAX_ROWS is {s}: it takes 1 to {d} rows a round", .{ getenv("TF_DS_MAX_ROWS").?, rounds.max_rows });
         return error.BadEnvironment;
     };
-    return .{ .rows = rows, .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false, .most_drafts = most_drafts };
+    const exact_cone = try envInt("TF_DS_EXACT_CONE", 0);
+    if (exact_cone > 1) return error.BadEnvironment;
+    const replay = if (getenv("TF_DS_REPLAY")) |r| std.mem.eql(u8, r, "1") else false;
+    if (exact_cone != 0 and replay) {
+        std.log.err("TF_DS_EXACT_CONE=1 cannot be combined with TF_DS_REPLAY=1", .{});
+        return error.BadEnvironment;
+    }
+    return .{ .exact_cone = exact_cone != 0, .rows = rows, .rank = rank, .world = world, .master = master, .port = port, .context = context, .bucket = bucket, .rope_dir = rope_dir, .cache_dir = cache_dir, .kernels_dir = kernels_dir, .chunk = chunk, .slots = slots, .pool = pool, .replay = replay, .most_drafts = most_drafts };
 }
 
 /// TF_DS_POOL's positions for a context of `context`: unset, the context; else a whole number at least the
