@@ -59,7 +59,7 @@ const Rank = struct {
     }
 };
 
-/// One run's per-rank caches and DSA scratch over `capacity` tokens. With TF_GLM_TIER=<dir> (bf16) each rank's
+/// One run's per-rank caches and DSA scratch over `capacity` tokens. With TF_GLM_TIER=<dir> (bf16 or FP8 rows) each rank's
 /// latent rows live on a tier (cuda_tier.zig) whose slab holds about half of them, the rest on a file in <dir>:
 /// every comparison must still hold (the latent write's cache is then not compared: the rows are the slab's).
 const Run = struct {
@@ -77,17 +77,17 @@ const Run = struct {
             r.cache[i] = try A.Cache.init(d, cfg, capacity, A.indexRing(capacity, @max(max_rows, prompt_rows)), kv);
             r.ds[i] = try A.Scratch.init(d, lay, max_rows, capacity, false);
             r.pds[i] = try A.Scratch.init(d, lay, prompt_rows, capacity, true);
-            if (dir) |dd| if (kv == .bf16) {
+            if (dir) |dd| {
                 const kvt = glm.tier.kv;
                 const cap = @max(std.mem.alignForward(usize, capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
                 const runs = kvt.home_runs + 4 + cap / kvt.seg_positions / 2;
                 const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-dsa-{s}-r{d}-{d}.bin", .{ dd, tag, i, std.c.getpid() }, 0);
                 defer gpa.free(path);
-                const t = try glm.tier.Tier.init(gpa, d, .{ .streams = 1, .layers = 1, .capacity = cap, .row_bytes = cfg.kv_lora * 2, .recent_runs = 2 }, runs * kvt.run_pools * kvt.block, prompt_rows, glm.glue.sparse_tokens, path);
+                const t = try glm.tier.Tier.init(gpa, d, .{ .streams = 1, .layers = 1, .capacity = cap, .row_bytes = kv.rowBytes(cfg.kv_lora), .recent_runs = 2 }, runs * kvt.run_pools * 4 * kv.rowBytes(cfg.kv_lora), prompt_rows, glm.glue.sparse_tokens, path);
                 try t.open(0, 1);
                 r.tier[i] = t;
                 r.cache[i].tier = .{ .t = t, .h = 0, .layer = 0 };
-            };
+            }
         }
         return r;
     }
@@ -254,7 +254,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool, want: 
         const lat = try h.fx.bytes("l_latent0");
         defer gpa.free(lat);
         try c.latent.upload(0, lat);
-        if (c.tier) |tr| try tr.t.host.load(0, 0, lat, @min(long_capacity, lat.len / (cfg.kv_lora * 2)));
+        if (c.tier) |tr| try tr.t.host.load(0, 0, lat, @min(long_capacity, lat.len / kv.rowBytes(cfg.kv_lora)));
         const pk = try h.fx.bytes("l_pk0");
         defer gpa.free(pk);
         try c.pk.upload(0, pk);

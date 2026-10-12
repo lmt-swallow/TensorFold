@@ -55,7 +55,7 @@ fn verifyAll(tier: *glm.tier.Tier, h: usize, whole: *const Buf, host: []u8, upto
             try tier.readSlot(@intCast(m.slot), &b1);
             try tier.readSlot(@intCast(m.slot), &b2);
             var dev: [kv.block]u8 = undefined;
-            try tier.d.check(tier.d.api.cuMemcpyDtoH_v2(&dev, tier.slab_dev + @as(u64, @intCast(m.slot)) * kv.block, kv.block), "cuMemcpyDtoH");
+            try tier.d.check(tier.d.api.cuMemcpyDtoH_v2(&dev, tier.slab_dev + @as(u64, @intCast(m.slot)) * tier.slot_bytes, tier.slot_bytes), "cuMemcpyDtoH");
             const want = host[m.pool * 4 * rb ..][0 .. 4 * rb];
             var zeros: usize = 0;
             for (b1) |x| zeros += @intFromBool(x == 0);
@@ -185,7 +185,11 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     const lay: glm.config.Layout = .{ .rank = 0, .world = 2, .cfg = &cfg };
     const H = lay.size(.heads);
     const lw = cfg.kv_lora;
-    const rb = lw * 2;
+    // TF_TIER_KV=fp8: FP8 cache rows (codes and scale, Kv.rowBytes: 528 bytes) through the FP8 latent write and
+    // sparse kernels; the latent input stays bf16 rows (lb)
+    const kvf: glm.glue.Kv = if (std.c.getenv("TF_TIER_KV")) |e| (if (std.mem.eql(u8, std.mem.span(e), "fp8")) .fp8 else .bf16) else .bf16;
+    const lb = lw * 2;
+    const rb = kvf.rowBytes(lw);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(cfg.qk_dim), -0.5));
     const N = if (positions_arg) |a| try std.fmt.parseInt(usize, a, 10) else 262_144;
     verify_every = if (std.c.getenv("TF_TIER_VERIFY_EVERY")) |e| try std.fmt.parseInt(usize, std.mem.span(e), 10) else 1;
@@ -208,7 +212,7 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53_tier_test_{d}.bin", .{ file_dir, std.c.getpid() }, 0);
     defer gpa.free(path);
     const o: kv.Options = .{ .streams = 2, .layers = 1, .capacity = N, .row_bytes = rb, .recent_runs = recent, .trace = std.c.getenv("TF_TIER_TRACE") != null };
-    const tier = try glm.tier.Tier.init(gpa, d, o, runs * kv.run_pools * kv.block, 64, W, path);
+    const tier = try glm.tier.Tier.init(gpa, d, o, runs * kv.run_pools * 4 * rb, 64, W, path);
     defer {
         tier.deinit(gpa);
         _ = std.c.unlink(path.ptr);
@@ -223,9 +227,9 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     var prng = std.Random.DefaultPrng.init(0x61a53);
     const rnd = prng.random();
     const chunk = kv.seg_positions;
-    const host_lat = try gpa.alloc(u8, chunk * rb);
+    const host_lat = try gpa.alloc(u8, chunk * lb);
     defer gpa.free(host_lat);
-    var lat = try Buf.alloc(d, chunk * rb);
+    var lat = try Buf.alloc(d, chunk * lb);
     defer lat.free();
     var pos_dev = try Buf.alloc(d, 16);
     defer pos_dev.free();
@@ -238,10 +242,10 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         try lat.upload(0, host_lat);
         const v: i32 = @intCast(pos);
         try pos_dev.upload(0, std.mem.asBytes(&v));
-        try g.latWrite(lat.ptr, lw, whole.ptr, .bf16, pos_dev.ptr, chunk, lw, stream);
+        try g.latWrite(lat.ptr, lw, whole.ptr, kvf, pos_dev.ptr, chunk, lw, stream);
         try tier.beginWindow(0, pos, chunk);
         for (try tier.writes(0, 0, pos, chunk, pos_dev.ptr)) |pc| if (pc) |p| {
-            try g.latWrite(lat.ptr + (p.pos - pos) * rb, lw, p.base, .bf16, p.pos_dev, p.rows, lw, stream);
+            try g.latWrite(lat.ptr + (p.pos - pos) * lb, lw, p.base, kvf, p.pos_dev, p.rows, lw, stream);
         };
         try stream.synchronize();
         try tier.commit(0, pos + chunk, stream);
@@ -257,9 +261,9 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     defer gpa.free(seen);
     @memset(seen, 0);
     var stamp: u32 = 0;
-    var qa = try Buf.alloc(d, 64 * H * rb);
+    var qa = try Buf.alloc(d, 64 * H * lb);
     defer qa.free();
-    const host_qa = try gpa.alloc(u8, 64 * H * rb);
+    const host_qa = try gpa.alloc(u8, 64 * H * lb);
     defer gpa.free(host_qa);
     var tok_a = try Buf.alloc(d, 64 * W * 4);
     defer tok_a.free();
@@ -267,9 +271,9 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     defer tok_b.free();
     var cnt = try Buf.alloc(d, 64 * 4);
     defer cnt.free();
-    var out_a = try Buf.alloc(d, 64 * H * rb);
+    var out_a = try Buf.alloc(d, 64 * H * lb);
     defer out_a.free();
-    var out_b = try Buf.alloc(d, 64 * H * rb);
+    var out_b = try Buf.alloc(d, 64 * H * lb);
     defer out_b.free();
     const ns = 5 * 16 * H; // chunks x rows x heads (decode windows of up to 16 rows)
     var po = try Buf.alloc(d, ns * lw * 4);
@@ -279,9 +283,9 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     var pl = try Buf.alloc(d, ns * 4);
     defer pl.free();
     const parts: glm.glue.Glue.Partials = .{ .po = po.ptr, .pm = pm.ptr, .pl = pl.ptr };
-    const ha = try gpa.alloc(u8, 64 * H * rb);
+    const ha = try gpa.alloc(u8, 64 * H * lb);
     defer gpa.free(ha);
-    const hb = try gpa.alloc(u8, 64 * H * rb);
+    const hb = try gpa.alloc(u8, 64 * H * lb);
     defer gpa.free(hb);
     var e0 = try cuda.Event.init(d, true);
     defer e0.deinit();
@@ -298,23 +302,23 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     var step: usize = 0;
     while (step < 48 and pos + 16 < N) : (step += 1) {
         const R = sizes[step % sizes.len];
-        fillBf16(rnd, host_lat[0 .. R * rb]);
-        try lat.upload(0, host_lat[0 .. R * rb]);
+        fillBf16(rnd, host_lat[0 .. R * lb]);
+        try lat.upload(0, host_lat[0 .. R * lb]);
         const v: i32 = @intCast(pos);
         try pos_dev.upload(0, std.mem.asBytes(&v));
-        try g.latWrite(lat.ptr, lw, whole.ptr, .bf16, pos_dev.ptr, R, lw, stream);
+        try g.latWrite(lat.ptr, lw, whole.ptr, kvf, pos_dev.ptr, R, lw, stream);
         try tier.beginWindow(0, pos, R);
         for (try tier.writes(0, 0, pos, R, pos_dev.ptr)) |pc| if (pc) |p| {
-            try g.latWrite(lat.ptr + (p.pos - pos) * rb, lw, p.base, .bf16, p.pos_dev, p.rows, lw, stream);
+            try g.latWrite(lat.ptr + (p.pos - pos) * lb, lw, p.base, kvf, p.pos_dev, p.rows, lw, stream);
         };
         selection(rnd, pos, R, tokens, counts, seen, &stamp);
-        fillBf16(rnd, host_qa[0 .. R * H * rb]);
-        try qa.upload(0, host_qa[0 .. R * H * rb]);
+        fillBf16(rnd, host_qa[0 .. R * H * lb]);
+        try qa.upload(0, host_qa[0 .. R * H * lb]);
         try tok_a.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
         try tok_b.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
         try cnt.upload(0, std.mem.sliceAsBytes(counts[0..R]));
         try e0.record(stream);
-        try g.sparseAttention(qa.ptr, whole.ptr, .bf16, tok_a.ptr, cnt.ptr, parts, out_a.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
+        try g.sparseAttention(qa.ptr, whole.ptr, kvf, tok_a.ptr, cnt.ptr, parts, out_a.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
         try e1.record(stream);
         try e1.synchronize();
         t_whole += try e0.elapsedMs(e1);
@@ -323,15 +327,15 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         resolve_ms += ms(t_r, io);
         resolves += 1;
         try e0.record(stream);
-        try g.sparseAttention(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
+        try g.sparseAttention(qa.ptr, res.base, kvf, res.tokens, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
         try e1.record(stream);
         try e1.synchronize();
         t_slab += try e0.elapsedMs(e1);
-        try out_a.download(0, ha[0 .. R * H * rb]);
-        try out_b.download(0, hb[0 .. R * H * rb]);
+        try out_a.download(0, ha[0 .. R * H * lb]);
+        try out_b.download(0, hb[0 .. R * H * lb]);
         window_pos = pos;
-        if (!std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb])) try diagnose(gpa, tier, &whole, tok_b, res.tokens, tokens, counts, R, rb);
-        try check.expect(std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb]), "glm53-tier: decode window of {d} rows at {d}: the slab's output differs from the whole cache's", .{ R, pos });
+        if (!std.mem.eql(u8, ha[0 .. R * H * lb], hb[0 .. R * H * lb])) try diagnose(gpa, tier, &whole, tok_b, res.tokens, tokens, counts, R, rb);
+        try check.expect(std.mem.eql(u8, ha[0 .. R * H * lb], hb[0 .. R * H * lb]), "glm53-tier: decode window of {d} rows at {d}: the slab's output differs from the whole cache's", .{ R, pos });
         checked += 1;
         const keep = 1 + rnd.uintLessThan(usize, R);
         pos += keep;
@@ -348,22 +352,22 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     {
         const R = 64;
         try tier.beginWindow(0, pos, R);
-        fillBf16(rnd, host_lat[0 .. R * rb]);
-        try lat.upload(0, host_lat[0 .. R * rb]);
+        fillBf16(rnd, host_lat[0 .. R * lb]);
+        try lat.upload(0, host_lat[0 .. R * lb]);
         const v: i32 = @intCast(pos);
         try pos_dev.upload(0, std.mem.asBytes(&v));
-        try g.latWrite(lat.ptr, lw, whole.ptr, .bf16, pos_dev.ptr, R, lw, stream);
+        try g.latWrite(lat.ptr, lw, whole.ptr, kvf, pos_dev.ptr, R, lw, stream);
         for (try tier.writes(0, 0, pos, R, pos_dev.ptr)) |pc| if (pc) |p| {
-            try g.latWrite(lat.ptr + (p.pos - pos) * rb, lw, p.base, .bf16, p.pos_dev, p.rows, lw, stream);
+            try g.latWrite(lat.ptr + (p.pos - pos) * lb, lw, p.base, kvf, p.pos_dev, p.rows, lw, stream);
         };
         selection(rnd, pos, R, tokens, counts, seen, &stamp);
-        fillBf16(rnd, host_qa[0 .. R * H * rb]);
-        try qa.upload(0, host_qa[0 .. R * H * rb]);
+        fillBf16(rnd, host_qa[0 .. R * H * lb]);
+        try qa.upload(0, host_qa[0 .. R * H * lb]);
         try tok_a.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
         try tok_b.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
         try cnt.upload(0, std.mem.sliceAsBytes(counts[0..R]));
         try e0.record(stream);
-        try g.sparseOnepass(qa.ptr, whole.ptr, .bf16, tok_a.ptr, cnt.ptr, out_a.ptr, R, H, lw, W, scale, stream);
+        try g.sparseOnepass(qa.ptr, whole.ptr, kvf, tok_a.ptr, cnt.ptr, out_a.ptr, R, H, lw, W, scale, stream);
         try e1.record(stream);
         try e1.synchronize();
         const tw = try e0.elapsedMs(e1);
@@ -372,13 +376,13 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         const res = try tier.resolve(0, 0, tok_b.ptr, cnt.ptr, R, W, stream);
         const rms = ms(t_r, io);
         try e0.record(stream);
-        try g.sparseOnepass(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, out_b.ptr, R, H, lw, W, scale, stream);
+        try g.sparseOnepass(qa.ptr, res.base, kvf, res.tokens, cnt.ptr, out_b.ptr, R, H, lw, W, scale, stream);
         try e1.record(stream);
         try e1.synchronize();
         const ts = try e0.elapsedMs(e1);
-        try out_a.download(0, ha[0 .. R * H * rb]);
-        try out_b.download(0, hb[0 .. R * H * rb]);
-        try check.expect(std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb]), "glm53-tier: prompt block of {d} rows: the slab's output differs from the whole cache's", .{R});
+        try out_a.download(0, ha[0 .. R * H * lb]);
+        try out_b.download(0, hb[0 .. R * H * lb]);
+        try check.expect(std.mem.eql(u8, ha[0 .. R * H * lb], hb[0 .. R * H * lb]), "glm53-tier: prompt block of {d} rows: the slab's output differs from the whole cache's", .{R});
         check.pass("glm53-tier: a 64-row prompt block (one-pass kernel) equals the whole cache's byte for byte; resolve {d:.2} ms ({d} pools read), kernel {d:.3} ms (slab) vs {d:.3} ms (device)", .{ rms, tier.host.reads - reads, ts, tw });
     }
 
@@ -395,28 +399,28 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         var bpos = rows;
         var windows: usize = 0;
         while (windows < 8) : (windows += 1) {
-            fillBf16(rnd, host_lat[0 .. R * rb]);
-            try lat.upload(0, host_lat[0 .. R * rb]);
+            fillBf16(rnd, host_lat[0 .. R * lb]);
+            try lat.upload(0, host_lat[0 .. R * lb]);
             const v: i32 = @intCast(bpos);
             try pos_dev.upload(0, std.mem.asBytes(&v));
-            try g.latWrite(lat.ptr, lw, whole_b.ptr, .bf16, pos_dev.ptr, R, lw, stream);
+            try g.latWrite(lat.ptr, lw, whole_b.ptr, kvf, pos_dev.ptr, R, lw, stream);
             try tier.beginWindow(b, bpos, R);
             for (try tier.writes(b, 0, bpos, R, pos_dev.ptr)) |pc| if (pc) |p| {
-                try g.latWrite(lat.ptr + (p.pos - bpos) * rb, lw, p.base, .bf16, p.pos_dev, p.rows, lw, stream);
+                try g.latWrite(lat.ptr + (p.pos - bpos) * lb, lw, p.base, kvf, p.pos_dev, p.rows, lw, stream);
             };
             selection(rnd, bpos, R, tokens, counts, seen, &stamp);
-            fillBf16(rnd, host_qa[0 .. R * H * rb]);
-            try qa.upload(0, host_qa[0 .. R * H * rb]);
+            fillBf16(rnd, host_qa[0 .. R * H * lb]);
+            try qa.upload(0, host_qa[0 .. R * H * lb]);
             try tok_a.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
             try tok_b.upload(0, std.mem.sliceAsBytes(tokens[0 .. R * W]));
             try cnt.upload(0, std.mem.sliceAsBytes(counts[0..R]));
-            try g.sparseAttention(qa.ptr, whole_b.ptr, .bf16, tok_a.ptr, cnt.ptr, parts, out_a.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
+            try g.sparseAttention(qa.ptr, whole_b.ptr, kvf, tok_a.ptr, cnt.ptr, parts, out_a.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
             const res = try tier.resolve(b, 0, tok_b.ptr, cnt.ptr, R, W, stream);
-            try g.sparseAttention(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
+            try g.sparseAttention(qa.ptr, res.base, kvf, res.tokens, cnt.ptr, parts, out_b.ptr, R, H, lw, W, glm.dsa.headBlock(R), scale, stream);
             try stream.synchronize();
-            try out_a.download(0, ha[0 .. R * H * rb]);
-            try out_b.download(0, hb[0 .. R * H * rb]);
-            try check.expect(std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb]), "glm53-tier: an alias's window at {d}: the slab's output differs from the whole cache's", .{bpos});
+            try out_a.download(0, ha[0 .. R * H * lb]);
+            try out_b.download(0, hb[0 .. R * H * lb]);
+            try check.expect(std.mem.eql(u8, ha[0 .. R * H * lb], hb[0 .. R * H * lb]), "glm53-tier: an alias's window at {d}: the slab's output differs from the whole cache's", .{bpos});
             bpos += R;
             try tier.commit(b, bpos, stream);
             try verifyAll(tier, b, &whole_b, whole_host, bpos, rb, "an alias's window", bpos);
@@ -428,13 +432,13 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         try tok_a.upload(0, std.mem.sliceAsBytes(tokens[0..W]));
         try tok_b.upload(0, std.mem.sliceAsBytes(tokens[0..W]));
         try cnt.upload(0, std.mem.sliceAsBytes(counts[0..1]));
-        try g.sparseAttention(qa.ptr, whole_b.ptr, .bf16, tok_a.ptr, cnt.ptr, parts, out_a.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
+        try g.sparseAttention(qa.ptr, whole_b.ptr, kvf, tok_a.ptr, cnt.ptr, parts, out_a.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
         const res = try tier.resolve(b, 0, tok_b.ptr, cnt.ptr, 1, W, stream);
-        try g.sparseAttention(qa.ptr, res.base, .bf16, res.tokens, cnt.ptr, parts, out_b.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
+        try g.sparseAttention(qa.ptr, res.base, kvf, res.tokens, cnt.ptr, parts, out_b.ptr, 1, H, lw, W, glm.dsa.headBlock(1), scale, stream);
         try stream.synchronize();
-        try out_a.download(0, ha[0 .. H * rb]);
-        try out_b.download(0, hb[0 .. H * rb]);
-        try check.expect(std.mem.eql(u8, ha[0 .. H * rb], hb[0 .. H * rb]), "glm53-tier: an alias after its parent closed: the slab's output differs", .{});
+        try out_a.download(0, ha[0 .. H * lb]);
+        try out_b.download(0, hb[0 .. H * lb]);
+        try check.expect(std.mem.eql(u8, ha[0 .. H * lb], hb[0 .. H * lb]), "glm53-tier: an alias after its parent closed: the slab's output differs", .{});
         check.pass("glm53-tier: an alias continuing {d} positions (9 windows, its parent closed before the last) equals a whole cache byte for byte", .{rows});
     }
 }

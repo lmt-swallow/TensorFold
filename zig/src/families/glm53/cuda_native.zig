@@ -4,7 +4,7 @@
 //! (TENSORFOLD_CUDA_KERNELS) must hold the reference's captured Triton kernels (tools/zig/glm53/capture.sh). Up to 4
 //! streams decode together, their DSA caches in one pool of TF_GLM_POOL positions (default: one stream's context;
 //! at least that, a multiple of 2,048), each stream an extent of it; every slot's other state (KDA states, rings, the
-//! head's rows) is made at load. TF_GLM_TIER=<dir> (bf16 caches) puts the DSA latent rows on a tier (cuda_tier.zig):
+//! head's rows) is made at load. TF_GLM_TIER=<dir> (bf16 or FP8 caches) puts the DSA latent rows on a tier (cuda_tier.zig):
 //! a pinned slab of TF_GLM_TIER_GIB GiB of resident pools (default: every slot's at a full context, at most 24), the
 //! rest in <dir>/glm53-kv-rank<r>.bin.
 //! Both ranks must run with the same --context, TF_GLM_POOL, TF_GLM_TIER and drafts setting.
@@ -329,10 +329,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     };
     own.tier = null;
     if (getenv("TF_GLM_TIER")) |tdir| {
-        if (kv != .bf16) {
-            std.log.err("TF_GLM_TIER holds bf16 latent rows: unset TF_GLM_KV or set it to bf16", .{});
-            return error.BadEnvironment;
-        }
         const kvt = Tr.kv;
         // default: every slot's latent rows at a full context (nothing evicted), at most 24 GiB (4 x 1M positions
         // keeps about half of them resident beside the weights and the pooled keys)
@@ -344,7 +340,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         // a slot's backbone and head streams, and the kept prompts' (each until the prompts reading through it end)
         const tstreams = 2 * (lanesmod.max_streams + keep.book.max_kept + 1);
         // map blocks: a backbone stream's DSA layers and its head stream's one, for every pair
-        own.tier = try Tr.Tier.init(gpa, d, .{ .streams = tstreams, .layers = own.cfg.count(.dsa), .capacity = tcap, .row_bytes = own.cfg.kv_lora * 2, .blocks = tstreams / 2 * (own.cfg.count(.dsa) + 1) }, @as(usize, gib) << 30, engine.prompt_rows, glue.sparse_tokens, path);
+        own.tier = try Tr.Tier.init(gpa, d, .{ .streams = tstreams, .layers = own.cfg.count(.dsa), .capacity = tcap, .row_bytes = kv.rowBytes(own.cfg.kv_lora), .blocks = tstreams / 2 * (own.cfg.count(.dsa) + 1) }, @as(usize, gib) << 30, engine.prompt_rows, glue.sparse_tokens, path);
     }
     errdefer if (own.tier) |t| t.deinit(gpa);
     own.pool = try P.Pool.init(gpa, d, &own.cfg, planes, positions, kv, own.tier == null);

@@ -36,6 +36,7 @@ pub const Tier = struct {
     host: kv.Tier,
     slab: cuda.DeviceBuffer,
     slab_dev: Ptr,
+    slot_bytes: usize, // a pool's 4 rows
     stage: cuda.DeviceBuffer, // stage_slots slots of bytes on their way between the host and the slab
     idx: cuda.DeviceBuffer, // [2, stage_slots] i32: a call's slot lists
     xs: cuda.Stream, // the slab's transfers and kernels, in order on it (each call synchronizes it): a copy on the
@@ -58,7 +59,8 @@ pub const Tier = struct {
     module: cuda.Module,
     remap_fn: cuda.Function,
 
-    /// `slab_bytes` of resident latents (whole runs of kv_tier.run_pools blocks), windows of up to `rows` rows
+    /// About `slab_bytes` of resident latents (whole runs of kv_tier.run_pools slots of 4 rows of o.row_bytes:
+    /// 1,024-byte bf16 rows or 528-byte FP8 ones), windows of up to `rows` rows
     /// selecting up to `w` positions a row, the backing file at `path`.
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, o: kv.Options, slab_bytes: usize, rows: usize, w: usize, path: [:0]const u8) !*Tier {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -66,7 +68,10 @@ pub const Tier = struct {
         errdefer gpa.destroy(t);
         t.d = d;
         t.at_next = 0;
-        t.slab = try cuda.DeviceBuffer.alloc(d, slab_bytes);
+        t.slot_bytes = o.row_bytes * kv.pool_rows;
+        const slots = slab_bytes / (t.slot_bytes * kv.run_pools) * kv.run_pools;
+        if (slots == 0 or t.slot_bytes % 16 != 0) return error.BadShape;
+        t.slab = try cuda.DeviceBuffer.alloc(d, slots * t.slot_bytes);
         errdefer t.slab.free();
         t.slab_dev = t.slab.ptr;
         t.stage = try cuda.DeviceBuffer.alloc(d, stage_slots * kv.block);
@@ -97,7 +102,7 @@ pub const Tier = struct {
         t.scatter_fn = try t.module.function("tf_glm53_tier_scatter");
         t.gather_fn = try t.module.function("tf_glm53_tier_gather");
         t.copy_fn = try t.module.function("tf_glm53_tier_copy");
-        const slab: kv.Slab = .{ .ctx = t, .slots = slab_bytes / kv.block, .put = slabPut, .get = slabGet, .copy = slabCopy };
+        const slab: kv.Slab = .{ .ctx = t, .slots = slots, .slot_bytes = t.slot_bytes, .put = slabPut, .get = slabGet, .copy = slabCopy };
         t.host = try kv.Tier.init(gpa, slab, t.map.slice(i32), path, o);
         return t;
     }
@@ -120,6 +125,8 @@ pub const Tier = struct {
             args.add(t.stage.ptr);
             args.add(t.slab.ptr);
             args.add(t.idx.ptr);
+            args.add(@as(i32, @intCast(t.slot_bytes / 16)));
+            args.add(@as(i32, kv.block / 16));
             try t.launchSlots(t.scatter_fn, n, &args);
             try t.xs.synchronize();
         }
@@ -135,6 +142,8 @@ pub const Tier = struct {
             args.add(t.slab.ptr);
             args.add(t.stage.ptr);
             args.add(t.idx.ptr);
+            args.add(@as(i32, @intCast(t.slot_bytes / 16)));
+            args.add(@as(i32, kv.block / 16));
             try t.launchSlots(t.gather_fn, n, &args);
             try t.xs.synchronize();
             try t.stage.download(0, out[at * kv.block ..][0 .. n * kv.block]);
@@ -152,6 +161,7 @@ pub const Tier = struct {
             args.add(t.slab.ptr);
             args.add(t.idx.ptr);
             args.add(t.idx.ptr + stage_slots * 4);
+            args.add(@as(i32, @intCast(t.slot_bytes / 16)));
             try t.launchSlots(t.copy_fn, n, &args);
             try t.xs.synchronize();
         }

@@ -80,15 +80,17 @@ pub const Piece = struct {
     rows: usize,
 };
 
-/// The slab's slots, wherever they live. kv_tier never touches a slot's bytes but through these three calls:
-/// cuda_tier keeps the slab in device memory (never visible to the CPU), the host tests in a host slice
-/// (`HostSlab`). Each call returns once its bytes landed.
+/// The slab's slots (slot_bytes each: a pool's 4 rows, 4,096 bytes in bf16, 2,112 in FP8), wherever they live.
+/// kv_tier never touches a slot's bytes but through these three calls: cuda_tier keeps the slab in device memory
+/// (never visible to the CPU), the host tests in a host slice (`HostSlab`). On the host side a slot's bytes sit a
+/// file block (4 KiB) apart, as the file holds them: one pool a block. Each call returns once its bytes landed.
 pub const Slab = struct {
     ctx: *anyopaque,
     slots: usize,
-    /// bytes[i * block ..][0..block] into slot slots[i]
+    slot_bytes: usize,
+    /// bytes[i * block ..][0..slot_bytes] into slot slots[i]
     put: *const fn (ctx: *anyopaque, slots: []const u32, bytes: []const u8) anyerror!void,
-    /// slot slots[i]'s bytes into out[i * block ..][0..block]
+    /// slot slots[i]'s bytes into out[i * block ..][0..slot_bytes]
     get: *const fn (ctx: *anyopaque, slots: []const u32, out: []u8) anyerror!void,
     /// slot dst[i] := slot src[i]
     copy: *const fn (ctx: *anyopaque, dst: []const u32, src: []const u32) anyerror!void,
@@ -97,24 +99,28 @@ pub const Slab = struct {
 /// A slab in a host slice (the host tests; a kernel never reads it).
 pub const HostSlab = struct {
     bytes: []align(block) u8,
+    slot_bytes: usize = block,
 
     pub fn slab(h: *HostSlab) Slab {
-        return .{ .ctx = h, .slots = h.bytes.len / block, .put = put, .get = get, .copy = copy };
+        return .{ .ctx = h, .slots = h.bytes.len / h.slot_bytes, .slot_bytes = h.slot_bytes, .put = put, .get = get, .copy = copy };
     }
 
     fn put(ctx: *anyopaque, slots: []const u32, bytes: []const u8) anyerror!void {
         const h: *HostSlab = @ptrCast(@alignCast(ctx));
-        for (slots, 0..) |x, i| @memcpy(h.bytes[@as(usize, x) * block ..][0..block], bytes[i * block ..][0..block]);
+        const sb = h.slot_bytes;
+        for (slots, 0..) |x, i| @memcpy(h.bytes[@as(usize, x) * sb ..][0..sb], bytes[i * block ..][0..sb]);
     }
 
     fn get(ctx: *anyopaque, slots: []const u32, out: []u8) anyerror!void {
         const h: *HostSlab = @ptrCast(@alignCast(ctx));
-        for (slots, 0..) |x, i| @memcpy(out[i * block ..][0..block], h.bytes[@as(usize, x) * block ..][0..block]);
+        const sb = h.slot_bytes;
+        for (slots, 0..) |x, i| @memcpy(out[i * block ..][0..sb], h.bytes[@as(usize, x) * sb ..][0..sb]);
     }
 
     fn copy(ctx: *anyopaque, dst: []const u32, src: []const u32) anyerror!void {
         const h: *HostSlab = @ptrCast(@alignCast(ctx));
-        for (dst, src) |d, x| @memcpy(h.bytes[@as(usize, d) * block ..][0..block], h.bytes[@as(usize, x) * block ..][0..block]);
+        const sb = h.slot_bytes;
+        for (dst, src) |d, x| @memcpy(h.bytes[@as(usize, d) * sb ..][0..sb], h.bytes[@as(usize, x) * sb ..][0..sb]);
     }
 };
 
@@ -175,7 +181,8 @@ pub const Tier = struct {
     /// `slab` (whole runs of run_pools slots) and `map` (Options.mapBlocks() * capacity / 4 entries, which the
     /// device's remap reads) are the caller's. `path` is the backing file (created, emptied, locked).
     pub fn init(gpa: std.mem.Allocator, slab: Slab, map: []i32, path: [:0]const u8, o: Options) Error!Tier {
-        if (o.row_bytes * pool_rows != block or o.capacity % seg_positions != 0 or o.capacity < home_positions) return error.BadShape;
+        const sb = o.row_bytes * pool_rows;
+        if (sb > block or sb % 16 != 0 or slab.slot_bytes != sb or o.capacity % seg_positions != 0 or o.capacity < home_positions) return error.BadShape;
         if (slab.slots % run_pools != 0 or slab.slots == 0) return error.BadShape;
         const pools = o.capacity / pool_rows;
         const keys = o.mapBlocks() * pools;
@@ -310,6 +317,11 @@ pub const Tier = struct {
 
     fn fileOffset(k: u32) u64 {
         return @as(u64, k) * block;
+    }
+
+    /// A slot's (a pool's) bytes in the slab: 4 rows.
+    pub fn slotBytes(t: *const Tier) usize {
+        return pool_rows * t.o.row_bytes;
     }
 
     /// Blocks a read or write stage holds (a flush past it).
@@ -481,13 +493,13 @@ pub const Tier = struct {
             const g = p / seg_positions;
             if (g < home_runs) {
                 const end = @min(pos + R, home_positions);
-                out[i] = .{ .base = @intCast(@as(u64, t.home[s * t.o.layers + l]) * run_pools * block), .pos = p, .rows = end - p };
+                out[i] = .{ .base = @intCast(@as(u64, t.home[s * t.o.layers + l]) * run_pools * t.slotBytes()), .pos = p, .rows = end - p };
                 p = end;
             } else {
                 const r = t.seg_run[(s * t.o.layers + l) * t.segs + g];
                 if (r == none) return error.NotOpen;
                 const end = @min(pos + R, (g + 1) * seg_positions);
-                const run_at: i64 = @intCast(@as(u64, r) * run_pools * block);
+                const run_at: i64 = @intCast(@as(u64, r) * run_pools * t.slotBytes());
                 out[i] = .{ .base = run_at - @as(i64, @intCast(g * seg_positions * t.o.row_bytes)), .pos = p, .rows = end - p };
                 p = end;
             }
@@ -497,7 +509,7 @@ pub const Tier = struct {
 
     /// The base dense attention reads layer `l`'s positions [0, home_positions) at.
     pub fn denseBase(t: *const Tier, s: usize, l: usize) i64 {
-        return @intCast(@as(u64, t.home[s * t.o.layers + l]) * run_pools * block);
+        return @intCast(@as(u64, t.home[s * t.o.layers + l]) * run_pools * t.slotBytes());
     }
 
     /// One stream-layer's selection: rows [counts.len], row r's first counts[r] positions at tokens[r * W ..].
@@ -699,7 +711,8 @@ pub const Tier = struct {
             var p: usize = home_pools;
             while (p < full) {
                 const n: usize = @min(@as(usize, run_pools), full - p);
-                @memcpy(bounce[0 .. n * block], bytes[p * pb ..][0 .. n * block]);
+                @memset(bounce[0 .. n * block], 0);
+                for (0..n) |i| @memcpy(bounce[i * block ..][0..pb], bytes[(p + i) * pb ..][0..pb]);
                 try t.io.add(.write, bounce[0 .. n * block], fileOffset(t.key(s, l, p)));
                 try t.flushReads();
                 for (p..p + n) |q| {
@@ -1086,11 +1099,11 @@ pub const Tier = struct {
                     if (slot >= 0) {
                         var in_slab: [block]u8 align(block) = undefined;
                         t.slab.get(t.slab.ctx, &.{@intCast(slot)}, &in_slab) catch return error.SlabFailed;
-                        if (!std.mem.eql(u8, want, &in_slab)) return .{ .layer = l, .pool = p, .slot = slot, .in_file = false, .run_kind = kind };
+                        if (!std.mem.eql(u8, want, in_slab[0..pb])) return .{ .layer = l, .pool = p, .slot = slot, .in_file = false, .run_kind = kind };
                     }
                     if (t.persisted.isSet(k)) {
                         const in = (p - p0) * block;
-                        if (got < @as(isize, @intCast(in + block)) or !std.mem.eql(u8, want, buf[in..][0..block]))
+                        if (got < @as(isize, @intCast(in + block)) or !std.mem.eql(u8, want, buf[in..][0..pb]))
                             return .{ .layer = l, .pool = p, .slot = slot, .in_file = true, .run_kind = kind };
                     }
                 }
@@ -1358,7 +1371,7 @@ const Fixture = struct {
         const gpa = testing.allocator;
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
-        f.host = .{ .bytes = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * block) };
+        f.host = .{ .bytes = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * o.row_bytes * pool_rows), .slot_bytes = o.row_bytes * pool_rows };
         @memset(f.host.bytes, 0xAA);
         f.map = try gpa.alloc(i32, blocks * o.capacity / pool_rows);
         // TF_TIER_TEST_DIR: a directory on the NVMe's file system (O_DIRECT and AIO; /tmp may be tmpfs)
@@ -1460,11 +1473,20 @@ const Fixture = struct {
 };
 
 test "a selection reads the bytes last written, through windows, drafts, commits and evictions" {
+    try randomRun(1024);
+}
+
+test "the same with FP8 rows (528 bytes: a 2,112-byte slot in a 4 KiB file block)" {
+    try randomRun(528);
+    try aliasRun(528);
+}
+
+fn randomRun(row_bytes: usize) !void {
     var prng = std.Random.DefaultPrng.init(0x7131);
     const rnd = prng.random();
     // 2 streams x 2 layers x 32,768 positions = 64 runs of latents in a 26-run slab: the home blocks take 12 runs,
     // the recent windows up to 12, the loose runs hold what else fits and the rest comes back from the file
-    const o: Options = .{ .streams = 2, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 2, .depth = 32 };
+    const o: Options = .{ .streams = 2, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 2, .depth = 32, .row_bytes = row_bytes };
     const f = try Fixture.init(o, 26, 1);
     defer f.deinit();
     const t = &f.tier;
@@ -1570,9 +1592,13 @@ test "fetchMany serves several streams' selections from one batch of reads" {
 }
 
 test "aliases read their parents' pools: kept prompts continued, parents closed first, chains" {
+    try aliasRun(1024);
+}
+
+fn aliasRun(row_bytes: usize) !void {
     var prng = std.Random.DefaultPrng.init(0xa11a5);
     const rnd = prng.random();
-    const o: Options = .{ .streams = 4, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 1, .depth = 16 };
+    const o: Options = .{ .streams = 4, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 1, .depth = 16, .row_bytes = row_bytes };
     const f = try Fixture.init(o, 60, 6);
     defer f.deinit();
     const t = &f.tier;
@@ -1622,9 +1648,14 @@ test "aliases read their parents' pools: kept prompts continued, parents closed 
 }
 
 test "load: a whole drawn cache, then windows and selections over it" {
+    try loadRun(1024);
+    try loadRun(528);
+}
+
+fn loadRun(row_bytes: usize) !void {
     var prng = std.Random.DefaultPrng.init(0x10ad);
     const rnd = prng.random();
-    const o: Options = .{ .streams = 1, .layers = 2, .capacity = 32 * seg_positions, .recent_runs = 2, .depth = 16 };
+    const o: Options = .{ .streams = 1, .layers = 2, .capacity = 32 * seg_positions, .recent_runs = 2, .depth = 16, .row_bytes = row_bytes };
     const f = try Fixture.init(o, 30, 7);
     defer f.deinit();
     const t = &f.tier;
