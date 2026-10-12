@@ -51,6 +51,7 @@ pub const qwen38fn_qmm: []const u8 = if (available) &Blob("fatbin_qwen38fn_qmm")
 pub const qwen38fn_draft_pick: []const u8 = if (available) &Blob("fatbin_qwen38fn_draft_pick").bytes else &.{};
 pub const qwen38fn_prompt_glue: []const u8 = if (available) &Blob("fatbin_qwen38fn_prompt_glue").bytes else &.{};
 pub const glm53_kda: []const u8 = if (available) &Blob("fatbin_glm53_kda").bytes else &.{};
+pub const glm53_kda_step: []const u8 = if (available) &Blob("fatbin_glm53_kda_step").bytes else &.{};
 pub const glm53_hc: []const u8 = if (available) &Blob("fatbin_glm53_hc").bytes else &.{};
 pub const glm53_exl3: []const u8 = if (available) &Blob("fatbin_glm53_exl3").bytes else &.{};
 pub const glm53_qmm: []const u8 = if (available) &Blob("fatbin_glm53_qmm").bytes else &.{};
