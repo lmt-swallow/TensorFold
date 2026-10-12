@@ -108,6 +108,7 @@ pub const Lanes = struct {
     /// The records since the last agreement (`agreesNow` false ones fold in here and are agreed on with the next).
     pending: std.crypto.hash.sha2.Sha256 = .init(.{}),
     pending_bad: bool = false,
+    draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts on its own head steps
 
     /// Lanes over `pool`, each stream at most `capacity` positions; every slot's sequence made now (its KDA states,
     /// rings and head buffers), so a stream waits for none.
@@ -122,6 +123,7 @@ pub const Lanes = struct {
         errdefer self.deinit();
         self.book.released = &self.released;
         self.tier = tier;
+        if (std.c.getenv("TF_GLM_DRAFT_BATCH")) |v| self.draft_batch = !std.mem.eql(u8, std.mem.span(v), "0");
         for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
         if (self.book.set.on) self.snaps = try keep.Snaps.init(gpa, d, self.book.set.snaps, keep.snapBytes(&self.slots[0].seq.?));
         return self;
@@ -498,8 +500,11 @@ pub const Lanes = struct {
                         nreq += 1;
                     }
                 }
-                // every drafting stream's absorb and chain steps as batched head steps
-                try self.r.draftMany(reqs[0..nreq]);
+                // every drafting stream's absorb and chain steps as batched head steps (TF_GLM_DRAFT_BATCH=0: one
+                // stream after another, the same drafts)
+                if (self.draft_batch) {
+                    try self.r.draftMany(reqs[0..nreq]);
+                } else for (reqs[0..nreq]) |*q| try self.r.draftMany(q[0..1]);
                 for (reqs[0..nreq], which[0..nreq]) |q, s| s.nheld = q.n;
             },
             .release => {
