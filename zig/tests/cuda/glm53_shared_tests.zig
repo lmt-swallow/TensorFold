@@ -30,10 +30,14 @@ const lengths = [streams]usize{ 3000, 2100, 1200, 333 };
 const Run = struct {
     logits: std.ArrayList(u8) = .empty,
     tokens: std.ArrayList(u32) = .empty,
+    drafts: std.ArrayList(u32) = .empty, // each round's head drafts, then their count
+    probs: std.ArrayList(u64) = .empty, // the drafts' confidences' bits
 
     fn deinit(x: *Run, gpa: std.mem.Allocator) void {
         x.logits.deinit(gpa);
         x.tokens.deinit(gpa);
+        x.drafts.deinit(gpa);
+        x.probs.deinit(gpa);
     }
 };
 
@@ -80,9 +84,29 @@ fn decode(rk: *pair.Rank, r: *E.Runner, pool: *const P.Pool, seqs: *[streams]E.S
             const k = keeps[round][i];
             try r.commit(&seqs[i], ws[i], k);
             pending[i] = outs[i][k - 1];
+            // the head owes the kept rows (the token after each: the samples)
+            try r.owe(&seqs[i], seqs[i].last.ptr, outs[i][0..k]);
+        }
+        // the head's drafts for the next round: each stream alone (`absorb`, `chain`), one a call (`draftMany` of
+        // one), or every stream's in one batch
+        var held: [streams][E.rows]u32 = undefined;
+        var probs: [streams][E.rows]f64 = undefined;
+        var reqs: [streams]E.Runner.DraftReq = undefined;
+        for (&reqs, seqs, 0..) |*q, *sq, i| q.* = .{ .q = sq, .depth = 3, .drafts = &held[i], .probs = &probs[i] };
+        switch (mode) {
+            .single => for (&reqs) |*q| {
+                try r.absorb(q.q);
+                q.n = try r.chain(q.q, q.depth, q.drafts, q.probs);
+            },
+            .alone => for (0..streams) |i| try r.draftMany(reqs[i .. i + 1]),
+            .shared => try r.draftMany(&reqs),
+        }
+        for (reqs, 0..) |q, i| {
+            try runs[i].drafts.appendSlice(gpa, q.drafts[0..q.n]);
+            try runs[i].drafts.append(gpa, @intCast(q.n));
+            for (q.probs[0..q.n]) |pb| try runs[i].probs.append(gpa, @bitCast(pb));
         }
     }
-    _ = gpa;
 }
 
 /// Window `i` of the last shared forward: its rows' logits and samples.
@@ -133,6 +157,10 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     for ([_]Mode{ .alone, .shared }) |mode| for (0..streams) |i| {
         const x = &single[i];
         const y = &runs[@intFromEnum(mode)][i];
+        if (!std.mem.eql(u32, x.drafts.items, y.drafts.items) or !std.mem.eql(u64, x.probs.items, y.probs.items)) {
+            std.debug.print("FAIL glm53-shared rank {d}: stream {d} head drafts or confidences differ ({t} against the single path)\n", .{ rank, i, mode });
+            bad += 1;
+        }
         if (!std.mem.eql(u32, x.tokens.items, y.tokens.items)) {
             std.debug.print("FAIL glm53-shared rank {d}: stream {d} samples differ ({t} against the single path)\n", .{ rank, i, mode });
             bad += 1;
@@ -147,5 +175,7 @@ fn body(_: Args, gpu: Gpu, rk: *pair.Rank, link: E.Link) !void {
     try check.expect(bad == 0, "glm53-shared rank {d}: a stream's rows differ in the shared forward", .{rank});
     var total: usize = 0;
     for (single) |x| total += x.tokens.items.len;
-    check.pass("BITEXACT glm53-shared rank {d}: {d} streams, {d} rounds, {d} rows: every row's logits and sample the same on the single path, alone and shared", .{ rank, streams, rounds, total });
+    var nd: usize = 0;
+    for (single) |x| nd += x.probs.items.len;
+    check.pass("BITEXACT glm53-shared rank {d}: {d} streams, {d} rounds, {d} rows: every row's logits and sample, and {d} head drafts with their confidences, the same on the single path, alone and shared", .{ rank, streams, rounds, total, nd });
 }

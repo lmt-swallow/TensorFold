@@ -474,6 +474,9 @@ pub const Lanes = struct {
             },
             .draft => {
                 const n = rd.byte().?;
+                var reqs: [max_streams]engine.Runner.DraftReq = undefined;
+                var which: [max_streams]*Slot = undefined;
+                var nreq: usize = 0;
                 for (0..n) |_| {
                     const s = &self.slots[rd.byte().?];
                     const kept = rd.byte().?;
@@ -490,10 +493,14 @@ pub const Lanes = struct {
                     }
                     s.nheld = 0;
                     if (want > 0 and s.drafts) {
-                        try self.r.absorb(q);
-                        s.nheld = try self.r.chain(q, @min(want, depth), &s.held, &s.probs);
+                        reqs[nreq] = .{ .q = q, .depth = @min(want, depth), .drafts = &s.held, .probs = &s.probs };
+                        which[nreq] = s;
+                        nreq += 1;
                     }
                 }
+                // every drafting stream's absorb and chain steps as batched head steps
+                try self.r.draftMany(reqs[0..nreq]);
+                for (reqs[0..nreq], which[0..nreq]) |q, s| s.nheld = q.n;
             },
             .release => {
                 const s = &self.slots[rd.byte().?];

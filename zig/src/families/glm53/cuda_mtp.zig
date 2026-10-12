@@ -16,6 +16,7 @@ const weights = @import("cuda_weights.zig");
 const dsa = @import("cuda_dsa.zig");
 const moe = @import("cuda_moe.zig");
 const draft_head = @import("draft_head.zig");
+const Tr = @import("cuda_tier.zig");
 
 const Glue = glue_mod.Glue;
 const Ptr = cuda.abi.DevicePtr;
@@ -194,9 +195,11 @@ pub const Buffers = struct {
             b.gath = try Buf.alloc(d, sizes.gath);
             b.sk = try Buf.alloc(d, sizes.sk);
         }
-        b.fnormed = try Buf.alloc(d, D * 2);
-        b.fxs = try Buf.alloc(d, D / 64 * 4);
-        b.logits = try Buf.alloc(d, lay.size(.vocab) * 2);
+        // a decode set holds the head rows of up to `dsa.max_segs` streams' steps at once (`runSegs`), row i each's
+        const heads: usize = if (prefill) 1 else dsa.max_segs;
+        b.fnormed = try Buf.alloc(d, heads * D * 2);
+        b.fxs = try Buf.alloc(d, heads * D / 64 * 4);
+        b.logits = try Buf.alloc(d, heads * lay.size(.vocab) * 2);
         return b;
     }
 
@@ -305,4 +308,93 @@ pub fn run(g: Glue, k: *const Kernels, mk: *const moe.Kernels, lay: config.Layou
     try moe.moeBlock(g, mk, lay, &m.moe, step.ms, b.normed.ptr, b.part.ptr, b.sk.ptr, n, stream);
     try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, n * D, stream);
     try head(g, k, c, m, b, lay.world, n, stream);
+}
+
+/// One stream's rows in a head step several streams share (`runSegs`): its next tokens and their input rows, its head
+/// position and cache.
+pub const Seg = struct {
+    next: []const u32,
+    hidden: Ptr, // next.len rows of D bf16 (row stride D)
+    mtp_len: usize,
+    cache: *const dsa.Cache,
+    pos_dev: Buf,
+};
+
+/// `run` for several streams at once (decode rows, `segs` in row order, at most b.rows rows in all): the row-wise
+/// blocks (the embedding, the norms, eh_proj, the projections, the MoE, the draft head) over every row, each
+/// stream's DSA attention over its own rows and cache (cuda_model.zig `forwardSegs`' split). Stream i's last row's
+/// shared_head.norm lands in b.fnormed row i and its logits in b.logits row i, the bits `run` gives it alone when
+/// the row-wise kernels give a row the same bits whatever the rows beside it (glm53-shared checks).
+pub fn runSegs(g: Glue, k: *const Kernels, mk: *const moe.Kernels, lay: config.Layout, m: *const Mtp, b: *const Buffers, ds: *const dsa.Scratch, ms: *const moe.Scratch, segs: []const Seg, embed: Ptr, gather: Gather, stream: cuda.Stream) !void {
+    const c = lay.cfg;
+    const D = c.hidden;
+    if (b.prefill or segs.len == 0 or segs.len > dsa.max_segs) return error.BadSegments;
+    var a0s: [dsa.max_segs]usize = undefined;
+    var R: usize = 0;
+    var sparse = false;
+    for (segs, 0..) |sg, i| {
+        const n = sg.next.len;
+        if (n == 0 or n > dsa.seg_rows) return error.BadSegments;
+        a0s[i] = R;
+        try b.ids.uploadAsync(R * 4, std.mem.sliceAsBytes(sg.next), stream.handle);
+        try b.hin.copyFrom(R * D * 2, sg.hidden, n * D * 2, stream.handle);
+        const p32: i32 = @intCast(sg.mtp_len);
+        try sg.pos_dev.uploadAsync(0, std.mem.asBytes(&p32), stream.handle);
+        sparse = sparse or dsa.sparseRows(c, sg.mtp_len, n);
+        R += n;
+    }
+    if (R > b.rows) return error.BadSegments;
+    // front over every row, the first position's embedding zeroed for a stream at position 0
+    try g.embed(b.ids.ptr, embed, b.me.ptr, R, 1, stream);
+    for (segs, a0s[0..segs.len]) |sg, a0| if (sg.mtp_len == 0) {
+        const row: Buf = .{ .d = b.me.d, .ptr = b.me.ptr + a0 * D * 2, .len = D * 2 };
+        try row.fill8(0, stream.handle);
+    };
+    try g.rmsnorm(b.me.ptr, D, m.enorm.ptr, b.mcat.ptr, 2 * D, 0, c.eps, R, D, stream);
+    try g.rmsnorm(b.hin.ptr, D, m.hnorm.ptr, b.mcat.ptr + D * 2, 2 * D, 0, c.eps, R, D, stream);
+    try g.bmm(b.mcat.ptr, 2 * D, m.eh.b16(), R, b.mx.ptr, false, b.sk.ptr, stream);
+    try g.rmsnorm(b.mx.ptr, D, m.in_norm.ptr, b.normed.ptr, D, b.xs.ptr, c.eps, R, D, stream);
+    // the DSA layer: every stream's selection, then (on a tier, one batch of reads) every stream's attention
+    try dsa.dsaFront(g, lay, &m.dsa, ds, b.normed.ptr, b.sk.ptr, 0, R, stream);
+    try dsa.dsaIndex(g, lay, &m.dsa, ds, b.normed.ptr, b.sk.ptr, R, sparse, stream);
+    var calls: [dsa.max_segs]dsa.Call = undefined;
+    for (segs, calls[0..segs.len]) |sg, *cl| cl.* = .{
+        .normed = b.normed.ptr,
+        .part = b.part.ptr,
+        .sk = b.sk.ptr,
+        .pos_dev = sg.pos_dev.ptr,
+        .host_pos = sg.mtp_len,
+        .nch = (sg.mtp_len + sg.next.len + 511) / 512,
+        .R = sg.next.len,
+    };
+    for (segs, calls[0..segs.len], a0s[0..segs.len], 0..) |sg, cl, a0, i| try dsa.dsaSelect(g, lay, &m.dsa, sg.cache, ds, cl, a0, ds.selection(i), stream);
+    var resolved: [dsa.max_segs]?Tr.Tier.Resolved = @splat(null);
+    if (segs[0].cache.tier) |tr| {
+        var sels: [dsa.max_segs]Tr.Tier.Sel = undefined;
+        var which: [dsa.max_segs]usize = undefined;
+        var n: usize = 0;
+        for (segs, 0..) |sg, i| if (dsa.sparseRows(c, sg.mtp_len, sg.next.len)) {
+            const x = sg.cache.tier.?;
+            const sel = ds.selection(i);
+            sels[n] = .{ .h = x.h, .layer = x.layer, .tokens = sel.tokens, .counts = sel.counts, .R = sg.next.len };
+            which[n] = i;
+            n += 1;
+        };
+        var out: [dsa.max_segs]Tr.Tier.Resolved = undefined;
+        if (n > 0) try tr.t.resolveMany(sels[0..n], glue_mod.sparse_tokens, stream, out[0..n]);
+        for (which[0..n], out[0..n]) |i, o| resolved[i] = o;
+    }
+    for (segs, calls[0..segs.len], a0s[0..segs.len], 0..) |sg, cl, a0, i| try dsa.dsaAttendRows(g, lay, &m.dsa, sg.cache, ds, cl, a0, ds.selection(i), resolved[i], stream);
+    try dsa.dsaExpand(g, lay, &m.dsa, ds, R, stream);
+    try dsa.dsaOut(g, lay, &m.dsa, ds, b.part.ptr, b.sk.ptr, 0, R, stream);
+    try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
+    try afterAttention(g, c, m, b, lay.world, R, stream);
+    try moe.moeBlock(g, mk, lay, &m.moe, ms, b.normed.ptr, b.part.ptr, b.sk.ptr, R, stream);
+    try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
+    // the residual over every row; each stream's last row normed into its head row, then the heads' logits at once
+    try g.residualAdd(b.mx.ptr, b.mx.ptr, b.gath.ptr, lay.world, R, stream);
+    for (segs, a0s[0..segs.len], 0..) |sg, a0, i| {
+        try g.rmsnorm(b.mx.ptr + (a0 + sg.next.len - 1) * D * 2, D, m.norm.ptr, b.fnormed.ptr + i * D * 2, D, b.fxs.ptr + i * D / 64 * 4, c.eps, 1, D, stream);
+    }
+    try headLogits(k, &m.head, b.fnormed.ptr, b.fxs.ptr, b.logits.ptr, segs.len, false, stream);
 }

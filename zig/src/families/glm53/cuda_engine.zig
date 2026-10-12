@@ -157,6 +157,7 @@ pub const Runner = struct {
     argmax_mod: cuda.Module,
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu): each row's first largest
     picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
+    heads: Buf, // [max_segs, D]: each drafting stream's last head row (`draftMany`: its next chain step's input)
     topk_mod: cuda.Module,
     topk_fn: cuda.Function, // tf_glm53_topk_row (glm53/topk.cu): a row's k best on the device
     topk_part: cuda.Function, // tf_glm53_topk_part: each column block's k best keys
@@ -173,7 +174,7 @@ pub const Runner = struct {
     overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined, .topk_mod = undefined, .topk_fn = undefined, .topk_part = undefined, .topk_merge = undefined, .topk_keys = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined, .topk_mod = undefined, .topk_fn = undefined, .topk_part = undefined, .topk_merge = undefined, .topk_keys = undefined, .heads = undefined };
         r.w = try M.Work.init(d, lay, batch_rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -193,6 +194,8 @@ pub const Runner = struct {
         r.argmax_fn = try r.argmax_mod.function("tf_argmax_rows_i32_kernel");
         r.picks = try Buf.alloc(d, batch_rows * 4 + (1 + lay.world) * 2 * batch_rows * 4);
         errdefer r.picks.free();
+        r.heads = try Buf.alloc(d, M.max_segs * lay.cfg.hidden * 2);
+        errdefer r.heads.free();
         r.topk_mod = try cuda.Module.load(d, cuda.kernels.glm53_topk);
         errdefer r.topk_mod.unload();
         r.topk_fn = try r.topk_mod.function("tf_glm53_topk_row");
@@ -219,6 +222,7 @@ pub const Runner = struct {
     pub fn deinit(r: *Runner) void {
         if (r.prof) |*p| p.deinit();
         r.picks.free();
+        r.heads.free();
         r.argmax_mod.unload();
         r.topk_keys.free();
         r.topk_mod.unload();
@@ -616,6 +620,97 @@ pub const Runner = struct {
         if (r.prof) |*p| try p.absorbEnd(owed, r.stream);
         // the absorbed rows are final; the chain's drafts after them are not
         try r.tierSettle(q, true, q.mtp_len);
+    }
+
+    /// One stream's request in `draftMany`: its chain's depth (0: nothing) and where its drafts and their confidences go.
+    pub const DraftReq = struct { q: *Seq, depth: usize, drafts: []u32, probs: []f64, n: usize = 0 };
+
+    /// `absorb` then `chain` for several streams, their head steps batched (T.runSegs): each stream's owed rows
+    /// absorbed (its windows of `rows` before its last run alone), then each chain step one row a stream, every
+    /// stream's drafts and confidences those its own `absorb` and `chain` give (the head's rows never mix).
+    pub fn draftMany(r: *Runner, reqs: []DraftReq) !void {
+        const D = r.lay.cfg.hidden;
+        if (reqs.len > M.max_segs) return error.TooManyStreams;
+        var live: [M.max_segs]usize = undefined; // reqs index of each stream whose head steps next
+        var nlive: usize = 0;
+        var off: [M.max_segs]usize = @splat(0); // owed rows absorbed alone before the batched window
+        for (reqs, 0..) |*q, i| {
+            q.n = 0;
+            if (q.depth == 0) continue;
+            const s = q.q;
+            s.fresh = false;
+            s.mtp_len -= s.mtp_drafted;
+            s.mtp_drafted = 0;
+            if (s.tier) |x| x.t.rewind(x.hm, s.mtp_len);
+            // owed rows past one window: its leading windows alone (as `absorb` runs them)
+            while (s.m_next.items.len - off[i] > rows) : (off[i] += rows) {
+                try r.mtpStep(s, &r.mb, s.m_next.items[off[i]..][0..rows], s.backlog.ptr + off[i] * D * 2);
+                s.mtp_len += rows;
+            }
+            if (s.m_next.items.len == off[i]) continue; // nothing to absorb: no logits to chain from
+            live[nlive] = i;
+            nlive += 1;
+        }
+        // the absorb (each stream's last owed window), then the chain steps, each a batched head step
+        var chain_p: [M.max_segs]f64 = @splat(1.0);
+        var step: usize = 0;
+        var toks: [M.max_segs]u32 = undefined;
+        while (nlive > 0) : (step += 1) {
+            var segs: [M.max_segs]T.Seg = undefined;
+            var R: usize = 0;
+            var n: usize = 0;
+            // a batch holds at most `r.mb.rows` rows; streams past it go in the next batch of the same step
+            var at: usize = 0;
+            while (at < nlive) {
+                n = 0;
+                R = 0;
+                const from = at;
+                while (at < nlive) : (at += 1) {
+                    const ri = live[at];
+                    const s = reqs[ri].q;
+                    const next: []const u32 = if (step == 0) s.m_next.items[off[ri]..] else toks[ri .. ri + 1];
+                    if (n > 0 and R + next.len > r.mb.rows) break;
+                    try r.tierBegin(s, true, s.mtp_len, next.len);
+                    segs[n] = .{ .next = next, .hidden = if (step == 0) s.backlog.ptr + off[ri] * D * 2 else r.heads.ptr + ri * D * 2, .mtp_len = s.mtp_len, .cache = &s.mcache, .pos_dev = s.mpos };
+                    n += 1;
+                    R += next.len;
+                }
+                try T.runSegs(r.k.g, r.tk, r.k.mk, r.lay, r.mtp, &r.mb, &r.w.ds, &r.w.ms, segs[0..n], r.model.embed.ptr, r.mtpGather(), r.stream);
+                for (live[from..at], 0..) |ri, j| {
+                    const s = reqs[ri].q;
+                    const rows_in = segs[j].next.len;
+                    s.mtp_len += rows_in;
+                    if (step == 0) {
+                        s.m_next.clearRetainingCapacity();
+                        try r.tierSettle(s, true, s.mtp_len);
+                    } else s.mtp_drafted += 1;
+                    try r.heads.copyFrom(ri * D * 2, r.mb.fnormed.ptr + j * D * 2, D * 2, r.stream.handle);
+                    // the head's logits of this stream: its next draft, kept or the chain cut (`chain`'s rule)
+                    const q = &reqs[ri];
+                    var p: f64 = 0;
+                    const tok = try r.sample(r.mb.logits, j, draft_k, &p);
+                    const cut_before = step > 0 and chain_p[ri] * p < copy_drafts.confidence;
+                    if (!cut_before) {
+                        q.drafts[q.n] = tok;
+                        q.probs[q.n] = p;
+                        q.n += 1;
+                        chain_p[ri] *= p;
+                    }
+                    toks[ri] = tok;
+                }
+            }
+            // the streams whose chain goes on: kept a draft this step, above the confidence, below their depth
+            var keep: usize = 0;
+            for (live[0..nlive]) |ri| {
+                const q = &reqs[ri];
+                const kept = q.n == step + 1;
+                if (kept and chain_p[ri] >= copy_drafts.confidence and step + 1 < q.depth) {
+                    live[keep] = ri;
+                    keep += 1;
+                }
+            }
+            nlive = keep;
+        }
     }
 
     /// decode.py `draft`'s chain after `absorb`: up to `depth` drafts, cut where the product of their confidences
