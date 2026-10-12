@@ -156,6 +156,18 @@ fn bucket(m: usize) usize {
     unreachable;
 }
 
+/// sparse.py `score_rows` (TF_GLM_SCORE_RB: 1, 2, 4 or 8, default 4): a prompt chunk's rows a _scores program
+/// takes. Every value gives a row the same bits: its pool keys are masked to its own pools before its dot.
+pub fn scoreRows() !usize {
+    const v = std.mem.span(std.c.getenv("TF_GLM_SCORE_RB") orelse return 4);
+    if (v.len == 0) return 4;
+    const n = std.fmt.parseInt(usize, v, 10) catch return error.BadScoreRows;
+    return switch (n) {
+        1, 2, 4, 8 => n,
+        else => error.BadScoreRows,
+    };
+}
+
 /// The glue's own CUDA kernels: hc.cu's mixing dots (decode rows), hc_fused.cu's hc_post with the next hc_pre's
 /// prompt dots (`Glue.hcPostPartial`) and bmm.cu's BF16 matmul (`Bmm`).
 pub const Hc = struct {
@@ -720,12 +732,12 @@ pub const Glue = struct {
 
     /// sparse.py `_scores` (a prompt chunk's rows from device position pos, RB rows a program) into out [R, np].
     pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
-        const rb = 4;
+        const rb = try scoreRows();
         try g.set.run(stream, "_scores", .{ @intCast(cdiv(R, rb)), @intCast(cdiv(np, 64)), 1 }, &.{
             aot.ptr("QI", "*bf16", qi),  aot.ptr("W", "*bf16", w),     aot.int("w_stride", n32(w_stride)), aot.ptr("PK", kv.values(), pk),
             aot.ptr("PKS", kv.scales(), pk), aot.ptr("OUT", "*fp32", out), aot.ptr("POS", "*i32", pos),        aot.int("R", n32(R)),
             aot.int("NP", n32(np)),      aot.float("scale", index_scale), aot.float("wscale", index_wscale),
-        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", rb), aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()) });
+        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", @intCast(rb)), aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()) });
     }
 
     /// sparse.py `_select_rows`: each row's 512 best pools ascending (ties to the lower pool) into out int64 [R, 512];

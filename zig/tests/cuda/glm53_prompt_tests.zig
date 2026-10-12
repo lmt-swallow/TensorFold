@@ -308,7 +308,9 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
         std.debug.print("FAIL glm53 config: {t}: {s}\n", .{ e, why.text() });
         return e;
     };
-    const aot_dir = try std.fs.path.join(gpa, &.{ work, "aot" });
+    // TF_GLM53_AOT: another Triton set than the fixture's own (a variant the reference run did not launch, e.g.
+    // TF_GLM_SCORE_RB=8's scores against an RB=4 capture)
+    const aot_dir = if (std.c.getenv("TF_GLM53_AOT")) |v| try gpa.dupe(u8, std.mem.span(v)) else try std.fs.path.join(gpa, &.{ work, "aot" });
     defer gpa.free(aot_dir);
     var set = try cuda.aot.Set.load(gpa, gpu.io, d, gpu.ctx.device, aot_dir);
     defer set.deinit();
