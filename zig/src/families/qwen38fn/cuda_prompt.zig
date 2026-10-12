@@ -117,8 +117,9 @@ fn f16Mode() !F16Mode {
     return modeOf(F16Mode, "TF_QFN_PROMPT_F16");
 }
 
-/// The widest selection (power-of-two block count) select.cu takes; past it 0.6.6's `_select` is faster.
-const fused_select_blocks = 16384;
+/// The most blocks (81,920 keys) select.cu lists; its time grows with the blocks, `_select`'s with the power-of-two
+/// width, so it is faster at about 17k blocks (0.13 vs 0.51 ms a call) and slower at about 32k (0.78 vs 0.62).
+const fused_select_blocks = 20480;
 
 /// scores.cu SMEM: a scores program's dynamic shared bytes (32 rows' queries as fp32, 64 keys).
 const scores_shared: u32 = 32 * 4 * 128 * 4 + 64 * (128 + 8) * 2;
@@ -618,8 +619,8 @@ pub const Prompt = struct {
                 try countDiffs(p.k.sc_diff, b, &a, .{ .x = 1024 }, "scores", n * blocks, stream);
             }
         }
-        // select.cu up to 16,384 blocks (65,536 keys); from there 0.6.6's `_select` and `_select_tiles` are faster
-        const tiles = std.math.ceilPowerOfTwoAssert(usize, blocks) > fused_select_blocks;
+        // select.cu up to fused_select_blocks blocks; past them 0.6.6's `_select` and `_select_tiles` are faster
+        const tiles = blocks > fused_select_blocks;
         if (b.select_mode == .captured or tiles) return ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
         const check = b.select_mode == .check;
         if (check) try ak.select(b.pos_blk.ptr, s, n, blocks, false, stream);
