@@ -143,6 +143,22 @@ threadlocal var bound: ?*const cuda.Context = null;
 
 const Gpu = struct { driver: cuda.Driver, ctx: cuda.Context };
 
+/// Copy continuations may be disabled independently of learned drafts.
+fn copyDrafts(value: ?[]const u8) !bool {
+    const v = value orelse return true;
+    if (std.mem.eql(u8, v, "1")) return true;
+    if (std.mem.eql(u8, v, "0")) return false;
+    return error.BadCopyDrafts;
+}
+
+test "copy draft setting preserves default and rejects ambiguous values" {
+    try std.testing.expect(try copyDrafts(null));
+    try std.testing.expect(try copyDrafts("1"));
+    try std.testing.expect(!try copyDrafts("0"));
+    for ([_][]const u8{ "", "false", "2" }) |v|
+        try std.testing.expectError(error.BadCopyDrafts, copyDrafts(v));
+}
+
 /// One loaded model behind the lane host: everything the engine thread reads lives here.
 const Host = struct {
     gpa: Allocator,
@@ -187,6 +203,8 @@ const Host = struct {
     fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain, interleave: u32, overlap: bool) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
         errdefer h.cfg.deinit(h.gpa);
+        if (!try copyDrafts(getenv("TENSORFOLD_COPY_DRAFTS"))) h.cfg.max_copy = 0;
+        std.log.info("CUDA copy drafts enabled={}", .{h.cfg.max_copy != 0});
         h.clock = .{ .io = io };
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();

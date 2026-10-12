@@ -493,6 +493,7 @@ pub const Lanes = struct {
                 if (self.dflash) |df| {
                     if (n != 1) return error.TooManyStreams;
                     try df.session.window(wins[0].ids, wins[0].out);
+                    if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 dflash verify: pos={d} inputs={any} samples={any}", .{ df.session.context.logical.end, wins[0].ids, wins[0].out[0..wins[0].ids.len] });
                 } else try self.r.windows(wins[0..n]);
                 for (wins[0..n], which[0..n]) |w, s| {
                     s.pending = w.ids.len;
@@ -526,6 +527,7 @@ pub const Lanes = struct {
                             defer self.gpa.free(drafts);
                             s.nheld = @min(want, drafts.len);
                             @memcpy(s.held[0..s.nheld], drafts[0..s.nheld]);
+                            if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 dflash draft: pos={d} pending={d} policy={s} ids={any}", .{ df.session.context.logical.end, s.first, df.session.policy.name(), s.held[0..s.nheld] });
                         }
                         continue;
                     }
@@ -687,6 +689,7 @@ pub const Lanes = struct {
         if (k == 0 or k > rows) return error.BadKeep;
         if (self.dflash) |df| {
             try df.session.commit(k);
+            if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 dflash commit: rows={d} keep={d} end={d}", .{ rows, k, df.session.context.logical.end });
             s.first = s.sampled[k - 1];
         } else try self.r.commit(&s.seq.?, rows, k);
         s.pending = null;
