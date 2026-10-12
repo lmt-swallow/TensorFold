@@ -227,6 +227,68 @@ pub const AttnKernels = struct {
     }
 };
 
+/// The prompt mHC between two sublayers: a sublayer's hc_post fused into the next sublayer's mixes, the posted
+/// streams written into the other stream buffer. TF_DS_HC=cuda: hc_fused.cu (`_hc_post` and `_hc_partial` in one
+/// pass, their bits), then the captured `_hc_finish`; `mix`: the fork's kernels.py hc_pre2 with `gathered`
+/// (`_hc_mix_part` posted, then `_hc_finish_s`; the same bits, slower at prompt rows: its programs are the decode
+/// path's); the default `split` keeps `_hc_post`, `_hc_partial`, `_hc_finish`. Fused where nothing reads the posted
+/// streams between the two sublayers: within a layer always, across layers unless the next one starts with Engram, a
+/// DSpark tap, the bounded-replay cut, or the walk's end (a piece's boundary).
+/// TF_DS_HC_CHECK=1 runs the split kernels beside every fused call and fails unless x, the new streams, pre, post and
+/// comb are byte-equal.
+pub const HcFuse = struct {
+    mode: Mode,
+    check: bool,
+    module: ?cuda.Module = null,
+    post_partial: ?cuda.Function = null,
+
+    pub const Mode = enum { split, mix, cuda };
+    /// hc_fused.cu's rows a program and dynamic shared memory (a step's fn columns of the 4 streams)
+    pub const rows_per_program = 8;
+    pub const smem: u32 = 24 * 4 * 128 * 4;
+
+    pub fn load(d: *const cuda.Driver) !HcFuse {
+        const mode = std.meta.stringToEnum(Mode, envOr("TF_DS_HC", "split")) orelse return error.BadShape;
+        var self: HcFuse = .{ .mode = mode, .check = std.mem.eql(u8, envOr("TF_DS_HC_CHECK", "0"), "1") };
+        if (mode == .cuda) {
+            if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+            var module = try cuda.Module.load(d, cuda.kernels.dsv41_hc_fused);
+            errdefer module.unload();
+            const f = try module.function("tf_dsv41_hc_post_partial");
+            try f.allowDynamicShared(smem);
+            self.module = module;
+            self.post_partial = f;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *HcFuse) void {
+        if (self.module) |*m| m.unload();
+    }
+
+    pub fn on(self: HcFuse) bool {
+        return self.mode != .split;
+    }
+
+    /// hc_fused.cu's kernel `f` (rows_per_program rows a program, smem bytes): h_out [rows, 4, d] = _hc_post of h with
+    /// gathered [2, rows, d] (rank partials rs elements apart), post [rows, 4], comb [rows, 4, 4]; part [rows, 40, 32]
+    /// = _hc_partial of h_out with fn [24, 4 d] (columns 0..24). h_out must not overlap h.
+    pub fn postPartial(f: cuda.Function, rows_a_program: u32, stream: cuda.Stream, h: Ptr, h_out: Ptr, gathered: Ptr, rs: usize, post_: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, d: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(h_out);
+        a.add(gathered);
+        a.add(@as(i64, @intCast(rs)));
+        a.add(post_);
+        a.add(comb);
+        a.add(fn_);
+        a.add(part);
+        a.add(ci(rows));
+        a.add(ci(d));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((rows + rows_a_program - 1) / rows_a_program), .y = @intCast(d / 512) }, .block = .{ .x = 256 }, .shared = smem }, stream, &a);
+    }
+};
+
 /// gate/up's prompt kernel: grouped_mma (the fork's) or grouped_mmb (the same bits, the mma over every warp).
 pub const Gu = enum { mma, mmb };
 
@@ -564,6 +626,61 @@ fn nowNs() i128 {
     return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
 }
 
+/// TF_DS_HC_CHECK: the split kernels' outputs for a fused mHC call (`Prompt.mixes`), and the byte comparison.
+const HcRef = struct {
+    h: cuda.DeviceBuffer,
+    x: cuda.DeviceBuffer,
+    pre: cuda.DeviceBuffer,
+    post: cuda.DeviceBuffer,
+    comb: cuda.DeviceBuffer,
+    part: cuda.DeviceBuffer,
+    got: cuda.DeviceBuffer, // a fused output, copied out of the walk's buffers for the download
+
+    fn init(d: *const cuda.Driver, rows: usize, dm: usize) !HcRef {
+        const hs = hcmod.hc_streams;
+        return .{
+            .h = try cuda.DeviceBuffer.alloc(d, rows * hs * dm * 2),
+            .x = try cuda.DeviceBuffer.alloc(d, rows * dm * 2),
+            .pre = try cuda.DeviceBuffer.alloc(d, rows * hs * 4),
+            .post = try cuda.DeviceBuffer.alloc(d, rows * hs * 4),
+            .comb = try cuda.DeviceBuffer.alloc(d, rows * hs * hs * 4),
+            .part = try cuda.DeviceBuffer.alloc(d, hcmod.Hc.partWords(rows) * 4),
+            .got = try cuda.DeviceBuffer.alloc(d, rows * hs * dm * 2),
+        };
+    }
+
+    fn deinit(self: *HcRef) void {
+        inline for (.{ "h", "x", "pre", "post", "comb", "part", "got" }) |f| @field(self, f).free();
+    }
+
+    /// The fused call's new streams, x, pre_out, post, comb (`got`, in that order) byte-equal to the split kernels',
+    /// else error.PromptKernelMismatch (logged with the first differing output and its count of differing bytes).
+    fn compare(self: *HcRef, li: usize, rows: usize, dm: usize, got: [5]Ptr, stream: cuda.Stream) !void {
+        const hs = hcmod.hc_streams;
+        const names = [5][]const u8{ "streams", "x", "pre", "post", "comb" };
+        const want = [5]cuda.DeviceBuffer{ self.h, self.x, self.pre, self.post, self.comb };
+        const bytes = [5]usize{ rows * hs * dm * 2, rows * dm * 2, rows * hs * 4, rows * hs * 4, rows * hs * hs * 4 };
+        const gpa = std.heap.page_allocator;
+        const a = try gpa.alloc(u8, bytes[0]);
+        defer gpa.free(a);
+        const b = try gpa.alloc(u8, bytes[0]);
+        defer gpa.free(b);
+        for (names, want, got, bytes) |name, wb, gp, n| {
+            try self.got.copyFrom(0, gp, n, stream.handle);
+            try stream.synchronize();
+            try wb.download(0, a[0..n]);
+            try self.got.download(0, b[0..n]);
+            var bad: usize = 0;
+            for (a[0..n], b[0..n]) |x, y| bad += @intFromBool(x != y);
+            if (bad != 0) {
+                std.log.err("deepseek_v41: layer {d} fused mHC ({d} rows): {s}: {d} of {d} bytes differ from _hc_post + _hc_partial + _hc_finish", .{ li, rows, name, bad, n });
+                return error.PromptKernelMismatch;
+            }
+        }
+        std.log.info("deepseek_v41: layer {d} fused mHC ({d} rows): byte-equal to _hc_post + _hc_partial + _hc_finish", .{ li, rows });
+    }
+};
+
 pub const Prompt = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -578,6 +695,7 @@ pub const Prompt = struct {
     pk: ExpertKernels,
     ix: IndexKernels,
     sa: AttnKernels,
+    hcf: HcFuse,
     gemm: Gemm32,
     rows: usize, // the chunk rows this holds buffers for (at most max_chunk)
     rr: attention.RopeRows, // a chunk's rope rows (the device path's: its positions, its groups', the indexer's)
@@ -585,6 +703,8 @@ pub const Prompt = struct {
     // the chunk's streams and mixes
     ids: cuda.DeviceBuffer,
     h: cuda.DeviceBuffer,
+    h2: ?cuda.DeviceBuffer, // TF_DS_HC=fused: the streams' other buffer (the posted streams go there)
+    hc_ref: ?HcRef, // TF_DS_HC_CHECK: the split kernels' outputs (made on first use)
     pre: cuda.DeviceBuffer,
     pre_a: cuda.DeviceBuffer,
     pre_f: cuda.DeviceBuffer,
@@ -673,6 +793,7 @@ pub const Prompt = struct {
     /// the next layer.
     const Walk = struct {
         h: Ptr,
+        h_alt: Ptr, // TF_DS_HC=fused: h's rows in the other stream buffer
         pre: Ptr,
         pre_f: Ptr,
         rows: usize,
@@ -708,6 +829,16 @@ pub const Prompt = struct {
         self.sa = try AttnKernels.load(d);
         errdefer self.sa.deinit();
         std.log.info("deepseek_v41 rank {d}: prompt sparse attention: {s}", .{ fwd.w.rank, if (self.sa.ws) "sparse_attn.cu, warp-specialized (TF_DS_SPARSE_ATTN=ws)" else if (self.sa.use) "sparse_attn.cu (TF_DS_SPARSE_ATTN=mma)" else "the captured _sparse_attn_part (TF_DS_SPARSE_ATTN=triton)" });
+        self.hcf = try HcFuse.load(d);
+        errdefer self.hcf.deinit();
+        // hc_fused.cu: two rank partials, 512-column K blocks (4 D = 40 x 512)
+        if (self.hcf.mode == .cuda and (fwd.world != 2 or 4 * dm != hcmod.hc_blocks * 512)) return error.BadShape;
+        std.log.info("deepseek_v41 rank {d}: prompt mHC: {s}{s}", .{ fwd.w.rank, switch (self.hcf.mode) {
+            .split => "_hc_post, _hc_partial, _hc_finish (TF_DS_HC=split)",
+            .mix => "_hc_mix_part posted + _hc_finish_s (TF_DS_HC=mix)",
+            .cuda => "hc_fused.cu + _hc_finish (TF_DS_HC=cuda)",
+        }, if (self.hcf.check) ", checked against the split kernels (TF_DS_HC_CHECK=1)" else "" });
+        self.hc_ref = null;
         self.gemm = try Gemm32.init(d);
         errdefer self.gemm.deinit();
         // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
@@ -720,6 +851,7 @@ pub const Prompt = struct {
         const r = rows;
         self.ids = try cuda.DeviceBuffer.alloc(d, r * 8);
         self.h = try cuda.DeviceBuffer.alloc(d, r * hcmod.hc_streams * dm * 2);
+        self.h2 = if (self.hcf.on()) try cuda.DeviceBuffer.alloc(d, r * hcmod.hc_streams * dm * 2) else null;
         self.pre = try cuda.DeviceBuffer.alloc(d, r * hcmod.hc_streams * 4);
         self.pre_a = try cuda.DeviceBuffer.alloc(d, r * hcmod.hc_streams * 4);
         self.pre_f = try cuda.DeviceBuffer.alloc(d, r * hcmod.hc_streams * 4);
@@ -880,12 +1012,15 @@ pub const Prompt = struct {
         if (self.profile) |*p| p.deinit();
         for (self.gate_w32) |*b| b.free();
         self.gpa.free(self.gate_w32);
+        if (self.h2) |*b| b.free();
+        if (self.hc_ref) |*b| b.deinit();
         inline for (.{ "had", "ids", "h", "pre", "pre_a", "pre_f", "post", "comb", "part", "x", "gathered", "xh", "wq", "z", "pos", "vis", "vis_blk", "gpos", "grows", "src_idx", "dst_idx", "wlo", "qa", "qr", "q", "ykv", "wsrc", "ckv", "cgate", "pooled", "lat", "lat2", "kraw", "k", "iq", "iqq", "x32", "wl", "wts", "score", "tmax", "cidx", "cand", "smax", "o", "og", "ug", "u", "out", "logits", "pick", "wts_moe", "moe", "xc", "local", "glog", "head_logits" }) |f| @field(self, f).free();
         self.scratch.deinit();
         self.gemm.deinit();
         self.pk.deinit();
         self.ix.deinit();
         self.sa.deinit();
+        self.hcf.deinit();
         self.glue.deinit();
         self.rr.deinit();
         self.gpa.free(self.ids_h);
@@ -1021,7 +1156,7 @@ pub const Prompt = struct {
         self.top_start = start;
         self.top_rows = n;
         // the window layers' picks (shared["topk"]) once replay leaves 16 rows or fewer: `attendWindow`
-        self.at_piece = .{ .h = self.h.ptr, .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .rows = n, .at = start, .floor = 0, .kv_done = false, .window_picks = null, .li = 0 };
+        self.at_piece = .{ .h = self.h.ptr, .h_alt = if (self.h2) |b| b.ptr else 0, .pre = self.pre.ptr, .pre_f = self.pre_f.ptr, .rows = n, .at = start, .floor = 0, .kv_done = false, .window_picks = null, .li = 0 };
     }
 
     /// The layer loop from `at_piece.li` to layer `end`; false when bounded replay leaves no row past the cut (the
@@ -1033,6 +1168,9 @@ pub const Prompt = struct {
         const fwd = self.fwd;
         const st = &self.at_piece;
         var nb: [32]u8 = undefined;
+        // TF_DS_HC=fused: self.gathered holds the last sublayer's partials, not yet posted into st.h (the next
+        // sublayer's mixes post them)
+        var pending = false;
         while (st.li < end) : (st.li += 1) {
             const li = st.li;
             const l = &w.layers[li];
@@ -1046,6 +1184,7 @@ pub const Prompt = struct {
                     return false;
                 }
                 st.h += first * hcmod.hc_streams * dm * 2;
+                st.h_alt += first * hcmod.hc_streams * dm * 2;
                 st.pre += first * hcmod.hc_streams * 4;
                 st.at += first;
                 st.rows -= first;
@@ -1054,21 +1193,25 @@ pub const Prompt = struct {
                 self.top_start = st.at;
                 self.top_rows = st.rows;
             };
-            const h = st.h;
             const rows = st.rows;
             const at = st.at;
+            const hbytes = rows * hcmod.hc_streams * dm * 2;
             const m0 = 1 + li * Profile.groups.len;
             if (l.engram_wkv != null) if (fwd.engram) |e| {
+                std.debug.assert(!pending);
                 const te = nowNs();
-                try e.call(e.ctx, li, h, at, rows, .{ .ctx = self, .call = mmF32 }, gather, stream);
+                try e.call(e.ctx, li, st.h, at, rows, .{ .ctx = self, .call = mmF32 }, gather, stream);
                 engram_ns.* += nowNs() - te;
-                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_engram", .{li}), st.h, hbytes, stream);
             };
             if (o.taps) |t| if (c.dspark_taps.indexOf(@intCast(li))) |ti| {
-                try fwd.hc.tap(stream, h, t.buf + ti * dm * 2, @intCast(t.stride), @intCast(rows));
+                std.debug.assert(!pending);
+                try fwd.hc.tap(stream, st.h, t.buf + ti * dm * 2, @intCast(t.stride), @intCast(rows));
             };
             try self.mark(m0, stream);
-            try fwd.hc.pre(stream, h, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), st.pre, l.attn_norm.ptr(), self.x.ptr, self.pre_a.ptr, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
+            try self.mixes(st, pending, l.hc_attn_fn.ptr(), l.hc_attn_scale.ptr(), l.hc_attn_base.ptr(), st.pre, l.attn_norm.ptr(), self.pre_a.ptr, rows, stream);
+            if (pending) try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li - 1}), st.h, hbytes, stream);
+            pending = false;
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, rows * dm * 2, stream);
             // 16 rows or fewer past a replay cut run model.py attention_k's ring mode: the window kernels
             const pa = if (st.kv_done and rows <= decode_rows)
@@ -1078,23 +1221,74 @@ pub const Prompt = struct {
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, rows * dm * 4, stream);
             try self.mark(m0 + 1, stream);
             try gather.run(pa, rows * dm, self.gathered.ptr, stream);
-            try fwd.hc.post(stream, self.gathered.ptr, fwd.world, h, self.post.ptr, self.comb.ptr, h, @intCast(rows));
-            try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_attn", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
+            if (self.hcf.on()) pending = true else {
+                try fwd.hc.post(stream, self.gathered.ptr, fwd.world, st.h, self.post.ptr, self.comb.ptr, st.h, @intCast(rows));
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_attn", .{li}), st.h, hbytes, stream);
+            }
             try self.mark(m0 + 2, stream);
-            try fwd.hc.pre(stream, h, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), self.x.ptr, st.pre_f, self.post.ptr, self.comb.ptr, self.part.ptr, @intCast(rows));
+            try self.mixes(st, pending, l.hc_ffn_fn.ptr(), l.hc_ffn_scale.ptr(), l.hc_ffn_base.ptr(), self.pre_a.ptr, l.ffn_norm.ptr(), st.pre_f, rows, stream);
+            if (pending) try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_attn", .{li}), st.h, hbytes, stream);
+            pending = false;
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_ffn", .{li}), self.x.ptr, rows * dm * 2, stream);
             const pm = try self.moeRows(li, self.x.ptr, rows, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_moe.r0", .{li}), pm, rows * dm * 4, stream);
             try self.mark(m0 + 3, stream);
             try gather.run(pm, rows * dm, self.gathered.ptr, stream);
-            try fwd.hc.post(stream, self.gathered.ptr, fwd.world, h, self.post.ptr, self.comb.ptr, h, @intCast(rows));
-            try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li}), h, rows * hcmod.hc_streams * dm * 2, stream);
+            if (self.hcf.on() and self.fusesInto(li + 1, end, o)) pending = true else {
+                try fwd.hc.post(stream, self.gathered.ptr, fwd.world, st.h, self.post.ptr, self.comb.ptr, st.h, @intCast(rows));
+                try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li}), st.h, hbytes, stream);
+            }
             try self.mark(m0 + 4, stream);
             const t = st.pre;
             st.pre = st.pre_f;
             st.pre_f = t;
         }
+        std.debug.assert(!pending);
         return true;
+    }
+
+    /// TF_DS_HC=fused: whether layer `li`'s attention mixes may post the previous layer's MoE partials, i.e. nothing
+    /// reads the posted streams before them: `li` is in this walk, and starts with no Engram, no DSpark tap and no
+    /// bounded-replay cut.
+    fn fusesInto(self: *const Prompt, li: usize, end: usize, o: Options) bool {
+        const c = self.fwd.cfg;
+        if (li >= end) return false;
+        if (self.fwd.w.layers[li].engram_wkv != null and self.fwd.engram != null) return false;
+        if (o.taps != null and c.dspark_taps.indexOf(@intCast(li)) != null) return false;
+        if (o.replay != null and li == c.n_layers / 2) return false;
+        return true;
+    }
+
+    /// hc_pre of a sublayer on st.h: x, pre_out and the sublayer's post / comb from its mixes (fn, scale, base) and
+    /// pre_in. `posted`: self.gathered holds the previous sublayer's partials, not yet posted into st.h; they are posted
+    /// into the other stream buffer (by the mixes' own programs), which becomes st.h.
+    fn mixes(self: *Prompt, st: *Walk, posted: bool, fn_: Ptr, scale: Ptr, base: Ptr, pre_in: Ptr, norm: Ptr, pre_out: Ptr, rows: usize, stream: cuda.Stream) !void {
+        const hc = &self.fwd.hc;
+        const r: u32 = @intCast(rows);
+        if (!posted) return hc.pre(stream, st.h, fn_, scale, base, pre_in, norm, self.x.ptr, pre_out, self.post.ptr, self.comb.ptr, self.part.ptr, r);
+        var ref: ?*HcRef = null;
+        if (self.hcf.check) {
+            if (self.hc_ref == null) self.hc_ref = try HcRef.init(self.d, self.rows, self.fwd.cfg.dim);
+            ref = &self.hc_ref.?;
+            const f = ref.?;
+            try hc.post(stream, self.gathered.ptr, self.fwd.world, st.h, self.post.ptr, self.comb.ptr, f.h.ptr, r);
+            try hc.pre(stream, f.h.ptr, fn_, scale, base, pre_in, norm, f.x.ptr, f.pre.ptr, f.post.ptr, f.comb.ptr, f.part.ptr, r);
+        }
+        const fused = self.hcf.post_partial != null;
+        if (self.hcf.post_partial) |f| {
+            try HcFuse.postPartial(f, HcFuse.rows_per_program, stream, st.h, st.h_alt, self.gathered.ptr, rows * self.fwd.cfg.dim, self.post.ptr, self.comb.ptr, fn_, self.part.ptr, rows, self.fwd.cfg.dim);
+        } else {
+            try hc.mixPart(stream, st.h, st.h_alt, self.gathered.ptr, @intCast(self.fwd.world), self.post.ptr, self.comb.ptr, fn_, self.part.ptr, r, hc.pdl, true);
+        }
+        const t = st.h;
+        st.h = st.h_alt;
+        st.h_alt = t;
+        if (fused) {
+            try hc.finish(stream, st.h, self.part.ptr, base, scale, pre_in, norm, self.x.ptr, pre_out, self.post.ptr, self.comb.ptr, r);
+        } else {
+            try hc.finishS(stream, st.h, self.part.ptr, base, scale, pre_in, norm, self.x.ptr, pre_out, self.post.ptr, self.comb.ptr, r, true);
+        }
+        if (ref) |f| try f.compare(st.li, rows, self.fwd.cfg.dim, .{ st.h, self.x.ptr, pre_out, self.post.ptr, self.comb.ptr }, stream);
     }
 
     /// The head on the walked chunk's last row (null without `o.logits`).

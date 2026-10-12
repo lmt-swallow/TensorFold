@@ -53,6 +53,11 @@ pub const Hc = struct {
         try self.set.run(stream, "_hc_partial", .{ rows, hc_blocks, 1 }, &.{
             aot.ptr("X", "*bf16", h), aot.ptr("FN", "*fp32", fn_), aot.ptr("PART", "*fp32", part),
         }, &.{ aot.ci("WIDE", wide), aot.ci("NB", hc_blocks), aot.ci("SUB", 128) });
+        try self.finish(stream, h, part, base, scale, pre_in, norm_w, out, pre_out, post_, comb, rows);
+    }
+
+    /// `pre`'s second launch alone (`_hc_finish`): out, pre_out, post, comb from the partial dots already in `part`.
+    pub fn finish(self: *const Hc, stream: cuda.Stream, h: Ptr, part: Ptr, base: Ptr, scale: Ptr, pre_in: Ptr, norm_w: Ptr, out: Ptr, pre_out: Ptr, post_: Ptr, comb: Ptr, rows: u32) !void {
         try self.set.run(stream, "_hc_finish", .{ rows, 1, 1 }, &.{
             aot.ptr("X", "*bf16", h),           aot.ptr("PART", "*fp32", part),   aot.ptr("BASE", "*fp32", base),
             aot.ptr("SCALE", "*fp32", scale),   aot.ptr("PRE_IN", "*fp32", pre_in), aot.ptr("NW", "*bf16", norm_w),

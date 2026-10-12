@@ -41,6 +41,7 @@ pub const dsv41_topk_glue: []const u8 = if (available) &Blob("fatbin_dsv41_topk_
 pub const dsv41_exl3_grouped: []const u8 = if (available) &Blob("fatbin_dsv41_exl3_grouped").bytes else &.{};
 pub const dsv41_l2_prefetch: []const u8 = if (available) &Blob("fatbin_dsv41_l2_prefetch").bytes else &.{};
 pub const dsv41_sparse_attn: []const u8 = if (available) &Blob("fatbin_dsv41_sparse_attn").bytes else &.{};
+pub const dsv41_hc_fused: []const u8 = if (available) &Blob("fatbin_dsv41_hc_fused").bytes else &.{};
 pub const dsv41_index_score: []const u8 = if (available) &Blob("fatbin_dsv41_index_score").bytes else &.{};
 pub const dsv41_rope: []const u8 = if (available) &Blob("fatbin_dsv41_rope").bytes else &.{};
 pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").bytes else &.{};
