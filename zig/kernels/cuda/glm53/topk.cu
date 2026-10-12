@@ -68,3 +68,70 @@ extern "C" __global__ void __launch_bounds__(TOPK_THREADS) tf_glm53_topk_row(con
         reinterpret_cast<int*>(out)[k + t] = t < counts[0] ? lists[0][t].id : -1;
     }
 }
+
+// The same k best in two stages (TF_GLM_DRAFT_TOPK=2): blocks of a row's columns each sort their slice's keys and
+// keep their k best, then one block sorts the blocks' k bests and writes the row's. A key is the value in total order
+// (-0 as +0) above the inverted id, so the order is the host scan's (larger value, then lower id) and the k best of
+// the row do not depend on how it was cut; the values written are the logits' own bits (a -0 stays -0). The NaN
+// caveat above holds here too: a NaN's key ranks above +inf.
+#define TOPK2_THREADS 256
+#define TOPK2_KEYS 2048
+
+__device__ __forceinline__ unsigned long long topk_key(float v, int id) {
+    uint32_t b = __float_as_uint(v);
+    if (b == 0x80000000u) b = 0u;
+    const uint32_t k = b ^ ((uint32_t)((int32_t)b >> 31) | 0x80000000u);
+    return ((unsigned long long)k << 32) | (unsigned long long)(0xFFFFFFFFu - (uint32_t)id);
+}
+
+// keys[0 .. TOPK2_KEYS) sorted descending in place (bitonic), by the block's threads.
+__device__ __forceinline__ void sort_desc(unsigned long long* keys) {
+    for (int size = 2; size <= TOPK2_KEYS; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int p = threadIdx.x; p < TOPK2_KEYS / 2; p += TOPK2_THREADS) {
+                const int i = 2 * p - (p & (stride - 1));
+                const int j = i + stride;
+                const bool desc = (i & size) == 0;
+                const unsigned long long a = keys[i], b = keys[j];
+                if ((a < b) == desc) {
+                    keys[i] = b;
+                    keys[j] = a;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Block b: columns [b * slice, min(n, (b + 1) * slice)) of the row (slice <= TOPK2_KEYS); its k best keys into
+// part[b * k ..] (zeros past the slice's end: below every key).
+extern "C" __global__ void __launch_bounds__(TOPK2_THREADS) tf_glm53_topk_part(const __nv_bfloat16* logits, int n,
+                                                                              int slice, int k, int id_base,
+                                                                              unsigned long long* part) {
+    __shared__ unsigned long long keys[TOPK2_KEYS];
+    const int c0 = blockIdx.x * slice;
+    for (int i = threadIdx.x; i < TOPK2_KEYS; i += TOPK2_THREADS) {
+        const int c = c0 + i;
+        keys[i] = (i < slice && c < n) ? topk_key(__bfloat162float(logits[c]), id_base + c) : 0ull;
+    }
+    __syncthreads();
+    sort_desc(keys);
+    for (int i = threadIdx.x; i < k; i += TOPK2_THREADS) part[blockIdx.x * k + i] = keys[i];
+}
+
+// One block: the `blocks` k bests (blocks * k <= TOPK2_KEYS) sorted, the row's k best into out [k values][k ids as int
+// bits] (f32 words, as tf_glm53_topk_row writes them), each value read back from the row.
+extern "C" __global__ void __launch_bounds__(TOPK2_THREADS) tf_glm53_topk_merge(const __nv_bfloat16* logits,
+                                                                               const unsigned long long* part,
+                                                                               int blocks, int k, int id_base,
+                                                                               float* out) {
+    __shared__ unsigned long long keys[TOPK2_KEYS];
+    for (int i = threadIdx.x; i < TOPK2_KEYS; i += TOPK2_THREADS) keys[i] = i < blocks * k ? part[i] : 0ull;
+    __syncthreads();
+    sort_desc(keys);
+    for (int i = threadIdx.x; i < k; i += TOPK2_THREADS) {
+        const int id = (int)(0xFFFFFFFFu - (uint32_t)(keys[i] & 0xFFFFFFFFull));
+        out[i] = __bfloat162float(logits[id - id_base]);
+        reinterpret_cast<int*>(out)[k + i] = id;
+    }
+}

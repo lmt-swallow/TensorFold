@@ -27,6 +27,9 @@ const Buf = cuda.DeviceBuffer;
 /// exact_sampling.py MARGIN and decode.py's draft candidates (20 and the margin from each rank).
 const margin = 8;
 pub const draft_k = 20 + margin;
+/// The two-stage device top-k's column blocks (topk.cu tf_glm53_topk_part): a vocabulary share of up to 131,072
+/// columns, 2,048 a block; their k bests (64 x 28 = 1,792) fit the merge's 2,048 keys.
+const topk_blocks = 64;
 /// drafter_choice.py: backlog rows the MTP head may owe before it absorbs them.
 const cap = 256;
 pub const rows = 16; // TF_GLM_MAX_ROWS: the widest verify window
@@ -156,16 +159,21 @@ pub const Runner = struct {
     picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
     topk_mod: cuda.Module,
     topk_fn: cuda.Function, // tf_glm53_topk_row (glm53/topk.cu): a row's k best on the device
-    /// TF_GLM_DRAFT_TOPK=1: `sample` takes the row's k best on the device (default: the host scan, faster until the
-    /// device's runs on more than one block); TF_GLM_TOPK_CHECK=1: both, compared every call.
+    topk_part: cuda.Function, // tf_glm53_topk_part: each column block's k best keys
+    topk_merge: cuda.Function, // tf_glm53_topk_merge: the row's k best of the blocks'
+    topk_keys: Buf, // [topk_blocks, draft_k] u64: the column blocks' k best keys
+    /// TF_GLM_DRAFT_TOPK=1: `sample` takes the row's k best on the device in one block, =2 in two stages (column blocks,
+    /// then one merge); default: the host scan. TF_GLM_TOPK_CHECK=1: the device's (the chosen form, one block by default)
+    /// and the host scan, compared every call.
     topk: enum { device, host, check } = .host,
+    topk_two: bool = false,
     /// TF_GLM_ROUND_PROFILE=1 on rank 0: the first rounds' phases logged (round_profile.zig).
     prof: ?RP.Profile = null,
     split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
     overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined, .topk_mod = undefined, .topk_fn = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined, .topk_mod = undefined, .topk_fn = undefined, .topk_part = undefined, .topk_merge = undefined, .topk_keys = undefined };
         r.w = try M.Work.init(d, lay, batch_rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -188,9 +196,15 @@ pub const Runner = struct {
         r.topk_mod = try cuda.Module.load(d, cuda.kernels.glm53_topk);
         errdefer r.topk_mod.unload();
         r.topk_fn = try r.topk_mod.function("tf_glm53_topk_row");
-        if (std.c.getenv("TF_GLM_DRAFT_TOPK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
-            r.topk = .device;
-        };
+        r.topk_part = try r.topk_mod.function("tf_glm53_topk_part");
+        r.topk_merge = try r.topk_mod.function("tf_glm53_topk_merge");
+        r.topk_keys = try Buf.alloc(d, topk_blocks * draft_k * 8);
+        errdefer r.topk_keys.free();
+        if (std.c.getenv("TF_GLM_DRAFT_TOPK")) |v| {
+            const want = std.mem.span(v);
+            if (std.mem.eql(u8, want, "1") or std.mem.eql(u8, want, "2")) r.topk = .device;
+            r.topk_two = std.mem.eql(u8, want, "2");
+        }
         if (std.c.getenv("TF_GLM_TOPK_CHECK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
             r.topk = .check;
         };
@@ -206,6 +220,7 @@ pub const Runner = struct {
         if (r.prof) |*p| p.deinit();
         r.picks.free();
         r.argmax_mod.unload();
+        r.topk_keys.free();
         r.topk_mod.unload();
         r.w.deinit();
         r.mb.deinit();
@@ -269,6 +284,32 @@ pub const Runner = struct {
         return a.v > b.v or (a.v == b.v and a.id < b.id);
     }
 
+    /// The two-stage device top-k of row `row` (TF_GLM_DRAFT_TOPK=2) into the candidates' send words: `topk_blocks`
+    /// column blocks' k best keys, then one block's merge of them.
+    fn deviceBestTwo(r: *Runner, logits: Buf, row: usize, k: usize) !void {
+        const nv = r.host.len;
+        const slice = (nv + topk_blocks - 1) / topk_blocks;
+        if (slice > 2048 or k > draft_k) return error.TopkShape;
+        const base: i32 = @intCast(r.lay.rank * nv);
+        const x = logits.ptr + row * nv * 2;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(nv)));
+        a.add(@as(i32, @intCast(slice)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(base);
+        a.add(r.topk_keys.ptr);
+        try cuda.launch.launch(r.topk_part, .{ .grid = .{ .x = topk_blocks }, .block = .{ .x = 256 } }, r.stream, &a);
+        var b: cuda.Args = .{};
+        b.add(x);
+        b.add(r.topk_keys.ptr);
+        b.add(@as(i32, @intCast(topk_blocks)));
+        b.add(@as(i32, @intCast(k)));
+        b.add(base);
+        b.add(r.cand.ptr);
+        try cuda.launch.launch(r.topk_merge, .{ .grid = .{ .x = 1 }, .block = .{ .x = 256 } }, r.stream, &b);
+    }
+
     /// The host scan of row `row` (this rank's vocabulary share): its k best as [values][ids] words.
     fn hostBest(r: *Runner, logits: Buf, row: usize, k: usize) ![2 * draft_k]f32 {
         const nv = r.host.len;
@@ -302,13 +343,15 @@ pub const Runner = struct {
         const nv = r.host.len;
         if (r.topk != .host) {
             // the rank's k best on the device, straight into the gather's send words
-            var a: cuda.Args = .{};
-            a.add(logits.ptr + row * nv * 2);
-            a.add(@as(i32, @intCast(nv)));
-            a.add(@as(i32, @intCast(k)));
-            a.add(@as(i32, @intCast(r.lay.rank * nv)));
-            a.add(r.cand.ptr);
-            try cuda.launch.launch(r.topk_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, r.stream, &a);
+            if (r.topk_two) try r.deviceBestTwo(logits, row, k) else {
+                var a: cuda.Args = .{};
+                a.add(logits.ptr + row * nv * 2);
+                a.add(@as(i32, @intCast(nv)));
+                a.add(@as(i32, @intCast(k)));
+                a.add(@as(i32, @intCast(r.lay.rank * nv)));
+                a.add(r.cand.ptr);
+                try cuda.launch.launch(r.topk_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, r.stream, &a);
+            }
         }
         if (r.topk != .device) {
             const mine = try r.hostBest(logits, row, k);
@@ -433,15 +476,28 @@ pub const Runner = struct {
         if (start != q.st.pos) return error.PositionMismatch;
         const R = @min(prompt_rows, prompt.len - start);
         var ps: Pm.Stream = .{
-            .kda = &q.st.kda,           .caches = q.st.caches,      .mtp_cache = &q.mcache,  .pos = q.st.pos,
-            .mtp_len = q.mtp_len,       .capacity = q.st.caches[0].capacity,
-            .pos_dev = q.st.pos_dev.ptr, .mtp_pos_dev = q.mpos.ptr,
+            .kda = &q.st.kda,
+            .caches = q.st.caches,
+            .mtp_cache = &q.mcache,
+            .pos = q.st.pos,
+            .mtp_len = q.mtp_len,
+            .capacity = q.st.caches[0].capacity,
+            .pos_dev = q.st.pos_dev.ptr,
+            .mtp_pos_dev = q.mpos.ptr,
         };
         const w = &r.w;
         const c: Pm.Chunk = .{
             .p = .{
-                .rows = prompt_rows, .b = &w.pb,  .temp = &w.temp,         .kscratch = &w.pscratch, .ds = &w.pds,
-                .ms = &w.pms,        .mb = &r.pmb, .fnormed = w.fnormed.ptr, .fxs = w.fxs.ptr,         .logits = w.logits.ptr,
+                .rows = prompt_rows,
+                .b = &w.pb,
+                .temp = &w.temp,
+                .kscratch = &w.pscratch,
+                .ds = &w.pds,
+                .ms = &w.pms,
+                .mb = &r.pmb,
+                .fnormed = w.fnormed.ptr,
+                .fxs = w.fxs.ptr,
+                .logits = w.logits.ptr,
                 .stage_rows = r.stage_rows.ptr,
             },
             .m = &r.pmodel,
