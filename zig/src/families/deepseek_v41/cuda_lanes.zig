@@ -2290,7 +2290,7 @@ pub const Engine = struct {
             // unless asked for, whatever the pieces
             e.streams.ahead = std.mem.eql(u8, getenv("TF_DS_FILL_AHEAD") orelse "0", "1");
             e.with_round = std.mem.eql(u8, getenv("TF_DS_FILL_WITH_ROUND") orelse "0", "1");
-            if (s.rank == 0) std.log.info("deepseek_v41: beside the rounds: graphs {}, pieces {d}, ahead {}, parts with rounds {}, urgent rounds {}", .{ e.streams.graphs_beside, e.streams.pieces, e.streams.ahead, e.with_round, urgent });
+            if (s.rank == 0) std.log.info("deepseek_v41: beside the rounds: graphs {}, pieces {d}, ahead {}, parts with rounds {}, urgent rounds {}, copy share {}, copy position {}", .{ e.streams.graphs_beside, e.streams.pieces, e.streams.ahead, e.with_round, urgent, envOn("TF_DS_COPY_SHARE"), envOn("TF_DS_COPY_POSITION") });
             if (urgent) try e.streams.runner.urgentSides();
             mem_note.note(ctx.d, "prompt passes beside the rounds", .{});
             std.log.info("deepseek_v41 rank {d}: prompt passes beside the rounds (TENSORFOLD_PREFILL_OVERLAP=1): a second communicator, the prompt's stream, counters, absorber and the rounds' Engram buffers, {d:.0} MiB", .{ s.rank, @as(f64, @floatFromInt(@as(i64, @intCast(before_comm)) - @as(i64, @intCast((try ctx.memInfo()).free)))) / (1 << 20) });

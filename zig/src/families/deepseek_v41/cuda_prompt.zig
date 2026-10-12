@@ -707,6 +707,7 @@ pub const Prompt = struct {
         errdefer self.ix.deinit();
         self.sa = try AttnKernels.load(d);
         errdefer self.sa.deinit();
+        std.log.info("deepseek_v41 rank {d}: prompt sparse attention: {s}", .{ fwd.w.rank, if (self.sa.ws) "sparse_attn.cu, warp-specialized (TF_DS_SPARSE_ATTN=ws)" else if (self.sa.use) "sparse_attn.cu (TF_DS_SPARSE_ATTN=mma)" else "the captured _sparse_attn_part (TF_DS_SPARSE_ATTN=triton)" });
         self.gemm = try Gemm32.init(d);
         errdefer self.gemm.deinit();
         // the Hadamard: 1 - 2 * parity(i & j), bf16 (exact)
