@@ -108,7 +108,8 @@ pub const Lanes = struct {
     /// The records since the last agreement (`agreesNow` false ones fold in here and are agreed on with the next).
     pending: std.crypto.hash.sha2.Sha256 = .init(.{}),
     pending_bad: bool = false,
-    draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts on its own head steps
+    draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts by `absorb` and `chain`, one after another
+    draft_log: bool = false, // TF_GLM_DRAFT_LOG=1: rank 0 logs every stream's drafts and their confidences
 
     /// Lanes over `pool`, each stream at most `capacity` positions; every slot's sequence made now (its KDA states,
     /// rings and head buffers), so a stream waits for none.
@@ -124,6 +125,7 @@ pub const Lanes = struct {
         self.book.released = &self.released;
         self.tier = tier;
         if (std.c.getenv("TF_GLM_DRAFT_BATCH")) |v| self.draft_batch = !std.mem.eql(u8, std.mem.span(v), "0");
+        if (std.c.getenv("TF_GLM_DRAFT_LOG")) |v| self.draft_log = std.mem.eql(u8, std.mem.span(v), "1");
         for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
         if (self.book.set.on) self.snaps = try keep.Snaps.init(gpa, d, self.book.set.snaps, keep.snapBytes(&self.slots[0].seq.?));
         return self;
@@ -504,8 +506,14 @@ pub const Lanes = struct {
                 // stream after another, the same drafts)
                 if (self.draft_batch) {
                     try self.r.draftMany(reqs[0..nreq]);
-                } else for (reqs[0..nreq]) |*q| try self.r.draftMany(q[0..1]);
-                for (reqs[0..nreq], which[0..nreq]) |q, s| s.nheld = q.n;
+                } else for (reqs[0..nreq]) |*q| {
+                    try self.r.absorb(q.q);
+                    q.n = try self.r.chain(q.q, q.depth, q.drafts, q.probs);
+                }
+                for (reqs[0..nreq], which[0..nreq]) |q, s| {
+                    s.nheld = q.n;
+                    if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 draft: depth {d}, {d} drafts {any}, confidences {any}", .{ q.depth, q.n, q.drafts[0..q.n], q.probs[0..q.n] });
+                }
             },
             .release => {
                 const s = &self.slots[rd.byte().?];
@@ -712,6 +720,7 @@ pub const Lanes = struct {
             const sl = &self.slots[slot];
             if (win.held > sl.nheld) return error.NoHeldDrafts;
             const rows = win.rows();
+            if (self.draft_log) std.log.info("glm53 verify: slot {d}, rows {d}, held {d}, host {d}, available drafts {d}", .{ slot, rows, win.held, win.tokens.len, sl.nheld });
             if (rows > max_rows) return error.WindowTooWide;
             total += rows;
             if (total > engine.batch_rows) return error.WindowTooWide;
