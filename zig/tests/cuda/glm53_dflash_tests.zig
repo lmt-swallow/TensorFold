@@ -1,5 +1,5 @@
-//! Isolated DFlash2 projection replay: real rank weights and every recorded Q4 input/output.
-//! Reference inputs isolate arithmetic errors; this does not prove a connected proposer or target verification.
+//! DFlash2 projection and connected proposer fixtures over real rank weights.
+//! Recorded peer partials isolate TP arithmetic; real communication and target verification are separate gates.
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm53");
