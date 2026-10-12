@@ -162,11 +162,11 @@ pub const Runner = struct {
     topk_part: cuda.Function, // tf_glm53_topk_part: each column block's k best keys
     topk_merge: cuda.Function, // tf_glm53_topk_merge: the row's k best of the blocks'
     topk_keys: Buf, // [topk_blocks, draft_k] u64: the column blocks' k best keys
-    /// TF_GLM_DRAFT_TOPK=1: `sample` takes the row's k best on the device in one block, =2 in two stages (column blocks,
-    /// then one merge); default: the host scan. TF_GLM_TOPK_CHECK=1: the device's (the chosen form, one block by default)
-    /// and the host scan, compared every call.
-    topk: enum { device, host, check } = .host,
-    topk_two: bool = false,
+    /// `sample` takes the row's k best on the device in two stages (column blocks, then one merge; the default, or
+    /// TF_GLM_DRAFT_TOPK=2), in one block (=1), or by the host scan (=0). TF_GLM_TOPK_CHECK=1: the device's (the chosen
+    /// form) and the host scan, compared every call.
+    topk: enum { device, host, check } = .device,
+    topk_two: bool = true,
     /// TF_GLM_ROUND_PROFILE=1 on rank 0: the first rounds' phases logged (round_profile.zig).
     prof: ?RP.Profile = null,
     split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
@@ -202,8 +202,8 @@ pub const Runner = struct {
         errdefer r.topk_keys.free();
         if (std.c.getenv("TF_GLM_DRAFT_TOPK")) |v| {
             const want = std.mem.span(v);
-            if (std.mem.eql(u8, want, "1") or std.mem.eql(u8, want, "2")) r.topk = .device;
-            r.topk_two = std.mem.eql(u8, want, "2");
+            if (std.mem.eql(u8, want, "0")) r.topk = .host;
+            r.topk_two = !std.mem.eql(u8, want, "1");
         }
         if (std.c.getenv("TF_GLM_TOPK_CHECK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
             r.topk = .check;
