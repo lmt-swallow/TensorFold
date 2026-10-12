@@ -20,6 +20,8 @@ const M = glm.moe;
 const T = glm.mtp;
 
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 fn nowNs() i128 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
@@ -96,7 +98,19 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
     // TF_GLM_HC_SPLIT=1: the chunk row-split as served (two pieces, the fronts during the swaps), its swaps local
     const split: ?P.Split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| (if (std.mem.eql(u8, std.mem.span(v), "1")) P.Split{} else null) else null;
     const kinds = [_][]const u8{ "hc glue", "kda front", "kda chain", "kda o_proj", "dsa front", "dsa rows", "dsa o_proj", "mlp", "moe route + experts", "moe shared", "moe sum", "gathers (local)", "tail", "mtp" };
-    for (positions) |pos| {
+    // TF_GLM53_TIME_ALT=NAME=value: each position again with that variable set (a switch read on every call, e.g.
+    // TF_GLM_ONEPASS=2), labelled "alt"
+    const alt_spec: ?[]const u8 = if (std.c.getenv("TF_GLM53_TIME_ALT")) |v| std.mem.span(v) else null;
+    var alt_name: [64:0]u8 = @splat(0);
+    var alt_value: [64:0]u8 = @splat(0);
+    if (alt_spec) |spec| {
+        const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return error.BadTimeAlt;
+        if (eq >= 64 or spec.len - eq - 1 >= 64) return error.BadTimeAlt;
+        @memcpy(alt_name[0..eq], spec[0..eq]);
+        @memcpy(alt_value[0 .. spec.len - eq - 1], spec[eq + 1 ..]);
+    }
+    for (0..@as(usize, if (alt_spec != null) 2 else 1)) |pass| for (positions) |pos| {
+        if (pass == 1) _ = setenv(&alt_name, &alt_value, 1);
         var ms: [kinds.len]f64 = @splat(0);
         var total: f64 = 0;
         for (0..2) |rep| {
@@ -138,8 +152,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
             }
             if (rep == 1) total = @as(f64, @floatFromInt(nowNs() - a)) / 1e6;
         }
-        std.debug.print("glm53-prompt-time: 2048 rows at {d}{s}: {d:.1} ms ({d:.0} tok/s on one rank, its gathers local, synchronized after every op)\n", .{ pos, if (split != null) " (row-split)" else "", total, 2048.0 / (total / 1e3) });
+        std.debug.print("glm53-prompt-time: 2048 rows at {d}{s}{s}: {d:.1} ms ({d:.0} tok/s on one rank, its gathers local, synchronized after every op)\n", .{ pos, if (split != null) " (row-split)" else "", if (pass == 1) " (alt)" else "", total, 2048.0 / (total / 1e3) });
         for (kinds, ms) |name, v| std.debug.print("  {s:<22} {d:>8.1} ms  {d:>5.1}%\n", .{ name, v, 100 * v / total });
-    }
+    };
     check.pass("glm53-prompt-time: {d} positions timed", .{positions.len});
 }
