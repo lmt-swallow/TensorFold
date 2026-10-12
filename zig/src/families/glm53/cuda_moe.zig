@@ -91,8 +91,6 @@ pub const Experts = struct {
     gt: Buf,
     ut: Buf,
     dt: Buf,
-    suh_g: Buf, // [E, D]
-    suh_u: Buf,
     svh_g: Buf, // [E, NI]
     svh_u: Buf,
     suh_d: Buf, // [E, NI]
@@ -111,10 +109,10 @@ pub const Experts = struct {
         x.count = E;
         x.width = NI;
         x.dims = D;
-        const sizes = [_]usize{ D / 16 * NI / 16 * 64, D / 16 * NI / 16 * 64, NI / 16 * D / 16 * 64, D, D, NI, NI, NI, D };
-        const projs = [_][]const u8{ "gate_proj", "up_proj", "down_proj", "gate_proj", "up_proj", "gate_proj", "up_proj", "down_proj", "down_proj" };
-        const parts = [_][]const u8{ "trellis", "trellis", "trellis", "suh", "suh", "svh", "svh", "suh", "svh" };
-        var bufs: [9]*Buf = .{ &x.gt, &x.ut, &x.dt, &x.suh_g, &x.suh_u, &x.svh_g, &x.svh_u, &x.suh_d, &x.svh_d };
+        const sizes = [_]usize{ D / 16 * NI / 16 * 64, D / 16 * NI / 16 * 64, NI / 16 * D / 16 * 64, NI, NI, NI, D };
+        const projs = [_][]const u8{ "gate_proj", "up_proj", "down_proj", "gate_proj", "up_proj", "down_proj", "down_proj" };
+        const parts = [_][]const u8{ "trellis", "trellis", "trellis", "svh", "svh", "suh", "svh" };
+        var bufs: [7]*Buf = .{ &x.gt, &x.ut, &x.dt, &x.svh_g, &x.svh_u, &x.suh_d, &x.svh_d };
         var made: usize = 0;
         errdefer for (bufs[0..made]) |b| b.free();
         var n: map.Name = .{};
@@ -132,9 +130,11 @@ pub const Experts = struct {
         // every expert's gate and up suh equal bit for bit: one rotated input a row serves them all
         const g0 = try l.hostShare(n.of(map.lm ++ "layers.{d}.mlp.experts.0.gate_proj.suh", .{i}));
         defer l.gpa.free(g0);
+        if (g0.len != D * 2) return error.UnexpectedTensor;
         for (0..E) |e| for ([_][]const u8{ "gate_proj", "up_proj" }) |proj| {
             const s = try l.hostShare(n.of(map.lm ++ "layers.{d}.mlp.experts.{d}.{s}.suh", .{ i, e, proj }));
             defer l.gpa.free(s);
+            if (s.len != D * 2) return error.UnexpectedTensor;
             if (!std.mem.eql(u8, s, g0)) return error.ExpertsDoNotShareSuh;
         };
         x.shared_suh = try Buf.fromHost(l.d, g0);
@@ -142,7 +142,7 @@ pub const Experts = struct {
     }
 
     pub fn deinit(x: *Experts) void {
-        inline for (.{ "gt", "ut", "dt", "suh_g", "suh_u", "svh_g", "svh_u", "suh_d", "svh_d", "shared_suh" }) |f| @field(x, f).free();
+        inline for (.{ "gt", "ut", "dt", "svh_g", "svh_u", "suh_d", "svh_d", "shared_suh" }) |f| @field(x, f).free();
     }
 };
 

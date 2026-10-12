@@ -48,12 +48,12 @@ fn checkWeights(gpa: std.mem.Allocator, io: std.Io, work: []const u8, layer: usi
         const want = parsed.value.object.get(try std.fmt.bufPrint(&kb, "rank{d}", .{ri})).?.object;
         const x = &r.moe.experts;
         const pairs = [_]struct { []const u8, Buf }{
-            .{ "ffn_hc.fn", r.frame.ffn_hc.fn_ },  .{ "ffn_hc.base", r.frame.ffn_hc.base },      .{ "ffn_hc.scale", r.frame.ffn_hc.scale },
-            .{ "post_norm", r.frame.post_norm },   .{ "moe.router", r.moe.router },              .{ "moe.bias", r.moe.bias },
-            .{ "moe.experts.gt", x.gt },           .{ "moe.experts.ut", x.ut },                  .{ "moe.experts.dt", x.dt },
-            .{ "moe.experts.suh_g", x.suh_g },     .{ "moe.experts.suh_u", x.suh_u },            .{ "moe.experts.svh_g", x.svh_g },
-            .{ "moe.experts.svh_u", x.svh_u },     .{ "moe.experts.suh_d", x.suh_d },            .{ "moe.experts.svh_d", x.svh_d },
-            .{ "moe.experts.shared_suh", x.shared_suh }, .{ "moe.shared.gu.weight", r.moe.shared.gu.buf }, .{ "moe.shared.down.weight", r.moe.shared.down.buf },
+            .{ "ffn_hc.fn", r.frame.ffn_hc.fn_ },                 .{ "ffn_hc.base", r.frame.ffn_hc.base },     .{ "ffn_hc.scale", r.frame.ffn_hc.scale },
+            .{ "post_norm", r.frame.post_norm },                  .{ "moe.router", r.moe.router },             .{ "moe.bias", r.moe.bias },
+            .{ "moe.experts.gt", x.gt },                          .{ "moe.experts.ut", x.ut },                 .{ "moe.experts.dt", x.dt },
+            .{ "moe.experts.svh_g", x.svh_g },                    .{ "moe.experts.svh_u", x.svh_u },           .{ "moe.experts.suh_d", x.suh_d },
+            .{ "moe.experts.svh_d", x.svh_d },                    .{ "moe.experts.shared_suh", x.shared_suh }, .{ "moe.shared.gu.weight", r.moe.shared.gu.buf },
+            .{ "moe.shared.down.weight", r.moe.shared.down.buf },
         };
         for (pairs) |p| {
             var key: [64]u8 = undefined;
