@@ -98,7 +98,6 @@ pub fn poolSetting(text: ?[]const u8, capacity: usize) error{BadPool}!usize {
     return pool;
 }
 
-
 /// This rank's device bytes of weights (its share of the pack's text tensors and its head rows).
 pub fn weightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
     var why: config.Why = .{};
@@ -119,6 +118,87 @@ fn gatherFn(p: *anyopaque, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, f
     try own.comm.allGather(send, recv, floats, .f32, stream.handle);
 }
 
+/// Device bytes `x` owns: every `cuda.DeviceBuffer` among its fields, arrays, owned slices and set optionals, recursively.
+/// Pointers are not followed (they name what another owner counts), and a DSA cache bound to a pool's extent counts its
+/// rings only (the pool counts its rows).
+fn deviceBytes(x: anytype) usize {
+    const T = @TypeOf(x);
+    if (T == cuda.DeviceBuffer) return x.len;
+    if (T == dsa.Cache) return x.ik.len + x.ig.len + if (x.owned) x.latent.len + x.pk.len else 0;
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| {
+            var n: usize = 0;
+            inline for (st.fields) |f| n += deviceBytes(@field(x, f.name));
+            return n;
+        },
+        .array => {
+            var n: usize = 0;
+            for (x) |e| n += deviceBytes(e);
+            return n;
+        },
+        .optional => return if (x) |v| deviceBytes(v) else 0,
+        .pointer => |pt| {
+            if (pt.size != .slice or @typeInfo(pt.child) == .pointer) return 0;
+            var n: usize = 0;
+            for (x) |e| n += deviceBytes(e);
+            return n;
+        },
+        else => return 0,
+    }
+}
+
+fn inGib(n: usize) f64 {
+    return @as(f64, @floatFromInt(n)) / (1 << 30);
+}
+
+/// The device's free bytes between `open`'s phases: what each phase took, beside what the engine's buffers of that
+/// phase account for (the rest is the driver's, NCCL's, the modules' and the allocator's).
+const Phases = struct {
+    ctx: *const cuda.Context,
+    rank: usize,
+    last: usize,
+
+    fn init(ctx: *const cuda.Context, rank: usize) Phases {
+        const m = ctx.memInfo() catch return .{ .ctx = ctx, .rank = rank, .last = 0 };
+        std.log.info("glm53 rank {d} memory: {d:.2} GiB free of {d:.2} at start", .{ rank, inGib(m.free), inGib(m.total) });
+        return .{ .ctx = ctx, .rank = rank, .last = m.free };
+    }
+
+    /// Phase `name` is done; `counted`: the bytes its buffers hold.
+    fn step(p: *Phases, name: []const u8, counted: usize) void {
+        const m = p.ctx.memInfo() catch return;
+        const took = p.last -| m.free;
+        std.log.info("glm53 rank {d} memory: {s}: took {d:.2} GiB, its buffers {d:.2}, the rest {d:.2}; {d:.2} GiB free", .{ p.rank, name, inGib(took), inGib(counted), inGib(took) - inGib(counted), inGib(m.free) });
+        p.last = m.free;
+    }
+};
+
+/// What the loaded engine's device buffers hold, by class, in GiB (one log line each).
+fn logClasses(own: *const Owned, rank: usize) void {
+    var by_kind: [5]usize = @splat(0); // frames (hyper-connections, norms), KDA, DSA, dense MLP, MoE
+    for (own.model.layers) |*l| {
+        by_kind[0] += deviceBytes(l.frame);
+        by_kind[1] += deviceBytes(l.kda);
+        by_kind[2] += deviceBytes(l.dsa);
+        by_kind[3] += deviceBytes(l.mlp);
+        by_kind[4] += deviceBytes(l.moe);
+    }
+    std.log.info("glm53 rank {d} memory: weights: frames {d:.2}, KDA {d:.2}, DSA {d:.2}, dense MLP {d:.2}, MoE {d:.2}, embed + norm + head {d:.2}, MTP layer + draft head {d:.2} GiB", .{
+        rank,                                                                                            inGib(by_kind[0]),            inGib(by_kind[1]), inGib(by_kind[2]), inGib(by_kind[3]), inGib(by_kind[4]),
+        inGib(deviceBytes(own.model.embed) + deviceBytes(own.model.norm) + deviceBytes(own.model.head)), inGib(deviceBytes(own.head)),
+    });
+    const r = &own.runner;
+    const w = &r.w;
+    std.log.info("glm53 rank {d} memory: window buffers b {d:.2}, ds {d:.2}, ms {d:.2}, mb {d:.2}; prompt buffers pb {d:.2}, pds {d:.2}, pms {d:.2}, pmb {d:.2}; KDA temps {d:.2}; final norm and logits {d:.2}; staging, picks and split {d:.2} GiB", .{
+        rank,                                                                       inGib(deviceBytes(w.b)),                                                                              inGib(deviceBytes(w.ds)),  inGib(deviceBytes(w.ms)),  inGib(deviceBytes(r.mb)),
+        inGib(deviceBytes(w.pb)),                                                   inGib(deviceBytes(w.pds)),                                                                            inGib(deviceBytes(w.pms)), inGib(deviceBytes(r.pmb)), inGib(deviceBytes(w.temp) + deviceBytes(w.pscratch)),
+        inGib(deviceBytes(w.fnormed) + deviceBytes(w.fxs) + deviceBytes(w.logits)), inGib(deviceBytes(r.stage_rows) + deviceBytes(r.picks) + deviceBytes(r.cand) + deviceBytes(r.split)),
+    });
+    var seqs: usize = 0;
+    for (own.lanes.slots) |sl| seqs += deviceBytes(sl.seq);
+    std.log.info("glm53 rank {d} memory: pool {d:.2}, stream slots (KDA states, rings, MTP backlog) {d:.2}, kept-prompt snapshots {d:.2} GiB", .{ rank, inGib(deviceBytes(own.pool.latent) + deviceBytes(own.pool.pk)), inGib(seqs), inGib(deviceBytes(own.lanes.snaps)) });
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     const world = try envInt("TF_TP_WORLD", 1);
     const rank = try envInt("TF_TP_RANK", 0);
@@ -133,6 +213,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         for (&master) |*b| b.* = std.fmt.parseInt(u8, it.next() orelse return error.BadMaster, 10) catch return error.BadMaster;
     }
     const d = ctx.d;
+    var phases = Phases.init(ctx, rank);
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
@@ -152,6 +233,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.mk.deinit();
     own.tk = try mtp.Kernels.load(d);
     errdefer own.tk.deinit();
+    phases.step("kernel modules (Triton set, hc, KDA, MoE, MTP)", 0);
     {
         var pack = try weights.Pack.open(gpa, io, dir);
         defer pack.close();
@@ -163,15 +245,18 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     }
     errdefer own.model.deinit();
     errdefer own.head.deinit();
+    phases.step("weights", deviceBytes(own.model.layers) + deviceBytes(own.model.embed) + deviceBytes(own.model.norm) + deviceBytes(own.model.head) + deviceBytes(own.head));
     // each rank loads on its own; the ranks meet here
     own.comm = try cuda.comm.Comm.init(rank, world, master, port, 1_800_000);
     errdefer own.comm.deinit();
+    phases.step("NCCL communicator", 0);
     own.stream = try cuda.Stream.init(d, true);
     errdefer own.stream.deinit();
     const capacity = capacityFor(o.context);
     const k: M.Kernels = .{ .g = .{ .set = &own.set, .hc = &own.hc, .hidden = own.cfg.hidden, .streams = own.cfg.streams }, .kk = &own.kk, .mk = &own.mk };
     own.runner = try engine.Runner.init(gpa, d, lay, k, &own.tk, &own.model, &own.head, .{ .ctx = own, .gather = gatherFn }, own.stream, capacity);
     errdefer own.runner.deinit();
+    phases.step("runner (window and prompt buffers)", deviceBytes(own.runner.w) + deviceBytes(own.runner.mb) + deviceBytes(own.runner.pmb) + deviceBytes(own.runner.stage_rows) + deviceBytes(own.runner.picks) + deviceBytes(own.runner.cand) + deviceBytes(own.runner.split));
     const positions = poolSetting(getenv("TF_GLM_POOL"), capacity) catch {
         std.log.err("TF_GLM_POOL is {s}: it takes a number of positions, at least a stream's {d}, a multiple of {d}", .{ getenv("TF_GLM_POOL").?, capacity, P.extent_align });
         return error.BadEnvironment;
@@ -203,7 +288,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer if (own.tier) |t| t.deinit(gpa);
     own.pool = try P.Pool.init(gpa, d, &own.cfg, planes, positions, kv, own.tier == null);
     errdefer own.pool.deinit();
+    phases.step("tier and pool", deviceBytes(own.pool.latent) + deviceBytes(own.pool.pk));
     own.lanes = try lanesmod.Lanes.init(gpa, d, lay, &own.runner, &own.comm, &own.pool, capacity, o.drafts, own.tier);
+    {
+        var seqs: usize = 0;
+        for (own.lanes.slots) |sl| seqs += deviceBytes(sl.seq);
+        phases.step("stream slots and kept-prompt snapshots", seqs + deviceBytes(own.lanes.snaps));
+    }
+    logClasses(own, rank);
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
