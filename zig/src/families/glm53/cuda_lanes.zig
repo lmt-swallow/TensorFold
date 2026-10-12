@@ -70,6 +70,7 @@ const Slot = struct {
     first: u32 = 0, // the reply's first token, once the pass ended
     pending: ?usize = null, // the last window's rows, uncommitted
     drafts: bool = false, // the stream drafts: its head absorbs the kept rows
+    prompt_sha256: [32]u8 = @splat(0),
     sampled: [max_rows]u32 = undefined,
     held: [depth]u32 = undefined,
     probs: [depth]f64 = undefined,
@@ -108,6 +109,8 @@ pub const Lanes = struct {
     /// The records since the last agreement (`agreesNow` false ones fold in here and are agreed on with the next).
     pending: std.crypto.hash.sha2.Sha256 = .init(.{}),
     pending_bad: bool = false,
+    occupancy_event: u64 = 0,
+    occupancy_trace: bool = false, // TF_GLM_OCCUPANCY_TRACE=1: host metadata at verify boundaries
     draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts by `absorb` and `chain`, one after another
     draft_log: bool = false, // TF_GLM_DRAFT_LOG=1: rank 0 logs every stream's drafts and their confidences
 
@@ -126,6 +129,7 @@ pub const Lanes = struct {
         self.tier = tier;
         if (std.c.getenv("TF_GLM_DRAFT_BATCH")) |v| self.draft_batch = !std.mem.eql(u8, std.mem.span(v), "0");
         if (std.c.getenv("TF_GLM_DRAFT_LOG")) |v| self.draft_log = std.mem.eql(u8, std.mem.span(v), "1");
+        if (std.c.getenv("TF_GLM_OCCUPANCY_TRACE")) |v| self.occupancy_trace = std.mem.eql(u8, std.mem.span(v), "1");
         for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
         if (self.book.set.on) self.snaps = try keep.Snaps.init(gpa, d, self.book.set.snaps, keep.snapBytes(&self.slots[0].seq.?));
         return self;
@@ -463,6 +467,7 @@ pub const Lanes = struct {
                     wins[i] = .{ .q = &s.seq.?, .ids = ids[i][0..rows], .out = &s.sampled };
                     which[i] = s;
                 }
+                if (self.occupancy_trace) self.traceOccupancy();
                 try self.r.windows(wins[0..n]);
                 for (wins[0..n], which[0..n]) |w, s| {
                     s.pending = w.ids.len;
@@ -526,6 +531,28 @@ pub const Lanes = struct {
         }
     }
 
+    /// One host-side snapshot before verify: positions are committed rows, not allocated capacity.
+    /// Prompt digests hash u32 token IDs in little-endian order; pending rows are reported separately.
+    fn traceOccupancy(self: *Lanes) void {
+        self.occupancy_event += 1;
+        var busy: usize = 0;
+        for (self.slots) |s| if (s.busy) { busy += 1; };
+        std.log.info("glm_occupancy rank={d} event={d} busy={d} pool_rows={d} capacity={d}", .{ self.lay.rank, self.occupancy_event, busy, self.pool.rows, self.capacity });
+        for (self.slots, 0..) |s, slot| {
+            if (!s.busy) continue;
+            const q = &s.seq.?;
+            std.log.info("glm_occupancy_slot rank={d} event={d} slot={d} base={d} size={d} pos={d} pending={d} filling={} prompt_len={d} prompt_sha256_le={s}", .{ self.lay.rank, self.occupancy_event, slot, s.base, s.size, q.len(), s.pending orelse 0, s.filling, s.prompt.?.len, std.fmt.bytesToHex(s.prompt_sha256, .lower) });
+            if (q.tier) |x| {
+                const hs = [_]usize{ x.h, x.hm };
+                for (hs, 0..) |h, head| {
+                    const t = &x.t.host;
+                    const st = t.streams[h];
+                    std.log.info("glm_occupancy_tier rank={d} event={d} slot={d} head={d} h={d} parent={?d} depth={d} end={d} committed={d} file_fd={d}", .{ self.lay.rank, self.occupancy_event, slot, head, h, st.parent, t.aliasDepth(h), st.end, st.committed, t.io.fd });
+                }
+            }
+        }
+    }
+
     /// Where an admission of `size` positions continuing `reuse` would go (the book and extents untouched); null:
     /// no room even with every kept prompt gone.
     fn trialPlace(self: *const Lanes, size: usize, reuse: ?kb.Reuse) ?kb.Placed {
@@ -561,6 +588,15 @@ pub const Lanes = struct {
         }
         self.settle();
         s.* = .{ .seq = s.seq, .busy = true, .base = base, .size = size, .prompt = ids, .filling = true, .marks = inherited };
+        if (self.occupancy_trace) {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (ids) |id| {
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, id, .little);
+                hash.update(&bytes);
+            }
+            hash.final(&s.prompt_sha256);
+        }
         const q = &s.seq.?;
         if (self.tier) |t| {
             const nd = q.st.caches.len;
