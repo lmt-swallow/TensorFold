@@ -527,14 +527,18 @@ pub const Profile = struct {
     /// The MoE group's parts: the FFN mix, the gate's logits and the route, the member and work lists, the experts'
     /// input rotation, gate/up, their epilogue, down, the combine (the decode path's experts count as the combine).
     pub const moe_parts = [_][]const u8{ "mix", "gate", "lists", "rot_in", "gate/up", "epilogue", "down", "combine" };
+    /// Prompt attention stages; a replay tail using window attention is charged to input projections.
+    pub const attn_parts = [_][]const u8{ "mix", "input projections", "kv/index", "sparse", "output projections" };
     /// [1 + layers * groups.len + 1]: before the embedding, after each layer's groups, after the head.
     marks: []cuda.Event,
     /// [layers * (moe_parts.len - 1)]: between the MoE group's parts.
     moe: []cuda.Event,
+    /// [layers * (attn_parts.len - 1)]: between the attention group's parts.
+    attn: []cuda.Event,
     gpa: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, layers: usize) !Profile {
-        const marks = try gpa.alloc(cuda.Event, 2 + layers * groups.len + layers * (moe_parts.len - 1));
+        const marks = try gpa.alloc(cuda.Event, 2 + layers * groups.len + layers * (moe_parts.len - 1) + layers * (attn_parts.len - 1));
         errdefer gpa.free(marks);
         var made: usize = 0;
         errdefer for (marks[0..made]) |*e| e.deinit();
@@ -543,11 +547,12 @@ pub const Profile = struct {
             made += 1;
         }
         const n = 2 + layers * groups.len;
-        return .{ .marks = marks[0..n], .moe = marks[n..], .gpa = gpa };
+        const na = layers * (attn_parts.len - 1);
+        return .{ .marks = marks[0..n], .moe = marks[n .. marks.len - na], .attn = marks[marks.len - na ..], .gpa = gpa };
     }
 
     pub fn deinit(self: *Profile) void {
-        const all = self.marks.ptr[0 .. self.marks.len + self.moe.len];
+        const all = self.marks.ptr[0 .. self.marks.len + self.moe.len + self.attn.len];
         for (all) |*e| e.deinit();
         self.gpa.free(all);
     }
@@ -1132,6 +1137,10 @@ pub const Prompt = struct {
         if (self.profile) |p| try p.moe[li * (Profile.moe_parts.len - 1) + k].record(stream);
     }
 
+    fn attnMark(self: *const Prompt, li: usize, k: usize, stream: cuda.Stream) !void {
+        if (self.profile) |p| try p.attn[li * (Profile.attn_parts.len - 1) + k].record(stream);
+    }
+
     /// The profiled chunk's line: the GPU's ms by sublayer group (summed over the layers), the head's, and the host's
     /// ms in the call (and in the Engram hook: hashing, row reads, uploads).
     fn report(self: *const Prompt, start: usize, n: usize, host_ns: i128, engram_ns: i128, stream: cuda.Stream) !void {
@@ -1153,6 +1162,17 @@ pub const Prompt = struct {
             for (1..nm - 1) |k| moe[k] += try cuda.Event.elapsedMs(ms[k - 1], ms[k]);
             moe[nm - 1] += try cuda.Event.elapsedMs(ms[nm - 2], p.marks[1 + li * ng + 3]);
         }
+        const na = Profile.attn_parts.len;
+        var attn: [na]f64 = @splat(0);
+        for (0..L) |li| {
+            const ms = p.attn[li * (na - 1) ..][0 .. na - 1];
+            attn[0] += try cuda.Event.elapsedMs(p.marks[1 + li * ng], ms[0]);
+            for (1..na - 1) |k| attn[k] += try cuda.Event.elapsedMs(ms[k - 1], ms[k]);
+            attn[na - 1] += try cuda.Event.elapsedMs(ms[na - 2], p.marks[1 + li * ng + 1]);
+        }
+        std.log.info("deepseek_v41 rank {d}: chunk at {d}: attention ms by part: mix {d:.1}, input projections {d:.1}, kv/index {d:.1}, sparse {d:.1}, output projections {d:.1}", .{
+            self.fwd.w.rank, start, attn[0], attn[1], attn[2], attn[3], attn[4],
+        });
         std.log.info("deepseek_v41 rank {d}: chunk at {d} ({d} rows): GPU {d:.0} ms (engram {d:.0}, attention {d:.0}, attention gather {d:.0}, moe {d:.0}, moe gather {d:.0}, head {d:.1}); host {d:.0} ms in the call ({d:.0} in Engram), then {d:.0} ms waiting for the GPU", .{
             self.fwd.w.rank, start, n, total, sum[0], sum[1], sum[2], sum[3], sum[4], head,
             @as(f64, @floatFromInt(host_ns)) / 1e6, @as(f64, @floatFromInt(engram_ns)) / 1e6, wait_ms,
@@ -1241,11 +1261,14 @@ pub const Prompt = struct {
             if (pending) try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.h_moe", .{li - 1}), st.h, hbytes, stream);
             pending = false;
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.x_attn", .{li}), self.x.ptr, rows * dm * 2, stream);
+            try self.attnMark(li, 0, stream);
             // 16 rows or fewer past a replay cut run model.py attention_k's ring mode: the window kernels
             const pa = if (st.kv_done and rows <= decode_rows)
                 try self.attendWindow(li, self.x.ptr, rows, at, li == c.n_layers / 2, &st.window_picks, stream)
             else
                 try self.attend(li, self.x.ptr, rows, at, st.floor, st.kv_done and li == c.n_layers / 2, stream);
+            // Window attention has no prompt stages; attribute it to the first interval.
+            if (st.kv_done and rows <= decode_rows) for (1..Profile.attn_parts.len - 1) |k| try self.attnMark(li, k, stream);
             try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.p_attn.r0", .{li}), pa, rows * dm * 4, stream);
             try self.mark(m0 + 1, stream);
             try gather.run(pa, rows * dm, self.gathered.ptr, stream);
@@ -1533,6 +1556,7 @@ pub const Prompt = struct {
         try self.mm(p.wq_b, self.qr.ptr, n, self.q.ptr, .bf16, stream);
         try self.ropeHeads(self.q.ptr, at_pos, n, heads, hd, false, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.q.r0", .{li}), self.q.ptr, n * heads * hd * 2, stream);
+        try self.attnMark(li, 1, stream);
         // the window keys: the ring's rows before start (from lo), then the chunk's normed, roped, quantized rows
         const lo: usize = @max(floor, if (start + 1 > c.window) start + 1 - c.window else 0);
         const before = start - lo;
@@ -1582,6 +1606,7 @@ pub const Prompt = struct {
         const srcp = if (ratio > 0) fwd.planes[fwd.source[li]] else null;
         const comp_codes: Ptr = if (has) srcp.?.comp_codes.ptr else self.wsrc.ptr;
         const comp_scales: Ptr = if (has) srcp.?.comp_scales.ptr else self.wsrc.ptr;
+        try self.attnMark(li, 2, stream);
         // window-only calls (no picks) stay on the captured kernel: GB10 runs them faster there
         const fast = self.sa.use and has and hd == 512 and heads == 32 and c.window == 128;
         if (fast and !self.sa.check) {
@@ -1603,6 +1628,7 @@ pub const Prompt = struct {
             aot.ci("PDL", 1), aot.ci("WPF", 0),
         });
         if (fast and self.sa.check) try self.attnCheck(li, n, comp_codes, comp_scales, has, p.sink, scale, n_pad, nblk, stream);
+        try self.attnMark(li, 3, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.wsrc.r0", .{li}), self.wsrc.ptr, (before + n) * hd * 2, stream);
         try self.probeOut(try std.fmt.bufPrint(&nb, "L{d}.dbg.o_raw.r0", .{li}), self.o.ptr, n * heads * hd * 2, stream);
         try self.ropeHeads(self.o.ptr, at_pos, n, heads, hd, true, stream);
