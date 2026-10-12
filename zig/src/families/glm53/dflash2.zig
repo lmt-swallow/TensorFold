@@ -283,3 +283,39 @@ test "greedy selector keeps one low-confidence row and uses the selected token a
     try std.testing.expectEqual(@as(u32, 77442), top[1].token);
     try std.testing.expectError(error.NonfiniteDraftLogit, topCandidates(a, &.{0x7fc0}, 0, 1));
 }
+
+/// Number of target input rows to commit: pending plus the matching draft prefix.
+/// The same number of target samples is emitted; the last sample becomes the next pending token.
+pub fn verifyKeep(samples: []const u32, drafts: []const u32, room: usize, eos: []const u32) !usize {
+    if (room == 0 or samples.len != drafts.len + 1) return error.BadVerifyShape;
+    var keep: usize = 1;
+    for (drafts, 0..) |draft, i| {
+        if (keep >= room or samples[i] != draft or std.mem.indexOfScalar(u32, eos, samples[i]) != null) break;
+        keep += 1;
+    }
+    return keep;
+}
+
+test "verification commits pending and only matching drafts within output and EOS boundaries" {
+    for (0..16) |count| {
+        for (0..count + 1) |mismatch| {
+            for (1..18) |room| {
+                for (0..count + 2) |eos_at| {
+                    var samples: [16]u32 = undefined;
+                    var drafts: [15]u32 = undefined;
+                    for (samples[0 .. count + 1], 0..) |*sample, i| sample.* = @intCast(100 + i);
+                    @memcpy(drafts[0..count], samples[0..count]);
+                    if (mismatch < count) drafts[mismatch] = 999;
+                    const eos = if (eos_at <= count) samples[eos_at] else 1000;
+                    const got = try verifyKeep(samples[0 .. count + 1], drafts[0..count], room, &.{eos});
+                    const want = @min(@min(mismatch + 1, room), eos_at + 1);
+                    try std.testing.expectEqual(want, got);
+                    try std.testing.expect(got > 0 and got <= samples[0 .. count + 1].len);
+                    try std.testing.expectEqualSlices(u32, samples[0 .. got - 1], drafts[0 .. got - 1]);
+                }
+            }
+        }
+    }
+    try std.testing.expectError(error.BadVerifyShape, verifyKeep(&.{1}, &.{}, 0, &.{}));
+    try std.testing.expectError(error.BadVerifyShape, verifyKeep(&.{1}, &.{2}, 1, &.{}));
+}

@@ -23,6 +23,9 @@ pub const Session = struct {
     context: B.Context,
     scratch: B.Scratch,
     taps: Taps,
+    trace_rounds: bool = false,
+    verified_rows: usize = 0,
+    verified_samples: [E.rows]u32 = undefined,
 
     /// Borrow rank weights/kernels/target runner; own bounded single-sequence proposer state.
     pub fn init(r: *E.Runner, q: *E.Seq, model: *const W.Model, head: *const T.DraftHead, kernels: K, projections: Q, hp: *const cuda.cublaslt.Linear) !Session {
@@ -135,16 +138,17 @@ pub const Session = struct {
         ids[0] = pending;
         @memcpy(ids[1..][0..drafts.len], drafts);
         const rows = 1 + drafts.len;
+        s.verified_rows = 0;
         var sampled: [E.rows]u32 = undefined;
         try r.windowHook(s.sequence, ids[0..rows], sampled[0..rows], try s.taps.begin(rows));
-        var keep: usize = 1;
-        for (drafts, 0..) |drafted, i| {
-            if (keep >= room or sampled[i] != drafted or std.mem.indexOfScalar(u32, r.lay.cfg.eos[0..r.lay.cfg.eos_n], sampled[i]) != null) break;
-            keep += 1;
-        }
+        const keep = try D.verifyKeep(sampled[0..rows], drafts, room, r.lay.cfg.eos[0..r.lay.cfg.eos_n]);
         try r.commit(s.sequence, rows, keep);
         try s.appendTaps(keep);
         @memcpy(out[0..keep], sampled[0..keep]);
+        if (s.trace_rounds) {
+            @memcpy(s.verified_samples[0..rows], sampled[0..rows]);
+            s.verified_rows = rows;
+        }
         if (s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
         return keep;
     }
