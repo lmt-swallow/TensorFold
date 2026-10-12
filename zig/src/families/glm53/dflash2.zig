@@ -225,6 +225,12 @@ pub fn topCandidates(a: std.mem.Allocator, logits: []const u16, offset: u32, k: 
 /// Select a greedy chain; projected rows are the reference BF16 projection expanded to f32.
 /// The returned allocation contains only accepted confidence-prefix candidates, including at least row zero.
 pub fn selectGreedy(a: std.mem.Allocator, candidates: []const Candidate, top_k: usize, projected: []const f32, selector_rank: usize, predecessor: []const u16, successor: []const u16, anchor: u32, confidence: f64) ![]u32 {
+    return selectGreedyBeta(a, candidates, top_k, projected, selector_rank, predecessor, successor, anchor, confidence, 1);
+}
+
+/// Apply temperature only to confidence probabilities; candidate ranking remains unchanged.
+pub fn selectGreedyBeta(a: std.mem.Allocator, candidates: []const Candidate, top_k: usize, projected: []const f32, selector_rank: usize, predecessor: []const u16, successor: []const u16, anchor: u32, confidence: f64, beta: f64) ![]u32 {
+    if (!std.math.isFinite(beta) or beta <= 0) return error.BadSelectorShape;
     if (top_k == 0 or selector_rank == 0 or candidates.len % top_k != 0 or predecessor.len != successor.len or
         predecessor.len % selector_rank != 0 or anchor >= predecessor.len / selector_rank or
         confidence < 0 or confidence > 1 or !std.math.isFinite(confidence)) return error.BadSelectorShape;
@@ -255,8 +261,8 @@ pub fn selectGreedy(a: std.mem.Allocator, candidates: []const Candidate, top_k: 
         }
         if (confidence > 0) {
             var sum: f64 = 0;
-            for (scores) |score| sum += @exp(score - max_score);
-            chain *= @exp(scores[best] - max_score) / sum;
+            for (scores) |score| sum += @exp((score - max_score) / beta);
+            chain *= @exp((scores[best] - max_score) / beta) / sum;
             if (row > 0 and chain < confidence) break;
         }
         previous = candidates[row * top_k + best].token;
@@ -318,4 +324,20 @@ test "verification commits pending and only matching drafts within output and EO
     }
     try std.testing.expectError(error.BadVerifyShape, verifyKeep(&.{1}, &.{}, 0, &.{}));
     try std.testing.expectError(error.BadVerifyShape, verifyKeep(&.{1}, &.{2}, 1, &.{}));
+}
+
+
+test "selector temperature changes confidence length without changing greedy ranking" {
+    const a = std.testing.allocator;
+    const candidates = [_]Candidate{ .{ .token = 0, .logit = 2 }, .{ .token = 1, .logit = 0 }, .{ .token = 0, .logit = 2 }, .{ .token = 1, .logit = 0 } };
+    const zeros = [_]u16{ 0, 0 };
+    const cold = try selectGreedyBeta(a, &candidates, 2, &.{ 0, 0 }, 1, &zeros, &zeros, 0, 0.6, 1);
+    defer a.free(cold);
+    const noisy = try selectGreedyBeta(a, &candidates, 2, &.{ 0, 0 }, 1, &zeros, &zeros, 0, 0.6, 2);
+    defer a.free(noisy);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, cold);
+    try std.testing.expectEqualSlices(u32, &.{0}, noisy);
+    for ([_]f64{ 0, -1, std.math.inf(f64), std.math.nan(f64) }) |bad| {
+        try std.testing.expectError(error.BadSelectorShape, selectGreedyBeta(a, &candidates, 2, &.{ 0, 0 }, 1, &zeros, &zeros, 0, 0.6, bad));
+    }
 }
