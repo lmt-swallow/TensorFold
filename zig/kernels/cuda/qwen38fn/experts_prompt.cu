@@ -418,6 +418,73 @@ __device__ __forceinline__ void down_body(const half* __restrict__ xd, const int
     }
 }
 
+// The down projection with each item's rows staged once (TF_QFN_XP_DOWN=loop2|loop3): one program per item (16 *
+// MT members) loops over every 256 columns of D, reusing the staged rows; the epilogue runs a 128-column half at a
+// time through a [16 MT][128] fp32 buffer after the rows. The bits are down_body's.
+template <int CB, int LO, int HI, int MT>
+__device__ __forceinline__ void down_loop_body(const half* __restrict__ xd, const int* __restrict__ items,
+                                               const int* __restrict__ nitems, const int* __restrict__ lists, int maxm,
+                                               const int* __restrict__ cnt, const int64_t* __restrict__ TPd,
+                                               const int* __restrict__ K2d, const half* __restrict__ svh_d,
+                                               uint16_t* __restrict__ out, int K, int D) {
+    constexpr int MG = 16 * MT;
+    extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ int rows_p[MG];
+    int e, nv;
+    if (!members<MG>(items, nitems, lists, maxm, cnt, rows_p, e, nv)) return;
+    half* A = reinterpret_cast<half*>(smem);
+    float* f = reinterpret_cast<float*>(smem + MG * APAD * 2);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int NTILES = D >> 4;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(TPd[e]);
+    const int k2 = K2d[e];
+    for (int i = threadIdx.x; i < nv * 16 * (KS / 8); i += WARPS_D * 32) {
+        const int m = i / (KS / 8), c8 = i % (KS / 8);
+        const int p = rows_p[m];
+        const uint4 v = p >= 0 ? *reinterpret_cast<const uint4*>(xd + (size_t)p * K + c8 * 8) : make_uint4(0, 0, 0, 0);
+        *reinterpret_cast<uint4*>(A + m * APAD + c8 * 8) = v;
+    }
+    __syncthreads();
+    constexpr int W = WARPS_D * 16;  // columns an iteration
+#pragma unroll 1
+    for (int c0 = 0; c0 < D; c0 += W) {
+        float cur[MT][2][4];
+        split_any<CB, LO, HI>(k2, T, NTILES, c0 / 16 + warp, 0, A, nv, lane, cur);
+#pragma unroll 1
+        for (int half_ = 0; half_ < W / 128; ++half_) {
+            __syncthreads();
+            if (warp / 8 == half_) {
+#pragma unroll
+                for (int m = 0; m < MT; ++m)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        if (m >= nv) continue;
+                        const int col = (warp % 8) * 16 + h * 8 + 2 * t, row = m * 16 + g;
+                        f[row * 128 + col] = 0.f + cur[m][h][0];
+                        f[row * 128 + col + 1] = 0.f + cur[m][h][1];
+                        f[(row + 8) * 128 + col] = 0.f + cur[m][h][2];
+                        f[(row + 8) * 128 + col + 1] = 0.f + cur[m][h][3];
+                    }
+            }
+            __syncthreads();
+            // down_epilogue_kernel: one warp a member
+            for (int m = warp; m < nv * 16; m += WARPS_D) {
+                const int p = rows_p[m];
+                if (p < 0) continue;
+                const int n = c0 + half_ * 128 + 4 * lane;
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = f[m * 128 + 4 * lane + j];
+                fwht128(v, lane);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    out[(size_t)p * D + n + j] = to_bf16(v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]));
+            }
+        }
+    }
+}
+
 }  // namespace tf_qfn_xp
 
 extern "C" __global__ void __launch_bounds__(256) tf_qfn_xp_list(const int* pick, int n, int* lists, int maxm,
@@ -464,3 +531,21 @@ extern "C" __global__ void __launch_bounds__(1024) tf_qfn_xp_plan(const int* cnt
                                                                    int mg) {
     tf_qfn_xp::plan_kernel(cnt, E, items, nitems, mg);
 }
+
+// the looping down projection: tf_qfn_xp_downloop<mt>_<cb>_<lo>_<hi>, 512 threads, grid (items),
+// 16 mt (APAD * 2 + 512) dynamic shared bytes
+#define TF_QFN_XDL(MT, CB, LO, HI)                                                                                   \
+    extern "C" __global__ void __launch_bounds__(512) tf_qfn_xp_downloop##MT##_##CB##_##LO##_##HI(                  \
+        const half* xd, const int* items, const int* nitems, const int* lists, int maxm, const int* cnt,            \
+        const int64_t* TPd, const int* K2d, const half* svh_d, uint16_t* out, int K, int D) {                       \
+        tf_qfn_xp::down_loop_body<CB, LO, HI, MT>(xd, items, nitems, lists, maxm, cnt, TPd, K2d, svh_d, out, K, D);  \
+    }
+#define TF_QFN_XDL_RANGES(MT, CB) TF_QFN_XDL(MT, CB, 8, 8) TF_QFN_XDL(MT, CB, 2, 10) TF_QFN_XDL(MT, CB, 2, 16)
+TF_QFN_XDL_RANGES(2, 0)
+TF_QFN_XDL_RANGES(2, 1)
+TF_QFN_XDL_RANGES(2, 2)
+TF_QFN_XDL_RANGES(3, 0)
+TF_QFN_XDL_RANGES(3, 1)
+TF_QFN_XDL_RANGES(3, 2)
+#undef TF_QFN_XDL_RANGES
+#undef TF_QFN_XDL

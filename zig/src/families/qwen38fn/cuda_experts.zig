@@ -218,6 +218,29 @@ pub const Experts = struct {
 /// the captured ones byte for byte after every window (error.ExpertsDiffer); the captured ones are kept.
 pub const Mode = enum { captured, fused, check };
 
+/// TF_QFN_XP_DOWN: the down programs of a fused window. `loop3` (default) / `loop2`: one program per 48 / 32 members
+/// over every column, the members' rows staged once; `tiles`: one per (64 members, 256 columns). The same bytes every
+/// way (spark-616b, 2,048-row chunk: loop3 166 ms, tiles 195, loop2 191).
+const DownVariant = enum {
+    tiles,
+    loop2,
+    loop3,
+
+    fn fromEnv() !DownVariant {
+        const v = std.mem.span(std.c.getenv("TF_QFN_XP_DOWN") orelse return .loop3);
+        if (v.len == 0) return .loop3;
+        return std.meta.stringToEnum(DownVariant, v) orelse error.BadExpertsVariant;
+    }
+
+    fn mt(v: DownVariant) usize {
+        return switch (v) {
+            .tiles => 4,
+            .loop2 => 2,
+            .loop3 => 3,
+        };
+    }
+};
+
 /// experts_prompt.cu: members a gate/up program and a down program, and their dynamic shared bytes.
 const gu_members = 32;
 const down_members = 64;
@@ -406,8 +429,10 @@ pub fn promptWindow(k: *const Kernels, ex: *const Experts, s: *const Scratch, x:
         a.add(counts.ptr);
         try cuda.launch.launch(k.list, .{ .grid = .{ .x = @intCast(E) }, .block = .{ .x = 256 } }, stream, &a);
     }
+    const dn = try DownVariant.fromEnv();
+    const dn_members = 16 * dn.mt();
     const stride = s.maxItems(E, gu_members) * 4;
-    for ([_]usize{ gu_members, down_members }, 0..) |mg, i| {
+    for ([_]usize{ gu_members, dn_members }, 0..) |mg, i| {
         var a: cuda.Args = .{};
         a.add(counts.ptr);
         a.add(@as(c_int, @intCast(E)));
@@ -435,7 +460,29 @@ pub fn promptWindow(k: *const Kernels, ex: *const Experts, s: *const Scratch, x:
         a.add(act_f32);
         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(s.maxItems(E, gu_members)), .y = @intCast(I / 128) }, .block = .{ .x = 256 }, .shared = gu_shared }, stream, &a);
     }
-    {
+    if (dn != .tiles) {
+        var buf: [64]u8 = undefined;
+        const r = range(ex.k2_d[0], ex.k2_d[1]);
+        const text = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "tf_qfn_xp_downloop{d}_{d}_{d}_{d}", .{ dn.mt(), @intFromEnum(ex.cb), r[0], r[1] });
+        buf[text.len] = 0;
+        const f = try k.prompt.function(buf[0..text.len :0]);
+        const shared: u32 = @intCast(dn_members * ((640 + 8) * 2 + 128 * 4));
+        try f.allowDynamicShared(shared);
+        var a: cuda.Args = .{};
+        a.add(xd.ptr);
+        a.add(items.ptr + stride);
+        a.add(nitems.ptr + 4);
+        a.add(lists.ptr);
+        a.add(@as(c_int, @intCast(s.frows)));
+        a.add(counts.ptr);
+        a.add(ex.down_ptr.ptr);
+        a.add(ex.down_k2.ptr);
+        a.add(ex.svh_d.ptr);
+        a.add(out);
+        a.add(@as(c_int, @intCast(I)));
+        a.add(@as(c_int, @intCast(D)));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(s.maxItems(E, dn_members)) }, .block = .{ .x = 512 }, .shared = shared }, stream, &a);
+    } else {
         const f = try k.promptFn("down", ex.cb, range(ex.k2_d[0], ex.k2_d[1]));
         try f.allowDynamicShared(down_shared);
         var a: cuda.Args = .{};
