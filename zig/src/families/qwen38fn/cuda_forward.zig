@@ -400,6 +400,8 @@ pub const Buffers = struct {
     moe: experts.Scratch,
     ple_dev: cuda.DeviceBuffer, // int16 [rows * heads, words]
     ple_host: []u8,
+    ple_ids: []i64, // the staged window's n-gram row ids [rows * heads], gathered when the n-gram layer runs
+    ple_pending: usize = 0, // rows whose n-gram rows are staged but not yet gathered and uploaded
     ple_emb: cuda.DeviceBuffer, // fp16 [rows, ple_dim]
     ple_keys: cuda.DeviceBuffer, // bf16 [rows, S * D]
     ple_vals: cuda.DeviceBuffer, // bf16 [rows, D]
@@ -462,6 +464,8 @@ pub const Buffers = struct {
         b.attn = try attn.Scratch.init(d, cfg, rows, capacity);
         b.moe = try experts.Scratch.init(d, &m.layers[0].experts, rows, slots);
         b.ple_host = try gpa.alloc(u8, rows * ple_heads * ple_words * 2);
+        b.ple_ids = try gpa.alloc(i64, rows * ple_heads);
+        b.ple_pending = 0;
         return b;
     }
 
@@ -472,6 +476,7 @@ pub const Buffers = struct {
         self.attn.deinit();
         self.moe.deinit();
         self.gpa.free(self.ple_host);
+        self.gpa.free(self.ple_ids);
     }
 };
 
@@ -504,8 +509,9 @@ pub const Forward = struct {
         try f.stageSegs(&.{.{ .st = st, .a0 = 0, .n = tokens.len }}, b, tokens, stream);
     }
 
-    /// forward.py `stage`: the token ids of every segment's rows (`tokens`, in row order) and each stream's n-gram
-    /// rows from its own history, copied to the device.
+    /// forward.py `stage`: the token ids of every segment's rows (`tokens`, in row order) copied to the device, and
+    /// each stream's n-gram row ids from its own history; the rows themselves are read from the table and uploaded
+    /// when the n-gram layer is issued (gatherPle), so the device runs the layers before it meanwhile.
     pub fn stageSegs(f: *Forward, segs: []const Seg, b: *Buffers, tokens: []const i32, stream: cuda.Stream) !void {
         const R = try segRows(segs);
         if (R != tokens.len) return error.BadSegments;
@@ -513,19 +519,28 @@ pub const Forward = struct {
         try b.ids.uploadAsync(0, std.mem.sliceAsBytes(tokens), stream.handle);
         if (f.m.ng) |*g| {
             const heads = g.heads();
-            const t = &f.m.table.?;
-            const row_bytes = heads * t.words * 2;
             for (segs) |sg| {
                 if (sg.n > 64) return error.WindowTooLarge;
                 var toks: [64]i64 = undefined;
                 for (tokens[sg.a0..][0..sg.n], 0..) |x, i| toks[i] = x;
-                var row_ids: [64 * ngram.max_heads]i64 = undefined;
-                try g.ids(sg.st.history[0 .. g.n - 1], toks[0..sg.n], row_ids[0 .. sg.n * heads]);
-                try t.gather(row_ids[0 .. sg.n * heads], b.ple_host[sg.a0 * row_bytes ..][0 .. sg.n * row_bytes]);
+                try g.ids(sg.st.history[0 .. g.n - 1], toks[0..sg.n], b.ple_ids[sg.a0 * heads ..][0 .. sg.n * heads]);
                 sg.st.last = .{ .history = sg.st.history, .tokens = toks, .n = sg.n };
             }
-            try b.ple_dev.uploadAsync(0, b.ple_host[0 .. R * row_bytes], stream.handle);
+            b.ple_pending = R;
         }
+    }
+
+    /// The staged window's n-gram rows read from the table and their upload queued (once a window).
+    pub fn gatherPle(f: *Forward, b: *Buffers, stream: cuda.Stream) !void {
+        const R = b.ple_pending;
+        if (R == 0) return;
+        const g = &f.m.ng.?;
+        const t = &f.m.table.?;
+        const heads = g.heads();
+        const bytes = b.ple_host[0 .. R * heads * t.words * 2];
+        try t.gather(b.ple_ids[0 .. R * heads], bytes);
+        try b.ple_dev.uploadAsync(0, bytes, stream.handle);
+        b.ple_pending = 0;
     }
 
     pub fn mm(f: *Forward, l: *const Linear, x: Ptr, R: usize, y: Ptr, b: *Buffers, stream: cuda.Stream) !void {
@@ -620,6 +635,7 @@ pub const Forward = struct {
                 try g.hcWriteback(w.h.ptr, w.pss.ptr, R, pending, stream);
                 pending = .none;
             }
+            try f.gatherPle(b, stream);
             try f.pleBlock(p, segs, b, R, stream);
         }
         // the attention hyper-connection
@@ -744,6 +760,8 @@ pub const Graphs = struct {
 
     /// computeSegs of `st`'s window of R rows (staged in `b`), at its context bucket.
     pub fn compute(g: *Graphs, f: *Forward, st: *Stream, b: *Buffers, R: usize, stream: cuda.Stream) !void {
+        // the n-gram rows' upload reads host memory: issued here, outside any capture (a replay reads the device copy)
+        try f.gatherPle(b, stream);
         const was = f.buckets;
         f.buckets = true;
         defer f.buckets = was;
