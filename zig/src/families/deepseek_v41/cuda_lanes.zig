@@ -2248,7 +2248,7 @@ pub const Engine = struct {
             }
         }
         clock.mark("the stream pool and the kept prompts' snapshots", .{});
-        if (getenv("TF_DS_PROFILE") != null) try e.streams.pr.enableProfile();
+        if (getenv("TF_DS_PROFILE")) |v| if (!std.mem.eql(u8, v, "0")) try e.streams.pr.enableProfile();
         if (getenv("TF_DS_PREFILL_TRACE") != null) try e.streams.pr.enableTrace();
         // the communicator after the loads: each rank loads on its own, then they meet (rank 1 retries its
         // connection for up to 30 minutes while rank 0 still loads, so the ranks may start in either order)

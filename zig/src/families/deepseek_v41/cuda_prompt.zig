@@ -520,10 +520,11 @@ pub const Options = struct {
 };
 
 /// A chunk's timing (`Prompt.enableProfile`, TF_DS_PROFILE=1 in the served engine): CUDA events between every
-/// layer's sublayer groups, read back after the chunk (a host sync a chunk, so chunks no longer overlap), and the
-/// host's time inside the chunk call. `chunk` logs one `info:` line a profiled chunk.
+/// completed layer's sublayer groups, read back after the chunk (a host sync a chunk, so chunks no longer overlap), and the
+/// host's time inside the chunk call. A replay cut's unfinished source update is charged to the head/tail interval.
+/// `chunk` logs one `info:` line a profiled chunk.
 pub const Profile = struct {
-    pub const groups = [_][]const u8{ "engram", "attention", "attention gather", "moe", "moe gather" };
+    pub const groups = [_][]const u8{ "engram/replay source", "attention", "attention gather", "moe", "moe gather" };
     /// The MoE group's parts: the FFN mix, the gate's logits and the route, the member and work lists, the experts'
     /// input rotation, gate/up, their epilogue, down, the combine (the decode path's experts count as the combine).
     pub const moe_parts = [_][]const u8{ "mix", "gate", "lists", "rot_in", "gate/up", "epilogue", "down", "combine" };
@@ -1090,8 +1091,11 @@ pub const Prompt = struct {
         }
         const out = try self.layers(g, ids, start, o, stream, &engram_ns);
         if (self.trace) |*t| try t.end(stream);
-        try self.mark(1 + self.fwd.w.layers.len * Profile.groups.len, stream);
-        if (self.profile != null and o.replay == null) try self.report(start, n, nowNs() - t0, engram_ns, stream);
+        // A replay cut stops after its source update. Only completed layers have all profile marks;
+        // the remaining source update is timed with the head/tail interval.
+        const completed = self.at_piece.li;
+        try self.mark(1 + completed * Profile.groups.len, stream);
+        if (self.profile != null) try self.report(start, n, completed, nowNs() - t0, engram_ns, stream);
         return out;
     }
 
@@ -1141,11 +1145,11 @@ pub const Prompt = struct {
         if (self.profile) |p| try p.attn[li * (Profile.attn_parts.len - 1) + k].record(stream);
     }
 
-    /// The profiled chunk's line: the GPU's ms by sublayer group (summed over the layers), the head's, and the host's
+    /// The profiled chunk's line: the GPU's ms by sublayer group (summed over completed layers), the head/replay tail's, and the host's
     /// ms in the call (and in the Engram hook: hashing, row reads, uploads).
-    fn report(self: *const Prompt, start: usize, n: usize, host_ns: i128, engram_ns: i128, stream: cuda.Stream) !void {
+    fn report(self: *const Prompt, start: usize, n: usize, completed: usize, host_ns: i128, engram_ns: i128, stream: cuda.Stream) !void {
         const p = self.profile.?;
-        const L = self.fwd.w.layers.len;
+        const L = completed;
         const ng = Profile.groups.len;
         const t_sync = nowNs();
         try stream.synchronize();
@@ -1173,8 +1177,8 @@ pub const Prompt = struct {
         std.log.info("deepseek_v41 rank {d}: chunk at {d}: attention ms by part: mix {d:.1}, input projections {d:.1}, kv/index {d:.1}, sparse {d:.1}, output projections {d:.1}", .{
             self.fwd.w.rank, start, attn[0], attn[1], attn[2], attn[3], attn[4],
         });
-        std.log.info("deepseek_v41 rank {d}: chunk at {d} ({d} rows): GPU {d:.0} ms (engram {d:.0}, attention {d:.0}, attention gather {d:.0}, moe {d:.0}, moe gather {d:.0}, head {d:.1}); host {d:.0} ms in the call ({d:.0} in Engram), then {d:.0} ms waiting for the GPU", .{
-            self.fwd.w.rank, start, n, total, sum[0], sum[1], sum[2], sum[3], sum[4], head,
+        std.log.info("deepseek_v41 rank {d}: chunk at {d} ({d} rows, {d} completed layers): GPU {d:.0} ms (engram/replay source {d:.0}, attention {d:.0}, attention gather {d:.0}, moe {d:.0}, moe gather {d:.0}, head/replay tail {d:.1}); host {d:.0} ms in the call ({d:.0} in Engram), then {d:.0} ms waiting for the GPU", .{
+            self.fwd.w.rank, start, n, completed, total, sum[0], sum[1], sum[2], sum[3], sum[4], head,
             @as(f64, @floatFromInt(host_ns)) / 1e6, @as(f64, @floatFromInt(engram_ns)) / 1e6, wait_ms,
         });
         std.log.info("deepseek_v41 rank {d}: chunk at {d}: moe ms by part: mix {d:.1}, gate {d:.1}, lists {d:.1}, rot_in {d:.1}, gate/up {d:.1}, epilogue {d:.1}, down {d:.1}, combine {d:.1}", .{
