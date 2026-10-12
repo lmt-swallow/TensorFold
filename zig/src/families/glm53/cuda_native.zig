@@ -5,7 +5,8 @@
 //! streams decode together, their DSA caches in one pool of TF_GLM_POOL positions (default: one stream's context;
 //! at least that, a multiple of 2,048), each stream an extent of it; every slot's other state (KDA states, rings, the
 //! head's rows) is made at load. TF_GLM_TIER=<dir> (bf16 caches) puts the DSA latent rows on a tier (cuda_tier.zig):
-//! a pinned slab of TF_GLM_TIER_GIB (default 8) GiB of resident pools, the rest in <dir>/glm53-kv-rank<r>.bin.
+//! a pinned slab of TF_GLM_TIER_GIB GiB of resident pools (default: every slot's at a full context, at most 24), the
+//! rest in <dir>/glm53-kv-rank<r>.bin.
 //! Both ranks must run with the same --context, TF_GLM_POOL, TF_GLM_TIER and drafts setting.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -187,7 +188,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             return error.BadEnvironment;
         }
         const kvt = Tr.kv;
-        const gib = try envInt("TF_GLM_TIER_GIB", 8);
+        // default: every slot's latent rows at a full context (nothing evicted), at most 24 GiB (4 x 1M positions
+        // keeps about half of them resident beside the weights and the pooled keys)
+        const whole = lanesmod.max_streams * capacity * (own.cfg.count(.dsa) + 1) * own.cfg.kv_lora * 2;
+        const gib = try envInt("TF_GLM_TIER_GIB", @intCast(@min(24, std.math.divCeil(usize, whole, 1 << 30) catch 24)));
         const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-kv-rank{d}.bin", .{ tdir, rank }, 0);
         defer gpa.free(path);
         const tcap = @max(std.mem.alignForward(usize, capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
