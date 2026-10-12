@@ -204,11 +204,11 @@ pub const Hc = struct {
         errdefer bmm.deinit();
         var sel = try Select.load(d);
         errdefer sel.deinit();
-        var sco = try Own.load(d, cuda.kernels.glm53_scores, "_ZN15tf_glm53_scores13scores_kernelEPK13__nv_bfloat16S2_iS2_PfPKiiiff", "tf_glm53_scores_smem", "TF_GLM_SCORES");
+        var sco = try Own.load(d, cuda.kernels.glm53_scores, "_ZN15tf_glm53_scores13scores_kernelEPK13__nv_bfloat16S2_iS2_PfPKiiiff", "tf_glm53_scores_smem", "TF_GLM_SCORES", true);
         errdefer sco.deinit();
-        var one = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass14onepass_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS");
+        var one = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass14onepass_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS", false);
         errdefer one.deinit();
-        const one_split = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass20onepass_split_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS");
+        const one_split = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass20onepass_split_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS", false);
         return .{
             .d = d,
             .module = module,
@@ -270,8 +270,10 @@ pub const Select = struct {
     }
 };
 
-/// One of the glue's own kernels standing in for a captured one with its bits (scores.cu for `_scores`): `use` unless
-/// its switch (`env` = 0), `check` under TF_GLM_PROMPT_CHECK=1 (the captured kernel beside it, byte for byte).
+/// One of the glue's own kernels standing in for a captured one with its bits (scores.cu for `_scores`, onepass.cu for
+/// `_sparse_onepass`): `use` by its switch `env` (1 on, 0 off; unset: `default_on`), `check` under
+/// TF_GLM_PROMPT_CHECK=1 (the captured kernel beside it, byte for byte). onepass.cu is off unless asked for: on GB10
+/// it measured slower than the captured kernel (119 ms against 106 a 2,048-row chunk; its head-split form 141).
 pub const Own = struct {
     d: *const cuda.Driver,
     module: cuda.Module,
@@ -280,7 +282,7 @@ pub const Own = struct {
     use: bool,
     check: bool,
 
-    pub fn load(d: *const cuda.Driver, image: []const u8, symbol: [:0]const u8, smem_symbol: [:0]const u8, env: [:0]const u8) !Own {
+    pub fn load(d: *const cuda.Driver, image: []const u8, symbol: [:0]const u8, smem_symbol: [:0]const u8, env: [:0]const u8, default_on: bool) !Own {
         var module = try cuda.Module.load(d, image);
         errdefer module.unload();
         const func = try module.function(symbol);
@@ -291,7 +293,7 @@ pub const Own = struct {
         try func.allowDynamicShared(smem);
         return .{
             .d = d, .module = module, .func = func, .smem = smem,
-            .use = !std.mem.eql(u8, envOr(env, "1"), "0"),
+            .use = !std.mem.eql(u8, envOr(env, if (default_on) "1" else "0"), "0"),
             .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
         };
     }
