@@ -872,7 +872,7 @@ pub const Glue = struct {
     pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
         const own = &g.hc.sco;
         if (!own.use or kv != .bf16) return g.scoresCaptured(qi, w, w_stride, pk, kv, out, pos, R, np, stream);
-        // scores.cu: 128 pools and 32 rows a block, its bits `_scores`'
+        // scores.cu: 256 pools and 32 rows a block, its bits `_scores`'
         var args: cuda.Args = .{};
         args.add(qi);
         args.add(w);
@@ -884,7 +884,7 @@ pub const Glue = struct {
         args.add(@as(c_int, @intCast(np)));
         args.add(index_scale);
         args.add(index_wscale);
-        try cuda.launch.launch(own.func, .{ .grid = .{ .x = @intCast(cdiv(np, 128)), .y = @intCast(cdiv(R, 32)) }, .block = .{ .x = 256 }, .shared = own.smem }, stream, &args);
+        try cuda.launch.launch(own.func, .{ .grid = .{ .x = @intCast(cdiv(np, 256)), .y = @intCast(cdiv(R, 32)) }, .block = .{ .x = 256 }, .shared = own.smem }, stream, &args);
         if (!own.check) return;
         const Cap = struct {
             g: Glue,
