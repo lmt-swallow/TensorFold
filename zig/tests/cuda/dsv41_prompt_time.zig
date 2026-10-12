@@ -9,6 +9,7 @@
 //! are byte-equal between them (PASS/FAIL): the prompt path's rows do not depend on how the prompt is chunked.
 //! TF_DS_FIXTURE_CONE=1 compares cold full/cone state instead of timing. TF_DS_FIXTURE_TP2=1 uses real NCCL
 //! gathers and requires explicit TF_TP_MASTER/TF_TP_PORT; launch both ranks with identical arguments except rank.
+//! TF_DS_FIXTURE_DSPARK=1 additionally checks the original per-chunk absorption and final draft rings.
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
@@ -96,9 +97,6 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
     defer if (eng) |e| e.deinit();
     const chunk: usize = if (getenv("TF_DS_PREFILL_CHUNK")) |v| try std.fmt.parseInt(usize, v, 10) else L.default_chunk;
     const other: ?usize = if (getenv("TF_DS_COMPARE_CHUNK")) |v| try std.fmt.parseInt(usize, v, 10) else null;
-    var seq = try L.Sequence.init(gpa, gpu.d, &fwd, &kernels, eng, @max(chunk, other orelse 0), stream, null);
-    defer seq.deinit(gpa);
-    if (!std.mem.eql(u8, getenv("TF_DS_PROFILE") orelse "1", "0")) try seq.pr.enableProfile();
     const replay = std.mem.eql(u8, getenv("TF_DS_REPLAY") orelse "0", "1");
     const tp2 = std.mem.eql(u8, getenv("TF_DS_FIXTURE_TP2") orelse "0", "1");
     var comm: ?cuda.comm.Comm = null;
@@ -112,6 +110,28 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
         const port = try std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse return error.BadConeFixture, 10);
         comm = try cuda.comm.Comm.init(@intCast(rank), world, master, port, 60000);
     }
+    const with_spark = std.mem.eql(u8, getenv("TF_DS_FIXTURE_DSPARK") orelse "0", "1");
+    if (with_spark) {
+        if (!tp2 or cfg.nextn != 3 or cfg.dspark_taps.len != 3) return error.BadConeFixture;
+        for (cfg.dspark_taps.slice(), 0..) |tap, i| if (tap != 37 + @as(i64, @intCast(i))) return error.BadConeFixture;
+    }
+    var ds: ?dsv41.weights.DSpark = null;
+    defer if (ds) |*v| v.deinit(gpa);
+    var stages: []dsv41.dspark.Stage = &.{};
+    defer if (stages.len > 0) gpa.free(stages);
+    var spark: ?*dsv41.dspark.Drafter = null;
+    defer if (spark) |v| v.deinit();
+    if (with_spark) {
+        ds = try dsv41.weights.loadDSpark(gpa, gpu.d, &cfg, &rc, &kernels, rank, world, .mul1);
+        stages = try gpa.alloc(dsv41.dspark.Stage, ds.?.blocks.len);
+        for (stages, ds.?.blocks) |*stage, *block| stage.* = dsv41.dspark.Stage.of(block);
+        const dims = dsv41.dspark.dimsOf(&cfg, rank, world);
+        spark = try dsv41.dspark.Drafter.init(gpa, gpu.d, dims, &set, &glue, &ek, stages, dsv41.dspark.headOf(&ds.?, &w.head), &comm.?);
+        try spark.?.enableWide(&kernels);
+    }
+    var seq = try L.Sequence.init(gpa, gpu.d, &fwd, &kernels, eng, @max(chunk, other orelse 0), stream, spark);
+    defer seq.deinit(gpa);
+    if (!std.mem.eql(u8, getenv("TF_DS_PROFILE") orelse "1", "0")) try seq.pr.enableProfile();
     const gather: dsv41.forward.Gather = if (comm) |*c| .{ .ctx = c, .call = tpGather } else .{ .ctx = &seq, .call = selfGather };
     const ids = try gpa.alloc(i64, tokens);
     defer gpa.free(ids);
@@ -123,7 +143,7 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
         }
         if (replay or chunk != L.default_chunk or other != null or runs != 1 or
             cfg.n_layers != 40 or w.layers.len != 40 or cfg.window != 128 or
-            seq.spark != null or seq.pr.pk.gu != .mmb or seq.pr.pk.down != .rowscp or
+            seq.pr.pk.gu != .mmb or seq.pr.pk.down != .rowscp or
             !std.mem.eql(u8, getenv("TF_DS_KEEP") orelse "0", "0")) return error.BadConeFixture;
         for (20..40) |li| {
             if (cfg.ratio(li) != 1 or (li > 20 and cfg.isKvSource(li)) or cfg.isEngram(li)) return error.BadConeFixture;
@@ -214,7 +234,7 @@ fn digests(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequen
 }
 
 /// Compare actual cache/logit bytes under selfGather or opt-in real TP2 NCCL. This tests the suffix property,
-/// not DSpark, pool extents, kept prefixes, future decode, or independent Python-reference parity.
+/// Optional DSpark checks absorbed rings and valid last-absorb inputs; no pool/KEEP/future-decode/Python parity.
 fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, chunk: usize, stream: cuda.Stream, tp2: bool) !void {
     const halo: usize = 144 + 20 * 127;
     const cut = (ids.len -| halo) / chunk * chunk;
@@ -227,20 +247,32 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
         want.deinit(gpu.gpa);
     }
     try clearConeCaches(fwd, stream);
+    try clearDraftCaches(seq, stream);
     try seq.prefill(gather, ids, chunk, false);
     try stream.synchronize();
-    const baseline_meta = .{ seq.pos, seq.held, seq.verify_rows, seq.verify_start, seq.tap_rows };
+    const baseline_meta = .{ seq.pos, seq.held, seq.verify_rows, seq.verify_start, seq.tap_rows, if (seq.dc) |c| c.absorbed else 0 };
     try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = seq.logits, .len = fwd.cfg.vocab * 4 });
     for (fwd.rings) |r| try buffers.append(gpu.gpa, r);
     for (fwd.planes) |pl| if (pl) |x| {
         inline for (plane_fields) |f| try buffers.append(gpu.gpa, @field(x, f));
     };
+    if (seq.dc) |c| {
+        for (c.rings) |ring| try buffers.append(gpu.gpa, ring);
+        const tail = ids.len % chunk;
+        const valid = @min(if (tail == 0) chunk else tail, 144);
+        const cols = fwd.cfg.dspark_taps.len * fwd.cfg.dim;
+        try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = seq.taps.ptr + ((if (tail == 0) chunk else tail) - valid) * cols * 2, .len = valid * cols * 2 });
+        const sp = seq.spark.?;
+        inline for (.{ "main_x", "main_y" }) |field| try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = @field(sp, field).ptr, .len = valid * fwd.cfg.dim * 2 });
+        inline for (.{ "abs_pos", "abs_slots" }) |field| try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = @field(sp, field).ptr, .len = valid * 8 });
+    }
     for (buffers.items) |buffer| {
         const bytes = try check.download(gpu, buffer);
         errdefer gpu.gpa.free(bytes);
         try want.append(gpu.gpa, bytes);
     }
     try clearConeCaches(fwd, stream);
+    try clearDraftCaches(seq, stream);
     try prefillCone(seq, gather, ids, chunk, cut);
     try stream.synchronize();
     // The head may use a different scratch address after the second pass.
@@ -250,13 +282,14 @@ fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Se
         defer gpu.gpa.free(got);
         var label: [96]u8 = undefined;
         var name: [64]u8 = undefined;
-        try check.sameBytes(try std.fmt.bufPrint(&label, "cone {s}", .{digestName(fwd, i, &name)}), got, expected);
+        try check.sameBytes(try std.fmt.bufPrint(&label, "cone buffer {d} ({s})", .{ i, digestName(fwd, i, &name) }), got, expected);
     }
-    const cone_meta = .{ seq.pos, seq.held, seq.verify_rows, seq.verify_start, seq.tap_rows };
+    const cone_meta = .{ seq.pos, seq.held, seq.verify_rows, seq.verify_start, seq.tap_rows, if (seq.dc) |c| c.absorbed else 0 };
     inline for (baseline_meta, cone_meta) |expected, actual| try check.expect(expected == actual, "cone sequence metadata", .{});
     try check.expect(seq.pos == ids.len, "cone position", .{});
+    if (seq.dc) |c| try check.expect(c.absorbed == ids.len, "cone absorbed position", .{});
     for (seq.hist[0..ids.len], ids) |got, expected| try check.expect(got == expected, "cone history", .{});
-    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; {s}, Engram={s}, no DSpark/KEEP/Python parity", .{ ids.len, cut, halo, chunk, if (tp2) "real TP2 NCCL" else "selfGather", if (seq.engram != null) "on" else "off" });
+    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; {s}, Engram={s}, DSpark={s}; no KEEP/futuredecode/Python parity", .{ ids.len, cut, halo, chunk, if (tp2) "real TP2 NCCL" else "selfGather", if (seq.engram != null) "on" else "off", if (seq.spark != null) "on" else "off" });
 }
 
 fn clearConeCaches(fwd: *dsv41.forward.Forward, stream: cuda.Stream) !void {
@@ -274,6 +307,7 @@ fn prefillCone(seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, i
     seq.held = 0;
     seq.verify_rows = 0;
     for (seq.hist[0..ids.len], ids) |*hv, id| hv.* = @intCast(id);
+    if (seq.dc) |*c| c.absorbed = 0;
     if (seq.engram) |g| {
         g.history = seq.hist[0..ids.len];
         try g.resetAhead();
@@ -284,14 +318,56 @@ fn prefillCone(seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, i
         const end = @min(ids.len, start + chunk);
         const last = end == ids.len;
         if (seq.engram) |g| if (!last) try g.prefetch(seq.hist[0..ids.len], end, @min(chunk, ids.len - end));
-        const out = try seq.pr.chunk(gather, ids[start..end], start, .{
-            .replay = cut,
-            .logits = last or end - start <= dsv41.serve_lanes.max_rows,
-        }, seq.stream);
+        var top: [2]usize = .{ start, end - start };
+        const out = if (seq.spark != null and end - start <= dsv41.serve_lanes.max_rows and cut <= start)
+            try coneRowsTapped(seq, gather, ids[start..end], start)
+        else blk: {
+            const out = try seq.pr.chunk(gather, ids[start..end], start, .{
+                .replay = cut,
+                .logits = last or end - start <= dsv41.serve_lanes.max_rows,
+                .taps = if (seq.spark != null) .{ .buf = seq.taps.ptr, .stride = seq.fwd.cfg.dspark_taps.len * seq.fwd.cfg.dim } else null,
+            }, seq.stream);
+            top = .{ seq.pr.top_start, seq.pr.top_rows };
+            break :blk out;
+        };
+        if (seq.spark) |sp| if (top[1] > 0) {
+            const rope = if (seq.fwd.cfg.ratio(seq.fwd.cfg.n_layers) > 0) seq.fwd.rope_c else seq.fwd.rope_w;
+            try sp.absorb(&seq.dc.?, seq.taps.ptr, top[0], top[1], rope, seq.stream);
+        };
         if (last) seq.logits = out orelse return error.BadConeFixture;
         start = end;
     }
     seq.pos = ids.len;
+}
+
+fn clearDraftCaches(seq: *dsv41.serve_lanes.Sequence, stream: cuda.Stream) !void {
+    if (seq.dc) |*c| {
+        for (c.rings) |ring| try ring.fill8(0, stream.handle);
+        c.absorbed = 0;
+        try seq.taps.fill8(0, stream.handle);
+    }
+}
+
+// The fixture's small tail uses the same Forward.rows/tap ordering as Sequence.prefill.
+fn coneRowsTapped(seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, start: usize) !Ptr {
+    const previous = seq.fwd.probe;
+    if (previous != null) return error.BadConeFixture;
+    seq.tap_rows = ids.len;
+    seq.fwd.probe = .{ .ctx = seq, .call = coneTapProbe };
+    defer seq.fwd.probe = previous;
+    return seq.fwd.rows(gather, ids, start, ids.len, false, seq.stream);
+}
+
+fn coneTapProbe(ctx: *anyopaque, name: []const u8, ptr: Ptr, _: usize, stream: cuda.Stream) anyerror!void {
+    const seq: *dsv41.serve_lanes.Sequence = @ptrCast(@alignCast(ctx));
+    if (name.len < 2 or name[0] != 'L') return;
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return;
+    if (!std.mem.eql(u8, name[dot + 1 ..], "h_moe")) return;
+    const li = (std.fmt.parseInt(usize, name[1..dot], 10) catch return) + 1;
+    // The cone guard excludes upper Engram gates, so h_moe is the tap-layer input.
+    const cfg = seq.fwd.cfg;
+    const col = cfg.dspark_taps.indexOf(@intCast(li)) orelse return;
+    try seq.fwd.hc.tap(stream, ptr, seq.taps.ptr + col * cfg.dim * 2, @intCast(cfg.dspark_taps.len * cfg.dim), @intCast(seq.tap_rows));
 }
 
 fn digest(gpu: Gpu, b: cuda.DeviceBuffer) !u64 {
