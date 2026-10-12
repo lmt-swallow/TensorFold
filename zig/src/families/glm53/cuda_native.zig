@@ -307,6 +307,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // NCCL_RUNTIME_CONNECT=0 it does so here, so a served process's memory stops growing once it has loaded (NCCL reads
     // its variables when the communicator is created; a value already set is kept)
     _ = setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    // four channels: at 1M x 4 with FP8 KV the communicator took 2.23 GiB a rank with NCCL's own choice and 0.50
+    // with 4, while code decoded at 31.2 tok/s against 30.6 and a 32k prompt filled at 1,518 tok/s against 1,476
+    _ = setenv("NCCL_MAX_NCHANNELS", "4", 0);
     // each rank loads on its own; the ranks meet here
     own.comm = try cuda.comm.Comm.init(rank, world, master, port, 1_800_000);
     errdefer own.comm.deinit();
