@@ -121,6 +121,10 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     try fields.probabilityOptions(cx, body);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
+    if (body.get("return_token_ids")) |value| {
+        if (value != .bool) return cx.refuse("return_token_ids must be a boolean");
+        input.return_token_ids = value.bool;
+    }
     if (is_chat) {
         input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));

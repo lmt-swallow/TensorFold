@@ -22,6 +22,7 @@ const Stay = struct {
 };
 
 const Text = struct {
+    end_ids: []const u32 = &.{},
     fn text(t: *@This()) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
     }
@@ -50,8 +51,9 @@ const Text = struct {
         return 256;
     }
 
-    fn eosIds(_: *anyopaque) []const u32 {
-        return &.{};
+    fn eosIds(ctx: *anyopaque) []const u32 {
+        const t: *Text = @ptrCast(@alignCast(ctx));
+        return t.end_ids;
     }
 
     fn render(_: *anyopaque, a: Allocator, messages: Value, options: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
@@ -74,6 +76,7 @@ const Text = struct {
 };
 
 const Eng = struct {
+    reply_tokens: []const u32 = &.{ 'O', 'K' },
     window: u32,
     prompts: std.ArrayList([]u8) = .empty,
     opened: bool = false,
@@ -96,7 +99,7 @@ const Eng = struct {
         e.prompts.append(gpa, buf) catch {};
         if (e.opened) e.late += 1 else e.early += 1;
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
-        sink.event(sink.ctx, id, &.{ .tokens = &.{ 'O', 'K' } });
+        sink.event(sink.ctx, id, &.{ .tokens = e.reply_tokens });
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
     }
 
@@ -404,6 +407,8 @@ test "an incremental request summarizes only the new middle and a user edit is t
 }
 
 const Watch = struct {
+    status: u16 = 0,
+    runtime: ?Value = null,
     eng: *Eng,
     opened: bool = false,
     saw: bool = false,
@@ -422,13 +427,16 @@ const Watch = struct {
         const w: *Watch = @ptrCast(@alignCast(ctx));
         const p = payload orelse return;
         if (p.get("tensorfold")) |t| {
+            w.runtime = t;
             if (t.get("compaction") != null) w.saw = true;
         }
     }
 
-    fn reply(ctx: *anyopaque, _: u16, payload: Value) void {
+    fn reply(ctx: *anyopaque, status: u16, payload: Value) void {
         const w: *Watch = @ptrCast(@alignCast(ctx));
+        w.status = status;
         if (payload.get("tensorfold")) |t| {
+            w.runtime = t;
             if (t.get("compaction") != null) w.saw = true;
         }
     }
@@ -453,4 +461,56 @@ test "a stream compacts before it opens" {
     try std.testing.expect(watch.saw);
     try std.testing.expect(eng.early >= 1);
     try std.testing.expect(eng.late >= 1);
+}
+
+test "generated token IDs are opt-in and include a terminating EOS in JSON and SSE" {
+    for ([_]bool{ false, true }) |stream| for ([_][]const u8{ "", ",\"return_token_ids\":false", ",\"return_token_ids\":true" }, 0..) |option, index| {
+        var eng: Eng = .{ .window = 1000, .reply_tokens = &.{ 'O', 'K', '!' } };
+        var text: Text = .{ .end_ids = &.{'!'} };
+        defer freePrompts(&eng);
+        const srv = try start(&eng, &text, null, null, null);
+        defer srv.deinit();
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"stream\":{},\"max_tokens\":32,\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]{s}}}", .{ stream, option });
+        var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+        var watch: Watch = .{ .eng = &eng };
+        openai.run(srv, a, watch.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
+        const runtime = watch.runtime orelse return error.MissingRuntime;
+        const returned = runtime.get("token_ids");
+        if (index == 2) {
+            try std.testing.expectEqual(@as(usize, 3), returned.?.array.len);
+            for (eng.reply_tokens, returned.?.array) |want, got| try std.testing.expectEqual(@as(i64, want), got.int64().?);
+            try std.testing.expectEqualStrings(&chat.tokenSha(eng.reply_tokens), runtime.get("token_sha").?.string);
+        } else try std.testing.expect(returned == null);
+        try std.testing.expectEqual(@as(usize, 1), eng.prompts.items.len);
+    };
+}
+
+test "token ID requests enforce boolean and generation bounds before submit" {
+    const cases = [_]struct { option: []const u8, max: usize, status: u16 }{
+        .{ .option = "\"true\"", .max = 32, .status = 400 },
+        .{ .option = "null", .max = 32, .status = 400 },
+        .{ .option = "1", .max = 32, .status = 400 },
+        .{ .option = "true", .max = 65_537, .status = 400 },
+        .{ .option = "true", .max = 65_536, .status = 200 },
+        .{ .option = "false", .max = 65_537, .status = 200 },
+    };
+    for (cases) |case| {
+        var eng: Eng = .{ .window = 100000 };
+        var text: Text = .{};
+        defer freePrompts(&eng);
+        const srv = try start(&eng, &text, null, null, null);
+        defer srv.deinit();
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"return_token_ids\":{s},\"max_tokens\":{d},\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}", .{ case.option, case.max });
+        var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+        var watch: Watch = .{ .eng = &eng };
+        openai.run(srv, a, watch.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
+        try std.testing.expectEqual(case.status, watch.status);
+        try std.testing.expectEqual(@as(usize, if (case.status == 200) 1 else 0), eng.prompts.items.len);
+    }
 }

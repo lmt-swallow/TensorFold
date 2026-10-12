@@ -25,6 +25,8 @@ pub const Input = struct {
     tools: []const Value = &.{},
     prompt: ?Prompt = null,
     max_tokens: ?i64 = null,
+    /// Include the collected generated IDs, including a terminating EOS, in runtime.token_ids. At most 65,536.
+    return_token_ids: bool = false,
     temperature: f64 = 0,
     /// The sampling fields: the request's own (``k in body``), its thinking switches and ``tool_call_required``.
     fields: Value,
@@ -161,6 +163,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
         limit = @min(limit, room);
     }
+    if (input.return_token_ids and limit > 65_536) return cx.refuse("return_token_ids requires max_tokens at most 65536");
     const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
@@ -232,7 +235,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .return_token_ids = input.return_token_ids };
     defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -307,6 +310,7 @@ const Generation = struct {
     stops: reply_text.Stops,
     ignore_eos: bool,
     max_tokens: u32,
+    return_token_ids: bool = false,
     tools: []const Value,
     calls: ?tool_stream.Streamer = null,
     collected: std.ArrayList(u32) = .empty,
@@ -518,6 +522,11 @@ const Generation = struct {
         try runtime.put(a, "drafts", .{ .bool = drafts });
         const sha = tokenSha(g.collected.items);
         try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
+        if (g.return_token_ids) {
+            const returned = try a.alloc(Value, g.collected.items.len);
+            for (g.collected.items, returned) |token, *value| value.* = try json.intValue(a, token);
+            try runtime.put(a, "token_ids", .{ .array = returned });
+        }
         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
         if (m.stats.loop_period) |period| {
             const loop_field = try json.newObject(a);
