@@ -172,17 +172,30 @@ const Phases = struct {
     last: usize,
     last_avail: usize,
 
-    fn available(p: *const Phases) usize {
-        const text = std.Io.Dir.cwd().readFileAlloc(p.io, "/proc/meminfo", p.gpa, .limited(1 << 16)) catch return 0;
+    /// Field `key` (a "Name:" line in kB) of `path`, in bytes; 0 when unreadable.
+    fn kb(p: *const Phases, path: []const u8, key: []const u8) usize {
+        const text = std.Io.Dir.cwd().readFileAlloc(p.io, path, p.gpa, .limited(1 << 16)) catch return 0;
         defer p.gpa.free(text);
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
-            if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
-            var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
-            const kb = std.fmt.parseInt(usize, f.next() orelse return 0, 10) catch return 0;
-            return kb * 1024;
+            if (!std.mem.startsWith(u8, line, key) or line.len <= key.len or line[key.len] != ':') continue;
+            var f = std.mem.tokenizeAny(u8, line[key.len + 1 ..], " \t");
+            const n = std.fmt.parseInt(usize, f.next() orelse return 0, 10) catch return 0;
+            return n * 1024;
         }
         return 0;
+    }
+
+    fn available(p: *const Phases) usize {
+        return p.kb("/proc/meminfo", "MemAvailable");
+    }
+
+    /// The process's host side: its resident set, its locked (pinned) pages, and the system's mapped and locked pages.
+    fn host(p: *const Phases, name: []const u8) void {
+        std.log.info("glm53 rank {d} memory: {s}: process VmRSS {d:.2} GiB, VmLck {d:.2}, VmPin {d:.2}; system Mapped {d:.2}, Mlocked {d:.2}, Shmem {d:.2}", .{
+            p.rank,                                         name,                                          inGib(p.kb("/proc/self/status", "VmRSS")), inGib(p.kb("/proc/self/status", "VmLck")),
+            inGib(p.kb("/proc/self/status", "VmPin")),      inGib(p.kb("/proc/meminfo", "Mapped")),        inGib(p.kb("/proc/meminfo", "Mlocked")),   inGib(p.kb("/proc/meminfo", "Shmem")),
+        });
     }
 
     fn init(ctx: *const cuda.Context, io: std.Io, gpa: std.mem.Allocator, rank: usize) Phases {
@@ -191,6 +204,7 @@ const Phases = struct {
         const m = ctx.memInfo() catch return p;
         p.last = m.free;
         std.log.info("glm53 rank {d} memory: at start MemAvailable {d:.2} GiB, device free {d:.2} of {d:.2}", .{ rank, inGib(p.last_avail), inGib(m.free), inGib(m.total) });
+        p.host("at start");
         return p;
     }
 
@@ -205,6 +219,7 @@ const Phases = struct {
         });
         p.last = m.free;
         p.last_avail = avail;
+        p.host(name);
     }
 };
 
