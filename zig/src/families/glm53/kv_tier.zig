@@ -57,6 +57,10 @@ pub const Options = struct {
     /// Keep each slot's last `trace_depth` events (what put bytes in it, for which pool, in which window): a
     /// mismatch then names its history (`history`). Off in serving.
     trace: bool = false,
+    /// Committed pools a stream lets accumulate before writing them out together (one slab gather and one wait
+    /// for the drive instead of one a stretch); 0 writes at every commit. Pools waiting are resident and only
+    /// written ones are evicted, so a slab that runs short writes every stream's out first.
+    commit_batch: usize = 512,
     /// Windows a selected pool stays out of the first eviction pass.
     hot_windows: u32 = 2,
     /// Reads and writes in flight at most a lane (Linux AIO), and lanes (threads) a large batch spreads over.
@@ -149,6 +153,8 @@ pub const Tier = struct {
     io: Io,
     trace_ev: []Ev = &.{}, // [slots * trace_depth], a ring a slot (Options.trace)
     reads: u64 = 0, // pools read from the file so far (statistics)
+    flushing: bool = false, // allocLoose is writing waiting pools out
+    write_calls: u64 = 0, // slab gets and file write waits a commit made (statistics: each is a device round trip)
     writes: u64 = 0,
 
     const Stream = struct {
@@ -194,6 +200,8 @@ pub const Tier = struct {
         t.gen = 1;
         t.reads = 0;
         t.writes = 0;
+        t.write_calls = 0;
+        t.flushing = false;
         @memset(map, -1);
         t.runs = try gpa.alloc(Run, nslots / run_pools);
         errdefer gpa.free(t.runs);
@@ -589,36 +597,79 @@ pub const Tier = struct {
         const st = &t.streams[s];
         if (!st.open) return error.NotOpen;
         try t.flushReads();
-        const hi = pos / pool_rows;
-        if (hi > st.dirty_lo) {
-            for (0..st.layers) |l| {
-                const k0 = t.mapBase(s, l);
-                var p = st.dirty_lo;
-                while (p < hi) {
-                    if (st.parent != null and p >= home_pools and p < st.fork_pool) {
-                        p = st.fork_pool; // the parent's pools
-                        continue;
-                    }
-                    const k: u32 = @intCast(k0 + p);
-                    if (t.persisted.isSet(k)) {
-                        p += 1;
-                        continue;
-                    }
-                    const slot = t.map[k];
-                    if (slot < 0) return error.NotPersisted; // a pool never written: nothing to commit
-                    // a stretch contiguous in the slab and the file
-                    var n: usize = 1;
-                    while (p + n < hi and !t.persisted.isSet(k + n) and t.map[k + n] == slot + @as(i32, @intCast(n))) n += 1;
-                    for (0..n) |i| t.note(@as(usize, @intCast(slot)) + i, .file_write, @intCast(k + i));
-                    try t.writeSlots(@intCast(slot), n, fileOffset(k));
-                    for (0..n) |i| t.persisted.set(k + i);
-                    t.writes += n;
-                    p += n;
+        const writes = t.commitWrites(s, pos);
+        st.committed = @max(st.committed, pos);
+        if (writes) try t.writeOut(s);
+        try t.flushReads();
+    }
+
+    /// Whether commit(s, pos) would write pools out now (cuda_tier then waits for the stream first: the pools'
+    /// latent writes must have landed).
+    pub fn commitWrites(t: *const Tier, s: usize, pos: usize) bool {
+        const st = &t.streams[s];
+        const hi = @max(st.committed, pos) / pool_rows;
+        return hi > st.dirty_lo and (hi - st.dirty_lo) * st.layers >= t.o.commit_batch;
+    }
+
+    /// Every whole committed pool of stream `s` not on the file yet, written: gathered from the slab a stage at a
+    /// time, contiguous file blocks one write each, one wait for the drive a stage.
+    fn writeOut(t: *Tier, s: usize) Error!void {
+        const st = &t.streams[s];
+        const hi = st.committed / pool_rows;
+        if (hi <= st.dirty_lo) return;
+        var ids: [stage_blocks]u32 = undefined;
+        var keys: [stage_blocks]u32 = undefined;
+        var n: usize = 0;
+        for (0..st.layers) |l| {
+            const k0 = t.mapBase(s, l);
+            var p = st.dirty_lo;
+            while (p < hi) : (p += 1) {
+                if (st.parent != null and p >= home_pools and p < st.fork_pool) {
+                    p = st.fork_pool - 1; // the parent's pools
+                    continue;
+                }
+                const k: u32 = @intCast(k0 + p);
+                if (t.persisted.isSet(k)) continue;
+                const slot = t.map[k];
+                if (slot < 0) return error.NotPersisted; // a pool never written: nothing to commit
+                ids[n] = @intCast(slot);
+                keys[n] = k;
+                n += 1;
+                if (n == stage_blocks) {
+                    try t.writeStage(ids[0..n], keys[0..n]);
+                    n = 0;
                 }
             }
-            st.dirty_lo = hi;
         }
-        st.committed = @max(st.committed, pos);
+        if (n > 0) try t.writeStage(ids[0..n], keys[0..n]);
+        st.dirty_lo = hi;
+    }
+
+    /// Slots `ids` (pools `keys`) to the file: one gather into the write stage, a write a run of contiguous file
+    /// blocks, one wait; then the pools count as written (evictable).
+    fn writeStage(t: *Tier, ids: []const u32, keys: []const u32) Error!void {
+        try t.io.finish(); // the stage's previous writes left
+        t.slab.get(t.slab.ctx, ids, t.wr_stage[0 .. ids.len * block]) catch return error.SlabFailed;
+        var i: usize = 0;
+        while (i < ids.len) {
+            var m: usize = 1;
+            while (i + m < ids.len and keys[i + m] == keys[i] + m) m += 1;
+            try t.io.add(.write, t.wr_stage[i * block ..][0 .. m * block], fileOffset(keys[i]));
+            i += m;
+        }
+        try t.io.finish();
+        for (ids, keys) |slot, k| {
+            t.note(slot, .file_write, k);
+            t.persisted.set(k);
+        }
+        t.writes += ids.len;
+        t.write_calls += 1;
+    }
+
+    /// Every committed pool written to the file now (batched commits' waiting ones included).
+    pub fn flush(t: *Tier) Error!void {
+        try t.flushReads();
+        for (t.streams, 0..) |st, s| if (st.open) try t.writeOut(s);
         try t.flushReads();
     }
 
@@ -732,21 +783,6 @@ pub const Tier = struct {
             try t.readSlot(@intCast(sd), fileOffset(ks));
             t.reads += 1;
         } else return error.NotPersisted;
-    }
-
-    /// Slots slot .. slot + n - 1 to the file at `off`: through the write stage, a stage at a time.
-    fn writeSlots(t: *Tier, slot: u32, n: usize, off: u64) Error!void {
-        var done: usize = 0;
-        var ids: [stage_blocks]u32 = undefined;
-        while (done < n) {
-            const m: usize = @min(@as(usize, stage_blocks), n - done);
-            for (0..m) |i| ids[i] = slot + @as(u32, @intCast(done + i));
-            try t.io.finish(); // the stage's previous writes left
-            t.slab.get(t.slab.ctx, ids[0..m], t.wr_stage[0 .. m * block]) catch return error.SlabFailed;
-            try t.io.add(.write, t.wr_stage[0 .. m * block], off + done * block);
-            try t.io.finish();
-            done += m;
-        }
     }
 
     /// Positions from `pos` on are dropped (rejected drafts, a shortened prompt): the next window rewrites them.
@@ -939,6 +975,17 @@ pub const Tier = struct {
                 }
                 t.evict(slot);
                 return @intCast(slot);
+            }
+        }
+        // pools waiting for a batched commit are not evictable: write every stream's out and sweep once more
+        if (!t.flushing) {
+            var waiting = false;
+            for (t.streams) |st| waiting = waiting or (st.open and st.committed / pool_rows > st.dirty_lo);
+            if (waiting) {
+                t.flushing = true;
+                defer t.flushing = false;
+                for (t.streams, 0..) |st, x| if (st.open) try t.writeOut(x);
+                return t.allocLoose();
             }
         }
         return error.TierFull;
@@ -1368,7 +1415,7 @@ const Fixture = struct {
     /// pool's file block (an alias's rows below its fork are its parent's, checked there).
     fn verifyAll(f: *Fixture, s: usize) !void {
         const t = &f.tier;
-        var refs: [8][]const u8 = undefined;
+        var refs: [16][]const u8 = undefined;
         for (0..t.streams[s].layers) |l| refs[l] = f.ref[s * t.o.layers + l];
         if (try t.verify(s, refs[0..t.streams[s].layers], t.streams[s].committed)) |m| {
             std.debug.print("verify: stream {d} {any}\n", .{ s, m });
@@ -1712,6 +1759,43 @@ test "the backing file is the tier's alone and starts empty" {
     _ = std.c.close(fd);
     f.tier = try Tier.init(testing.allocator, f.host.slab(), f.map, f.path, o);
     try testing.expectEqual(@as(std.c.off_t, 0), std.c.lseek(f.tier.io.fd, 0, std.c.SEEK.END));
+}
+
+test "decode rounds' commits: pools written and device round trips a round" {
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = 2, .layers = 11, .capacity = 64 * seg_positions, .recent_runs = 4, .depth = 16 };
+    const f = try Fixture.init(o, 11 * 12 + 11 * 6, 14);
+    defer f.deinit();
+    const t = &f.tier;
+    try t.open(0, 11);
+    try t.open(1, 1); // the MTP head's stream
+    var pos: usize = 0;
+    while (pos < 8 * seg_positions) : (pos += seg_positions) {
+        try f.write(rnd, 0, pos, seg_positions);
+        try t.commit(0, pos + seg_positions);
+        try f.write(rnd, 1, pos, seg_positions);
+        try t.commit(1, pos + seg_positions);
+    }
+    const w0 = t.writes;
+    const c0 = t.write_calls;
+    const rounds = 400;
+    var mpos = pos;
+    for (0..rounds) |_| {
+        // a round: a window of 4 rows keeping 1 to 4 (2.84 on average in the reference), the head absorbing them
+        const R = 4;
+        const keep = 1 + rnd.uintLessThan(usize, R);
+        try f.write(rnd, 0, pos, R);
+        pos += keep;
+        t.rewind(0, pos);
+        try t.commit(0, pos);
+        try f.write(rnd, 1, mpos, keep);
+        mpos += keep;
+        try t.commit(1, mpos);
+    }
+    try t.flush();
+    for (0..2) |x| try f.verifyAll(x);
+    std.debug.print("\ncommit per decode round: {d:.1} pools written, {d:.2} device round trips (slab get + file write wait)\n", .{ @as(f64, @floatFromInt(t.writes - w0)) / rounds, @as(f64, @floatFromInt(t.write_calls - c0)) / rounds });
 }
 
 test "prefetchRange brings a layer's whole context back" {

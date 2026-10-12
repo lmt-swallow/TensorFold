@@ -309,11 +309,18 @@ pub const Tier = struct {
         return t.host.acquire(layers);
     }
 
-    /// kv_tier.Tier.commit after `stream` finished: the pools it writes to the file are read from the slab by the
-    /// drive's DMA, so every latent write queued before (on `stream`) must have landed first.
+    /// kv_tier.Tier.commit: the pools it writes out (every commit_batch of them) are gathered from the slab, so
+    /// every latent write queued before on `stream` must have landed first: the stream is waited for only then.
     pub fn commit(t: *Tier, s: usize, pos: usize, stream: cuda.Stream) !void {
-        try stream.synchronize();
+        // only a commit that writes pools out (kv_tier batches them) reads the slab: wait for the stream then
+        if (t.host.commitWrites(s, pos)) try stream.synchronize();
         try t.host.commit(s, pos);
+    }
+
+    /// Every committed pool written to the file now, after `stream` finished.
+    pub fn flush(t: *Tier, stream: cuda.Stream) !void {
+        try stream.synchronize();
+        try t.host.flush();
     }
 
     pub fn rewind(t: *Tier, s: usize, pos: usize) void {
