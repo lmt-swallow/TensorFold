@@ -104,6 +104,9 @@ pub const Lanes = struct {
     agree_recv: Buf,
     stepped: u64 = 0,
     broken: bool = false,
+    /// The records since the last agreement (`agreesNow` false ones fold in here and are agreed on with the next).
+    pending: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    pending_bad: bool = false,
 
     /// Lanes over `pool`, each stream at most `capacity` positions; every slot's sequence made now (its KDA states,
     /// rings and head buffers), so a stream waits for none.
@@ -253,9 +256,13 @@ pub const Lanes = struct {
 
     /// Every rank's digest of `op` must match (four 16-bit pieces of its sha256 as f32, one all-gather). A rank that
     /// cannot run `op` offers a digest no rank's matches, so every rank stops at the agreement.
-    fn agree(self: *Lanes, op: []const u8, can_run: bool) !void {
+    fn agree(self: *Lanes, op: []const u8, can_run_op: bool) !void {
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(op, &digest, .{});
+        self.pending.update(op);
+        self.pending.final(&digest);
+        self.pending = .init(.{});
+        const can_run = can_run_op and !self.pending_bad;
+        self.pending_bad = false;
         var mine: [4]f32 = undefined;
         for (&mine, 0..) |*m, i| m.* = @floatFromInt(std.mem.readInt(u16, digest[2 * i ..][0..2], .little));
         if (!can_run) mine[0] = -1;
@@ -276,11 +283,24 @@ pub const Lanes = struct {
 
     /// Rank 0 sends the step to rank 1, both agree on it, both run it. A failure breaks the lane (the follower
     /// would otherwise pair its next gather wrongly).
+    /// Whether the ranks agree on a record before its step runs (with the records folded in since): a verify, a prompt
+    /// part, the stop. The others (open, keep, draft, release) fold into the next agreement, so a decode round agrees
+    /// once. Records reach the followers byte for byte over the control link; what an agreement catches is a rank
+    /// that cannot run one (its state differs), and a draft's head steps before that agreement then pair their
+    /// gathers wrongly or wait: the lane is broken either way and both ranks restart.
+    fn agreesNow(op: []const u8) bool {
+        const code = std.enums.fromInt(Op, op[0]) orelse return true;
+        return switch (code) {
+            .open, .keep, .draft, .release => false,
+            .fill, .verify, .stop => true,
+        };
+    }
+
     fn both(self: *Lanes, op: []const u8) !void {
         if (self.broken) return error.OutOfStep;
         errdefer self.broken = true;
         for (1..self.lay.world) |peer| try self.comm.sendTo(@intCast(peer), op);
-        try self.agree(op, true);
+        if (agreesNow(op)) try self.agree(op, true) else self.pending.update(op);
         self.run(op) catch |e| {
             std.log.err("glm53 rank {d}: step {d} failed ({s}); restart both ranks", .{ self.lay.rank, self.stepped, @errorName(e) });
             return e;
@@ -300,7 +320,16 @@ pub const Lanes = struct {
             const code = std.enums.fromInt(Op, op[0]) orelse return error.OutOfStep;
             if (code == .stop) return;
             const ok = self.runnable(op);
-            try self.agree(op, ok);
+            if (agreesNow(op)) {
+                try self.agree(op, ok);
+            } else {
+                // agreed on with the next agreeing record; one this rank cannot run fails that agreement
+                self.pending.update(op);
+                if (!ok) {
+                    self.pending_bad = true;
+                    continue;
+                }
+            }
             self.run(op) catch |e| {
                 std.log.err("glm53 rank {d}: step {d} ({s}) failed ({s}); restart both ranks", .{ self.lay.rank, self.stepped, @tagName(code), @errorName(e) });
                 return e;
