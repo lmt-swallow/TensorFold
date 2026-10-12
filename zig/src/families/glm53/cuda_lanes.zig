@@ -114,6 +114,7 @@ pub const Lanes = struct {
     occupancy_event: u64 = 0,
     occupancy_trace: bool = false, // TF_GLM_OCCUPANCY_TRACE=1: host metadata at verify boundaries
     dflash: ?*DF = null,
+    dflash_backend_depth: bool = false,
     draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts by `absorb` and `chain`, one after another
     draft_log: bool = false, // TF_GLM_DRAFT_LOG=1: rank 0 logs every stream's drafts and their confidences
 
@@ -144,8 +145,12 @@ pub const Lanes = struct {
         const D = @import("dflash2.zig");
         const value = if (std.c.getenv("TF_GLM_DFLASH_POLICY")) |v| std.mem.span(v) else null;
         const policy = try D.Policy.parse(value);
+        const depth_value = if (std.c.getenv("TF_GLM_DFLASH_BACKEND_DEPTH")) |v| std.mem.span(v) else "0";
+        if (!std.mem.eql(u8, depth_value, "0") and !std.mem.eql(u8, depth_value, "1")) return error.BadDflashDepthSettings;
+        self.dflash_backend_depth = std.mem.eql(u8, depth_value, "1");
         self.dflash = try DF.init(self.gpa, io, self.r, &self.slots[0].seq.?, self.capacity, dir);
         self.dflash.?.session.policy = policy;
+        std.log.info("glm53 DFlash2 backend_depth={any}", .{self.dflash_backend_depth});
         std.log.info("glm53 DFlash2 policy={s} beta={d} confidence=0.3 block=8 max_drafts=7 streams=1", .{ policy.name(), policy.beta() });
     }
 
@@ -185,7 +190,7 @@ pub const Lanes = struct {
     /// table: the round loop keeps every draft it holds).
     pub fn facts(self: *const Lanes) lanes.Model {
         const rows = engine.batch_rows;
-        if (self.dflash != null) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = held_capacity, .draft_probabilities = false, .draft_streams = true, .hidden_rows = true, .max_streams = 1, .batch_rows = rows };
+        if (self.dflash != null) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = held_capacity, .backend_draft_depth = self.dflash_backend_depth, .draft_probabilities = false, .draft_streams = true, .hidden_rows = true, .max_streams = 1, .batch_rows = rows };
         if (!self.drafts) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
         return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
     }
@@ -290,6 +295,7 @@ pub const Lanes = struct {
         if (self.dflash) |df| {
             self.pending.update("glm53/dflash2/block8");
             self.pending.update(df.session.policy.name());
+            self.pending.update(if (self.dflash_backend_depth) "backend-depth" else "adaptive-depth");
         }
         var digest: [32]u8 = undefined;
         self.pending.update(op);
@@ -1035,10 +1041,14 @@ test "DFlash serving advertises one stream and declines MTP probability buffers"
     var self: Lanes = undefined;
     self.drafts = true;
     self.dflash = @ptrFromInt(@alignOf(DF));
+    self.dflash_backend_depth = false;
     const facts = self.facts();
     try std.testing.expectEqual(@as(u32, 1), facts.max_streams);
     try std.testing.expectEqual(@as(u32, 7), facts.drafts);
     try std.testing.expect(!facts.draft_probabilities);
+    try std.testing.expect(!facts.backend_draft_depth);
+    self.dflash_backend_depth = true;
+    try std.testing.expect(self.facts().backend_draft_depth);
     var stream: lanes.Stream = undefined;
     var probabilities = [_]f64{ -1, -1 };
     try std.testing.expect(!try Lanes.probabilitiesFn(&self, &stream, &probabilities));
