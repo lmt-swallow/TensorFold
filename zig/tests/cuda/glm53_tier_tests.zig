@@ -27,9 +27,22 @@ fn ms(t0: i96, io: std.Io) f64 {
     return @as(f64, @floatFromInt(now(io) - t0)) / 1e6;
 }
 
+var verify_calls: usize = 0;
+
+/// The next verifyAll checks whatever the interval.
+fn verifyNow() void {
+    verify_calls = verify_every - 1;
+}
+
+var verify_every: usize = 1;
+
 /// Every row stream `h` holds below `upto` (slab and file) against the whole cache `whole` (downloaded to `host`):
 /// the full-slab check after each window, so a PASS means every row was compared, not the sampled ones.
 fn verifyAll(tier: *glm.tier.Tier, h: usize, whole: *const Buf, host: []u8, upto: usize, rb: usize, what: []const u8, at: usize) !void {
+    // TF_TIER_VERIFY_EVERY=n: every n-th window only (the check's pause between windows can hide a race); each
+    // phase still ends with a check (`verifyNow`)
+    verify_calls += 1;
+    if (verify_calls % verify_every != 0) return;
     try whole.download(0, host[0 .. upto * rb]);
     const refs = [_][]const u8{host[0 .. upto * rb]};
     if (try tier.host.verify(h, &refs, upto)) |m| {
@@ -118,6 +131,7 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     const rb = lw * 2;
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(cfg.qk_dim), -0.5));
     const N = if (positions_arg) |a| try std.fmt.parseInt(usize, a, 10) else 262_144;
+    verify_every = if (std.c.getenv("TF_TIER_VERIFY_EVERY")) |e| try std.fmt.parseInt(usize, std.mem.span(e), 10) else 1;
     if (N % kv.seg_positions != 0) return error.BadShape;
     var set = try cuda.aot.Set.load(gpa, io, d, gpu.ctx.device, aot_dir);
     defer set.deinit();
@@ -263,6 +277,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         try stream.synchronize();
         try verifyAll(tier, 0, &whole, whole_host, pos, rb, "a decode window", pos);
     }
+    verifyNow();
+    try verifyAll(tier, 0, &whole, whole_host, pos, rb, "the decode windows", pos);
     check.pass("glm53-tier: {d} decode windows (1, 3, 16 rows) over {d} positions: the slab's sparse attention equals the whole cache's byte for byte; resolve {d:.2} ms a window, kernel {d:.3} ms (slab) vs {d:.3} ms (device)", .{ checked, pos, resolve_ms / @as(f64, @floatFromInt(resolves)), t_slab / @as(f64, @floatFromInt(checked)), t_whole / @as(f64, @floatFromInt(checked)) });
 
     // a prompt block: 64 rows, one-pass kernel
@@ -342,6 +358,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
             try tier.commit(b, bpos, stream);
             try verifyAll(tier, b, &whole_b, whole_host, bpos, rb, "an alias's window", bpos);
         }
+        verifyNow();
+        try verifyAll(tier, b, &whole_b, whole_host, bpos, rb, "the alias's windows", bpos);
         tier.close(0); // the parent let go while its alias reads through it
         selection(rnd, bpos - 1, 1, tokens, counts, seen, &stamp);
         try tok_a.upload(0, std.mem.sliceAsBytes(tokens[0..W]));
