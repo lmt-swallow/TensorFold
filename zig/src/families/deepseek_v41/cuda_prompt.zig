@@ -1970,7 +1970,7 @@ pub const Prompt = struct {
                     aot.ci("KEYS", @intFromBool(keyed)),  aot.ci("HAS_TMAX", @intFromBool(keyed)), aot.ci("SKIP_DEAD", 1), aot.ci("DEAD_PAD", 0),
                 });
             } else if (fast and !self.ix.check) {
-                try self.indexScoreMma(li, q, wt, vr, rows, n_comp_end, nt, keyed, stream);
+                try self.indexScoreMma(li, q, wt, vr, rows, n_comp_end, nt, keyed, false, stream);
             } else {
                 try fwd.set.run(stream, "_index_score_rows", .{ @intCast((rows + 7) / 8), @intCast(nt), 1 }, &.{
                     aot.ptr("Q", "*bf16", q),                     aot.ptr("K", "*u8", caches.idxk_codes.ptr),
@@ -2027,7 +2027,7 @@ pub const Prompt = struct {
 
     /// `_index_score_rows` on the row block at `q` through index_score.cu: scores or keys into `score`,
     /// from the layer's packed index keys; CHECK also needs tile maxima for reference comparison.
-    fn indexScoreMma(self: *Prompt, li: usize, q: Ptr, wt: Ptr, vr: Ptr, rows: usize, n: usize, nt: usize, keyed: bool, stream: cuda.Stream) !void {
+    fn indexScoreMma(self: *Prompt, li: usize, q: Ptr, wt: Ptr, vr: Ptr, rows: usize, n: usize, nt: usize, keyed: bool, tile_max: bool, stream: cuda.Stream) !void {
         const caches = self.fwd.cachesOf(li);
         const tiles = @max(1, self.ix.tiles);
         const rb = self.ix.rb;
@@ -2044,7 +2044,7 @@ pub const Prompt = struct {
         a.add(@as(c_int, @intCast(nt)));
         a.add(@as(c_int, @intCast(tiles)));
         // Prompt selection consumes keys only; CHECK compares the captured tile maxima as well.
-        if (keyed) a.add(@as(c_int, @intFromBool(self.ix.check)));
+        if (keyed) a.add(@as(c_int, @intFromBool(tile_max)));
         const grid: cuda.launch.Dim3 = .{ .x = @intCast((rows + rb - 1) / rb), .y = @intCast((nt + tiles - 1) / tiles) };
         try cuda.launch.launch(if (keyed) self.ix.keys else self.ix.score, .{ .grid = grid, .block = .{ .x = @intCast(32 * rb) } }, stream, &a);
     }
@@ -2062,7 +2062,7 @@ pub const Prompt = struct {
         defer gpa.free(got);
         try self.score.download(0, want[0..sb]);
         if (keyed) try self.tmax.download(0, want[sb..]);
-        try self.indexScoreMma(li, q, wt, vr, rows, n, nt, keyed, stream);
+        try self.indexScoreMma(li, q, wt, vr, rows, n, nt, keyed, true, stream);
         try stream.synchronize();
         try self.score.download(0, got[0..sb]);
         if (keyed) try self.tmax.download(0, got[sb..]);
@@ -2073,6 +2073,18 @@ pub const Prompt = struct {
             return error.PromptKernelMismatch;
         }
         std.log.info("deepseek_v41: layer {d} indexer ({d} rows, {d} keys, keyed {}): byte-equal to _index_score_rows", .{ li, rows, n, keyed });
+        if (keyed) {
+            // Test the production no-maxima path against the same captured keys. Compare raw
+            // bytes after synchronization, without numeric tolerance or special-value normalization.
+            try self.indexScoreMma(li, q, wt, vr, rows, n, nt, true, false, stream);
+            try stream.synchronize();
+            try self.score.download(0, got[0..sb]);
+            if (!std.mem.eql(u8, want[0..sb], got[0..sb])) {
+                std.log.err("deepseek_v41: layer {d} indexer without tile maxima: keys differ from _index_score_rows", .{li});
+                return error.PromptKernelMismatch;
+            }
+            std.log.info("deepseek_v41: layer {d} indexer without tile maxima: all {d} key bytes equal to _index_score_rows", .{ li, sb });
+        }
     }
 
     /// cidx [n, n_idx] -> [n, n_pad] with -1 past n_idx (torch.nn.functional.pad): rows moved from the back, in place
