@@ -262,3 +262,27 @@ template __global__ void __launch_bounds__(1 * 4 * 32) tf_glm53_qmm::qmm_kernel<
     int, int, int, int, int, int);
 template __global__ void tf_glm53_qmm::reduce_kernel<false>(const float*, void*, long long, int);
 __device__ const unsigned long long tf_glm53_qmm_smem = tf_glm53_qmm::Tile<64, 16, 64, 1, 4, 4>::SMEM;
+
+// DFlash2 row-parallel projections retain FP32 partials until the rank-ordered gather.
+template __global__ void __launch_bounds__(1 * 4 * 32) tf_glm53_qmm::qmm_kernel<64, 16, 64, 1, 4, 4, true, false, false>(
+    const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, float*, int,
+    int, int, int, int, int, int);
+template __global__ void tf_glm53_qmm::reduce_kernel<true>(const float*, void*, long long, int);
+
+// DFlash2's _row: rank-ordered FP32 addition, then one BF16 conversion.
+extern "C" __global__ void tf_glm53_dflash_sum(const float* gathered, __nv_bfloat16* out, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = __float2bfloat16_rn(__fadd_rn(gathered[i], gathered[count + i]));
+}
+
+// PyTorch's DFlash2 rotary expression, with ordinary libdevice functions and explicit FP32 products.
+extern "C" __global__ void tf_glm53_dflash_rotary(float* cos_out, float* sin_out, int start, int rows, float theta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * 64) return;
+    const int d = i % 64;
+    const float exponent = __fmul_rn(static_cast<float>(d), 1.0f / 64.0f);
+    const float inv = __fdiv_rn(1.0f, powf(theta, exponent));
+    const float phase = __fmul_rn(static_cast<float>(start + i / 64), inv);
+    cos_out[i] = cosf(phase);
+    sin_out[i] = sinf(phase);
+}

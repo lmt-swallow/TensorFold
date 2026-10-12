@@ -28,6 +28,7 @@ pub const Model = struct {
     batch_rows: u32 = 0, // a shared forward's rows at most (0: 32)
     max_streams: u32 = 0, // a shared forward's streams at most (0: 32)
     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
+    backend_draft_depth: bool = false, // single-stream backend selects its own chain length within the requested cap
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     draft_slack: ?u32 = null, // drafts a stream offers in a shared round past its last grant (null: the rule's)
@@ -52,6 +53,7 @@ pub const Config = struct {
     batch_rows: u32,
     batch_streams: u32,
     node_probabilities: bool,
+    backend_draft_depth: bool = false,
     fill_lanes: u32 = 0, // rows a window may grow to with suffix-match branches (0: off; lanes/fill.zig)
     fill_match: u32 = 8, // context tokens a suffix-match branch must match (shorter ones are coincidental phrases)
     fill_floor: f64 = 0.35, // the share of grafted rows a stream must keep to go on reading its chain back every round
@@ -71,6 +73,7 @@ pub const Config = struct {
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+        if (m.backend_draft_depth and m.max_streams != 1) return error.BackendDepthRequiresSingleStream;
         if (max_rows < 1) return error.BadMaxRows;
         const width: u32 = @max(1, @min(@max(m.exact_width, 1), max_rows));
         const max_copy = width - 1;
@@ -114,6 +117,7 @@ pub const Config = struct {
             .batch_rows = batch_rows,
             .batch_streams = if (streams) (if (m.max_streams != 0) m.max_streams else 32) else 1,
             .node_probabilities = m.draft_probabilities,
+            .backend_draft_depth = m.backend_draft_depth,
             .draft_streams = m.draft_streams,
             .head_trees = m.head_trees,
             .depth_prior = depth_prior,
@@ -155,4 +159,14 @@ test "position costs reach the config from two or more timed positions" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), c.position_costs.extraMs(5120, 2), 1e-9);
     // rows past the timed widths extend to batch_rows: 4 rows cost 22 ms (= 4/2 * 11) and 28 ms
     try std.testing.expectApproxEqAbs(@as(f64, 6.0), c.position_costs.extraMs(9216, 4), 1e-9);
+}
+
+test "backend depth requires an explicit single stream and obeys draft caps" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.BackendDepthRequiresSingleStream, Config.init(gpa, .{ .backend_draft_depth = true }, 8, 7));
+    var c = try Config.init(gpa, .{ .backend_draft_depth = true, .max_streams = 1, .exact_width = 8, .drafts = 7 }, 4, 2);
+    defer c.deinit(gpa);
+    try std.testing.expect(c.backend_draft_depth);
+    try std.testing.expect(!c.node_probabilities);
+    try std.testing.expectEqual(@as(u32, 2), c.most_drafts);
 }

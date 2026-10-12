@@ -163,7 +163,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("dsv41", mods.dsv41);
     runner.addImport("qwen38fn", mods.qwen38fn);
     runner.addImport("glm53", mods.glm53);
-    b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+    const test_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
+    const test_install = b.addInstallArtifact(test_exe, .{});
+    b.getInstallStep().dependOn(&test_install.step);
+    b.step("cuda-test", "Build and install the CUDA fixture executable").dependOn(&test_install.step);
     // GLM-5.3-Flash's pack against the family's plan: headers only, no GPU (safe beside a serving rank)
     const glm53_validate = b.createModule(.{ .root_source_file = b.path("zig/tests/glm53/validate.zig"), .target = target, .optimize = optimize, .link_libc = true });
     glm53_validate.addImport("core", mods.core);

@@ -27,6 +27,7 @@ const keep = @import("cuda_keep.zig");
 const kb = keep.book;
 const Tr = @import("cuda_tier.zig");
 const RP = @import("round_profile.zig");
+const DF = @import("cuda_dflash_serving.zig").Serving;
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -43,6 +44,7 @@ pub const max_streams = 4;
 
 /// The MTP chain's drafts at most (decode.py DepthPolicy `fixed`).
 pub const depth = copy_drafts.depth_most;
+const held_capacity: usize = 7;
 
 /// Step opcodes; each record starts with one.
 pub const Op = enum(u8) { open = 1, fill = 2, verify = 3, keep = 4, draft = 5, release = 6, stop = 7 };
@@ -72,8 +74,8 @@ const Slot = struct {
     drafts: bool = false, // the stream drafts: its head absorbs the kept rows
     prompt_sha256: [32]u8 = @splat(0),
     sampled: [max_rows]u32 = undefined,
-    held: [depth]u32 = undefined,
-    probs: [depth]f64 = undefined,
+    held: [held_capacity]u32 = undefined,
+    probs: [held_capacity]f64 = undefined,
     nheld: usize = 0,
 };
 
@@ -111,6 +113,8 @@ pub const Lanes = struct {
     pending_bad: bool = false,
     occupancy_event: u64 = 0,
     occupancy_trace: bool = false, // TF_GLM_OCCUPANCY_TRACE=1: host metadata at verify boundaries
+    dflash: ?*DF = null,
+    dflash_backend_depth: bool = false,
     draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts by `absorb` and `chain`, one after another
     draft_log: bool = false, // TF_GLM_DRAFT_LOG=1: rank 0 logs every stream's drafts and their confidences
 
@@ -135,11 +139,27 @@ pub const Lanes = struct {
         return self;
     }
 
+    /// Initial DFlash serving has one stream and no kept-prefix snapshots. Default MTP behavior is unchanged.
+    pub fn enableDflash(self: *Lanes, io: std.Io, dir: []const u8) !void {
+        if (self.dflash != null or self.book.set.on or !self.drafts) return error.BadDflashServingSettings;
+        const D = @import("dflash2.zig");
+        const value = if (std.c.getenv("TF_GLM_DFLASH_POLICY")) |v| std.mem.span(v) else null;
+        const policy = try D.Policy.parse(value);
+        const depth_value = if (std.c.getenv("TF_GLM_DFLASH_BACKEND_DEPTH")) |v| std.mem.span(v) else "0";
+        if (!std.mem.eql(u8, depth_value, "0") and !std.mem.eql(u8, depth_value, "1")) return error.BadDflashDepthSettings;
+        self.dflash_backend_depth = std.mem.eql(u8, depth_value, "1");
+        self.dflash = try DF.init(self.gpa, io, self.r, &self.slots[0].seq.?, self.capacity, dir);
+        self.dflash.?.session.policy = policy;
+        std.log.info("glm53 DFlash2 backend_depth={any}", .{self.dflash_backend_depth});
+        std.log.info("glm53 DFlash2 policy={s} beta={d} confidence=0.3 block=8 max_drafts=7 streams=1", .{ policy.name(), policy.beta() });
+    }
+
     pub fn deinit(self: *Lanes) void {
         for (&self.slots) |*s| {
             self.clear(s);
             if (s.seq) |*q| q.deinit();
         }
+        if (self.dflash) |df| df.deinit();
         for (self.book.slice()) |k| self.gpa.free(k.ids);
         if (self.snaps) |*x| x.deinit();
         self.agree_send.free();
@@ -170,6 +190,7 @@ pub const Lanes = struct {
     /// table: the round loop keeps every draft it holds).
     pub fn facts(self: *const Lanes) lanes.Model {
         const rows = engine.batch_rows;
+        if (self.dflash != null) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = held_capacity, .backend_draft_depth = self.dflash_backend_depth, .draft_probabilities = false, .draft_streams = true, .hidden_rows = true, .max_streams = 1, .batch_rows = rows };
         if (!self.drafts) return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
         return .{ .exact_width = max_rows, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = depth, .draft_probabilities = true, .draft_streams = true, .hidden_rows = true, .max_streams = max_streams, .batch_rows = rows };
     }
@@ -185,6 +206,7 @@ pub const Lanes = struct {
     /// The slot free again: its extent back to the pool, its snapshots let go, its prompt freed; its sequence kept
     /// for the next stream.
     fn clear(self: *Lanes, s: *Slot) void {
+        if (s.busy) if (self.dflash) |df| df.closeStream();
         if (s.prompt) |p| self.gpa.free(p);
         if (s.seq) |*q| if (q.tier) |x| {
             q.tier_owed = .{ null, null };
@@ -269,6 +291,12 @@ pub const Lanes = struct {
     /// Every rank's digest of `op` must match (four 16-bit pieces of its sha256 as f32, one all-gather). A rank that
     /// cannot run `op` offers a digest no rank's matches, so every rank stops at the agreement.
     fn agree(self: *Lanes, op: []const u8, can_run_op: bool) !void {
+        // A mismatched drafter would issue a different sequence of collectives during the prompt pass.
+        if (self.dflash) |df| {
+            self.pending.update("glm53/dflash2/block8");
+            self.pending.update(df.session.policy.name());
+            self.pending.update(if (self.dflash_backend_depth) "backend-depth" else "adaptive-depth");
+        }
         var digest: [32]u8 = undefined;
         self.pending.update(op);
         self.pending.final(&digest);
@@ -445,11 +473,11 @@ pub const Lanes = struct {
                 const ids = s.prompt.?;
                 var n: u32 = 0;
                 while (n < chunks and s.start < ids.len) : (n += 1) {
-                    s.start = try self.r.fill(q, ids, s.start);
+                    s.start = if (self.dflash) |df| try df.session.fill(ids, s.start) else try self.r.fill(q, ids, s.start);
                     if (s.points.has(s.start + 1)) if (self.snapshot(s)) |id| s.marks.add(.{ .at = s.start + 1, .snap = id });
                 }
                 if (s.start == ids.len) {
-                    s.first = try self.r.first(q);
+                    s.first = if (self.dflash) |df| try df.session.first() else try self.r.first(q);
                     s.filling = false;
                     if (q.tier) |x| x.t.favor(x.h, false);
                 }
@@ -468,7 +496,11 @@ pub const Lanes = struct {
                     which[i] = s;
                 }
                 if (self.occupancy_trace) self.traceOccupancy();
-                try self.r.windows(wins[0..n]);
+                if (self.dflash) |df| {
+                    if (n != 1) return error.TooManyStreams;
+                    try df.session.window(wins[0].ids, wins[0].out);
+                    if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 dflash verify: pos={d} inputs={any} samples={any}", .{ df.session.context.logical.end, wins[0].ids, wins[0].out[0..wins[0].ids.len] });
+                } else try self.r.windows(wins[0..n]);
                 for (wins[0..n], which[0..n]) |w, s| {
                     s.pending = w.ids.len;
                     s.nheld = 0;
@@ -494,6 +526,17 @@ pub const Lanes = struct {
                     for (after[0..kept]) |*t| t.* = rd.int().?;
                     try self.bind(s, if (kept > 0) kept else null);
                     const q = &s.seq.?;
+                    if (self.dflash) |df| {
+                        s.nheld = 0;
+                        if (want > 0 and s.drafts) {
+                            const drafts = try df.session.draft(s.first);
+                            defer self.gpa.free(drafts);
+                            s.nheld = @min(want, drafts.len);
+                            @memcpy(s.held[0..s.nheld], drafts[0..s.nheld]);
+                            if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 dflash draft: pos={d} pending={d} policy={s} ids={any}", .{ df.session.context.logical.end, s.first, df.session.policy.name(), s.held[0..s.nheld] });
+                        }
+                        continue;
+                    }
                     // the kept rows' hidden rows (the last window's) and the token after each; after a prompt the
                     // head already owes its last row (`Runner.first`)
                     if (kept > 0 and s.drafts) {
@@ -509,7 +552,9 @@ pub const Lanes = struct {
                 }
                 // every drafting stream's absorb and chain steps as batched head steps (TF_GLM_DRAFT_BATCH=0: one
                 // stream after another, the same drafts)
-                if (self.draft_batch) {
+                if (self.dflash != null) {
+                    // DFlash already proposed above; no MTP absorb or step is queued.
+                } else if (self.draft_batch) {
                     try self.r.draftMany(reqs[0..nreq]);
                 } else for (reqs[0..nreq]) |*q| {
                     try self.r.absorb(q.q);
@@ -608,6 +653,7 @@ pub const Lanes = struct {
         try q.bind(self.pool, base, size);
         q.reach(self.capacity);
         try q.reset(self.r.stream);
+        if (self.dflash) |df| try df.openStream(self.r, q);
         if (reuse) |r| {
             const at = r.cut - 1; // the book's point is one past the boundary
             // the latent rows before the boundary: read through the kept prompt's tier streams, else copied
@@ -647,7 +693,11 @@ pub const Lanes = struct {
         const rows = s.pending orelse return;
         const k = kept orelse rows;
         if (k == 0 or k > rows) return error.BadKeep;
-        try self.r.commit(&s.seq.?, rows, k);
+        if (self.dflash) |df| {
+            try df.session.commit(k);
+            if (self.draft_log and self.lay.rank == 0) std.log.info("glm53 dflash commit: rows={d} keep={d} end={d}", .{ rows, k, df.session.context.logical.end });
+            s.first = s.sampled[k - 1];
+        } else try self.r.commit(&s.seq.?, rows, k);
         s.pending = null;
     }
 
@@ -693,6 +743,7 @@ pub const Lanes = struct {
         const ids = s.prompt();
         if (ids.len == 0) return error.PromptTooLong;
         const size = self.extentFor(ids.len, s.max_new) orelse return error.PromptTooLong;
+        if (self.dflash != null) for (self.owners) |o| if (o != null) return error.NoRoom;
         const slot: u8 = for (self.owners, 0..) |o, i| {
             if (o == null) break @intCast(i);
         } else return error.NoRoom;
@@ -746,7 +797,7 @@ pub const Lanes = struct {
         w.byte(@intFromEnum(Op.verify));
         w.byte(@intCast(windows.len));
         var slots: [max_streams]u8 = undefined;
-        var echo: [max_streams][depth]u32 = undefined; // the held drafts each window carries (`run` drops them)
+        var echo: [max_streams][held_capacity]u32 = undefined; // the held drafts each window carries (`run` drops them)
         var total: usize = 0;
         for (windows, 0..) |win, i| {
             if (win.parents != null) return error.TreesNotBuilt;
@@ -814,7 +865,7 @@ pub const Lanes = struct {
             if (r.position != len + 1) return error.PositionMismatch;
             w.byte(slot);
             w.byte(@intCast(kept));
-            w.byte(@intCast(@min(r.depth, depth)));
+            w.byte(@intCast(@min(r.depth, if (self.dflash != null) held_capacity else depth)));
             for (r.follow[0..kept]) |t| w.int(t);
         }
         try self.both(w.done());
@@ -830,6 +881,7 @@ pub const Lanes = struct {
 
     fn probabilitiesFn(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
         const self = of(ptr);
+        if (self.dflash != null) return false;
         const i = self.slotOf(s) orelse return false;
         const sl = &self.slots[i];
         if (out.len > sl.nheld) return false;
@@ -967,6 +1019,7 @@ test "draft probabilities cover the requested prefix or decline without partial 
     var self: Lanes = undefined;
     self.owners = @splat(null);
     self.slots = @splat(.{});
+    self.dflash = null;
     var stream: lanes.Stream = undefined;
     self.owners[0] = &stream;
     self.slots[0].nheld = 2;
@@ -982,4 +1035,25 @@ test "draft probabilities cover the requested prefix or decline without partial 
     try std.testing.expectEqualSlices(f64, &.{ -1, -1, -1 }, &extended);
     self.slots[0].nheld = 0;
     try std.testing.expect(!try Lanes.probabilitiesFn(&self, &stream, &prefix));
+}
+
+test "DFlash serving advertises one stream and declines MTP probability buffers" {
+    var self: Lanes = undefined;
+    self.drafts = true;
+    self.dflash = @ptrFromInt(@alignOf(DF));
+    self.dflash_backend_depth = false;
+    const facts = self.facts();
+    try std.testing.expectEqual(@as(u32, 1), facts.max_streams);
+    try std.testing.expectEqual(@as(u32, 7), facts.drafts);
+    try std.testing.expect(!facts.draft_probabilities);
+    try std.testing.expect(!facts.backend_draft_depth);
+    self.dflash_backend_depth = true;
+    try std.testing.expect(self.facts().backend_draft_depth);
+    var stream: lanes.Stream = undefined;
+    var probabilities = [_]f64{ -1, -1 };
+    try std.testing.expect(!try Lanes.probabilitiesFn(&self, &stream, &probabilities));
+    try std.testing.expectEqualSlices(f64, &.{ -1, -1 }, &probabilities);
+    self.dflash = null;
+    try std.testing.expectEqual(@as(u32, depth), self.facts().drafts);
+    try std.testing.expectEqual(@as(u32, max_streams), self.facts().max_streams);
 }
