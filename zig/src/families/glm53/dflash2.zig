@@ -162,3 +162,35 @@ test "projection K slices cover real DFlash shapes without changing head arithme
         try std.testing.expectEqual(@as(usize, 0), (c[1] / 64) % c[2]);
     }
 }
+
+pub const RingSpan = struct { source_row: usize, ring_row: usize, rows: usize };
+pub const RingWrite = struct { spans: [2]RingSpan, count: usize };
+
+/// Split one contiguous update at the physical ring boundary. Does not commit logical rows.
+pub fn ringWrite(position: usize, rows: usize, capacity: usize) !RingWrite {
+    if (capacity == 0 or rows == 0 or rows > capacity) return error.BadDflashRingWrite;
+    const slot = position % capacity;
+    const first = @min(rows, capacity - slot);
+    return .{ .spans = .{
+        .{ .source_row = 0, .ring_row = slot, .rows = first },
+        .{ .source_row = first, .ring_row = 0, .rows = rows - first },
+    }, .count = if (first == rows) 1 else 2 };
+}
+
+test "ring copies preserve absolute row mapping across wrap without aliasing live update rows" {
+    for (0..3 * 2176) |position| {
+        for (1..65) |rows| {
+            const plan = try ringWrite(position, rows, 2176);
+            var copied: usize = 0;
+            for (plan.spans[0..plan.count]) |span| {
+                try std.testing.expect(span.ring_row + span.rows <= 2176);
+                try std.testing.expectEqual(copied, span.source_row);
+                for (0..span.rows) |i| try std.testing.expectEqual((position + copied + i) % 2176, span.ring_row + i);
+                copied += span.rows;
+            }
+            try std.testing.expectEqual(rows, copied);
+        }
+    }
+    try std.testing.expectError(error.BadDflashRingWrite, ringWrite(0, 0, 2176));
+    try std.testing.expectError(error.BadDflashRingWrite, ringWrite(0, 2177, 2176));
+}
