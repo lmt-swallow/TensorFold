@@ -13,6 +13,33 @@ pub const Rendered = struct { ids: []const u32, history_len: usize = 0 };
 
 pub const isTitle = messages_mod.isTitleRequest;
 
+/// Messages whose strings add up to more than this many bytes are rendered and tokenized one request at a time
+/// (`Server.large_prompt`): 256 KiB of text is about 64k tokens, whose tokenizer workspace is about 33 MiB; a
+/// million-token prompt's is about 0.5 GiB. Smaller prompts are not held up.
+pub const large_prompt_bytes: usize = 256 << 10;
+
+/// Counts string payload bytes for large-prompt admission, excluding object keys.
+pub fn stringBytes(v: Value) usize {
+    return switch (v) {
+        .string => |s| s.len,
+        .array => |items| blk: {
+            var n: usize = 0;
+            for (items) |x| n += stringBytes(x);
+            break :blk n;
+        },
+        .object => |o| blk: {
+            var n: usize = 0;
+            for (o.values()) |x| n += stringBytes(x);
+            break :blk n;
+        },
+        else => 0,
+    };
+}
+
+fn isLarge(messages: Value, tools: []const Value) bool {
+    return stringBytes(messages) + stringBytes(.{ .array = @constCast(tools) }) > large_prompt_bytes;
+}
+
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
     const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool));
@@ -23,6 +50,9 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
         .enable_thinking = thinking,
         .reasoning_effort = if (thinking) effort else null,
     };
+    const large = isLarge(normalized, tools);
+    if (large) srv.large_prompt.lockUncancelable(srv.io);
+    defer if (large) srv.large_prompt.unlock(srv.io);
     var ids = srv.text.renderIds(cx.a, normalized, options, &problem) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Template => return cx.fail(.server, "{s}", .{problem}),
@@ -43,10 +73,15 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
 /// A request's prompt: raw text or ids for a completion, else the chat template's, with its history length.
 pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
     if (input.prompt) |p| switch (p) {
-        .text => |t| return .{ .ids = srv.text.encode(cx.a, t, true) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Template => return cx.fail(.server, "the tokenizer cannot encode this prompt", .{}),
-        } },
+        .text => |t| {
+            const large = t.len > large_prompt_bytes;
+            if (large) srv.large_prompt.lockUncancelable(srv.io);
+            defer if (large) srv.large_prompt.unlock(srv.io);
+            return .{ .ids = srv.text.encode(cx.a, t, true) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Template => return cx.fail(.server, "the tokenizer cannot encode this prompt", .{}),
+            } };
+        },
         .ids => |ids| return .{ .ids = ids },
     };
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
@@ -75,4 +110,25 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
     var shared: usize = 0;
     while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;
     return if (shared >= 512) shared else 0;
+}
+
+test "stringBytes counts what a template can render from the messages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result = try json.parse(a, "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"abcdef\"}]},{\"role\":\"assistant\",\"content\":\"xyz\",\"n\":3}]");
+    const parsed = result.ok;
+    // "user" 4 + "text" 4 + "abcdef" 6 + "assistant" 9 + "xyz" 3; numbers and keys add nothing
+    try std.testing.expectEqual(@as(usize, 26), stringBytes(parsed));
+}
+
+test "large admission includes tools and preserves the threshold boundary" {
+    const text = try std.testing.allocator.alloc(u8, large_prompt_bytes);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'a');
+    const message: Value = .{ .string = text };
+    try std.testing.expect(!isLarge(message, &.{}));
+    try std.testing.expect(isLarge(message, &.{.{ .string = "x" }}));
+    try std.testing.expect(!isLarge(.null, &.{message}));
+    try std.testing.expect(isLarge(.{ .string = "x" }, &.{message}));
 }

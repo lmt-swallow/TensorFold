@@ -76,6 +76,9 @@ pub const Server = struct {
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
+    /// Held while one large prompt (`prompt.large_prompt_bytes`) is rendered and tokenized: the tokenizer's workspace
+    /// is about 130 times the text, so concurrent large prompts would each add theirs at once.
+    large_prompt: std.Io.Mutex = .init,
     arena: std.heap.ArenaAllocator,
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
@@ -221,7 +224,8 @@ pub const Server = struct {
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
         defer arena.deinit();
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            // Release oversized request storage before waiting for the next keep-alive request.
+            _ = arena.reset(.{ .retain_with_limit = 1 << 20 });
             const a = arena.allocator();
             const outcome = conn.readRequest(a, true) catch break;
             switch (outcome) {
