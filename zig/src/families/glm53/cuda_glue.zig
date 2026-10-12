@@ -156,22 +156,49 @@ fn bucket(m: usize) usize {
     unreachable;
 }
 
-/// The glue's own CUDA kernels: hc.cu's mixing dots (decode rows) and bmm.cu's BF16 matmul (`Bmm`).
+/// The glue's own CUDA kernels: hc.cu's mixing dots (decode rows), hc_fused.cu's hc_post with the next hc_pre's
+/// prompt dots (`Glue.hcPostPartial`) and bmm.cu's BF16 matmul (`Bmm`).
 pub const Hc = struct {
+    d: *const cuda.Driver,
     module: cuda.Module,
     partial: cuda.Function,
+    fused_module: cuda.Module,
+    post_partial: cuda.Function,
+    /// TF_GLM_HC_FUSED (default 1): hcPostPartial runs hc_fused.cu; 0: _hc_post then _hc_partial_mma.
+    fused: bool,
+    /// TF_GLM_PROMPT_CHECK=1: every hc_fused.cu call against the captured pair, byte for byte.
+    check: bool,
     bmm: Bmm,
+
+    /// hc_fused.cu from this many rows (GB10: 1.18x the captured pair at 2,048 rows, 0.97x at 777, slower below).
+    const fused_min_rows = 1024;
+    /// hc_fused.cu's dynamic shared memory: 4 streams x (64 rows + 32 FN rows) x 72 halfs.
+    const fused_smem = 4 * (64 + 32) * 72 * 2;
 
     pub fn load(d: *const cuda.Driver) !Hc {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var module = try cuda.Module.load(d, cuda.kernels.glm53_hc);
         errdefer module.unload();
         const partial = try module.function("_ZN11tf_glm53_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi");
-        return .{ .module = module, .partial = partial, .bmm = try Bmm.load(d) };
+        var fused_module = try cuda.Module.load(d, cuda.kernels.glm53_hc_fused);
+        errdefer fused_module.unload();
+        const post_partial = try fused_module.function("tf_glm53_hc_post_partial");
+        try post_partial.allowDynamicShared(fused_smem);
+        return .{
+            .d = d,
+            .module = module,
+            .partial = partial,
+            .fused_module = fused_module,
+            .post_partial = post_partial,
+            .fused = !std.mem.eql(u8, envOr("TF_GLM_HC_FUSED", "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+            .bmm = try Bmm.load(d),
+        };
     }
 
     pub fn deinit(self: *Hc) void {
         self.bmm.deinit();
+        self.fused_module.unload();
         self.module.unload();
     }
 };
@@ -320,13 +347,17 @@ pub const Glue = struct {
         iters: usize,
         rows: usize,
         prompt: bool,
+        /// `part` already holds the prompt dots of x (hcPostPartial): only _hc_finish runs.
+        partial_done: bool = false,
     };
 
     /// glue.py `hc_pre`: the mixing dots (a prompt chunk's on the tensor cores, decode rows' in hc.cu, each with
     /// its own bits), then _hc_finish: the normed collapsed row, its sums, post and the Sinkhorn-balanced comb.
     pub fn hcPre(g: Glue, a: HcPre, stream: cuda.Stream) !void {
         const wide = g.streams * g.hidden;
-        if (a.prompt) {
+        if (a.partial_done) {
+            if (!a.prompt) return error.UnsupportedShape;
+        } else if (a.prompt) {
             try g.set.run(stream, "_hc_partial_mma", .{ @intCast(cdiv(a.rows, 64)), hc_blocks, 1 }, &.{
                 aot.ptr("X", "*bf16", a.x), aot.ptr("FN", "*bf16", a.fn_), aot.ptr("PART", "*fp32", a.part), aot.int("R", n32(a.rows)),
             }, &.{ aot.ci("WIDE", @intCast(wide)), aot.ci("NB", hc_blocks), aot.ci("BM", 64), aot.ci("BK", 64) });
@@ -373,6 +404,79 @@ pub const Glue = struct {
             aot.ptr("X", "*bf16", x),       aot.ptr("XOUT", "*bf16", xout), aot.ptr("G", "*fp32", g0),
             aot.ptr("POST", "*fp32", post), aot.ptr("COMB", "*fp32", comb), aot.int("RS", rs),
         }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("WORLD", 2), aot.ci("BLOCK", @intCast(block)) });
+    }
+
+    /// hc_post of two ranks' fp32 partials (rank 0's at g0, rank 1's `rs` elements on) into xout, then the next
+    /// hc_pre's prompt dots of xout into `part` (`_hc_partial_mma`), the bytes of hcPostPair (or hcPost with
+    /// gathered = g0, rs = rows D) followed by hcPre's partial; the caller's hcPre then passes `partial_done`.
+    /// hc_fused.cu runs both in one pass (the streams it writes are not read back) at D 4096, 4 streams.
+    pub fn hcPostPartial(g: Glue, x: Ptr, xout: Ptr, g0: Ptr, rs: i64, post: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, stream: cuda.Stream) !void {
+        if (rows == 0) return;
+        const h = g.hc;
+        const aligned = (x | xout | g0) % 16 == 0 and @mod(rs, 4) == 0;
+        if (!h.fused or rows < Hc.fused_min_rows or g.hidden != 4096 or g.streams != 4 or !aligned) return g.hcPostPartialCaptured(x, xout, g0, rs, post, comb, fn_, part, rows, stream);
+        const xb = rows * g.streams * g.hidden * 2;
+        var keep: ?cuda.DeviceBuffer = null; // TF_GLM_PROMPT_CHECK: x as it was (xout may be x)
+        defer if (keep) |*k| k.free();
+        if (h.check) {
+            keep = try cuda.DeviceBuffer.alloc(h.d, xb);
+            try keep.?.copyFrom(0, x, xb, stream.handle);
+        }
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(xout);
+        a.add(g0);
+        a.add(rs);
+        a.add(post);
+        a.add(comb);
+        a.add(fn_);
+        a.add(part);
+        a.add(@as(c_int, @intCast(rows)));
+        try cuda.launch.launch(h.post_partial, .{ .grid = .{ .x = @intCast(cdiv(rows, 64)), .y = @intCast(g.hidden / 1024) }, .block = .{ .x = 128 }, .shared = Hc.fused_smem }, stream, &a);
+        if (keep) |k| try g.checkPostPartial(k, xout, g0, rs, post, comb, fn_, part, rows, stream);
+    }
+
+    fn hcPostPartialCaptured(g: Glue, x: Ptr, xout: Ptr, g0: Ptr, rs: i64, post: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.hcPostPair(x, xout, g0, @intCast(@as(i64, @intCast(g0)) + rs * 4), post, comb, rows, stream);
+        try g.set.run(stream, "_hc_partial_mma", .{ @intCast(cdiv(rows, 64)), hc_blocks, 1 }, &.{
+            aot.ptr("X", "*bf16", xout), aot.ptr("FN", "*bf16", fn_), aot.ptr("PART", "*fp32", part), aot.int("R", n32(rows)),
+        }, &.{ aot.ci("WIDE", @intCast(g.streams * g.hidden)), aot.ci("NB", hc_blocks), aot.ci("BM", 64), aot.ci("BK", 64) });
+    }
+
+    /// TF_GLM_PROMPT_CHECK: the captured pair from `x0` (x before the fused call) into scratch, against the fused
+    /// call's xout and part (the 24 dots and the sum of squares of every row's 16 blocks), byte for byte.
+    fn checkPostPartial(g: Glue, x0: cuda.DeviceBuffer, xout: Ptr, g0: Ptr, rs: i64, post: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, stream: cuda.Stream) !void {
+        const d = g.hc.d;
+        const xb = x0.len;
+        const pb = rows * hc_blocks * 32 * 4;
+        var xo = try cuda.DeviceBuffer.alloc(d, xb);
+        defer xo.free();
+        var pt = try cuda.DeviceBuffer.alloc(d, pb);
+        defer pt.free();
+        try g.hcPostPartialCaptured(x0.ptr, xo.ptr, g0, rs, post, comb, fn_, pt.ptr, rows, stream);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, xb + pb);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, xb + pb);
+        defer gpa.free(got);
+        try xo.download(0, want[0..xb]);
+        try pt.download(0, want[xb..]);
+        try (cuda.DeviceBuffer{ .d = d, .ptr = xout, .len = xb }).download(0, got[0..xb]);
+        try (cuda.DeviceBuffer{ .d = d, .ptr = part, .len = pb }).download(0, got[xb..]);
+        var bad: usize = 0;
+        for (want[0..xb], got[0..xb]) |p, q| bad += @intFromBool(p != q);
+        // PART: columns 0..24 of each row's blocks (25..31 are never written)
+        const wp = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(want[xb..])));
+        const gp = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(got[xb..])));
+        for (0..rows * hc_blocks) |i| for (0..25) |m| {
+            bad += @intFromBool(wp[i * 32 + m] != gp[i * 32 + m]);
+        };
+        if (bad != 0) {
+            std.log.err("glm53: hc_fused ({d} rows): {d} values differ from _hc_post + _hc_partial_mma", .{ rows, bad });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("glm53: hc_fused ({d} rows): byte-equal to _hc_post + _hc_partial_mma", .{rows});
     }
 
     /// glue.py `residual_add` (the MTP layer): xout = bf16(x + bf16(the partials summed rank 0 first)).

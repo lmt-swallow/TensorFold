@@ -123,7 +123,7 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
                 const dt = @as(f64, @floatFromInt(nowNs() - s0)) / 1e6;
                 if (rep == 0) continue;
                 const slot: usize = switch (op) {
-                    .embed, .zero_pad, .hc_pre, .hc_post, .post_pair, .mean => 0,
+                    .embed, .zero_pad, .hc_pre, .hc_post, .post_pair, .post_pre, .mean => 0,
                     .front => |x| if (x.site == .mixer) (if (m.layers[x.l].mixer == .kda) @as(usize, 1) else 4) else (if (m.layers[x.l].ffn == .mlp) @as(usize, 7) else 9),
                     .rest => |x| if (x.site == .mixer) (if (m.layers[x.l].mixer == .kda) @as(usize, 2) else 5) else 8,
                     .fill => |x| if (x.site == .mixer) (if (m.layers[x.l].mixer == .kda) @as(usize, 3) else 6) else (if (m.layers[x.l].ffn == .mlp) @as(usize, 7) else 10),

@@ -527,6 +527,12 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, op: P.Op, pos: usize, R: us
             try h.also("comb", b.comb.ptr + x.lo * S * S * 4);
         },
         .hc_post => try h.call("hc_post", "xout", b.x.ptr),
+        .post_pre => |x| {
+            if (x.got == null) try h.call("hc_post", "xout", b.x.ptr) else try h.call("hc_post_pair", "xout", b.x.ptr + x.lo * S * D * 2);
+            try h.call("hc_pre", "out", b.normed.ptr + x.lo * D * 2);
+            try h.also("post", b.post.ptr + x.lo * S * 4);
+            try h.also("comb", b.comb.ptr + x.lo * S * S * 4);
+        },
         .post_pair => |x| try h.call("hc_post_pair", "xout", b.x.ptr + x.lo * S * D * 2),
         .mean => |x| try h.call("stream_mean", "out", b.hidden.ptr + x.lo * D * 2),
         .front => |x| switch (x.site) {

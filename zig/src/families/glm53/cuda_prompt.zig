@@ -191,6 +191,9 @@ pub const Op = union(enum) {
     hc_pre: struct { l: usize, site: Site, lo: usize, hi: usize },
     hc_post, // unsplit: every row from the gathered partials
     post_pair: struct { lo: usize, hi: usize, got: Ptr }, // split: this rank's rows from its partial and the peer's
+    // hc_post (got null) or post_pair (got the peer's piece) with the next hc_pre's prompt dots in one pass
+    // (Glue.hcPostPartial), then that hc_pre's finish: the same outputs as the two ops in turn
+    post_pre: struct { l: usize, site: Site, lo: usize, hi: usize, got: ?Ptr },
     mean: struct { lo: usize, hi: usize }, // the streams' mean into the hidden rows
     front: struct { l: usize, site: Site, lo: usize, hi: usize },
     rest: struct { l: usize, site: Site },
@@ -255,6 +258,11 @@ pub const Chunk = struct {
         if (c.st.pos + R > c.st.capacity or c.st.mtp_len + c.next.len > c.st.capacity) return error.PastCapacity;
     }
 
+    /// Whether hc_post and the next hc_pre run as one op (`post_pre`): hc_fused.cu takes two ranks' partials.
+    fn fusesHc(c: *const Chunk) bool {
+        return c.k.g.hc.fused and c.lay.world == 2;
+    }
+
     /// Whether this chunk runs row-split (hcsplit.py `applies`).
     pub fn splits(c: *const Chunk) bool {
         const sp = c.split orelse return false;
@@ -275,14 +283,23 @@ pub const Chunk = struct {
         if (c.splits()) {
             try c.planSplit(gpa, &ops);
         } else {
+            const fuse = c.fusesHc();
             for (0..L) |l| {
-                if (l > 0) try ops.append(gpa, .hc_post);
-                try ops.append(gpa, .{ .hc_pre = .{ .l = l, .site = .mixer, .lo = 0, .hi = R } });
+                if (l > 0 and fuse) {
+                    try ops.append(gpa, .{ .post_pre = .{ .l = l, .site = .mixer, .lo = 0, .hi = R, .got = null } });
+                } else {
+                    if (l > 0) try ops.append(gpa, .hc_post);
+                    try ops.append(gpa, .{ .hc_pre = .{ .l = l, .site = .mixer, .lo = 0, .hi = R } });
+                }
                 try c.block(gpa, &ops, l, .mixer, null, null);
                 try ops.append(gpa, .{ .gather = .{ .send = b.part.ptr, .recv = b.gath.ptr, .bytes = R * D * 4, .ev = 0 } });
                 try ops.append(gpa, .{ .wait = 0 });
-                try ops.append(gpa, .hc_post);
-                try ops.append(gpa, .{ .hc_pre = .{ .l = l, .site = .ffn, .lo = 0, .hi = R } });
+                if (fuse) {
+                    try ops.append(gpa, .{ .post_pre = .{ .l = l, .site = .ffn, .lo = 0, .hi = R, .got = null } });
+                } else {
+                    try ops.append(gpa, .hc_post);
+                    try ops.append(gpa, .{ .hc_pre = .{ .l = l, .site = .ffn, .lo = 0, .hi = R } });
+                }
                 try c.block(gpa, &ops, l, .ffn, null, null);
                 try ops.append(gpa, .{ .gather = .{ .send = b.part.ptr, .recv = b.gath.ptr, .bytes = R * D * 4, .ev = 0 } });
                 try ops.append(gpa, .{ .wait = 0 });
@@ -411,6 +428,25 @@ pub const Chunk = struct {
 
     const LayerSite = struct { l: usize, site: Site };
 
+    /// glue.hc_pre of rows lo .. hi of layer l's `site` (partial_done: hcPostPartial wrote their prompt dots).
+    fn hcPreRows(c: *const Chunk, l: usize, site: Site, lo: usize, hi: usize, partial_done: bool, stream: cuda.Stream) !void {
+        const cfg = c.lay.cfg;
+        const D = cfg.hidden;
+        const S = cfg.streams;
+        const b = c.p.b;
+        const f = c.m.layers[l].frame;
+        const hc = if (site == .ffn) &f.ffn_hc else &f.attn_hc;
+        try c.k.g.hcPre(.{
+            .x = b.x.ptr + lo * S * D * 2, .fn_ = hc.fn_.ptr, .base = hc.base.ptr, .scale = hc.scale.ptr,
+            .norm = (if (site == .ffn) f.post_norm else f.in_norm).ptr,
+            .out = b.normed.ptr + lo * D * 2, .xs = b.xs.ptr + lo * D / 64 * 4,
+            .post = b.post.ptr + lo * S * 4, .comb = b.comb.ptr + lo * S * S * 4,
+            .part = b.hcpart.ptr + lo * glue_mod.hc_blocks * 32 * 4,
+            .eps = cfg.eps, .hc_eps = cfg.hc_eps, .iters = cfg.hc_iters, .rows = hi - lo, .prompt = true,
+            .partial_done = partial_done,
+        }, stream);
+    }
+
     /// hcsplit.py `HcSplit.glue`: per piece, this rank's rows' hc_post (after the piece's partial arrived), the final
     /// mean (`final`), the next hc_pre (`next`), the rows swapped, then `front` on them; the swaps all done after.
     fn glue(c: *const Chunk, gpa: std.mem.Allocator, ops: *std.ArrayList(Op), s: *const SplitPlan, next: ?LayerSite, final: bool, front: ?LayerSite) !void {
@@ -422,9 +458,14 @@ pub const Chunk = struct {
             const hi = s.mine + pc.hi;
             const n = pc.hi - pc.lo;
             try ops.append(gpa, .{ .wait = @intCast(j) });
-            try ops.append(gpa, .{ .post_pair = .{ .lo = lo, .hi = hi, .got = c.p.b.gath.ptr + (2 * pc.lo + peer * n) * D * 4 } });
-            if (final) try ops.append(gpa, .{ .mean = .{ .lo = lo, .hi = hi } });
-            if (next) |x| try ops.append(gpa, .{ .hc_pre = .{ .l = x.l, .site = x.site, .lo = lo, .hi = hi } });
+            const got = c.p.b.gath.ptr + (2 * pc.lo + peer * n) * D * 4;
+            if (next != null and !final and c.fusesHc()) {
+                try ops.append(gpa, .{ .post_pre = .{ .l = next.?.l, .site = next.?.site, .lo = lo, .hi = hi, .got = got } });
+            } else {
+                try ops.append(gpa, .{ .post_pair = .{ .lo = lo, .hi = hi, .got = got } });
+                if (final) try ops.append(gpa, .{ .mean = .{ .lo = lo, .hi = hi } });
+                if (next) |x| try ops.append(gpa, .{ .hc_pre = .{ .l = x.l, .site = x.site, .lo = lo, .hi = hi } });
+            }
             // the rows the next step reads whole: the normed rows, or the hidden rows after the last layer
             const t: Ptr = if (final) b.hidden.ptr else b.normed.ptr;
             const stage = c.p.stage_rows + 2 * pc.lo * D * 2;
@@ -475,17 +516,19 @@ pub const Chunk = struct {
                 const ps: Buf = .{ .d = b.x.d, .ptr = b.part.ptr + z.lo * D * 4, .len = (z.hi - z.lo) * D * 4 };
                 try ps.fill8(0, stream.handle);
             },
-            .hc_pre => |h| {
-                const f = c.m.layers[h.l].frame;
-                const hc = if (h.site == .ffn) &f.ffn_hc else &f.attn_hc;
-                try g.hcPre(.{
-                    .x = b.x.ptr + h.lo * S * D * 2, .fn_ = hc.fn_.ptr, .base = hc.base.ptr, .scale = hc.scale.ptr,
-                    .norm = (if (h.site == .ffn) f.post_norm else f.in_norm).ptr,
-                    .out = b.normed.ptr + h.lo * D * 2, .xs = b.xs.ptr + h.lo * D / 64 * 4,
-                    .post = b.post.ptr + h.lo * S * 4, .comb = b.comb.ptr + h.lo * S * S * 4,
-                    .part = b.hcpart.ptr + h.lo * glue_mod.hc_blocks * 32 * 4,
-                    .eps = cfg.eps, .hc_eps = cfg.hc_eps, .iters = cfg.hc_iters, .rows = h.hi - h.lo, .prompt = true,
-                }, stream);
+            .hc_pre => |h| try c.hcPreRows(h.l, h.site, h.lo, h.hi, false, stream),
+            .post_pre => |x| {
+                const f = c.m.layers[x.l].frame;
+                const hc = if (x.site == .ffn) &f.ffn_hc else &f.attn_hc;
+                const xp = b.x.ptr + x.lo * S * D * 2;
+                // rank 0's partial first: unsplit, the gathered [2, R, D]; split, this rank's piece and the peer's
+                const g0: Ptr, const rs: i64 = if (x.got) |got| blk: {
+                    const own = b.part.ptr + x.lo * D * 4;
+                    const a0, const a1 = if (c.lay.rank == 0) .{ own, got } else .{ got, own };
+                    break :blk .{ a0, @divExact(@as(i64, @intCast(a1)) - @as(i64, @intCast(a0)), 4) };
+                } else .{ b.gath.ptr, @intCast(R * D) };
+                try g.hcPostPartial(xp, xp, g0, rs, b.post.ptr + x.lo * S * 4, b.comb.ptr + x.lo * S * S * 4, hc.fn_.ptr, b.hcpart.ptr + x.lo * glue_mod.hc_blocks * 32 * 4, x.hi - x.lo, stream);
+                try c.hcPreRows(x.l, x.site, x.lo, x.hi, true, stream);
             },
             .hc_post => try forward.hcPost(c.ctx(), b, R, stream),
             .post_pair => |x| {
