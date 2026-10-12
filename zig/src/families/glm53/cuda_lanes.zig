@@ -602,7 +602,13 @@ pub const Lanes = struct {
         const slot: u8 = for (self.owners, 0..) |o, i| {
             if (o == null) break @intCast(i);
         } else return error.NoRoom;
-        const reuse: ?kb.Reuse = if (self.book.set.on) self.book.match(ids, false) else null;
+        var reuse: ?kb.Reuse = if (self.book.set.on) self.book.match(ids, false) else null;
+        // on a tier a kept prompt is continued by reading through its tier streams: one whose chain is already
+        // max_chain deep (a continuation of continuations) is prefilled instead (the record carries the choice)
+        if (reuse) |r| if (self.tier) |t| {
+            const src = self.keptTier(r.eid);
+            if (src == null or t.host.aliasDepth(src.?.h) > Tr.kv.max_chain or t.host.aliasDepth(src.?.hm) > Tr.kv.max_chain) reuse = null;
+        };
         const base = (self.trialPlace(size, reuse) orelse return error.NoRoom).base;
         const op = self.op_buf[0 .. open_header + 4 * ids.len];
         op[0] = @intFromEnum(Op.open);

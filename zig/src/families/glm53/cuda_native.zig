@@ -193,7 +193,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         const tcap = @max(std.mem.alignForward(usize, capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
         // a slot's backbone and head streams, and the kept prompts' (each until the prompts reading through it end)
         const tstreams = 2 * (lanesmod.max_streams + keep.book.max_kept + 1);
-        own.tier = try Tr.Tier.init(gpa, d, .{ .streams = tstreams, .layers = own.cfg.count(.dsa), .capacity = tcap, .row_bytes = own.cfg.kv_lora * 2 }, @as(usize, gib) << 30, engine.prompt_rows, glue.sparse_tokens, path);
+        // map blocks: a backbone stream's DSA layers and its head stream's one, for every pair
+        own.tier = try Tr.Tier.init(gpa, d, .{ .streams = tstreams, .layers = own.cfg.count(.dsa), .capacity = tcap, .row_bytes = own.cfg.kv_lora * 2, .blocks = tstreams / 2 * (own.cfg.count(.dsa) + 1) }, @as(usize, gib) << 30, engine.prompt_rows, glue.sparse_tokens, path);
     }
     errdefer if (own.tier) |t| t.deinit(gpa);
     own.pool = try P.Pool.init(gpa, d, &own.cfg, planes, positions, kv, own.tier == null);
