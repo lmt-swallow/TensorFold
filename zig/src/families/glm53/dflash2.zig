@@ -194,3 +194,92 @@ test "ring copies preserve absolute row mapping across wrap without aliasing liv
     try std.testing.expectError(error.BadDflashRingWrite, ringWrite(0, 0, 2176));
     try std.testing.expectError(error.BadDflashRingWrite, ringWrite(0, 2177, 2176));
 }
+
+fn bf16(x: u16) f32 {
+    return @bitCast(@as(u32, x) << 16);
+}
+
+/// One rank's top candidates; ties at the cutoff prefer the lower global ID.
+/// Reference topk cutoff membership is independently checked against captured candidates.
+pub fn topCandidates(a: std.mem.Allocator, logits: []const u16, offset: u32, k: usize) ![]Candidate {
+    if (k == 0 or k > logits.len or logits.len > std.math.maxInt(u32) - offset) return error.BadSelectorShape;
+    const out = try a.alloc(Candidate, k);
+    errdefer a.free(out);
+    var count: usize = 0;
+    for (logits, 0..) |bits, i| {
+        const score = bf16(bits);
+        if (!std.math.isFinite(score)) return error.NonfiniteDraftLogit;
+        const item: Candidate = .{ .token = offset + @as(u32, @intCast(i)), .logit = score };
+        var at: usize = 0;
+        while (at < count and candidateBefore({}, out[at], item)) : (at += 1) {}
+        if (at >= k) continue;
+        const end = @min(count, k - 1);
+        var j = end;
+        while (j > at) : (j -= 1) out[j] = out[j - 1];
+        out[at] = item;
+        count = @min(count + 1, k);
+    }
+    return out;
+}
+
+/// Select a greedy chain; projected rows are the reference BF16 projection expanded to f32.
+/// The returned allocation contains only accepted confidence-prefix candidates, including at least row zero.
+pub fn selectGreedy(a: std.mem.Allocator, candidates: []const Candidate, top_k: usize, projected: []const f32, selector_rank: usize, predecessor: []const u16, successor: []const u16, anchor: u32, confidence: f64) ![]u32 {
+    if (top_k == 0 or selector_rank == 0 or candidates.len % top_k != 0 or predecessor.len != successor.len or
+        predecessor.len % selector_rank != 0 or anchor >= predecessor.len / selector_rank or
+        confidence < 0 or confidence > 1 or !std.math.isFinite(confidence)) return error.BadSelectorShape;
+    const rows = candidates.len / top_k;
+    if (rows == 0 or projected.len != rows * selector_rank) return error.BadSelectorShape;
+    const result = try a.alloc(u32, rows);
+    errdefer a.free(result);
+    const scores = try a.alloc(f64, top_k);
+    defer a.free(scores);
+    var previous = anchor;
+    var chain: f64 = 1;
+    var length: usize = 0;
+    for (0..rows) |row| {
+        var best: usize = 0;
+        var max_score = -std.math.inf(f64);
+        for (candidates[row * top_k ..][0..top_k], 0..) |candidate, j| {
+            if (candidate.token >= predecessor.len / selector_rank or !std.math.isFinite(candidate.logit)) return error.BadSelectorShape;
+            var edge: f64 = 0;
+            for (0..selector_rank) |i| edge += @as(f64, bf16(successor[@as(usize, candidate.token) * selector_rank + i])) *
+                (@as(f64, bf16(predecessor[@as(usize, previous) * selector_rank + i])) * @as(f64, projected[row * selector_rank + i]));
+            const score = candidate.logit + 0.6 * edge;
+            if (!std.math.isFinite(score)) return error.NonfiniteSelectorScore;
+            scores[j] = score;
+            if (score > max_score) {
+                best = j;
+                max_score = score;
+            }
+        }
+        if (confidence > 0) {
+            var sum: f64 = 0;
+            for (scores) |score| sum += @exp(score - max_score);
+            chain *= @exp(scores[best] - max_score) / sum;
+            if (row > 0 and chain < confidence) break;
+        }
+        previous = candidates[row * top_k + best].token;
+        result[length] = previous;
+        length += 1;
+    }
+    return a.realloc(result, length);
+}
+
+test "greedy selector keeps one low-confidence row and uses the selected token as the next predecessor" {
+    const a = std.testing.allocator;
+    const candidates = [_]Candidate{ .{ .token = 0, .logit = 0 }, .{ .token = 1, .logit = 0 }, .{ .token = 0, .logit = 0 }, .{ .token = 1, .logit = 0 } };
+    const pred = [_]u16{ 0x3f80, 0xbf80 };
+    const succ = [_]u16{ 0x3f80, 0xbf80 };
+    const full = try selectGreedy(a, &candidates, 2, &.{ -1, 1 }, 1, &pred, &succ, 0, 0);
+    defer a.free(full);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1 }, full);
+    const cut = try selectGreedy(a, &candidates, 2, &.{ 0, 0 }, 1, &pred, &succ, 0, 0.9);
+    defer a.free(cut);
+    try std.testing.expectEqual(@as(usize, 1), cut.len);
+    const top = try topCandidates(a, &.{ 0x3f80, 0x4000, 0x4000, 0xbf80 }, 77440, 2);
+    defer a.free(top);
+    try std.testing.expectEqual(@as(u32, 77441), top[0].token);
+    try std.testing.expectEqual(@as(u32, 77442), top[1].token);
+    try std.testing.expectError(error.NonfiniteDraftLogit, topCandidates(a, &.{0x7fc0}, 0, 1));
+}
