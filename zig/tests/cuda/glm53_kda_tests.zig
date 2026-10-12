@@ -91,7 +91,8 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool) !void 
     defer set.deinit();
     const fx_dir = try std.fs.path.join(gpa, &.{ work, "out", "fixture" });
     defer gpa.free(fx_dir);
-    var h: Harness = .{ .gpu = gpu, .fx = try fixture.Fixture.open(gpa, gpu.io, fx_dir), .stream = try cuda.Stream.init(d, true), .isolated = isolated };
+    // a blocking stream: the harness's synchronous uploads from pageable memory land before its next kernels
+    var h: Harness = .{ .gpu = gpu, .fx = try fixture.Fixture.open(gpa, gpu.io, fx_dir), .stream = try cuda.Stream.init(d, false), .isolated = isolated };
     defer h.fx.deinit();
     defer h.stream.deinit();
     defer h.deinit();

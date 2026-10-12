@@ -80,7 +80,7 @@ pub fn run(gpu: Gpu, aot_dir: []const u8) !void {
     var hc = try glm.glue.Hc.load(d);
     defer hc.deinit();
     const g: glm.glue.Glue = .{ .set = &set, .hc = &hc, .hidden = 4096, .streams = 4 };
-    var stream = try cuda.Stream.init(d, true);
+    var stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
     defer stream.deinit();
     var prng = std.Random.DefaultPrng.init(20261012);
     const rng = prng.random();
@@ -152,7 +152,7 @@ pub fn runScores(gpu: Gpu, aot_dir: []const u8) !void {
     var hc = try glm.glue.Hc.load(d);
     defer hc.deinit();
     const g: glm.glue.Glue = .{ .set = &set, .hc = &hc, .hidden = 4096, .streams = 4 };
-    var stream = try cuda.Stream.init(d, true);
+    var stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
     defer stream.deinit();
     var prng = std.Random.DefaultPrng.init(20261013);
     const rng = prng.random();
@@ -222,7 +222,7 @@ pub fn runOnepass(gpu: Gpu, aot_dir: []const u8) !void {
     var hc = try glm.glue.Hc.load(d);
     defer hc.deinit();
     const g: glm.glue.Glue = .{ .set = &set, .hc = &hc, .hidden = 4096, .streams = 4 };
-    var stream = try cuda.Stream.init(d, true);
+    var stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
     defer stream.deinit();
     var prng = std.Random.DefaultPrng.init(20261014);
     const rng = prng.random();

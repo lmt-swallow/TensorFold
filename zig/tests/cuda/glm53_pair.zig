@@ -50,7 +50,7 @@ pub const Rank = struct {
         // a rank's fixture holds its own copy (r<rank>_); a local run's one fixture rank 0's
         var nb: [32]u8 = undefined;
         self.prompt_bytes = self.fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_prompt_ids", .{rank})) catch try self.fx.bytes("r0_prompt_ids");
-        self.stream = try cuda.Stream.init(d, true);
+        self.stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
         self.hck = try glm.glue.Hc.load(d);
         self.kk = try glm.kda.Kernels.load(d);
         self.mk = try glm.moe.Kernels.load(d);

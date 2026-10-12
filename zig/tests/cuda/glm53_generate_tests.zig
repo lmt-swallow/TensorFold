@@ -40,7 +40,7 @@ pub fn run(gpu: Gpu, dir: []const u8, model: []const u8, rank: usize, master: []
     defer gpa.free(fx_dir);
     var fx = try fixture.Fixture.open(gpa, gpu.io, fx_dir);
     defer fx.deinit();
-    var stream = try cuda.Stream.init(d, true);
+    var stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
     defer stream.deinit();
     var ip: [4]u8 = undefined;
     var it = std.mem.splitScalar(u8, master, '.');

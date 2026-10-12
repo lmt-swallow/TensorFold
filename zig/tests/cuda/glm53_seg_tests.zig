@@ -85,7 +85,7 @@ fn load(r: *Rank, gpu: Gpu, cfg: *const glm.config.Config, set: *const cuda.aot.
     r.cfg = cfg;
     r.set = set;
     r.lay = .{ .rank = rank, .world = 2, .cfg = cfg };
-    r.stream = try cuda.Stream.init(d, true);
+    r.stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
     r.hck = try glm.glue.Hc.load(d);
     r.kk = try glm.kda.Kernels.load(d);
     r.mk = try glm.moe.Kernels.load(d);

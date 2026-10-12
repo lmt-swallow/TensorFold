@@ -330,7 +330,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
     const ring: usize = @intCast(params.get("ring").?.integer);
     const long_ring: usize = @intCast(params.get("long_ring").?.integer);
     const kv = try fixtureKv(params, want);
-    var stream = try cuda.Stream.init(d, true);
+    var stream = try cuda.Stream.init(d, false); // blocking: a synchronous upload from pageable memory lands before its next kernels
     defer stream.deinit();
     var h: Digests = .{ .gpa = gpa, .d = d, .stream = stream, .trace = fx.parsed.value.object.get("trace").?.array.items, .steps = params.get("digests").?.object };
     defer h.deinit();
