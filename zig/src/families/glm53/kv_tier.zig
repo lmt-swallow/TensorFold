@@ -35,7 +35,7 @@ pub const home_pools = home_positions / pool_rows;
 /// Streams a chain of aliases reads through at most (a stream and its ancestors; cuda_tier's remap takes as many).
 pub const max_chain = 8;
 
-pub const Error = error{ TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory, NoStream, ChainTooDeep };
+pub const Error = error{ FileBusy, TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory, NoStream, ChainTooDeep };
 
 pub const Options = struct {
     pub fn mapBlocks(o: Options) usize {
@@ -821,6 +821,45 @@ pub const Tier = struct {
         return @intCast(b);
     }
 
+    /// Where a verify found a row that differs from the reference.
+    pub const Mismatch = struct { layer: usize, pool: usize, slot: i32, in_file: bool, run_kind: Kind };
+
+    /// Every pool of stream `s` below `upto` positions (whole pools) that the tier holds, checked against `ref`
+    /// (layer l's rows at ref[l], row p at p * row_bytes): a resident pool's slab bytes and a written pool's file
+    /// block (an alias's pools below its fork are its parent's: checked there). Returns the first that differs.
+    pub fn verify(t: *Tier, s: usize, ref: []const []const u8, upto: usize) Error!?Mismatch {
+        try t.io.finish();
+        const st = t.streams[s];
+        const pb = pool_rows * t.o.row_bytes;
+        // the file read in spans of `span` blocks (a layer's keys are contiguous on the file)
+        const span: usize = 256;
+        const buf = try t.gpa.alignedAlloc(u8, .fromByteUnits(block), span * block);
+        defer t.gpa.free(buf);
+        for (0..st.layers) |l| {
+            const np = upto / pool_rows;
+            var p0: usize = 0;
+            while (p0 < np) : (p0 += span) {
+                const n: usize = @min(span, np - p0);
+                const got = std.c.pread(t.io.fd, buf.ptr, n * block, @intCast(fileOffset(t.key(s, l, p0))));
+                for (p0..p0 + n) |p| {
+                    if (st.parent != null and p >= home_pools and p < st.fork_pool) continue;
+                    const k = t.key(s, l, p);
+                    const want = ref[l][p * pb ..][0..pb];
+                    const slot = t.map[k];
+                    const kind: Kind = if (slot >= 0) t.runs[@as(usize, @intCast(slot)) / run_pools].kind else .free;
+                    if (slot >= 0 and !std.mem.eql(u8, want, t.slotBytes(@intCast(slot))))
+                        return .{ .layer = l, .pool = p, .slot = slot, .in_file = false, .run_kind = kind };
+                    if (t.persisted.isSet(k)) {
+                        const in = (p - p0) * block;
+                        if (got < @as(isize, @intCast(in + block)) or !std.mem.eql(u8, want, buf[in..][0..block]))
+                            return .{ .layer = l, .pool = p, .slot = slot, .in_file = true, .run_kind = kind };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     /// Checks that the map and the slots' owners name each other (tests).
     pub fn check(t: *const Tier) !void {
         for (t.map, 0..) |slot, k| if (slot >= 0) {
@@ -848,6 +887,10 @@ pub const Tier = struct {
 /// Block reads and writes on the backing file: Linux AIO on O_DIRECT where the kernel and file system allow it (the
 /// engine runs in Docker, whose default seccomp profile refuses io_uring but not AIO), else positional calls.
 /// `add` queues (submitting when the queue is full), `finish` returns once every queued transfer landed.
+extern "c" fn flock(fd: c_int, op: c_int) c_int;
+const lock_ex = 2;
+const lock_nb = 4;
+
 pub const Io = struct {
     gpa: std.mem.Allocator,
     fd: c_int,
@@ -888,6 +931,7 @@ pub const Io = struct {
         bad: bool = false,
     };
 
+
     /// `lanes` AIO contexts of `depth` transfers each (the measured NVMe: QD 64 on one thread reads 1.0M 4 KiB
     /// blocks a second, four threads 2.2M).
     pub fn open(gpa: std.mem.Allocator, path: [:0]const u8, depth: usize, lanes: usize) Error!Io {
@@ -899,6 +943,10 @@ pub const Io = struct {
         if (io.fd < 0) io.fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o600));
         if (io.fd < 0) return error.OpenFailed;
         errdefer _ = std.c.close(io.fd);
+        // the file is this tier's alone and starts empty: another process on the same path (a second server, a
+        // test left running) is refused, and nothing a previous run left is ever there to be read
+        if (flock(io.fd, lock_ex | lock_nb) != 0) return error.FileBusy;
+        if (std.c.ftruncate(io.fd, 0) != 0) return error.OpenFailed;
         if (builtin.os.tag == .linux) {
             io.lanes = try gpa.alloc(Lane, @max(lanes, 1));
             var made: usize = 0;
@@ -1114,6 +1162,18 @@ const Fixture = struct {
     }
 
     /// A selection of R rows over the stream's visible positions, fetched and remapped, compared byte for byte.
+    /// Every committed row of stream `s` checked where the tier keeps it: a resident pool's slab rows, a written
+    /// pool's file block (an alias's rows below its fork are its parent's, checked there).
+    fn verifyAll(f: *Fixture, s: usize) !void {
+        const t = &f.tier;
+        var refs: [8][]const u8 = undefined;
+        for (0..t.streams[s].layers) |l| refs[l] = f.ref[s * t.o.layers + l];
+        if (try t.verify(s, refs[0..t.streams[s].layers], t.streams[s].committed)) |m| {
+            std.debug.print("verify: stream {d} {any}\n", .{ s, m });
+            return error.TierDiffers;
+        }
+    }
+
     fn select(f: *Fixture, rnd: std.Random, s: usize, R: usize, W: usize) !void {
         const t = &f.tier;
         const rb = t.o.row_bytes;
@@ -1162,7 +1222,8 @@ test "a selection reads the bytes last written, through windows, drafts, commits
     for (0..o.streams) |s| try t.open(s, o.layers);
     var committed: [2]usize = .{ 0, 0 };
     var steps: usize = 0;
-    while (steps < 400) : (steps += 1) {
+    const iters: usize = if (std.c.getenv("TF_TIER_ITERS")) |e| std.fmt.parseInt(usize, std.mem.span(e), 10) catch 400 else 400;
+    while (steps < iters) : (steps += 1) {
         const s = rnd.uintLessThan(usize, o.streams);
         const pos = committed[s];
         if (pos + seg_positions > o.capacity) continue;
@@ -1179,6 +1240,7 @@ test "a selection reads the bytes last written, through windows, drafts, commits
         try t.commit(s, committed[s]);
         f.end[s] = committed[s];
         try t.check();
+        for (0..o.streams) |x| try f.verifyAll(x);
     }
     try testing.expect(t.reads > 0); // the slab is too small to hold everything: some pools came back from the file
     try testing.expect(t.writes > 0);
@@ -1398,6 +1460,26 @@ test "a chain of max_chain streams reads through every level; one more is refuse
         prev = next;
     }
     try testing.expectEqual(@as(usize, max_chain), level);
+}
+
+test "the backing file is the tier's alone and starts empty" {
+    const o: Options = .{ .streams = 1, .layers = 1, .capacity = 4 * seg_positions, .depth = 8 };
+    const f = try Fixture.init(o, 8, 12);
+    defer f.deinit();
+    // a second tier on the same path (another process, or a test still running) is refused
+    const slab = try testing.allocator.alignedAlloc(u8, .fromByteUnits(block), 8 * run_pools * block);
+    defer testing.allocator.free(slab);
+    const map = try testing.allocator.alloc(i32, o.capacity / pool_rows);
+    defer testing.allocator.free(map);
+    try testing.expectError(error.FileBusy, Tier.init(testing.allocator, slab, map, f.path, o));
+    // a file a previous run left behind is emptied at open
+    f.tier.deinit();
+    const fd = std.c.open(f.path, .{ .ACCMODE = .RDWR }, @as(c_uint, 0));
+    try testing.expect(fd >= 0);
+    _ = std.c.pwrite(fd, slab.ptr, block, 0);
+    _ = std.c.close(fd);
+    f.tier = try Tier.init(testing.allocator, f.slab, f.map, f.path, o);
+    try testing.expectEqual(@as(std.c.off_t, 0), std.c.lseek(f.tier.io.fd, 0, std.c.SEEK.END));
 }
 
 test "prefetchRange brings a layer's whole context back" {

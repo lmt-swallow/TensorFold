@@ -383,11 +383,11 @@ pub const Runner = struct {
     }
 
     /// The tier stream's positions before `pos` final, the ones from it dropped (rejected rows).
-    fn tierSettle(q: *const Seq, head: bool, pos: usize) !void {
+    fn tierSettle(r: *Runner, q: *const Seq, head: bool, pos: usize) !void {
         const x = q.tier orelse return;
         const h = if (head) x.hm else x.h;
         x.t.rewind(h, pos);
-        try x.t.commit(h, pos);
+        try x.t.commit(h, pos, r.stream);
     }
 
     fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr) !void {
@@ -429,8 +429,8 @@ pub const Runner = struct {
         try q.last.copyFrom(0, w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
         q.st.pos = ps.pos;
         q.mtp_len = ps.mtp_len;
-        try tierSettle(q, false, q.st.pos);
-        try tierSettle(q, true, q.mtp_len);
+        try r.tierSettle(q, false, q.st.pos);
+        try r.tierSettle(q, true, q.mtp_len);
         return start + R;
     }
 
@@ -488,7 +488,7 @@ pub const Runner = struct {
     /// Keep the last window's first `keep` of its `R` rows.
     pub fn commit(r: *Runner, q: *Seq, R: usize, keep: usize) !void {
         try M.commit(r.k, r.lay, &q.st, R, keep, false, &r.w, r.stream);
-        try tierSettle(q, false, q.st.pos);
+        try r.tierSettle(q, false, q.st.pos);
     }
 
     /// The head owes the rows at `hidden` (one a token of `next`, the token after each); absorbed by `absorb`.
@@ -521,7 +521,7 @@ pub const Runner = struct {
         }
         q.m_next.clearRetainingCapacity();
         // the absorbed rows are final; the chain's drafts after them are not
-        try tierSettle(q, true, q.mtp_len);
+        try r.tierSettle(q, true, q.mtp_len);
     }
 
     /// decode.py `draft`'s chain after `absorb`: up to `depth` drafts, cut where the product of their confidences

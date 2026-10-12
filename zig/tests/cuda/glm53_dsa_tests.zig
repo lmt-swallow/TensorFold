@@ -81,7 +81,7 @@ const Run = struct {
                 const kvt = glm.tier.kv;
                 const cap = @max(std.mem.alignForward(usize, capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
                 const runs = kvt.home_runs + 4 + cap / kvt.seg_positions / 2;
-                const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-dsa-{s}-r{d}.bin", .{ dd, tag, i }, 0);
+                const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-dsa-{s}-r{d}-{d}.bin", .{ dd, tag, i, std.c.getpid() }, 0);
                 defer gpa.free(path);
                 const t = try glm.tier.Tier.init(gpa, d, .{ .streams = 1, .layers = 1, .capacity = cap, .row_bytes = cfg.kv_lora * 2, .recent_runs = 2 }, runs * kvt.run_pools * kvt.block, prompt_rows, glm.glue.sparse_tokens, path);
                 try t.open(0, 1);
@@ -93,10 +93,10 @@ const Run = struct {
     }
 
     /// Before a window of R rows at `pos` (the fixture's: rows before it are final).
-    fn window(r: *Run, pos: usize, R: usize) !void {
+    fn window(r: *Run, pos: usize, R: usize, stream: cuda.Stream) !void {
         for (r.tier) |x| if (x) |t| {
             t.rewind(0, pos);
-            try t.commit(0, pos);
+            try t.commit(0, pos, stream);
             try t.beginWindow(0, pos, R);
         };
     }
@@ -276,7 +276,7 @@ fn runSteps(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, cfg: *const glm
         const before = h.failures;
         var nb: [16]u8 = undefined;
         const step = try std.fmt.bufPrint(&nb, tag ++ "{d}", .{s});
-        try run_.window(pos, R);
+        try run_.window(pos, R, h.stream);
         // the attention site: embed, hc_pre, the DSA block
         for (ranks, 0..) |*r, ri| {
             const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
@@ -343,7 +343,7 @@ fn runMtp(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, tk: *const T.Kern
         const before = h.failures;
         var nb: [16]u8 = undefined;
         const step = try std.fmt.bufPrint(&nb, "m{d}", .{s});
-        try run_.window(mtp_len, n);
+        try run_.window(mtp_len, n, h.stream);
         for (ranks, 0..) |*r, ri| {
             const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
             const b = if (prefill) &r.pmb else &r.mb;

@@ -27,6 +27,51 @@ fn ms(t0: i96, io: std.Io) f64 {
     return @as(f64, @floatFromInt(now(io) - t0)) / 1e6;
 }
 
+/// Every row stream `h` holds below `upto` (slab and file) against the whole cache `whole` (downloaded to `host`):
+/// the full-slab check after each window, so a PASS means every row was compared, not the sampled ones.
+fn verifyAll(tier: *glm.tier.Tier, h: usize, whole: *const Buf, host: []u8, upto: usize, rb: usize, what: []const u8, at: usize) !void {
+    try whole.download(0, host[0 .. upto * rb]);
+    const refs = [_][]const u8{host[0 .. upto * rb]};
+    if (try tier.host.verify(h, &refs, upto)) |m| {
+        std.debug.print("FAIL glm53-tier verify after {s} at {d}: pool {d} (positions {d}..{d}), slot {d} ({t} run), {s} differs\n", .{ what, at, m.pool, m.pool * 4, m.pool * 4 + 3, m.slot, m.run_kind, if (m.in_file) "file block" else "slab row" });
+        return error.TestFailed;
+    }
+}
+
+/// On a mismatch: whether the device remap gave the host's rows, and whether those slab rows hold the whole
+/// cache's bytes (so a failure names the remap, the slab's contents, or the attention kernel).
+fn diagnose(gpa: std.mem.Allocator, tier: *glm.tier.Tier, whole: *const Buf, tok_b: Buf, rows_dev: Ptr, tokens: []const i32, counts: []const i32, R: usize, rb: usize) !void {
+    const n = R * W;
+    const pos_dev = try gpa.alloc(i32, n);
+    defer gpa.free(pos_dev);
+    try tok_b.download(0, std.mem.sliceAsBytes(pos_dev));
+    const rows = try gpa.alloc(i32, n);
+    defer gpa.free(rows);
+    try tier.d.check(tier.d.api.cuMemcpyDtoH_v2(rows.ptr, rows_dev, n * 4), "cuMemcpyDtoH");
+    const want = try gpa.alloc(i32, n);
+    defer gpa.free(want);
+    @memcpy(want, tokens[0..n]);
+    tier.host.remap(0, 0, want, counts[0..R], W);
+    const row = try gpa.alloc(u8, rb);
+    defer gpa.free(row);
+    var pos_bad: usize = 0;
+    var remap_bad: usize = 0;
+    var bytes_bad: usize = 0;
+    var first: ?usize = null;
+    for (0..R) |r| for (0..@intCast(counts[r])) |i| {
+        const j = r * W + i;
+        pos_bad += @intFromBool(pos_dev[j] != tokens[j]);
+        if (rows[j] != want[j]) {
+            remap_bad += 1;
+            if (first == null) first = j;
+        }
+        try whole.download(@as(usize, @intCast(tokens[j])) * rb, row);
+        const slab = tier.slab.bytes[@as(usize, @intCast(want[j])) * rb ..][0..rb];
+        bytes_bad += @intFromBool(!std.mem.eql(u8, row, slab));
+    };
+    std.debug.print("glm53-tier diagnose: {d} positions changed on the device, {d} device rows differ from the host remap (first at {?d}: pos {d} device {d} host {d}), {d} slab rows differ from the whole cache's\n", .{ pos_bad, remap_bad, first, if (first) |f| tokens[f] else 0, if (first) |f| rows[f] else 0, if (first) |f| want[f] else 0, bytes_bad });
+}
+
 /// Random finite bf16 values of magnitude 2^-7 .. 2^2.
 fn fillBf16(rnd: std.Random, out: []u8) void {
     var i: usize = 0;
@@ -84,7 +129,7 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     // the slab: the home block, the recent window and about half of the rest
     const recent = 8;
     const runs = 2 * (kv.home_runs + 2) + recent + (N / kv.seg_positions) / 2; // the alias phase takes a second stream
-    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53_tier_test.bin", .{file_dir}, 0);
+    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53_tier_test_{d}.bin", .{ file_dir, std.c.getpid() }, 0);
     defer gpa.free(path);
     const o: kv.Options = .{ .streams = 2, .layers = 1, .capacity = N, .row_bytes = rb, .recent_runs = recent };
     const tier = try glm.tier.Tier.init(gpa, d, o, runs * kv.run_pools * kv.block, 64, W, path);
@@ -96,6 +141,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     var whole = try Buf.alloc(d, N * rb);
     defer whole.free();
     try whole.fill8(0, null);
+    const whole_host = try gpa.alloc(u8, N * rb);
+    defer gpa.free(whole_host);
 
     var prng = std.Random.DefaultPrng.init(0x61a53);
     const rnd = prng.random();
@@ -121,7 +168,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
             try g.latWrite(lat.ptr + (p.pos - pos) * rb, lw, p.base, .bf16, p.pos_dev, p.rows, lw, stream);
         };
         try stream.synchronize();
-        try tier.commit(0, pos + chunk);
+        try tier.commit(0, pos + chunk, stream);
+        try verifyAll(tier, 0, &whole, whole_host, pos + chunk, rb, "a prompt chunk", pos);
     }
     std.debug.print("glm53-tier: {d} positions written in {d:.0} ms ({d} pools written, {d} read back, slab {d} of {d} runs)\n", .{ pos, ms(t_fill, io), tier.host.writes, tier.host.reads, runs, N / kv.seg_positions });
 
@@ -205,12 +253,15 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
         t_slab += try e0.elapsedMs(e1);
         try out_a.download(0, ha[0 .. R * H * rb]);
         try out_b.download(0, hb[0 .. R * H * rb]);
+        if (!std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb])) try diagnose(gpa, tier, &whole, tok_b, res.tokens, tokens, counts, R, rb);
         try check.expect(std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb]), "glm53-tier: decode window of {d} rows at {d}: the slab's output differs from the whole cache's", .{ R, pos });
         checked += 1;
         const keep = 1 + rnd.uintLessThan(usize, R);
         pos += keep;
         tier.rewind(0, pos);
-        try tier.commit(0, pos);
+        try tier.commit(0, pos, stream);
+        try stream.synchronize();
+        try verifyAll(tier, 0, &whole, whole_host, pos, rb, "a decode window", pos);
     }
     check.pass("glm53-tier: {d} decode windows (1, 3, 16 rows) over {d} positions: the slab's sparse attention equals the whole cache's byte for byte; resolve {d:.2} ms a window, kernel {d:.3} ms (slab) vs {d:.3} ms (device)", .{ checked, pos, resolve_ms / @as(f64, @floatFromInt(resolves)), t_slab / @as(f64, @floatFromInt(checked)), t_whole / @as(f64, @floatFromInt(checked)) });
 
@@ -288,7 +339,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
             try out_b.download(0, hb[0 .. R * H * rb]);
             try check.expect(std.mem.eql(u8, ha[0 .. R * H * rb], hb[0 .. R * H * rb]), "glm53-tier: an alias's window at {d}: the slab's output differs from the whole cache's", .{bpos});
             bpos += R;
-            try tier.commit(b, bpos);
+            try tier.commit(b, bpos, stream);
+            try verifyAll(tier, b, &whole_b, whole_host, bpos, rb, "an alias's window", bpos);
         }
         tier.close(0); // the parent let go while its alias reads through it
         selection(rnd, bpos - 1, 1, tokens, counts, seen, &stamp);

@@ -221,7 +221,10 @@ pub const Tier = struct {
         return t.host.acquire(layers);
     }
 
-    pub fn commit(t: *Tier, s: usize, pos: usize) !void {
+    /// kv_tier.Tier.commit after `stream` finished: the pools it writes to the file are read from the slab by the
+    /// drive's DMA, so every latent write queued before (on `stream`) must have landed first.
+    pub fn commit(t: *Tier, s: usize, pos: usize, stream: cuda.Stream) !void {
+        try stream.synchronize();
         try t.host.commit(s, pos);
     }
 
