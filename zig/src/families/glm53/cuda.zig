@@ -19,6 +19,7 @@ pub const dflash_weights = @import("cuda_dflash_weights.zig");
 pub const dflash_kernels = @import("cuda_dflash_kernels.zig");
 pub const dflash_projections = @import("cuda_dflash_qmm.zig");
 pub const dflash_buffers = @import("cuda_dflash_buffers.zig");
+pub const dflash_session = @import("cuda_dflash_session.zig");
 pub const dflash_taps = @import("cuda_dflash_taps.zig");
 pub const dflash_forward = @import("cuda_dflash_forward.zig");
 pub const mtp = @import("cuda_mtp.zig");
