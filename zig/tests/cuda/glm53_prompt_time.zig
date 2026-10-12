@@ -1,10 +1,10 @@
 //! `glm53-prompt-time <aot-dir> <model-dir> [pos ...]`: the prompt path's speed on one rank (rank 0 of two), without
-//! the other rank or a fixture. The rank's whole model (45 layers, the MTP layer, the head), zero caches over
-//! `capacity` tokens, a 2,048-row chunk of fixed token ids at each position given (default 0 and 30,720; each chunk
+//! the other rank or a fixture. The rank's whole model (45 layers, the MTP layer, the head), zero caches through the
+//! deepest position given, a 2,048-row chunk of fixed token ids at each position (default 0 and 30,720; each chunk
 //! starts there, the caches before it zero) with its MTP absorb, and gathers that stand the rank's own bytes in for
 //! the other rank's. Each chunk runs twice (the first warms up); the second's ops are timed one by one (the stream
-//! synchronized after each) and summed by kind. TF_GLM_HC_SPLIT=1 plans the chunk row-split. The bits are not checked. `aot-dir` holds Triton
-//! variants of 2,048-row chunks at those positions (glm53/capture.sh prompt's covers 0 .. 34,816).
+//! synchronized after each) and summed by kind. TF_GLM_HC_SPLIT=1 plans the chunk row-split. The bits are not checked.
+//! `aot-dir` holds the Triton variants of 2,048-row chunks at those positions.
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm53");
@@ -19,7 +19,6 @@ const A = glm.dsa;
 const M = glm.moe;
 const T = glm.mtp;
 
-const capacity = 40_960;
 
 fn nowNs() i128 {
     var ts: std.c.timespec = undefined;
@@ -48,6 +47,10 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, positions: []const 
     var pack = try glm.weights.Pack.open(gpa, gpu.io, model);
     defer pack.close();
     const lay: glm.config.Layout = .{ .rank = 0, .world = 2, .cfg = &cfg };
+    // the caches hold the deepest chunk asked for (zero before it), in whole 4,096-token steps
+    var deepest: usize = 0;
+    for (positions) |p| deepest = @max(deepest, p);
+    const capacity = std.mem.alignForward(usize, deepest + P.chunk_rows + 64, 4096);
     const l: glm.weights.Loader = .{ .gpa = gpa, .d = d, .pack = &pack, .lay = lay };
     const t0 = nowNs();
     var whole = try glm.model.Model.load(l, cfg.layers);
