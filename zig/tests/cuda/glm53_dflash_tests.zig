@@ -26,14 +26,19 @@ fn projection(m: *const glm.dflash_weights.Model, head: *const Head, call: usize
 }
 
 pub fn run(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8) !void {
-    return replay(gpu, work, target, draft, false);
+    return replay(gpu, work, target, draft, false, false);
 }
 
 pub fn connected(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8) !void {
-    return replay(gpu, work, target, draft, true);
+    return replay(gpu, work, target, draft, true, false);
 }
 
-fn replay(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8, pipeline: bool) !void {
+/// Replay committed synthetic taps across two physical ring wraps and reset.
+pub fn wrap(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8) !void {
+    return replay(gpu, work, target, draft, true, true);
+}
+
+fn replay(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u8, pipeline: bool, wrapping: bool) !void {
     const a = gpu.gpa;
     const aot_dir = try std.fs.path.join(a, &.{ work, "aot" });
     defer a.free(aot_dir);
@@ -68,16 +73,19 @@ fn replay(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u
         const lay: glm.config.Layout = .{ .rank = rank, .world = 2, .cfg = &cfg };
         var head = try Head.load(.{ .gpa = a, .d = gpu.d, .pack = &pack, .lay = lay });
         defer head.deinit();
-        var context = try glm.dflash_buffers.Context.init(gpu.d, 4096);
+        var context = try glm.dflash_buffers.Context.init(gpu.d, if (wrapping) 8192 else 4096);
         defer context.deinit();
         var embedding = try (glm.weights.Loader{ .gpa = a, .d = gpu.d, .pack = &pack, .lay = lay }).share("model.language_model.embed_tokens.weight");
         defer embedding.free();
-        for (0..9) |step| {
+        var update: usize = 0;
+        var tap_start: usize = 0;
+        for (0..@as(usize, if (wrapping) 6 else 9)) |step| {
             try h.begin(rank, step);
             var sb: [16]u8 = undefined;
             const name = try std.fmt.bufPrint(&sb, "s{d}", .{step});
             if (pipeline) {
-                try connectedStep(&h, &context, &model, &head, scratch, dk, kernels, glue, embedding, &hp, step);
+                if (wrapping) try wrapUpdates(&h, &context, &model, scratch, dk, kernels, glue, step, &update, &tap_start);
+                try connectedStep(&h, &context, &model, &head, scratch, dk, kernels, glue, embedding, &hp, step, !wrapping);
                 continue;
             }
             var count: usize = 0;
@@ -106,7 +114,40 @@ fn replay(gpu: check.Gpu, work: []const u8, target: []const u8, draft: []const u
         }
     }
     try check.expect(h.failures == 0, "DFlash2 projection replay: {d} failures", .{h.failures});
-    if (pipeline) check.pass("DFlash2 connected nine-step rank outputs and rings equal the captured fixture", .{}) else check.pass("DFlash2 all 666 rank/step projections equal the captured BF16/FP32 outputs", .{});
+    if (wrapping) check.pass("DFlash2 two ring wraps and reset equal the captured fixture", .{}) else if (pipeline) check.pass("DFlash2 connected nine-step rank outputs and rings equal the captured fixture", .{}) else check.pass("DFlash2 all 666 rank/step projections equal the captured BF16/FP32 outputs", .{});
+}
+
+fn wrapUpdates(h: *hs.Harness, context: *glm.dflash_buffers.Context, model: *const glm.dflash_weights.Model, scratch: glm.dflash_buffers.Scratch, dk: glm.dflash_kernels.Kernels, qk: glm.dflash_projections.Kernels, glue: glm.glue.Glue, step: usize, update: *usize, tap_start: *usize) !void {
+    const params = h.fx.parsed.value.object.get("params").?.object;
+    const target: usize = @intCast(params.get("checkpoints").?.array.items[step].integer);
+    const resetting = step == 5;
+    if (resetting) {
+        try context.reset(h.stream);
+        tap_start.* = 0;
+    }
+    const raw = try h.fx.bytes("committed_taps");
+    defer h.gpu.gpa.free(raw);
+    while (context.logical.end < target) {
+        const rows: usize = if (resetting) 1 else @intCast(params.get("tap_rows").?.array.items[update.*].integer);
+        if (rows == 0 or rows > 64 or context.logical.end + rows > target) return error.BadDflashTrace;
+        const bytes_per_row = 5 * 4096 * 2;
+        const offset = tap_start.* * bytes_per_row;
+        if (offset + rows * bytes_per_row > raw.len) return error.BadDflashTrace;
+        try scratch.get("taps").upload(0, raw[offset..][0 .. rows * bytes_per_row]);
+        try qk.rotary(scratch.get("cos").ptr, scratch.get("sin").ptr, context.logical.end, rows, model.theta, h.stream);
+        var name: [96]u8 = undefined;
+        inline for ([_][]const u8{ "cos", "sin" }) |part| {
+            const key = if (resetting)
+                try std.fmt.bufPrint(&name, "r{d}_reset_{s}", .{ h.rank, part })
+            else
+                try std.fmt.bufPrint(&name, "r{d}_update{d}_{s}", .{ h.rank, update.*, part });
+            try h.same(key, scratch.get(part).ptr);
+        }
+        try glm.dflash_forward.addTaps(context, model, scratch, dk, qk, glue, scratch.get("taps"), scratch.get("cos"), scratch.get("sin"), rows, model.eps, h.stream);
+        tap_start.* += rows;
+        if (!resetting) update.* += 1;
+    }
+    try check.expect(context.logical.end == target, "DFlash wrap checkpoint committed end", .{});
 }
 
 /// Each native rank partial is checked before combining it with the recorded peer partial.
@@ -142,7 +183,7 @@ fn feedCall(h: *hs.Harness, seq: i64, function: []const u8, argument: []const u8
     return cuda.DeviceBuffer.fromHost(h.gpu.d, bytes);
 }
 
-fn connectedStep(h: *hs.Harness, context: *glm.dflash_buffers.Context, model: *const glm.dflash_weights.Model, head: *const Head, scratch: glm.dflash_buffers.Scratch, dk: glm.dflash_kernels.Kernels, qk: glm.dflash_projections.Kernels, glue: glm.glue.Glue, embedding: cuda.DeviceBuffer, hp: *const cuda.cublaslt.Linear, step: usize) !void {
+fn connectedStep(h: *hs.Harness, context: *glm.dflash_buffers.Context, model: *const glm.dflash_weights.Model, head: *const Head, scratch: glm.dflash_buffers.Scratch, dk: glm.dflash_kernels.Kernels, qk: glm.dflash_projections.Kernels, glue: glm.glue.Glue, embedding: cuda.DeviceBuffer, hp: *const cuda.cublaslt.Linear, step: usize, update_taps: bool) !void {
     const a = h.gpu.gpa;
     var gathers: Gather = .{ .h = h, .seqs = undefined, .step = step };
     var ng: usize = 0;
@@ -171,16 +212,18 @@ fn connectedStep(h: *hs.Harness, context: *glm.dflash_buffers.Context, model: *c
             if (ret.get("shape").?.array.items[1].integer == 77440) head_seq = seq;
         }
     }
-    if (ng != 10 or tap_seq == null or block_seq == null or head_seq == null) return error.BadDflashTrace;
-    // The first projection's input is the committed tap tile, not an intermediate replay input.
-    var taps = try feedCall(h, 0, "_mm", "x_in");
-    defer taps.free();
-    var tc = try feedCall(h, tap_seq.?, "_prep", "cos_in");
-    defer tc.free();
-    var ts = try feedCall(h, tap_seq.?, "_prep", "sin_in");
-    defer ts.free();
-    const rows: usize = @intCast(h.fx.parsed.value.object.get("params").?.object.get("tap_rows").?.array.items[step].integer);
-    try glm.dflash_forward.addTaps(context, model, scratch, dk, qk, glue, taps, tc, ts, rows, 1e-5, h.stream);
+    if (ng != 10 or (update_taps and tap_seq == null) or block_seq == null or head_seq == null) return error.BadDflashTrace;
+    if (update_taps) {
+        // The first projection input is the committed tap tile, not an intermediate replay input.
+        var taps = try feedCall(h, 0, "_mm", "x_in");
+        defer taps.free();
+        var tc = try feedCall(h, tap_seq.?, "_prep", "cos_in");
+        defer tc.free();
+        var ts = try feedCall(h, tap_seq.?, "_prep", "sin_in");
+        defer ts.free();
+        const rows: usize = @intCast(h.fx.parsed.value.object.get("params").?.object.get("tap_rows").?.array.items[step].integer);
+        try glm.dflash_forward.addTaps(context, model, scratch, dk, qk, glue, taps, tc, ts, rows, 1e-5, h.stream);
+    }
     const committed = context.logical.end;
     var bc = try feedCall(h, block_seq.?, "_prep", "cos_in");
     defer bc.free();
@@ -190,7 +233,12 @@ fn connectedStep(h: *hs.Harness, context: *glm.dflash_buffers.Context, model: *c
     @memset(&ids, 154856);
     ids[0] = @intCast(try h.fx.int("pending"));
     try scratch.get("ids").upload(0, std.mem.sliceAsBytes(&ids));
-    try glm.dflash_forward.block(context, model, head, scratch, dk, qk, glue, embedding.ptr, bc.ptr, bs.ptr, 1e-5, .{ .ctx = &gathers, .run = Gather.run }, hp, h.stream);
+    if (!update_taps) {
+        try qk.rotary(scratch.get("cos").ptr, scratch.get("sin").ptr, committed, 8, model.theta, h.stream);
+        try h.same(try h.arrayName(block_seq.?, "_prep", "cos_in"), scratch.get("cos").ptr);
+        try h.same(try h.arrayName(block_seq.?, "_prep", "sin_in"), scratch.get("sin").ptr);
+    }
+    try glm.dflash_forward.block(context, model, head, scratch, dk, qk, glue, embedding.ptr, if (update_taps) bc.ptr else scratch.get("cos").ptr, if (update_taps) bs.ptr else scratch.get("sin").ptr, 1e-5, .{ .ctx = &gathers, .run = Gather.run }, hp, h.stream);
     try check.expect(gathers.at == 10 and context.logical.end == committed, "DFlash2 block preserves committed position and consumes ten rank partials", .{});
     try h.same(try h.arrayName(head_seq.?, "_mm", "ret"), scratch.get("logits").ptr);
     for (0..5) |i| {
