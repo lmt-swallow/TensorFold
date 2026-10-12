@@ -490,10 +490,11 @@ pub const Runner = struct {
     }
 
     fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr, phase: []const u8, step: usize) !void {
-        if (r.union_trace) |t| {
+        // Prompt MTP absorbs use untraced prompt scratch, regardless of prompt length.
+        if (!b.prefill) if (r.union_trace) |t| {
             try t.begin(phase, step, next.len, r.w.ms.slots, r.lay.cfg.experts, &.{.{ .stream = @intFromPtr(q), .pos = q.mtp_len, .start = 0, .rows = next.len }});
             r.w.ms.trace = t;
-        }
+        };
         defer r.w.ms.trace = null;
         if (!b.prefill) try r.tierBegin(q, true, q.mtp_len, next.len);
         const pre = b.prefill;
