@@ -53,6 +53,12 @@ LINK_POLL=${LINK_POLL:-0}
 # a prompt alone runs as fast either way. results/bench/20261012-0310-overlap-sweep.md has the sweep.
 PROMPT_SMS=${PROMPT_SMS:-36}
 URGENT=${URGENT:-1}
+# Copy drafts (TF_DS_COPY_DRAFTS) propose prompt-reference copies for edit-like replies; COPY_POSITION prices a copy
+# window at its stream's position and COPY_SHARE keeps shared rows for the other streams (measured 2026-10-12: all
+# token shas unchanged; 256k needle 31 -> 63 tok/s, code beside an edit 18 -> 36 tok/s). 0 turns each off.
+COPY_DRAFTS=${COPY_DRAFTS:-1}
+COPY_POSITION=${COPY_POSITION:-1}
+COPY_SHARE=${COPY_SHARE:-1}
 READY_TIMEOUT=${READY_TIMEOUT:-3600}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1800}
 LOG_DIR=${LOG_DIR:-${TMPDIR:-/tmp}/dsv41-smoke-$(date +%Y%m%d-%H%M%S)}
@@ -183,6 +189,7 @@ esac
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 [ "$LINK_POLL" = 0 ] && ENVS="$ENVS -e TF_DS_LINK_POLL=0"
 ENVS="$ENVS -e TF_DS_PROMPT_SMS=$PROMPT_SMS -e TF_DS_ROUNDS_URGENT=$URGENT"
+ENVS="$ENVS -e TF_DS_COPY_DRAFTS=$COPY_DRAFTS -e TF_DS_COPY_POSITION=$COPY_POSITION -e TF_DS_COPY_SHARE=$COPY_SHARE"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
 [ "$DRAFTS" = 0 ] && SERVE="$SERVE --no-drafts"
