@@ -23,10 +23,10 @@ const Buf = cuda.DeviceBuffer;
 pub const chunk = engine.prompt_rows;
 
 /// TF_GLM_KEEP (default on), TF_GLM_KEEP_ENTRIES, TF_GLM_KEEP_MARKS, TF_GLM_KEEP_SHRINK, TF_GLM_KEEP_SHRINK_MIN and
-/// TF_GLM_KEEP_SNAPS (default 16 snapshots, ~90 MB each on a rank), as the DeepSeek-V4.1 book reads its own. Both
+/// TF_GLM_KEEP_SNAPS (default 8 snapshots, ~86 MB each on a rank: 0.65 GiB; 16 took 1.29 GiB at 1M x 4), as the DeepSeek-V4.1 book reads its own. Both
 /// ranks must read the same values.
 pub fn settings() book.Settings {
-    var s: book.Settings = .{ .snaps = 16 };
+    var s: book.Settings = .{ .snaps = 8 };
     s.on = flag("TF_GLM_KEEP", true);
     s.entries = @min(int("TF_GLM_KEEP_ENTRIES", s.entries), book.max_kept - 1);
     s.marks = @max(@min(int("TF_GLM_KEEP_MARKS", s.marks), book.max_marks), 2);
