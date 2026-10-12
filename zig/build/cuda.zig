@@ -134,7 +134,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const pinned = b.option([]const u8, "glm53-nvcc", "nvcc 13.3 for the glm53 kernels (their reference's release; default -Dnvcc)") orelse nvcc;
     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
     const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) versionOf(b, nvcc.?) else null;
-    const pinned_version: ?std.Build.LazyPath = if (prebuilt == null and pinned != null) versionOf(b, pinned.?) else null;
+    // Identical capture commands share an output path; use one producer so neither truncates the other's input.
+    const pinned_version: ?std.Build.LazyPath = if (prebuilt == null and pinned != null)
+        if (nvcc != null and std.mem.eql(u8, nvcc.?, pinned.?)) version else versionOf(b, pinned.?)
+    else
+        null;
     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
     const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
     for (kernels, &images) |k, *image| {
