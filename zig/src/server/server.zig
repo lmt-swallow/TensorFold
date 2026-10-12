@@ -76,8 +76,7 @@ pub const Server = struct {
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
-    /// Held while one large prompt (`prompt.large_prompt_bytes`) is rendered and tokenized: the tokenizer's workspace
-    /// is about 130 times the text, so concurrent large prompts would each add theirs at once.
+    /// Serializes large rendered prompts while encoding to bound overlapping tokenizer workspaces.
     large_prompt: std.Io.Mutex = .init,
     arena: std.heap.ArenaAllocator,
 

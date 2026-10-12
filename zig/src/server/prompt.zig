@@ -13,32 +13,9 @@ pub const Rendered = struct { ids: []const u32, history_len: usize = 0 };
 
 pub const isTitle = messages_mod.isTitleRequest;
 
-/// Messages whose strings add up to more than this many bytes are rendered and tokenized one request at a time
-/// (`Server.large_prompt`): 256 KiB of text is about 64k tokens, whose tokenizer workspace is about 33 MiB; a
-/// million-token prompt's is about 0.5 GiB. Smaller prompts are not held up.
+/// Prompts above this rendered byte length encode one at a time, bounding overlapping tokenizer workspaces.
+/// Smaller prompts can encode while a large request waits or runs.
 pub const large_prompt_bytes: usize = 256 << 10;
-
-/// Counts string payload bytes for large-prompt admission, excluding object keys.
-pub fn stringBytes(v: Value) usize {
-    return switch (v) {
-        .string => |s| s.len,
-        .array => |items| blk: {
-            var n: usize = 0;
-            for (items) |x| n += stringBytes(x);
-            break :blk n;
-        },
-        .object => |o| blk: {
-            var n: usize = 0;
-            for (o.values()) |x| n += stringBytes(x);
-            break :blk n;
-        },
-        else => 0,
-    };
-}
-
-fn isLarge(messages: Value, tools: []const Value) bool {
-    return stringBytes(messages) + stringBytes(.{ .array = @constCast(tools) }) > large_prompt_bytes;
-}
 
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
@@ -50,10 +27,14 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
         .enable_thinking = thinking,
         .reasoning_effort = if (thinking) effort else null,
     };
-    const large = isLarge(normalized, tools);
+    const rendered = srv.text.render(cx.a, normalized, options, &problem) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Template => return cx.fail(.server, "{s}", .{problem}),
+    };
+    const large = rendered.len > large_prompt_bytes;
     if (large) srv.large_prompt.lockUncancelable(srv.io);
     defer if (large) srv.large_prompt.unlock(srv.io);
-    var ids = srv.text.renderIds(cx.a, normalized, options, &problem) catch |e| switch (e) {
+    var ids = srv.text.encode(cx.a, rendered, false) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Template => return cx.fail(.server, "{s}", .{problem}),
     };
@@ -112,23 +93,59 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
     return if (shared >= 512) shared else 0;
 }
 
-test "stringBytes counts what a template can render from the messages" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const result = try json.parse(a, "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"abcdef\"}]},{\"role\":\"assistant\",\"content\":\"xyz\",\"n\":3}]");
-    const parsed = result.ok;
-    // "user" 4 + "text" 4 + "abcdef" 6 + "assistant" 9 + "xyz" 3; numbers and keys add nothing
-    try std.testing.expectEqual(@as(usize, 26), stringBytes(parsed));
-}
+test "concurrent large rendered prompts encode serially with unchanged ids" {
+    const Probe = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        ready: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
 
-test "large admission includes tools and preserves the threshold boundary" {
-    const text = try std.testing.allocator.alloc(u8, large_prompt_bytes);
-    defer std.testing.allocator.free(text);
-    @memset(text, 'a');
-    const message: Value = .{ .string = text };
-    try std.testing.expect(!isLarge(message, &.{}));
-    try std.testing.expect(isLarge(message, &.{.{ .string = "x" }}));
-    try std.testing.expect(!isLarge(.null, &.{message}));
-    try std.testing.expect(isLarge(.{ .string = "x" }, &.{message}));
+        fn render(_: *anyopaque, a: std.mem.Allocator, _: Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
+            const text = try a.alloc(u8, large_prompt_bytes + 1);
+            @memset(text, 'x');
+            return text;
+        }
+        fn encode(ctx: *anyopaque, a: std.mem.Allocator, text: []const u8, _: bool) model_text.Error![]u32 {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            const active = p.active.fetchAdd(1, .seq_cst) + 1;
+            defer _ = p.active.fetchSub(1, .seq_cst);
+            _ = p.peak.fetchMax(active, .seq_cst);
+            std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+            const ids = try a.alloc(u32, text.len);
+            for (text, ids) |byte, *id| id.* = byte;
+            return ids;
+        }
+        fn worker(p: *@This(), srv: *Server) void {
+            _ = p.ready.fetchAdd(1, .seq_cst);
+            while (p.ready.load(.seq_cst) != 4) std.atomic.spinLoopHint();
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var cx: Cx = .{ .a = arena.allocator() };
+            const parsed = json.parse(cx.a, "[{\"role\":\"user\",\"content\":\"hi\"}]") catch {
+                p.failed.store(true, .seq_cst);
+                return;
+            };
+            const ids = renderIds(srv, &cx, parsed.ok, &.{}, true, null, true) catch {
+                p.failed.store(true, .seq_cst);
+                return;
+            };
+            if (ids.len != large_prompt_bytes + 1) p.failed.store(true, .seq_cst);
+            for (ids) |id| if (id != 'x') {
+                p.failed.store(true, .seq_cst);
+            };
+        }
+    };
+    var probe: Probe = .{};
+    // Only the fields used by renderIds are needed; the engine is never invoked.
+    var srv: Server = undefined;
+    srv.io = std.testing.io;
+    srv.late_system = "system";
+    srv.needs_user_after_tool = false;
+    srv.large_prompt = .init;
+    srv.text = .{ .ctx = &probe, .vtable = &.{ .encode = Probe.encode, .render = Probe.render, .decode = undefined, .token_id = undefined, .token_string = undefined, .vocab_size = undefined, .eos_ids = undefined, .template_source = undefined } };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Probe.worker, .{ &probe, &srv });
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!probe.failed.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), probe.peak.load(.seq_cst));
 }
