@@ -2025,8 +2025,8 @@ pub const Prompt = struct {
         try self.probeOut(try std.fmt.bufPrint(&nbuf, "L{d}.cidx", .{li}), self.cidx.ptr, n * kk * 8, stream);
     }
 
-    /// `_index_score_rows` on the row block at `q` through index_score.cu: scores (or keyed, the keys and tile maxima)
-    /// into `score` / `tmax`, from the layer's packed index keys.
+    /// `_index_score_rows` on the row block at `q` through index_score.cu: scores or keys into `score`,
+    /// from the layer's packed index keys; CHECK also needs tile maxima for reference comparison.
     fn indexScoreMma(self: *Prompt, li: usize, q: Ptr, wt: Ptr, vr: Ptr, rows: usize, n: usize, nt: usize, keyed: bool, stream: cuda.Stream) !void {
         const caches = self.fwd.cachesOf(li);
         const tiles = @max(1, self.ix.tiles);
@@ -2043,7 +2043,8 @@ pub const Prompt = struct {
         if (keyed) a.add(self.tmax.ptr);
         a.add(@as(c_int, @intCast(nt)));
         a.add(@as(c_int, @intCast(tiles)));
-        if (keyed) a.add(@as(c_int, 1));
+        // Prompt selection consumes keys only; CHECK compares the captured tile maxima as well.
+        if (keyed) a.add(@as(c_int, @intFromBool(self.ix.check)));
         const grid: cuda.launch.Dim3 = .{ .x = @intCast((rows + rb - 1) / rb), .y = @intCast((nt + tiles - 1) / tiles) };
         try cuda.launch.launch(if (keyed) self.ix.keys else self.ix.score, .{ .grid = grid, .block = .{ .x = @intCast(32 * rb) } }, stream, &a);
     }
