@@ -76,8 +76,8 @@ pub const Scratch = struct {
         .{ "sin", 64 * 64 * 4 },           .{ "partial", 8 * 4096 * 4 },
         .{ "gathered", 2 * 8 * 4096 * 4 }, .{ "gu", 8 * 12288 * 2 },
         .{ "activation", 8 * 6144 * 2 },   .{ "logits", 7 * 77440 * 2 },
-        .{ "projected", 7 * 256 * 4 },     .{ "matrix_partials", 8 * 64 * 4096 * 4 },
-        .{ "ids", 8 * 4 },
+        .{ "projected", 7 * 256 * 2 },     .{ "matrix_partials", 8 * 64 * 4096 * 4 },
+        .{ "ids", 8 * 4 },                 .{ "blas_workspace", 32 << 20 },
     };
     pub const bytes: usize = blk: {
         var end: usize = 0;

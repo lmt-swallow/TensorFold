@@ -268,3 +268,9 @@ template __global__ void __launch_bounds__(1 * 4 * 32) tf_glm53_qmm::qmm_kernel<
     const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, float*, int,
     int, int, int, int, int, int);
 template __global__ void tf_glm53_qmm::reduce_kernel<true>(const float*, void*, long long, int);
+
+// DFlash2's _row: rank-ordered FP32 addition, then one BF16 conversion.
+extern "C" __global__ void tf_glm53_dflash_sum(const float* gathered, __nv_bfloat16* out, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = __float2bfloat16_rn(__fadd_rn(gathered[i], gathered[count + i]));
+}
