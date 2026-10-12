@@ -128,7 +128,7 @@ fn deviceBytes(x: anytype) usize {
     switch (@typeInfo(T)) {
         .@"struct" => |st| {
             var n: usize = 0;
-            inline for (st.fields) |f| n += deviceBytes(@field(x, f.name));
+            inline for (st.field_names) |name| n += deviceBytes(@field(x, name));
             return n;
         },
         .array => {
