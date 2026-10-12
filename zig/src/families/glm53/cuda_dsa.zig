@@ -25,11 +25,18 @@ const Buf = cuda.DeviceBuffer;
 /// tensorfold/cuda/geometry.py MLA_PROMPT_ATT_ROWS and MLA_SELECT_ROWS.
 pub const prompt_att_rows = 512;
 pub const select_rows = 512;
-/// Rows a prompt chunk's pool selection scores at a time. sparse.py's `_select_prompt` takes blocks of select_rows; a
-/// row's scores, pools and tokens depend on that row alone (`_scores` keeps rows apart, the selection is per row), so
-/// smaller blocks give the same bytes and shrink the scores scratch: [block, pools] fp32 is 512 MiB at 512 rows and a
-/// 1M context (262,144 pools), 128 MiB at 128 rows.
-pub const select_block = 128;
+/// TF_GLM_SELECT_ROWS: rows a prompt chunk's pool selection scores at a time, from 16 to select_rows (default
+/// select_rows, sparse.py `_select_prompt`'s blocks). A row's scores, pools and tokens depend on that row alone
+/// (`_scores` keeps rows apart, the selection is per row), so every block size gives the same bytes; smaller blocks
+/// shrink the scores scratch ([block, pools] fp32: 512 MiB at 512 rows and a 1M context's 262,144 pools, 128 MiB at
+/// 128) and cost launches (at 204,800 positions select.cu takes 62.4 ms a chunk at 128 rows, 50.5 at 512).
+pub fn selectBlock() error{BadSelectRows}!usize {
+    const v = std.mem.span(std.c.getenv("TF_GLM_SELECT_ROWS") orelse return select_rows);
+    if (v.len == 0) return select_rows;
+    const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return error.BadSelectRows;
+    if (n < 16 or n > select_rows) return error.BadSelectRows;
+    return n;
+}
 /// sparse.py PROMPT_ROWS (windows from this many rows take the prompt selection), SPLIT_FROM, SPLIT_ROWS,
 /// ROW_SCORE_G; latent.py CHUNK.
 const prompt_select_from = 64;
@@ -241,6 +248,7 @@ pub const seg_rows = 16;
 pub const Scratch = struct {
     rows: usize,
     prefill: bool,
+    select_block: usize, // a prompt chunk's selection rows at a time (`selectBlock`)
     dp: Buf, // [rows, q_lora + kv_lora] bf16
     qr: Buf, // [rows, q_lora]
     xs_qr: Buf,
@@ -273,6 +281,7 @@ pub const Scratch = struct {
         const lw = c.kv_lora;
         var s: Scratch = undefined;
         s.rows = rows;
+        s.select_block = try selectBlock();
         s.prefill = prefill;
         const a = struct {
             fn f(dd: *const cuda.Driver, n: usize) !Buf {
@@ -303,7 +312,7 @@ pub const Scratch = struct {
         s.sparse_bufs = .{ try a(d, ns * lw * 4), try a(d, ns * 4), try a(d, ns * 4) };
         s.sparse = .{ .po = s.sparse_bufs[0].ptr, .pm = s.sparse_bufs[1].ptr, .pl = s.sparse_bufs[2].ptr };
         const np_max = capacity / 4;
-        s.scores = try a(d, @min(rows, select_block) * @max(np_max, 1024) * 4);
+        s.scores = try a(d, @min(rows, s.select_block) * @max(np_max, 1024) * 4);
         s.pools = try a(d, rows * 512 * 8);
         // a decode window's streams' selections each in a block of `seg_rows` rows (16-byte aligned starts)
         const sel_rows = if (prefill) rows else @max(rows, max_segs * seg_rows);
@@ -315,7 +324,7 @@ pub const Scratch = struct {
             @max(glue_mod.splitScratchBytes(split_rows - 1, @max(np_max, 1024)), glue_mod.splitScratchBytes(split_rows - 1, std.math.clamp(np_max, 1024, 16384)))
         else
             glue_mod.splitScratchBytes(rows, @max(np_max, 1024)));
-        s.at = try a(d, at_select + (rows / select_block + 2) * 16);
+        s.at = try a(d, at_select + (rows / s.select_block + 2) * 16);
         return s;
     }
 
@@ -499,9 +508,9 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi:
     const np_max = cache.poolRows();
     const qrow = 32 * 128 * 2;
     if (R >= prompt_select_from) {
-        // _select_prompt's selection, in blocks of select_block rows scoring the chunk's pool_count pools
+        // _select_prompt's selection, in blocks of s.select_block rows scoring the chunk's pool_count pools
         const NP = poolCount(call.host_pos, R, np_max);
-        const B = @min(R, select_block);
+        const B = @min(R, s.select_block);
         var a: usize = 0;
         var i: usize = 0;
         while (a < R) : ({
