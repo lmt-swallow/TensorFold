@@ -142,11 +142,15 @@ pub const Runner = struct {
     argmax_mod: cuda.Module,
     argmax_fn: cuda.Function, // tf_argmax_rows_i32_kernel (torch_ops/argmax.cu): each row's first largest
     picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
+    topk_mod: cuda.Module,
+    topk_fn: cuda.Function, // tf_glm53_topk_row (glm53/topk.cu): a row's k best on the device
+    /// TF_GLM_DRAFT_TOPK=0: `sample` scans the row on the host; TF_GLM_TOPK_CHECK=1: both, compared every call.
+    topk: enum { device, host, check } = .device,
     split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
     overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lay: config.Layout, k: M.Kernels, tk: *const T.Kernels, model: *const M.Model, mtp: *const T.Mtp, link: Link, stream: cuda.Stream, capacity: usize) !Runner {
-        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined };
+        var r: Runner = .{ .gpa = gpa, .d = d, .lay = lay, .k = k, .tk = tk, .model = model, .mtp = mtp, .link = link, .stream = stream, .w = undefined, .mb = undefined, .pmb = undefined, .host = undefined, .cand = undefined, .players = undefined, .pmodel = undefined, .stage_rows = undefined, .argmax_mod = undefined, .argmax_fn = undefined, .picks = undefined, .topk_mod = undefined, .topk_fn = undefined };
         r.w = try M.Work.init(d, lay, batch_rows, prompt_rows, capacity);
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
@@ -164,6 +168,15 @@ pub const Runner = struct {
         r.argmax_fn = try r.argmax_mod.function("tf_argmax_rows_i32_kernel");
         r.picks = try Buf.alloc(d, batch_rows * 4 + (1 + lay.world) * 2 * batch_rows * 4);
         errdefer r.picks.free();
+        r.topk_mod = try cuda.Module.load(d, cuda.kernels.glm53_topk);
+        errdefer r.topk_mod.unload();
+        r.topk_fn = try r.topk_mod.function("tf_glm53_topk_row");
+        if (std.c.getenv("TF_GLM_DRAFT_TOPK")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) {
+            r.topk = .host;
+        };
+        if (std.c.getenv("TF_GLM_TOPK_CHECK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+            r.topk = .check;
+        };
         r.players = try gpa.alloc(Pm.Layer, model.layers.len);
         errdefer gpa.free(r.players);
         r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
@@ -174,6 +187,7 @@ pub const Runner = struct {
     pub fn deinit(r: *Runner) void {
         r.picks.free();
         r.argmax_mod.unload();
+        r.topk_mod.unload();
         r.w.deinit();
         r.mb.deinit();
         r.pmb.deinit();
@@ -236,10 +250,8 @@ pub const Runner = struct {
         return a.v > b.v or (a.v == b.v and a.id < b.id);
     }
 
-    /// decode.py `sample_rows`, greedy, of row `row` of `logits` (this rank's vocabulary share): every rank's `k`
-    /// best (value, id) gathered, the best by value then the lower id; with `prob`, its probability among the
-    /// gathered candidates at temperature 1 (`_probability`, a draft's confidence).
-    pub fn sample(r: *Runner, logits: Buf, row: usize, k: usize, prob: ?*f64) !u32 {
+    /// The host scan of row `row` (this rank's vocabulary share): its k best as [values][ids] words.
+    fn hostBest(r: *Runner, logits: Buf, row: usize, k: usize) ![2 * draft_k]f32 {
         const nv = r.host.len;
         try r.stream.synchronize();
         try logits.download(row * nv * 2, std.mem.sliceAsBytes(r.host));
@@ -261,7 +273,36 @@ pub const Runner = struct {
             mine[i] = b.v;
             mine[k + i] = @bitCast(b.id);
         }
-        try r.cand.uploadAsync(0, std.mem.sliceAsBytes(mine[0 .. 2 * k]), r.stream.handle);
+        return mine;
+    }
+
+    /// decode.py `sample_rows`, greedy, of row `row` of `logits` (this rank's vocabulary share): every rank's `k`
+    /// best (value, id) gathered, the best by value then the lower id; with `prob`, its probability among the
+    /// gathered candidates at temperature 1 (`_probability`, a draft's confidence).
+    pub fn sample(r: *Runner, logits: Buf, row: usize, k: usize, prob: ?*f64) !u32 {
+        const nv = r.host.len;
+        if (r.topk != .host) {
+            // the rank's k best on the device, straight into the gather's send words
+            var a: cuda.Args = .{};
+            a.add(logits.ptr + row * nv * 2);
+            a.add(@as(i32, @intCast(nv)));
+            a.add(@as(i32, @intCast(k)));
+            a.add(@as(i32, @intCast(r.lay.rank * nv)));
+            a.add(r.cand.ptr);
+            try cuda.launch.launch(r.topk_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, r.stream, &a);
+        }
+        if (r.topk != .device) {
+            const mine = try r.hostBest(logits, row, k);
+            if (r.topk == .check) {
+                var dev: [2 * draft_k]f32 = undefined;
+                try r.stream.synchronize();
+                try r.cand.download(0, std.mem.sliceAsBytes(dev[0 .. 2 * k]));
+                if (!std.mem.eql(u32, @ptrCast(dev[0 .. 2 * k]), @ptrCast(mine[0 .. 2 * k]))) {
+                    std.log.err("glm53: the device top-{d} differs from the host scan (row {d})", .{ k, row });
+                    return error.TopkMismatch;
+                }
+            } else try r.cand.uploadAsync(0, std.mem.sliceAsBytes(mine[0 .. 2 * k]), r.stream.handle);
+        }
         try r.link.gather(r.link.ctx, r.cand.ptr, r.cand.ptr + 2 * draft_k * 4, 2 * k, r.stream);
         try r.stream.synchronize();
         var both: [4 * draft_k]f32 = undefined;

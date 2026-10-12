@@ -58,6 +58,7 @@ pub const glm53_qmm: []const u8 = if (available) &Blob("fatbin_glm53_qmm").bytes
 pub const glm53_qmm_prefill: []const u8 = if (available) &Blob("fatbin_glm53_qmm_prefill").bytes else &.{};
 pub const glm53_tier: []const u8 = if (available) &Blob("fatbin_glm53_tier").bytes else &.{};
 pub const glm53_hc_fused: []const u8 = if (available) &Blob("fatbin_glm53_hc_fused").bytes else &.{};
+pub const glm53_topk: []const u8 = if (available) &Blob("fatbin_glm53_topk").bytes else &.{};
 pub const glm53_bmm: []const u8 = if (available) &Blob("fatbin_glm53_bmm").bytes else &.{};
 pub const glm53_select: []const u8 = if (available) &Blob("fatbin_glm53_select").bytes else &.{};
 pub const glm53_onepass: []const u8 = if (available) &Blob("fatbin_glm53_onepass").bytes else &.{};
