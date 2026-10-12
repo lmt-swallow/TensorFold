@@ -796,8 +796,8 @@ pub const Lanes = struct {
         const self = of(ptr);
         const i = self.slotOf(s) orelse return false;
         const sl = &self.slots[i];
-        const n = @min(out.len, sl.nheld);
-        @memcpy(out[0..n], sl.probs[0..n]);
+        if (out.len > sl.nheld) return false;
+        @memcpy(out, sl.probs[0..out.len]);
         return true;
     }
 
@@ -925,4 +925,25 @@ test "a follower runs only records whose slots hold what the step needs" {
     v.int(9);
     try std.testing.expect(!l.runnable(v.done()));
     try std.testing.expect(!l.runnable(&.{99}));
+}
+
+test "draft probabilities cover the requested prefix or decline without partial writes" {
+    var self: Lanes = undefined;
+    self.owners = @splat(null);
+    self.slots = @splat(.{});
+    var stream: lanes.Stream = undefined;
+    self.owners[0] = &stream;
+    self.slots[0].nheld = 2;
+    self.slots[0].probs[0..2].* = .{ 0.8, 0.6 };
+    var prefix: [1]f64 = undefined;
+    try std.testing.expect(try Lanes.probabilitiesFn(&self, &stream, &prefix));
+    try std.testing.expectEqual(@as(f64, 0.8), prefix[0]);
+    var exact: [2]f64 = undefined;
+    try std.testing.expect(try Lanes.probabilitiesFn(&self, &stream, &exact));
+    try std.testing.expectEqualSlices(f64, &.{ 0.8, 0.6 }, &exact);
+    var extended = [_]f64{ -1, -1, -1 };
+    try std.testing.expect(!try Lanes.probabilitiesFn(&self, &stream, &extended));
+    try std.testing.expectEqualSlices(f64, &.{ -1, -1, -1 }, &extended);
+    self.slots[0].nheld = 0;
+    try std.testing.expect(!try Lanes.probabilitiesFn(&self, &stream, &prefix));
 }
