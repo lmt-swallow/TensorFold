@@ -44,6 +44,9 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
         const text = body.get("prompt");
         if (text == null or text.? != .string) return cx.refuse("prompt must be a string (or send messages)");
         const special = try flag(cx, body, "add_special_tokens", true);
+        const large = text.?.string.len > prompt.large_prompt_bytes;
+        if (large) srv.large_prompt.lockUncancelable(srv.io);
+        defer if (large) srv.large_prompt.unlock(srv.io);
         ids = srv.text.encode(a, text.?.string, special) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Template => return cx.other("the tokenizer cannot encode this prompt"),
