@@ -174,7 +174,12 @@ const Phases = struct {
 
     /// Field `key` (a "Name:" line in kB) of `path`, in bytes; 0 when unreadable.
     fn kb(p: *const Phases, path: []const u8, key: []const u8) usize {
-        const text = std.Io.Dir.cwd().readFileAlloc(p.io, path, p.gpa, .limited(1 << 16)) catch return 0;
+        // /proc files report a size of 0: read them as a stream to the end
+        var file = std.Io.Dir.cwd().openFile(p.io, path, .{}) catch return 0;
+        defer file.close(p.io);
+        var buf: [4096]u8 = undefined;
+        var r = file.readerStreaming(p.io, &buf);
+        const text = r.interface.allocRemaining(p.gpa, .limited(1 << 20)) catch return 0;
         defer p.gpa.free(text);
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
