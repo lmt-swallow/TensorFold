@@ -103,6 +103,7 @@ pub const Tier = struct {
         open: bool = false,
         layers: usize = 0, // layers 0 .. layers - 1 in use (the MTP head's cache: 1)
         hi: usize = 0, // newest segment a window touched
+        end: usize = 0, // rows [0, end) hold the stream's rows (rewind lowers it); pools wholly past it are stale
         committed: usize = 0,
         dirty_lo: usize = 0, // pools below this are persisted wherever full and committed
         // an alias's: pools [home_pools, fork_pool) are the parent's (read through it, never written here)
@@ -293,7 +294,7 @@ pub const Tier = struct {
                         t.runs[sr[g]] = .{};
                         sr[g] = none;
                     }
-                    for (home_runs..t.segs) |g| if (sr[g] != none) t.demote(sr, g);
+                    for (home_runs..t.segs) |g| if (sr[g] != none) t.demote(s, sr, g);
                     t.home[s * t.o.layers + l] = none;
                 }
             }
@@ -350,9 +351,10 @@ pub const Tier = struct {
         const first = pos / seg_positions;
         const last = (pos + R - 1) / seg_positions;
         st.hi = @max(st.hi, last);
+        st.end = @max(st.end, pos + R);
         for (0..st.layers) |l| {
             const sr = t.seg_run[(s * t.o.layers + l) * t.segs ..][0..t.segs];
-            for (home_runs..t.segs) |g| if (sr[g] != none and g < first and g + t.o.recent_runs <= st.hi) t.demote(sr, g);
+            for (home_runs..t.segs) |g| if (sr[g] != none and g < first and g + t.o.recent_runs <= st.hi) t.demote(s, sr, g);
         }
         for (0..st.layers) |l| {
             for (first..last + 1) |g| if (t.seg_run[(s * t.o.layers + l) * t.segs + g] == none) {
@@ -570,6 +572,7 @@ pub const Tier = struct {
         try t.io.finish();
         st.hi = @max(st.hi, (rows - 1) / seg_positions);
         st.committed = @max(st.committed, rows);
+        st.end = @max(st.end, rows);
         st.dirty_lo = @max(st.dirty_lo, full);
     }
 
@@ -612,6 +615,7 @@ pub const Tier = struct {
         try t.io.finish();
         ds.hi = (rows - 1) / seg_positions;
         ds.committed = rows;
+        ds.end = rows;
         ds.dirty_lo = 0;
     }
 
@@ -634,6 +638,35 @@ pub const Tier = struct {
     pub fn rewind(t: *Tier, s: usize, pos: usize) void {
         const st = &t.streams[s];
         st.committed = @min(st.committed, pos);
+        if (pos < st.end) t.dropPast(s, pos);
+    }
+
+    /// Rows from `pos` on are stale: the pools wholly past it that sit in loose slots or only on the file are
+    /// forgotten (a linear run's stay for the window that rewrites them), so stale pools never pin slab slots.
+    fn dropPast(t: *Tier, s: usize, pos: usize) void {
+        const st = &t.streams[s];
+        const lo = (pos + pool_rows - 1) / pool_rows;
+        const hi = (st.end + pool_rows - 1) / pool_rows;
+        for (0..st.layers) |l| {
+            const k0 = t.mapBase(s, l);
+            for (lo..hi) |p| {
+                if (st.parent != null and p >= home_pools and p < st.fork_pool) continue;
+                const slot = t.map[k0 + p];
+                if (slot >= 0 and t.runs[@as(usize, @intCast(slot)) / run_pools].kind != .loose) continue;
+                t.drop(k0 + p);
+            }
+            // segments wholly past `pos` (beyond the home block) let their linear runs go: a stream sent far back
+            // would otherwise keep every segment it ever wrote linear
+            const sr = t.seg_run[(s * t.o.layers + l) * t.segs ..][0..t.segs];
+            for (@max(home_runs, (pos + seg_positions - 1) / seg_positions)..t.segs) |g| if (sr[g] != none) {
+                const r = sr[g];
+                for (r * run_pools..(r + 1) * run_pools) |slot| if (t.owner[slot] != none) t.drop(t.owner[slot]);
+                t.runs[r] = .{};
+                sr[g] = none;
+            };
+        }
+        st.end = pos;
+        st.hi = @min(st.hi, if (pos == 0) 0 else (pos - 1) / seg_positions);
     }
 
     // -- slots and runs --------------------------------------------------------------------------------------------
@@ -692,12 +725,15 @@ pub const Tier = struct {
         }
     }
 
-    fn demote(t: *Tier, sr: []u32, g: usize) void {
+    fn demote(t: *Tier, s: usize, sr: []u32, g: usize) void {
         const r = sr[g];
         sr[g] = none;
         t.runs[r].kind = .loose;
         for (r * run_pools..(r + 1) * run_pools) |slot| {
             t.ref.unset(slot);
+            // a pool wholly past the stream's rows is stale: it would pin the slot (never written out) for nothing
+            const k = t.owner[slot];
+            if (k != none and (k % t.pools) * pool_rows >= t.streams[s].end) t.drop(k);
             if (t.owner[slot] == none) t.free_slots.append(t.gpa, @intCast(slot)) catch {};
         }
     }
@@ -1258,10 +1294,10 @@ const Fixture = struct {
 test "a selection reads the bytes last written, through windows, drafts, commits and evictions" {
     var prng = std.Random.DefaultPrng.init(0x7131);
     const rnd = prng.random();
-    // 2 streams x 2 layers x 32,768 positions = 64 runs of latents in a 32-run slab: the home blocks take 12 runs,
-    // the recent windows up to 12, the 8 loose runs hold what else fits and the rest comes back from the file
+    // 2 streams x 2 layers x 32,768 positions = 64 runs of latents in a 26-run slab: the home blocks take 12 runs,
+    // the recent windows up to 12, the loose runs hold what else fits and the rest comes back from the file
     const o: Options = .{ .streams = 2, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 2, .depth = 32 };
-    const f = try Fixture.init(o, 32, 1);
+    const f = try Fixture.init(o, 26, 1);
     defer f.deinit();
     const t = &f.tier;
     for (0..o.streams) |s| try t.open(s, o.layers);
@@ -1292,6 +1328,35 @@ test "a selection reads the bytes last written, through windows, drafts, commits
     if (builtin.os.tag == .linux and std.c.getenv("TF_TIER_TEST_DIR") != null) {
         // on the NVMe the transfers take the engine's path
         try testing.expect(t.io.aio and t.io.direct);
+    }
+}
+
+test "a stream sent back again and again keeps its slab use bounded (rejected and shortened rows let go)" {
+    var prng = std.Random.DefaultPrng.init(0xbac4);
+    const rnd = prng.random();
+    const o: Options = .{ .streams = 1, .layers = 2, .capacity = 16 * seg_positions, .recent_runs = 2, .depth = 16 };
+    // home 6 runs, the recent window and window 2 x 4: a stream that kept every segment it wrote needs 32
+    const f = try Fixture.init(o, 16, 13);
+    defer f.deinit();
+    const t = &f.tier;
+    try t.open(0, 2);
+    for (0..12) |_| {
+        // forward to near the capacity in prompt chunks and drafted windows, then back to an early position
+        var pos = t.streams[0].committed;
+        while (pos + seg_positions < o.capacity) {
+            const R = if (rnd.boolean()) seg_positions else 1 + rnd.uintLessThan(usize, 16);
+            try f.write(rnd, 0, pos, R);
+            pos += if (R == seg_positions) R else 1 + rnd.uintLessThan(usize, R);
+            t.rewind(0, pos);
+            try t.commit(0, pos);
+            f.end[0] = pos;
+        }
+        try f.select(rnd, 0, 4, 512);
+        const back = rnd.uintLessThan(usize, 4 * seg_positions);
+        t.rewind(0, back);
+        f.end[0] = back;
+        try t.check();
+        try f.verifyAll(0);
     }
 }
 
