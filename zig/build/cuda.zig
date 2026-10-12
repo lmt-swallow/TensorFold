@@ -63,6 +63,7 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_hc_fused", .src = "glm53/hc_fused", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: _hc_post with the next _hc_partial_mma, their bits in one pass
     .{ .name = "glm53_bmm", .src = "glm53/bmm", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // ours: qmm.py _bmm and _reduce's bits (prompt rows) at the mma rate
     .{ .name = "glm53_select", .src = "glm53/select", .flags = &.{"-O3"} }, // ours: sparse.py top_pools of prompt rows (integers: any exact selection's output)
+    .{ .name = "glm53_onepass", .src = "glm53/onepass", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: latent.py _sparse_onepass' bits (bf16 cache), its duplicated dots left out
     .{ .name = "glm53_scores", .src = "glm53/scores", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: sparse.py _scores' bits (prompt rows) with more rows and pools a block
 };
 

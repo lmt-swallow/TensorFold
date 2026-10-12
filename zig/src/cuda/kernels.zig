@@ -60,6 +60,7 @@ pub const glm53_tier: []const u8 = if (available) &Blob("fatbin_glm53_tier").byt
 pub const glm53_hc_fused: []const u8 = if (available) &Blob("fatbin_glm53_hc_fused").bytes else &.{};
 pub const glm53_bmm: []const u8 = if (available) &Blob("fatbin_glm53_bmm").bytes else &.{};
 pub const glm53_select: []const u8 = if (available) &Blob("fatbin_glm53_select").bytes else &.{};
+pub const glm53_onepass: []const u8 = if (available) &Blob("fatbin_glm53_onepass").bytes else &.{};
 pub const glm53_scores: []const u8 = if (available) &Blob("fatbin_glm53_scores").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).

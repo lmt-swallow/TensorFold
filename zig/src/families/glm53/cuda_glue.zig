@@ -183,6 +183,7 @@ pub const Hc = struct {
     bmm: Bmm,
     sel: Select,
     sco: Own,
+    one: Own,
 
     /// hc_fused.cu from this many rows (GB10: 1.18x the captured pair at 2,048 rows, 0.97x at 777, slower below).
     const fused_min_rows = 1024;
@@ -203,6 +204,8 @@ pub const Hc = struct {
         var sel = try Select.load(d);
         errdefer sel.deinit();
         var sco = try Own.load(d, cuda.kernels.glm53_scores, "_ZN15tf_glm53_scores13scores_kernelEPK13__nv_bfloat16S2_iS2_PfPKiiiff", "tf_glm53_scores_smem", "TF_GLM_SCORES");
+        errdefer sco.deinit();
+        const one = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass14onepass_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS");
         return .{
             .d = d,
             .module = module,
@@ -214,10 +217,12 @@ pub const Hc = struct {
             .bmm = bmm,
             .sel = sel,
             .sco = sco,
+            .one = one,
         };
     }
 
     pub fn deinit(self: *Hc) void {
+        self.one.deinit();
         self.sco.deinit();
         self.sel.deinit();
         self.bmm.deinit();
@@ -803,6 +808,35 @@ pub const Glue = struct {
 
     /// latent.py `sparse_onepass` (prompt rows): one online softmax a row over its selected tokens, straight to out.
     pub fn sparseOnepass(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
+        const own = &g.hc.one;
+        if (!own.use or kv != .bf16 or H != 32 or lw != 512) return g.sparseOnepassCaptured(qa, cache, kv, tok, counts, out, R, H, lw, w, scale, stream);
+        // onepass.cu: the captured kernel's arithmetic, its duplicated dots left out, the tiles gathered by cp.async
+        var args: cuda.Args = .{};
+        args.add(qa);
+        args.add(cache);
+        args.add(tok);
+        args.add(counts);
+        args.add(out);
+        args.add(@as(c_int, @intCast(w)));
+        args.add(scale);
+        try cuda.launch.launch(own.func, .{ .grid = .{ .x = @intCast(R) }, .block = .{ .x = 256 }, .shared = own.smem }, stream, &args);
+        if (!own.check) return;
+        const bytes = R * H * lw * 2;
+        const Cap = struct {
+            g: Glue,
+            qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream,
+            fn run(c: @This(), o: Ptr) !void {
+                // rows with count 0 are left alone by both: start the reference from this call's output
+                const ref: cuda.DeviceBuffer = .{ .d = c.g.hc.one.d, .ptr = o, .len = c.R * c.H * c.lw * 2 };
+                try ref.copyFrom(0, c.out, ref.len, c.stream.handle);
+                try c.g.sparseOnepassCaptured(c.qa, c.cache, c.kv, c.tok, c.counts, o, c.R, c.H, c.lw, c.w, c.scale, c.stream);
+            }
+        };
+        try own.same("onepass.cu", out, bytes, stream, Cap{ .g = g, .qa = qa, .cache = cache, .kv = kv, .tok = tok, .counts = counts, .out = out, .R = R, .H = H, .lw = lw, .w = w, .scale = scale, .stream = stream });
+    }
+
+    /// `sparseOnepass` through the captured `_sparse_onepass`.
+    fn sparseOnepassCaptured(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
         try g.set.run(stream, "_sparse_onepass", .{ @intCast(R), @intCast(cdiv(H, 32)), 1 }, &.{
             aot.ptr("QA", "*bf16", qa),      aot.ptr("LC", kv.values(), cache), aot.ptr("LS", kv.scales(), cache), aot.ptr("TOK", "*i32", tok),
             aot.ptr("CNT", "*i32", counts), aot.ptr("OUT", "*bf16", out),

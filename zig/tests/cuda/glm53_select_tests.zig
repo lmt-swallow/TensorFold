@@ -210,3 +210,94 @@ pub fn runScores(gpu: Gpu, aot_dir: []const u8) !void {
     try check.expect(failures == 0, "glm53-scores: {d} of {d} cases differ from _scores", .{ failures, cases.len });
     check.pass("glm53-scores: {d} cases byte-equal to the captured _scores", .{cases.len});
 }
+
+/// `glm53-onepass <aot-dir>`: onepass.cu (glue.zig `Glue.sparseOnepass`) against the captured `_sparse_onepass` byte
+/// for byte on drawn queries, latents and token lists: counts 0 (rows left alone), a few tokens, a partial last tile,
+/// and the full 2,051, over caches whose scores span many tiles' maxima (the online softmax's rescaling).
+pub fn runOnepass(gpu: Gpu, aot_dir: []const u8) !void {
+    const gpa = gpu.gpa;
+    const d = gpu.d;
+    var set = try cuda.aot.Set.load(gpa, gpu.io, d, gpu.ctx.device, aot_dir);
+    defer set.deinit();
+    var hc = try glm.glue.Hc.load(d);
+    defer hc.deinit();
+    const g: glm.glue.Glue = .{ .set = &set, .hc = &hc, .hidden = 4096, .streams = 4 };
+    var stream = try cuda.Stream.init(d, true);
+    defer stream.deinit();
+    var prng = std.Random.DefaultPrng.init(20261014);
+    const rng = prng.random();
+    const H = 32;
+    const LW = 512;
+    const W = glm.glue.sparse_tokens;
+    const R = 300;
+    const tokens = 40_000;
+    const cache = try gpa.alloc(u16, tokens * LW);
+    defer gpa.free(cache);
+    const qa = try gpa.alloc(u16, R * H * LW);
+    defer gpa.free(qa);
+    for (cache, 0..) |*x, i| {
+        // rows of different magnitudes: the tiles' maxima move, so the softmax rescales
+        const v: f32 = rng.floatNorm(f32) * (1.0 + @as(f32, @floatFromInt((i / LW) % 7)));
+        x.* = @intCast(@as(u32, @bitCast(v)) >> 16);
+    }
+    for (qa) |*x| x.* = @intCast(@as(u32, @bitCast(rng.floatNorm(f32) * 0.5)) >> 16);
+    const tok = try gpa.alloc(i32, R * W);
+    defer gpa.free(tok);
+    const cnt = try gpa.alloc(i32, R);
+    defer gpa.free(cnt);
+    for (0..R) |r| {
+        const n: usize = switch (r % 6) {
+            0 => 0,
+            1 => 1 + r % 31,
+            2 => 33,
+            3 => 2051,
+            4 => 2048 + r % 3,
+            else => 1000 + r,
+        };
+        cnt[r] = @intCast(n);
+        var last: usize = rng.intRangeLessThan(usize, 0, 100);
+        for (0..W) |j| {
+            if (j < n) {
+                tok[r * W + j] = @intCast(last % tokens);
+                last += 1 + rng.intRangeLessThan(usize, 0, 15);
+            } else tok[r * W + j] = -1;
+        }
+    }
+    var bc = try Buf.fromHost(d, std.mem.sliceAsBytes(cache));
+    defer bc.free();
+    var bq = try Buf.fromHost(d, std.mem.sliceAsBytes(qa));
+    defer bq.free();
+    var bt = try Buf.fromHost(d, std.mem.sliceAsBytes(tok));
+    defer bt.free();
+    var bn = try Buf.fromHost(d, std.mem.sliceAsBytes(cnt));
+    defer bn.free();
+    var o1 = try Buf.alloc(d, R * H * LW * 2);
+    defer o1.free();
+    var o2 = try Buf.alloc(d, R * H * LW * 2);
+    defer o2.free();
+    try o1.fill8(0x5A, null); // rows with count 0 keep this in both
+    try o2.fill8(0x5A, null);
+    const scale: f32 = @floatCast(std.math.pow(f64, 256.0, -0.5));
+    hc.one.check = false;
+    hc.one.use = true;
+    try g.sparseOnepass(bq.ptr, bc.ptr, .bf16, bt.ptr, bn.ptr, o1.ptr, R, H, LW, W, scale, stream);
+    hc.one.use = false;
+    try g.sparseOnepass(bq.ptr, bc.ptr, .bf16, bt.ptr, bn.ptr, o2.ptr, R, H, LW, W, scale, stream);
+    try stream.synchronize();
+    const a = try gpa.alloc(u8, R * H * LW * 2);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u8, R * H * LW * 2);
+    defer gpa.free(b);
+    try o1.download(0, a);
+    try o2.download(0, b);
+    var bad: usize = 0;
+    for (0..R) |r| {
+        const n = H * LW * 2;
+        if (!std.mem.eql(u8, a[r * n ..][0..n], b[r * n ..][0..n])) {
+            if (bad < 5) std.debug.print("FAIL glm53-onepass row {d} (count {d}) differs from _sparse_onepass\n", .{ r, cnt[r] });
+            bad += 1;
+        }
+    }
+    try check.expect(bad == 0, "glm53-onepass: {d} of {d} rows differ from _sparse_onepass", .{ bad, R });
+    check.pass("glm53-onepass: {d} rows byte-equal to the captured _sparse_onepass", .{R});
+}

@@ -96,6 +96,7 @@ const usage =
     \\  glm53-keep <fwd-dir> <model-dir> <rank> <master-ip|local> <port> <aot-dir> [layers]  GLM-5.3-Flash a prompt continued from a kept prompt's boundary (pool extents, a snapshot) on the pair against its fresh prefill
     \\  glm53-generate <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>  GLM-5.3-Flash the fixture's request decoded serially on the pair, its reply against the reference's ids
     \\  glm53-forward <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir> [layers]  GLM-5.3-Flash whole forward on one rank of the pair (NCCL gathers) against the Mia fork's forward fixture (glm53/b1/forward_capture.sh)
+    \\  glm53-onepass <aot-dir>  GLM-5.3-Flash onepass.cu against the captured _sparse_onepass
     \\  glm53-scores <aot-dir>  GLM-5.3-Flash scores.cu against the captured _scores (TF_GLM_SCORE_RB's variant)
     \\  glm53-select <aot-dir>  GLM-5.3-Flash select.cu's prompt pool selection against the definition and the captured kernels
     \\  glm53-prompt-time <aot-dir> <model-dir> [pos ...]  GLM-5.3-Flash prompt path speed on rank 0 alone: a 2,048-row chunk at each position, its segments timed by kind
@@ -200,6 +201,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-forward")) return glm53_forward.run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5), if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null);
     if (std.mem.eql(u8, cmd, "glm53-select")) return glm53_select.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm53-scores")) return glm53_select.runScores(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm53-onepass")) return glm53_select.runOnepass(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm53-prompt-time")) {
         var pos: [16]usize = undefined;
         var n: usize = 0;
