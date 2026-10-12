@@ -105,7 +105,10 @@ pub const Session = struct {
         var ids: [8]u32 = undefined;
         @memset(&ids, s.model.mask);
         ids[0] = pending;
-        try s.scratch.get("ids").upload(0, std.mem.sliceAsBytes(&ids));
+        // Keep stack-backed upload sources alive if a later enqueue fails before its normal synchronization.
+        errdefer r.stream.synchronize() catch {};
+        // Order pageable host copies with consumers on the nonblocking inference stream.
+        try s.scratch.get("ids").uploadAsync(0, std.mem.sliceAsBytes(&ids), r.stream.handle);
         try s.projections.rotary(s.scratch.get("cos").ptr, s.scratch.get("sin").ptr, s.context.logical.end, 8, s.model.theta, r.stream);
         try F.block(&s.context, s.model, s.head, s.scratch, s.kernels, s.projections, r.k.g, r.model.embed.ptr, s.scratch.get("cos").ptr, s.scratch.get("sin").ptr, s.model.eps, .{ .ctx = s, .run = gather }, s.hidden_projection, r.stream);
         try r.stream.synchronize();
@@ -122,7 +125,7 @@ pub const Session = struct {
                 local[(row * 16 + i) * 2 + 1] = @bitCast(candidate.token);
             }
         }
-        try s.scratch.get("partial").upload(0, std.mem.sliceAsBytes(&local));
+        try s.scratch.get("partial").uploadAsync(0, std.mem.sliceAsBytes(&local), r.stream.handle);
         try gather(s, s.scratch.get("partial").ptr, s.scratch.get("gathered").ptr, local.len, r.stream);
         try r.stream.synchronize();
         var all: [2 * 7 * 16 * 2]f32 = undefined;
