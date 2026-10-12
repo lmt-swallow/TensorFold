@@ -19,6 +19,7 @@ are chosen so that every prompt-form kernel variant the served engine can reach 
   s5  2,048, 1,500 (7 latent chunks)
   s6  2, 2,048, 2,048 (the third chunk at 2,050: one dense row, 9 latent chunks)
   s7  4 x 2,048, then 37 rows at 8,192 (decode-form scores over 4,096 pools: 64 programs a row)
+  t<n> one chunk of n rows (SHORT); u<n> 2,048 + n rows (PAST); v52 4,096 + 52 rows
   l   drawn caches (layer 3's and the MTP layer's latents and pooled keys from `draw`, KDA state zero; quantized rows
       with TF_GLM53_REF_KV=fp8), then chunks at 40,000
       (2,048, 549, 37) and 600,000 (549, 37): the selection over 10k-150k pools, positions past 524,288
@@ -32,7 +33,11 @@ params "digests" the per-step states: x_out (the streams after the last layer), 
 KDA state and conv window after the commit), latent / pk (layer 3's latent rows of the chunk and its pooled keys up
 to the chunk's end), mtp_latent (the MTP layer's latent rows the absorb wrote).
 
-  python3 -B /w/tools/zig/glm53/dump_prompt.py --tools /w/tools/zig --out /aot/out --model /model
+With --split the prompt buffers run hcsplit.HcSplit as served (each rank's hyper-connection glue on its own rows,
+the partials and normed rows swapped, the next block's front on own rows meanwhile, row pieces on a second stream):
+the trace then holds those calls, and params "split" its settings.
+
+  python3 -B /w/tools/zig/glm53/dump_prompt.py --tools /w/tools/zig --out /aot/out --model /model [--split]
 """
 
 from __future__ import annotations
@@ -69,6 +74,14 @@ SCENARIOS = {
     "s6": [(0, 2), (2, 2_048), (2_050, 2_048)],
     "s7": _chunks(8_192) + [(8_192, 37)],
 }
+# short prompts and prompts a few rows past a chunk: a matmul's variant depends on its rows (the 16-, 32-, 64- or
+# 128-row tile, a multiple of 16 or not, one row, the sequential K form from 256), and the MTP absorb of a prompt's
+# last chunk takes one row fewer
+SHORT = (1, 2, 7, 16, 17, 20, 32, 33, 48, 52, 64, 65, 100, 128, 129, 131, 144, 200, 256, 257, 300, 1_031, 2_047)
+PAST = (1, 2, 52, 300)
+SCENARIOS.update({f"t{n}": [(0, n)] for n in SHORT})
+SCENARIOS.update({f"u{n}": _chunks(2_048 + n) for n in PAST})
+SCENARIOS["v52"] = _chunks(4_096 + 52)         # a 52-row tail at 4,096: decode-form scores over 2,048 pools
 CAPACITY = 36_864
 LONG = [(40_000, (2_048, 549, 37)), (600_000, (549, 37))]
 LONG_CAPACITY = 602_112
@@ -162,12 +175,39 @@ class DigestTracer(ref.Tracer):
         setattr(module, name, traced)
 
 
+class PairComm(ref.RankComm):
+    """ref.RankComm with the two-rank ``exchange`` hcsplit's row split uses (``tensorfold.cuda.comm.NCCL``'s
+    send/receive group): each rank's sends cloned at its turn, the peer's copied into its receives on the current
+    stream, one rendezvous a call in the ranks' common call order (shared with the all-gathers)."""
+
+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
+        p, r = self.p, self.rank
+        if peer != 1 - r or len(sends) != len(recvs):
+            raise ValueError("exchange: one receive per send, from the other rank")
+        k = p.count[r]
+        p.count[r] += 1
+        torch.cuda.synchronize()
+        mine = [x.detach().contiguous().clone() for x in sends]
+        with p.cv:
+            p.parts[r][k] = mine
+            p._wait(r, lambda: k in p.parts[1 - r])
+            other = p.parts[1 - r].pop(k)
+        for dst, src in zip(recvs, other):
+            if dst.numel() != src.numel() or dst.dtype != src.dtype:
+                raise RuntimeError(f"exchange {k}: rank {r} receives {dst.numel()} {dst.dtype}, the other sends "
+                                   f"{src.numel()} {src.dtype}")
+            dst.copy_(src.view(dst.shape))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tools", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--only", default="", help="comma-separated scenarios to run (default: all, and l)")
+    ap.add_argument("--split", action="store_true",
+                    help="prompt chunks row-split between the ranks as served (TF_GLM_HC_SPLIT=1, "
+                         "TF_GLM_PREFILL_OVERLAP=2: hcsplit.HcSplit on the prompt buffers, exchanges between the pair)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -187,13 +227,14 @@ def main() -> int:
     if [l.kind for l in ws[0].layers] != ["kda", "dsa"] or ws[0].mtp is None:
         raise SystemExit(f"layers {LAYERS} must be a KDA and a DSA layer and the pack must hold the MTP layer")
     for r, w in enumerate(ws):
-        w.comm = pair.comm(r)
+        w.comm = PairComm(pair, r)
     (out / "weights.json").write_text(json.dumps({f"rank{r}": ref.weight_shas(w) for r, w in enumerate(ws)},
                                                  indent=1, sort_keys=True) + "\n")
     tr = DigestTracer()
     tr.wrap_all(((glue, ("embed", "hc_pre", "hc_post", "rmsnorm", "router", "select", "swiglu", "combine_shared",
                          "residual_add", "stream_mean")),
                  (F, ("mm", "gather", "_shift_conv", "dense_attention")), (M, ("mm",)),
+                 (glue, ("hc_post_pair",)),
                  (kda_mod, ("chain",)),
                  (latent, ("latent_write", "absorb_q", "sparse_onepass", "expand_v")),
                  (sparse, ("index_update", "select_tokens")),
@@ -211,6 +252,10 @@ def main() -> int:
         slots = F.Slots(w, 1, MAX_ROWS)
         st = F.State(w, capacity, MAX_ROWS, caches=caches, slots=slots)
         pb = F.Buffers(w, PREFILL_ROWS, capacity, prefill=True)
+        if a.split:
+            from tensorfold.families.glm5_next.cuda.hcsplit import HcSplit, SplitSettings
+
+            pb.split = HcSplit(w, pb, SplitSettings.from_env())
         return SimpleNamespace(w=w, st=st, pbuf=pb, last_hidden=None)
 
     def chunk(r: int, e, prompt: list[int], start: int, R: int, step: str) -> None:
@@ -272,11 +317,19 @@ def main() -> int:
 
     pair.run(rank_run)
     for name in [n for n in digests if n.startswith("r0_")]:
-        # the KDA state and conv window are each rank's heads; the streams and the latent caches both ranks hold alike
-        if name.endswith(("_x_out", "_latent", "_pk")) and \
+        # the KDA state and conv window are each rank's heads; the latent caches both ranks hold alike, and the streams
+        # too unless the chunk ran row-split (each rank's streams then current on its own rows only)
+        if name.endswith(("_latent", "_pk") if a.split else ("_x_out", "_latent", "_pk")) and \
                 digests[name] != digests["r1_" + name[3:]]:
             raise SystemExit(f"{name[3:]}: the ranks differ")
-    params = {"layers": LAYERS, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
+    if a.split:
+        from tensorfold.families.glm5_next.cuda.hcsplit import SplitSettings
+
+        st_ = SplitSettings.from_env()
+        split = {"pieces": st_.piece_count(), "min_rows": st_.min_rows, "fronts": st_.fronts, "overlap": st_.overlap}
+    else:
+        split = None
+    params = {"layers": LAYERS, "split": split, "mtp_layer": ws[0].cfg.layers, "capacity": CAPACITY, "long_capacity": LONG_CAPACITY,
               "rows": MAX_ROWS, "prompt_rows": PREFILL_ROWS, "world": 2, "steps": steps, "digests": digests,
               "dense_limit": ws[0].cfg.dense_limit, "ring": F.index_ring(CAPACITY, max(MAX_ROWS, PREFILL_ROWS)),
               "long_ring": F.index_ring(LONG_CAPACITY, max(MAX_ROWS, PREFILL_ROWS)), "kv": ref.KV}

@@ -46,6 +46,7 @@ const Digests = struct {
     failures: usize = 0,
     passes: usize = 0,
     unchanged: usize = 0,
+    split: ?P.Split = null, // the fixture's hcsplit settings (dump_prompt.py --split)
 
     fn deinit(h: *Digests) void {
         for (&h.cur) |*c| c.calls.deinit(h.gpa);
@@ -148,11 +149,13 @@ const Rank = struct {
     norm: Buf,
     head_rows: []u8,
     head: Buf,
-    p: P.Prompt,
+    p: P.Owned,
     st: F.KdaState,
-    cache: A.Cache = undefined,
+    pos_dev: Buf,
+    mpos_dev: Buf,
+    caches: [1]A.Cache = undefined,
     mcache: A.Cache = undefined,
-    caches: bool = false,
+    have_caches: bool = false,
     layers: [2]P.Layer = undefined,
     model: P.Model = undefined,
     stream: P.Stream = undefined,
@@ -171,36 +174,41 @@ const Rank = struct {
         r.head.free();
         r.p.deinit();
         r.st.deinit();
+        r.pos_dev.free();
+        r.mpos_dev.free();
         r.dropCaches();
     }
 
     fn dropCaches(r: *Rank) void {
-        if (!r.caches) return;
-        r.cache.deinit();
+        if (!r.have_caches) return;
+        r.caches[0].deinit();
         r.mcache.deinit();
-        r.caches = false;
+        r.have_caches = false;
     }
 
     /// A fresh stream over `capacity` tokens: zero caches, KDA state and conv windows, position 0.
     fn fresh(r: *Rank, d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, ring: usize, kv: A.Kv) !void {
         r.dropCaches();
-        r.cache = try A.Cache.init(d, cfg, capacity, ring, kv);
+        r.caches[0] = try A.Cache.init(d, cfg, capacity, ring, kv);
         r.mcache = try A.Cache.init(d, cfg, capacity, ring, kv);
-        r.caches = true;
+        r.have_caches = true;
         try r.st.rec.fill8(0, null);
         try r.st.conv.fill8(0, null);
         r.st.cur = 0;
         r.st.pos = 0;
         r.layers = .{
             .{ .frame = &r.f0, .mixer = .{ .kda = .{ .w = &r.kda, .li = 0 } }, .ffn = .{ .mlp = &r.mlp } },
-            .{ .frame = &r.f3, .mixer = .{ .dsa = .{ .w = &r.dsa, .cache = &r.cache } }, .ffn = .{ .moe = &r.moe } },
+            .{ .frame = &r.f3, .mixer = .{ .dsa = .{ .w = &r.dsa, .di = 0 } }, .ffn = .{ .moe = &r.moe } },
         };
         r.model = .{
             .layers = &r.layers, .embed = r.embed.ptr, .norm = r.norm.ptr,
             .head = .{ .ptr = r.head.ptr, .n = r.head_rows.len / 2 / cfg.hidden, .k = cfg.hidden },
-            .mtp = &r.mtp, .mtp_cache = &r.mcache,
+            .mtp = &r.mtp,
         };
-        r.stream = .{ .kda = &r.st, .pos = 0, .mtp_len = 0, .capacity = capacity };
+        r.stream = .{
+            .kda = &r.st, .caches = &r.caches, .mtp_cache = &r.mcache, .pos = 0, .mtp_len = 0, .capacity = capacity,
+            .pos_dev = r.pos_dev.ptr, .mtp_pos_dev = r.mpos_dev.ptr,
+        };
     }
 };
 
@@ -300,7 +308,9 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
         std.debug.print("FAIL glm53 config: {t}: {s}\n", .{ e, why.text() });
         return e;
     };
-    const aot_dir = try std.fs.path.join(gpa, &.{ work, "aot" });
+    // TF_GLM53_AOT: another Triton set than the fixture's own (a variant the reference run did not launch, e.g.
+    // TF_GLM_SCORE_RB=8's scores against an RB=4 capture)
+    const aot_dir = if (std.c.getenv("TF_GLM53_AOT")) |v| try gpa.dupe(u8, std.mem.span(v)) else try std.fs.path.join(gpa, &.{ work, "aot" });
     defer gpa.free(aot_dir);
     var set = try cuda.aot.Set.load(gpa, gpu.io, d, gpu.ctx.device, aot_dir);
     defer set.deinit();
@@ -324,6 +334,12 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
     defer stream.deinit();
     var h: Digests = .{ .gpa = gpa, .d = d, .stream = stream, .trace = fx.parsed.value.object.get("trace").?.array.items, .steps = params.get("digests").?.object };
     defer h.deinit();
+    if (params.get("split")) |sv| if (sv == .object) {
+        h.split = .{
+            .pieces = @intCast(sv.object.get("pieces").?.integer), .min_rows = @intCast(sv.object.get("min_rows").?.integer),
+            .fronts = sv.object.get("fronts").?.bool,
+        };
+    };
 
     var hck = try glm.glue.Hc.load(d);
     defer hck.deinit();
@@ -355,9 +371,11 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
             .head = undefined,
             .p = undefined,
             .st = undefined,
+            .pos_dev = try Buf.alloc(d, 16),
+            .mpos_dev = try Buf.alloc(d, 16),
         };
         r.head = try Buf.fromHost(d, r.head_rows);
-        r.p = try P.Prompt.init(d, lay, prompt_rows, long_capacity);
+        r.p = try P.Owned.init(d, lay, prompt_rows, long_capacity);
         r.st = try F.KdaState.init(d, lay, 1, 16);
         loaded += 1;
     }
@@ -375,7 +393,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, want: ?A.Kv) !void {
         if (long) for (&ranks) |*r| {
             // dump_prompt.py's draws: layer 3's latents and pooled keys, then the MTP layer's
             const widths = [_]usize{ cfg.kv_lora, cfg.index_dim, cfg.kv_lora, cfg.index_dim };
-            for ([_]Buf{ r.cache.latent, r.cache.pk, r.mcache.latent, r.mcache.pk }, widths, 0..) |b, width, seed| try draw(gpa, b, seed, kv, width);
+            for ([_]Buf{ r.caches[0].latent, r.caches[0].pk, r.mcache.latent, r.mcache.pk }, widths, 0..) |b, width, seed| try draw(gpa, b, seed, kv, width);
         };
         const list = e.value_ptr.array.items;
         for (list, 0..) |sv, si| {
@@ -397,21 +415,21 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
     const absorbed: usize = @intCast(s.get("absorbed").?.integer);
     const before = h.failures;
     var raws: [2][]u8 = undefined;
-    var ids: [2][]const i32 = undefined;
-    var next: [2][]i32 = undefined;
+    var ids: [2][]const u32 = undefined;
+    var next: [2][]u32 = undefined;
     var cs: [2]P.Chunk = undefined;
     for (ranks, 0..) |*r, ri| {
         var nb: [64]u8 = undefined;
         raws[ri] = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_ids", .{ ri, step }));
-        ids[ri] = @alignCast(std.mem.bytesAsSlice(i32, raws[ri]));
+        ids[ri] = @alignCast(std.mem.bytesAsSlice(u32, raws[ri]));
         // the next tokens: the chunk's own past its first row, then the next chunk's first (unless the prompt ends)
-        next[ri] = try gpa.alloc(i32, absorbed);
+        next[ri] = try gpa.alloc(u32, absorbed);
         @memcpy(next[ri][0..@min(absorbed, R - 1)], ids[ri][1..][0..@min(absorbed, R - 1)]);
         if (absorbed == R) {
             const a = after orelse return error.BadFixture;
             const raw2 = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_ids", .{ ri, a.get("step").?.string }));
             defer gpa.free(raw2);
-            next[ri][R - 1] = std.mem.bytesToValue(i32, raw2[0..4]);
+            next[ri][R - 1] = std.mem.bytesToValue(u32, raw2[0..4]);
         }
         // a prompt continuing a cached context (the long run) starts where the fixture says
         if (r.stream.pos != pos) {
@@ -419,30 +437,54 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
             r.st.pos = pos;
         }
         r.stream.mtp_len = mtp0;
-        cs[ri] = .{ .p = &r.p, .m = &r.model, .k = k, .lay = .{ .rank = ri, .world = 2, .cfg = cfg }, .st = &r.stream, .ids = ids[ri], .next = next[ri] };
+        cs[ri] = .{ .p = r.p.view(), .m = &r.model, .k = k, .lay = .{ .rank = ri, .world = 2, .cfg = cfg }, .st = &r.stream, .ids = ids[ri], .next = next[ri], .split = h.split };
         try h.begin(ri, step);
     }
     defer for (0..2) |ri| {
         gpa.free(raws[ri]);
         gpa.free(next[ri]);
     };
-    const n = cs[0].sites();
-    for (0..n + 1) |i| {
+    const split = cs[0].splits();
+    var plans: [2][]P.Op = undefined;
+    for (0..2) |ri| plans[ri] = try cs[ri].plan(gpa);
+    defer for (plans) |x| gpa.free(x);
+    // each rank runs its ops up to its next gather; the gathers then move both ranks' bytes (rank 0's first)
+    var at: [2]usize = .{ 0, 0 };
+    while (true) {
         for (ranks, 0..) |*r, ri| {
             h.on(ri, step);
-            if (i > 0) try h.call("gather", "ret", cs[ri].exchange(i - 1).gath);
-            try cs[ri].run(i, h.stream);
-            try compare(h, &cs[ri], r, i, pos, R, mtp0);
-        }
-        if (i < n) {
-            var parts: [2]Ptr = undefined;
-            var gaths: [2]Ptr = undefined;
-            for (0..2) |ri| {
-                const x = cs[ri].exchange(i);
-                parts[ri] = x.part;
-                gaths[ri] = x.gath;
+            while (at[ri] < plans[ri].len) : (at[ri] += 1) {
+                const op = plans[ri][at[ri]];
+                switch (op) {
+                    .gather => break,
+                    .wait => {},
+                    else => {
+                        try cs[ri].exec(op, h.stream);
+                        try compare(h, &cs[ri], r, op, pos, R, mtp0);
+                    },
+                }
             }
-            try hs.gather(&parts, &gaths, cs[0].exchange(i).bytes, h.d, h.stream);
+        }
+        if (at[0] == plans[0].len and at[1] == plans[1].len) break;
+        if (at[0] == plans[0].len or at[1] == plans[1].len) return error.RanksOutOfStep;
+        const x0 = plans[0][at[0]].gather;
+        const x1 = plans[1][at[1]].gather;
+        if (x0.bytes != x1.bytes) return error.RanksOutOfStep;
+        const xs = [2]@TypeOf(x0){ x0, x1 };
+        for (xs) |x| {
+            const dst: Buf = .{ .d = h.d, .ptr = x.recv, .len = 2 * x.bytes };
+            for (xs, 0..) |y, k2| try dst.copyFrom(k2 * x.bytes, y.send, x.bytes, h.stream.handle);
+        }
+        for (xs, 0..) |x, ri| {
+            if (x.copy) |cp| {
+                const dst: Buf = .{ .d = h.d, .ptr = cp.dst, .len = cp.bytes };
+                try dst.copyFrom(0, cp.src, cp.bytes, h.stream.handle);
+            } else if (x.recv == ranks[ri].p.mb.gath.ptr or (!split and x.recv == ranks[ri].p.b.gath.ptr)) {
+                // the reference's all-gathers are traced (forward.py `gather`); the split's swaps are not
+                h.on(ri, step);
+                try h.call("gather", "ret", x.recv);
+            }
+            at[ri] += 1;
         }
     }
     // the chunk's states
@@ -451,8 +493,8 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
         try h.state("x_out", r.p.b.x.ptr);
         try h.state("rec", r.st.state(r.st.cur, 0));
         try h.state("conv", r.st.convOf(0));
-        try h.state("latent", r.cache.latent.ptr + r.cache.latentAt(cfg, pos));
-        try h.state("pk", r.cache.pk.ptr);
+        try h.state("latent", r.caches[0].latent.ptr + r.caches[0].latentAt(cfg, pos));
+        try h.state("pk", r.caches[0].pk.ptr);
         if (absorbed > 0) try h.state("mtp_latent", r.mcache.latent.ptr + r.mcache.latentAt(cfg, mtp0));
         var nb: [64]u8 = undefined;
         const want = try fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_{s}_head", .{ ri, step }));
@@ -470,52 +512,90 @@ fn chunk(h: *Digests, fx: *fixture.Fixture, k: P.Kernels, cfg: *const glm.config
     if (h.failures == before) check.pass("BITEXACT glm53-prompt {s}: {d} rows at {d} (MTP {d} rows at {d}), both ranks equal to the reference", .{ step, R, pos, absorbed, mtp0 });
 }
 
-/// Segment i's traced calls (the reference's call order) against this rank's buffers.
-fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: usize, mtp0: usize) !void {
+/// An op's traced calls (the reference's call order) against this rank's buffers, right after the op.
+fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, op: P.Op, pos: usize, R: usize, mtp0: usize) !void {
     const p = &r.p;
     const b = &p.b;
-    const limit = c.lay.cfg.denseLimit();
-    switch (c.kind(i)) {
-        .mixer => |li| {
-            if (li == 0) {
-                try h.call("embed", "out", b.x.ptr);
-            } else try h.call("hc_post", "xout", b.x.ptr);
-            try h.call("hc_pre", "out", b.normed.ptr);
-            try h.also("post", b.post.ptr);
-            try h.also("comb", b.comb.ptr);
-            switch (c.m.layers[li].mixer) {
+    const cfg = c.lay.cfg;
+    const D = cfg.hidden;
+    const S = cfg.streams;
+    const limit = cfg.denseLimit();
+    switch (op) {
+        .embed => try h.call("embed", "out", b.x.ptr),
+        .zero_pad, .gather, .wait, .commit => {},
+        .hc_pre => |x| {
+            try h.call("hc_pre", "out", b.normed.ptr + x.lo * D * 2);
+            try h.also("post", b.post.ptr + x.lo * S * 4);
+            try h.also("comb", b.comb.ptr + x.lo * S * S * 4);
+        },
+        .hc_post => try h.call("hc_post", "xout", b.x.ptr),
+        .post_pre => |x| {
+            if (x.got == null) try h.call("hc_post", "xout", b.x.ptr) else try h.call("hc_post_pair", "xout", b.x.ptr + x.lo * S * D * 2);
+            try h.call("hc_pre", "out", b.normed.ptr + x.lo * D * 2);
+            try h.also("post", b.post.ptr + x.lo * S * 4);
+            try h.also("comb", b.comb.ptr + x.lo * S * S * 4);
+        },
+        .post_pair => |x| try h.call("hc_post_pair", "xout", b.x.ptr + x.lo * S * D * 2),
+        .mean => |x| try h.call("stream_mean", "out", b.hidden.ptr + x.lo * D * 2),
+        .front => |x| switch (x.site) {
+            .mixer => switch (c.m.layers[x.l].mixer) {
+                .kda => |k| {
+                    const LW = k.w.heads * glm.kda.dk;
+                    try h.call("mm", "out", b.kproj.ptr + x.lo * c.lay.kdaProj() * 2);
+                    try h.call("mm", "out", b.ka.ptr + x.lo * LW * 2);
+                    try h.call("mm", "out", b.kg.ptr + x.lo * LW * 2);
+                },
+                .dsa => |a| {
+                    const ds = &p.ds;
+                    try h.call("mm", "out", ds.dp.ptr + x.lo * (cfg.q_lora + cfg.kv_lora) * 2);
+                    try h.call("rmsnorm", "out", ds.qr.ptr + x.lo * cfg.q_lora * 2);
+                    try h.call("rmsnorm", "out", ds.lat.ptr + x.lo * cfg.kv_lora * 2);
+                    try h.call("mm", "out", ds.q.ptr + x.lo * a.w.heads * cfg.qk_dim * 2);
+                },
+            },
+            .ffn => switch (c.m.layers[x.l].ffn) {
+                .mlp => |w| {
+                    try h.call("mm", "out", b.gu.ptr + x.lo * 2 * w.width * 2);
+                    try h.call("swiglu", "out", b.act.ptr + x.lo * w.width * 2);
+                    try h.also("xs", b.xs_act.ptr + x.lo * w.width / 64 * 4);
+                },
+                .moe => |w| {
+                    const ms = &p.ms;
+                    try h.call("mm", "out", ms.sgu.ptr + x.lo * 2 * w.shared.width * 2);
+                    try h.call("swiglu", "out", ms.sact.ptr + x.lo * w.shared.width * 2);
+                    try h.call("mm", "out", ms.sy.ptr + x.lo * D * 4);
+                },
+            },
+        },
+        .rest => |x| switch (x.site) {
+            .mixer => switch (c.m.layers[x.l].mixer) {
                 .kda => {
-                    try h.call("mm", "out", b.kproj.ptr);
-                    try h.call("mm", "out", b.ka.ptr);
-                    try h.call("mm", "out", b.kg.ptr);
                     try h.call("chain", "ret", p.kscratch.layer(0).out);
                     try h.also("state_out", r.st.state(1 - r.st.cur, 0));
                     try h.call("_shift_conv", "conv", r.st.convOf(0));
                 },
-                .dsa => |x| try compareDsa(h, &p.ds, x.cache, pos, R, limit),
-            }
-            try h.call("mm", "out", b.part.ptr);
+                .dsa => |a| try compareDsaRows(h, &p.ds, &r.caches[a.di], pos, R, limit),
+            },
+            .ffn => {
+                const ms = &p.ms;
+                try h.call("router", "out", ms.logits.ptr);
+                try h.call("select", "pick", ms.pick.ptr);
+                try h.also("wts", ms.wts.ptr);
+            },
         },
-        .ffn => |li| {
-            try h.call("hc_post", "xout", b.x.ptr);
-            try h.call("hc_pre", "out", b.normed.ptr);
-            switch (c.m.layers[li].ffn) {
-                .mlp => {
-                    try h.call("mm", "out", b.gu.ptr);
-                    try h.call("swiglu", "out", b.act.ptr);
-                    try h.also("xs", b.xs_act.ptr);
-                    try h.call("mm", "out", b.part.ptr);
-                },
-                .moe => try compareMoe(h, &p.ms, b.part.ptr),
-            }
+        .fill => |x| switch (x.site) {
+            .ffn => if (c.m.layers[x.l].ffn == .moe)
+                try h.call("combine_shared", "out", b.part.ptr + x.lo * D * 4)
+            else
+                try h.call("mm", "out", b.part.ptr + x.lo * D * 4),
+            .mixer => try h.call("mm", "out", b.part.ptr + x.lo * D * 4),
         },
         .tail => {
-            try h.call("hc_post", "xout", b.x.ptr);
-            try h.call("stream_mean", "out", b.hidden.ptr);
             try h.call("rmsnorm", "out", p.fnormed.ptr);
             try h.also("xs", p.fxs.ptr);
             if (c.head) try h.call("mm", "out", p.logits.ptr);
-            if (c.next.len == 0) return;
+        },
+        .mtp_front => {
             const mb = &p.mb;
             // the embedding's first row is zeroed after the call at a stream's first MTP position
             if (mtp0 > 0) try h.call("embed", "out", mb.me.ptr) else try h.next("embed");
@@ -523,10 +603,10 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: us
             try h.next("rmsnorm");
             try h.call("mm", "out", mb.mx.ptr);
             try h.call("rmsnorm", "out", mb.normed.ptr);
-            try compareDsa(h, &p.ds, c.m.mtp_cache, mtp0, c.next.len, limit);
+            try compareDsa(h, &p.ds, &r.mcache, mtp0, c.next.len, limit);
             try h.call("mm", "out", mb.part.ptr);
         },
-        .mtp_ffn => {
+        .mtp_mid => {
             const mb = &p.mb;
             try h.call("residual_add", "xout", mb.mx.ptr);
             try h.call("rmsnorm", "out", mb.normed.ptr);
@@ -541,12 +621,17 @@ fn compare(h: *Digests, c: *const P.Chunk, r: *Rank, i: usize, pos: usize, R: us
     }
 }
 
-/// A DSA block's calls up to (not including) o_proj (cuda_dsa.zig `dsaBlock`, forward.py `dsa_rows`).
+/// A DSA block's calls up to (not including) o_proj (cuda_dsa.zig `dsaBlock`, forward.py `dsa_front`, `dsa_rows`).
 fn compareDsa(h: *Digests, ds: *const A.Scratch, cache: *const A.Cache, pos: usize, R: usize, limit: usize) !void {
     try h.call("mm", "out", ds.dp.ptr);
     try h.call("rmsnorm", "out", ds.qr.ptr);
     try h.call("rmsnorm", "out", ds.lat.ptr);
     try h.call("mm", "out", ds.q.ptr);
+    try compareDsaRows(h, ds, cache, pos, R, limit);
+}
+
+/// forward.py `dsa_rows`' calls (cuda_dsa.zig `dsaRows`).
+fn compareDsaRows(h: *Digests, ds: *const A.Scratch, cache: *const A.Cache, pos: usize, R: usize, limit: usize) !void {
     try h.call("latent_write", "cache", cache.latent.ptr);
     try h.call("mm", "out", ds.ikr.ptr);
     try h.call("router", "out", ds.igr.ptr);

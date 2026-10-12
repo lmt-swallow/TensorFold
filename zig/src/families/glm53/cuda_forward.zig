@@ -30,7 +30,8 @@ pub const Buffers = struct {
     hcpart: Buf, // [rows, 16, 32] fp32
     ka: Buf, // [rows, L 128] bf16: f_b's output (the decay rows)
     kg: Buf, // [rows, L 128] bf16: g_b's output (the gate rows)
-    kproj: Buf, // prefill: [rows, KDA projection width] bf16
+    kproj: Buf, // [rows, KDA projection width] bf16 (a decode window's: several streams' rows, `kdaSegs`)
+    kout: Buf, // decode: [rows, L 128] bf16, several streams' chain outputs (`kdaSegs`)
     gu: Buf, // [rows, 2 W_dense] bf16
     act: Buf, // [rows, W_dense] bf16
     xs_act: Buf, // [rows, W_dense / 64] fp32
@@ -57,7 +58,8 @@ pub const Buffers = struct {
         b.hcpart = try alloc(d, rows * glue_mod.hc_blocks * 32 * 4);
         b.ka = try alloc(d, rows * LW * 2);
         b.kg = try alloc(d, rows * LW * 2);
-        b.kproj = try alloc(d, if (prefill) rows * lay.kdaProj() * 2 else 0);
+        b.kproj = try alloc(d, rows * lay.kdaProj() * 2);
+        b.kout = try alloc(d, if (prefill) 0 else rows * LW * 2);
         b.gu = try alloc(d, rows * 2 * W * 2);
         b.act = try alloc(d, rows * W * 2);
         b.xs_act = try alloc(d, rows * W / 64 * 4);
@@ -70,7 +72,7 @@ pub const Buffers = struct {
     }
 
     pub fn deinit(b: *Buffers) void {
-        inline for (.{ "ids", "x", "normed", "xs", "post", "comb", "hcpart", "ka", "kg", "kproj", "gu", "act", "xs_act", "part", "gath", "sk", "hidden" }) |f| @field(b, f).free();
+        inline for (.{ "ids", "x", "normed", "xs", "post", "comb", "hcpart", "ka", "kg", "kproj", "kout", "gu", "act", "xs_act", "part", "gath", "sk", "hidden" }) |f| @field(b, f).free();
     }
 };
 
@@ -178,6 +180,41 @@ pub fn kdaBlock(cx: Ctx, w: *const weights.Kda, st: *KdaState, li: usize, b: *co
         try cx.g.convShift(st.convOf(li), p, R, 1, C, 3 * C, b.rows * width, width, stream);
     }
     try cx.g.bmm(sc.out, LW, w.o.b16(), R, b.part.ptr, true, b.sk.ptr, stream);
+}
+
+/// One stream's rows of a decode window several streams share: rows [a0, a0 + n) of the buffers, the stream's KDA
+/// state and its index among the KDA layers.
+pub const KdaSeg = struct { st: *KdaState, li: usize, a0: usize, n: usize };
+
+/// `kdaBlock` for a decode window of several streams' rows (`segs`, in row order, R rows in all): the projections and
+/// out_proj over every row at once, each stream's chain over its own rows and state, so every row gets the bits of
+/// its stream's window alone. Each stream's projection rows land in its state as `kdaBlock`'s do (the commit's conv
+/// shift reads them).
+pub fn kdaSegs(cx: Ctx, w: *const weights.Kda, segs: []const KdaSeg, b: *const Buffers, R: usize, stream: cuda.Stream) !void {
+    if (b.prefill) return error.PromptSegments;
+    const c = cx.lay.cfg;
+    const width = segs[0].st.width;
+    const offs = cx.lay.kdaOffsets();
+    try cx.g.bmm(b.normed.ptr, c.hidden, w.proj.b16(), R, b.kproj.ptr, false, b.sk.ptr, stream);
+    try cx.g.bmm(b.kproj.ptr + offs[0] * 2, width, w.fb.b16(), R, b.ka.ptr, false, b.sk.ptr, stream);
+    try cx.g.bmm(b.kproj.ptr + offs[1] * 2, width, w.gb.b16(), R, b.kg.ptr, false, b.sk.ptr, stream);
+    const LW = w.heads * kda.dk;
+    for (segs) |sg| {
+        const st = sg.st;
+        const p: Ptr = st.proj.ptr + sg.li * st.rows * width * 2;
+        try st.proj.copyFrom(sg.li * st.rows * width * 2, b.kproj.ptr + sg.a0 * width * 2, sg.n * width * 2, stream.handle);
+        const sc = st.scratch.layer(sg.li);
+        const cur = st.cur;
+        try kda.chainWide(cx.kk, cx.temp, .{
+            .heads = w.heads,           .p = p,                          .p_stride = width,                   .b_off = offs[2],
+            .a = b.ka.ptr + sg.a0 * LW * 2, .a_stride = LW,              .g = b.kg.ptr + sg.a0 * LW * 2,      .g_stride = LW,
+            .conv_state = st.convOf(sg.li), .conv_w = w.conv.ptr,        .state_in = st.state(cur, sg.li),    .a_log = w.a_log.ptr,
+            .dt_bias = w.dt_bias.ptr,   .norm_w = w.norm.ptr,            .eps = c.eps,                        .lower = c.lower,
+            .rows = sg.n,               .out = b.kout.ptr + sg.a0 * LW * 2, .state_out = st.state(1 - cur, sg.li),
+            .k = sc.k,                  .v = sc.v,                       .gs = sc.g,                          .b = sc.b,
+        }, stream);
+    }
+    try cx.g.bmm(b.kout.ptr, LW, w.o.b16(), R, b.part.ptr, true, b.sk.ptr, stream);
 }
 
 /// forward.py `commit` for the KDA layers: a decode window keeping `keep` of its R rows replays every layer's state

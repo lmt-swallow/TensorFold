@@ -35,7 +35,9 @@ if s.count(anchor) != 1:
     raise SystemExit("start.sh: RUN_ARGS not found as expected")
 s = s.replace(anchor, anchor + (
     f'RUN_ARGS+=(-v {work}:/aot -e PYTHONPATH=/shim -v {work}/shim:/shim:ro -e TRITON_CACHE_DIR=/aot/triton\n'
-    f'          -e TF_DSV41_CAPTURE_DIR=/aot/rankX)\n'))
+    f'          -e TF_DSV41_CAPTURE_DIR=/aot/rankX)\n'
+    # concurrent streams without DFlash2 decode without drafts (the server refuses --parallel > 1 otherwise)
+    '[[ "$PARALLEL" == 1 ]] || SERVE_ARGS+=(--no-drafts)\n'))
 # start.sh serves concurrent streams only with DFlash2 drafts (CC BY-NC-ND, never downloaded here): with DRAFTER=mtp
 # and PARALLEL > 1 the ranks run --parallel without a drafter (the MTP head is single-stream only, engine.mtp_head),
 # so the concurrent windows are a stream's pending row and its copy drafts

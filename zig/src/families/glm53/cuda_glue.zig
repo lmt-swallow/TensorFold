@@ -156,21 +156,274 @@ fn bucket(m: usize) usize {
     unreachable;
 }
 
+/// sparse.py `score_rows` (TF_GLM_SCORE_RB: 1, 2, 4 or 8, default 4): a prompt chunk's rows a _scores program
+/// takes. Every value gives a row the same bits: its pool keys are masked to its own pools before its dot.
+pub fn scoreRows() !usize {
+    const v = std.mem.span(std.c.getenv("TF_GLM_SCORE_RB") orelse return 4);
+    if (v.len == 0) return 4;
+    const n = std.fmt.parseInt(usize, v, 10) catch return error.BadScoreRows;
+    return switch (n) {
+        1, 2, 4, 8 => n,
+        else => error.BadScoreRows,
+    };
+}
+
+/// The glue's own CUDA kernels: hc.cu's mixing dots (decode rows), hc_fused.cu's hc_post with the next hc_pre's
+/// prompt dots (`Glue.hcPostPartial`), bmm.cu's BF16 matmul (`Bmm`) and select.cu's prompt pool selection (`Select`).
 pub const Hc = struct {
+    d: *const cuda.Driver,
     module: cuda.Module,
     partial: cuda.Function,
+    fused_module: cuda.Module,
+    post_partial: cuda.Function,
+    /// TF_GLM_HC_FUSED (default 1): hcPostPartial runs hc_fused.cu; 0: _hc_post then _hc_partial_mma.
+    fused: bool,
+    /// TF_GLM_PROMPT_CHECK=1: every hc_fused.cu call against the captured pair, byte for byte.
+    check: bool,
+    bmm: Bmm,
+    sel: Select,
+    sco: Own,
+    one: Own,
+    one_split: Own, // TF_GLM_ONEPASS=2: onepass.cu's head-split scoring (every warp half the dots)
+
+    /// hc_fused.cu from this many rows (GB10: 1.18x the captured pair at 2,048 rows, 0.97x at 777, slower below).
+    const fused_min_rows = 1024;
+    /// hc_fused.cu's dynamic shared memory: 4 streams x (64 rows + 32 FN rows) x 72 halfs.
+    const fused_smem = 4 * (64 + 32) * 72 * 2;
 
     pub fn load(d: *const cuda.Driver) !Hc {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var module = try cuda.Module.load(d, cuda.kernels.glm53_hc);
         errdefer module.unload();
-        return .{ .module = module, .partial = try module.function("_ZN11tf_glm53_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi") };
+        const partial = try module.function("_ZN11tf_glm53_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi");
+        var fused_module = try cuda.Module.load(d, cuda.kernels.glm53_hc_fused);
+        errdefer fused_module.unload();
+        const post_partial = try fused_module.function("tf_glm53_hc_post_partial");
+        try post_partial.allowDynamicShared(fused_smem);
+        var bmm = try Bmm.load(d);
+        errdefer bmm.deinit();
+        var sel = try Select.load(d);
+        errdefer sel.deinit();
+        var sco = try Own.load(d, cuda.kernels.glm53_scores, "_ZN15tf_glm53_scores13scores_kernelEPK13__nv_bfloat16S2_iS2_PfPKiiiff", "tf_glm53_scores_smem", "TF_GLM_SCORES", true);
+        errdefer sco.deinit();
+        var one = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass14onepass_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS", false);
+        errdefer one.deinit();
+        const one_split = try Own.load(d, cuda.kernels.glm53_onepass, "_ZN16tf_glm53_onepass20onepass_split_kernelEPK13__nv_bfloat16S2_PKiS4_PS0_if", "tf_glm53_onepass_smem", "TF_GLM_ONEPASS", false);
+        return .{
+            .d = d,
+            .module = module,
+            .partial = partial,
+            .fused_module = fused_module,
+            .post_partial = post_partial,
+            .fused = !std.mem.eql(u8, envOr("TF_GLM_HC_FUSED", "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+            .bmm = bmm,
+            .sel = sel,
+            .sco = sco,
+            .one = one,
+            .one_split = one_split,
+        };
     }
 
     pub fn deinit(self: *Hc) void {
+        self.one_split.deinit();
+        self.one.deinit();
+        self.sco.deinit();
+        self.sel.deinit();
+        self.bmm.deinit();
+        self.fused_module.unload();
         self.module.unload();
     }
 };
+
+/// select.cu: a prompt chunk's pool selection (sparse.py `top_pools` without positions: `_select_rows`, or
+/// `select_split`'s pool form for blocks of fewer than 64 rows over 8,192 scores or more). Its output is fixed by its
+/// definition (each row's 512 best scores in total order, ties to the lower pool, ascending), so it is the captured
+/// kernels' byte for byte with fewer passes over the scores. TF_GLM_SELECT=0 keeps the captured kernels;
+/// TF_GLM_PROMPT_CHECK=1 runs them beside it on every call and fails unless the pools are byte-equal.
+pub const Select = struct {
+    d: *const cuda.Driver,
+    module: cuda.Module,
+    func: cuda.Function,
+    smem: u32,
+    use: bool,
+    check: bool,
+
+    pub fn load(d: *const cuda.Driver) !Select {
+        var module = try cuda.Module.load(d, cuda.kernels.glm53_select);
+        errdefer module.unload();
+        const func = try module.function("_ZN15tf_glm53_select19select_pools_kernelEPKfiiiPl");
+        const g = try module.global("tf_glm53_select_smem");
+        var smem: u32 = 0;
+        const view: cuda.DeviceBuffer = .{ .d = d, .ptr = g.ptr, .len = g.len };
+        try view.download(0, std.mem.asBytes(&smem));
+        try func.allowDynamicShared(smem);
+        return .{
+            .d = d, .module = module, .func = func, .smem = smem,
+            .use = !std.mem.eql(u8, envOr("TF_GLM_SELECT", "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+        };
+    }
+
+    pub fn deinit(self: *Select) void {
+        self.module.unload();
+    }
+};
+
+/// One of the glue's own kernels standing in for a captured one with its bits (scores.cu for `_scores`, onepass.cu for
+/// `_sparse_onepass`): `use` by its switch `env` (1 on, 0 off; unset: `default_on`), `check` under
+/// TF_GLM_PROMPT_CHECK=1 (the captured kernel beside it, byte for byte). onepass.cu is off unless asked for: on GB10
+/// it measured slower than the captured kernel (119 ms against 106 a 2,048-row chunk; its head-split form 141).
+pub const Own = struct {
+    d: *const cuda.Driver,
+    module: cuda.Module,
+    func: cuda.Function,
+    smem: u32,
+    use: bool,
+    check: bool,
+
+    pub fn load(d: *const cuda.Driver, image: []const u8, symbol: [:0]const u8, smem_symbol: [:0]const u8, env: [:0]const u8, default_on: bool) !Own {
+        var module = try cuda.Module.load(d, image);
+        errdefer module.unload();
+        const func = try module.function(symbol);
+        const g = try module.global(smem_symbol);
+        var smem: u32 = 0;
+        const view: cuda.DeviceBuffer = .{ .d = d, .ptr = g.ptr, .len = g.len };
+        try view.download(0, std.mem.asBytes(&smem));
+        try func.allowDynamicShared(smem);
+        return .{
+            .d = d, .module = module, .func = func, .smem = smem,
+            .use = !std.mem.eql(u8, envOr(env, if (default_on) "1" else "0"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+        };
+    }
+
+    pub fn deinit(self: *Own) void {
+        self.module.unload();
+    }
+
+    /// TF_GLM_PROMPT_CHECK: `bytes` at `out` against the captured kernel's on the same call (`captured` writes them
+    /// into the buffer it is given).
+    fn same(self: *const Own, what: []const u8, out: Ptr, bytes: usize, stream: cuda.Stream, captured: anytype) !void {
+        var ref = try cuda.DeviceBuffer.alloc(self.d, bytes);
+        defer ref.free();
+        try captured.run(ref.ptr);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try ref.download(0, want);
+        const view: cuda.DeviceBuffer = .{ .d = self.d, .ptr = out, .len = bytes };
+        try view.download(0, got);
+        if (!std.mem.eql(u8, want, got)) {
+            std.log.err("glm53: {s}: differs from the captured kernel's output", .{what});
+            return error.PromptKernelMismatch;
+        }
+    }
+};
+
+/// bmm.cu: `_bmm` (and `_reduce` after the split grid) with their bits at the mma rate, for prompt rows (seq_rows or
+/// more) of the shapes in `table`; other calls take the captured kernels. TF_GLM_BMM=0 keeps the captured kernels
+/// for every call; TF_GLM_PROMPT_CHECK=1 runs the captured kernels beside bmm.cu on every call it takes and fails
+/// unless the outputs are byte-equal.
+pub const Bmm = struct {
+    d: *const cuda.Driver,
+    module: cuda.Module,
+    fns: [kernels.len]cuda.Function,
+    use: bool,
+    check: bool,
+
+    const Kernel = struct { name: [:0]const u8, bm: u32, bn: u32, bk: u32, threads: u32, stages: u32, swizzled: bool, split: bool, f32: bool };
+    const kernels = [_]Kernel{
+        .{ .name = "tf_glm53_bmm_128x256_1b", .bm = 128, .bn = 256, .bk = 32, .threads = 256, .stages = 3, .swizzled = false, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x256k64z_1b", .bm = 128, .bn = 256, .bk = 64, .threads = 256, .stages = 2, .swizzled = true, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64_1b", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 2, .swizzled = false, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64z_1b", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 3, .swizzled = true, .split = false, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64_sb", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 2, .swizzled = false, .split = true, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64_sf", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 2, .swizzled = false, .split = true, .f32 = true },
+        .{ .name = "tf_glm53_bmm_128x128k64z_sb", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 3, .swizzled = true, .split = true, .f32 = false },
+        .{ .name = "tf_glm53_bmm_128x128k64z_sf", .bm = 128, .bn = 128, .bk = 64, .threads = 256, .stages = 3, .swizzled = true, .split = true, .f32 = true },
+        .{ .name = "tf_glm53_bmm_128x64_sb", .bm = 128, .bn = 64, .bk = 32, .threads = 256, .stages = 4, .swizzled = false, .split = true, .f32 = false },
+    };
+    /// Per-rank shapes (n, k, fp32 out) bmm.cu takes, and the kernel each runs (measured on GB10 at 2,048 rows); the
+    /// rest stay on the captured kernels (bmm.cu was slower there).
+    const Shape = struct { n: usize, k: usize, f32: bool, kernel: []const u8 };
+    const table = [_]Shape{
+        .{ .n = 12576, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256k64z_1b" },
+        .{ .n = 12288, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x256k64z_1b" },
+        .{ .n = 2048, .k = 4096, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64z_sb" },
+        .{ .n = 4096, .k = 1024, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64z_sf" },
+        .{ .n = 4096, .k = 1536, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64z_sb" },
+        .{ .n = 4096, .k = 4096, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64z_sf" },
+        .{ .n = 4096, .k = 6144, .f32 = true, .kernel = "tf_glm53_bmm_128x128k64z_sf" },
+        .{ .n = 4096, .k = 8192, .f32 = false, .kernel = "tf_glm53_bmm_128x128k64z_sb" },
+    };
+
+    pub fn load(d: *const cuda.Driver) !Bmm {
+        var module = try cuda.Module.load(d, cuda.kernels.glm53_bmm);
+        errdefer module.unload();
+        var fns: [kernels.len]cuda.Function = undefined;
+        for (kernels, &fns) |k, *f| {
+            f.* = try module.function(k.name);
+            try f.allowDynamicShared(smem(k));
+        }
+        return .{
+            .d = d,
+            .module = module,
+            .fns = fns,
+            .use = !std.mem.eql(u8, envOr("TF_GLM_BMM", "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+        };
+    }
+
+    pub fn deinit(self: *Bmm) void {
+        self.module.unload();
+    }
+
+    fn smem(k: Kernel) u32 {
+        return k.stages * (k.bm + k.bn) * (if (k.swizzled) k.bk else k.bk + 8) * 2;
+    }
+
+    /// The kernel for a call, or null (the captured kernels): prompt rows, a shape in `table`, and bmm.cu's operand
+    /// requirements (16-byte aligned rows, k a multiple of the kernel's K step times sk, n even).
+    fn pick(self: *const Bmm, x: Ptr, x_stride: usize, w: B16, m: usize, fp32: bool, sk: usize) ?usize {
+        if (!self.use or m < seq_rows) return null;
+        if (x % 16 != 0 or w.ptr % 16 != 0 or x_stride % 8 != 0 or w.n % 2 != 0) return null;
+        const name = for (table) |e| {
+            if (e.n == w.n and e.k == w.k and e.f32 == fp32) break e.kernel;
+        } else return null;
+        for (kernels, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) {
+            if (k.split != (sk > 1) or k.f32 != fp32 or w.k % (k.bk * sk) != 0) return null;
+            return i;
+        };
+        return null;
+    }
+
+    fn run(self: *const Bmm, i: usize, x: Ptr, x_stride: usize, w: B16, m: usize, out: Ptr, sk: usize, stream: cuda.Stream) !void {
+        const k = kernels[i];
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(c_int, @intCast(x_stride)));
+        a.add(w.ptr);
+        a.add(out);
+        a.add(@as(c_int, @intCast(m)));
+        a.add(@as(c_int, @intCast(w.n)));
+        a.add(@as(c_int, @intCast(w.k)));
+        a.add(@as(c_int, @intCast(sk)));
+        try cuda.launch.launch(self.fns[i], .{
+            .grid = .{ .x = @intCast(cdiv(m, k.bm)), .y = @intCast(cdiv(w.n, k.bn)) },
+            .block = .{ .x = k.threads },
+            .shared = smem(k),
+        }, stream, &a);
+    }
+};
+
+fn envOr(name: [:0]const u8, default: []const u8) []const u8 {
+    const v = std.mem.span(std.c.getenv(name) orelse return default);
+    return if (v.len == 0) default else v;
+}
 
 /// A BF16 matrix [n, k] on the device (qmm.py `B16`), row-major.
 pub const B16 = struct { ptr: Ptr, n: usize, k: usize };
@@ -215,13 +468,17 @@ pub const Glue = struct {
         iters: usize,
         rows: usize,
         prompt: bool,
+        /// `part` already holds the prompt dots of x (hcPostPartial): only _hc_finish runs.
+        partial_done: bool = false,
     };
 
     /// glue.py `hc_pre`: the mixing dots (a prompt chunk's on the tensor cores, decode rows' in hc.cu, each with
     /// its own bits), then _hc_finish: the normed collapsed row, its sums, post and the Sinkhorn-balanced comb.
     pub fn hcPre(g: Glue, a: HcPre, stream: cuda.Stream) !void {
         const wide = g.streams * g.hidden;
-        if (a.prompt) {
+        if (a.partial_done) {
+            if (!a.prompt) return error.UnsupportedShape;
+        } else if (a.prompt) {
             try g.set.run(stream, "_hc_partial_mma", .{ @intCast(cdiv(a.rows, 64)), hc_blocks, 1 }, &.{
                 aot.ptr("X", "*bf16", a.x), aot.ptr("FN", "*bf16", a.fn_), aot.ptr("PART", "*fp32", a.part), aot.int("R", n32(a.rows)),
             }, &.{ aot.ci("WIDE", @intCast(wide)), aot.ci("NB", hc_blocks), aot.ci("BM", 64), aot.ci("BK", 64) });
@@ -253,6 +510,94 @@ pub const Glue = struct {
             aot.ptr("X", "*bf16", x),       aot.ptr("XOUT", "*bf16", xout), aot.ptr("G", "*fp32", gathered),
             aot.ptr("POST", "*fp32", post), aot.ptr("COMB", "*fp32", comb), aot.int("RS", n32(rows * g.hidden)),
         }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("WORLD", @intCast(world)), aot.ci("BLOCK", @intCast(block)) });
+    }
+
+    /// glue.py `hc_post_pair` (TF_GLM_HC_SPLIT): hc_post of two ranks' fp32 partials [rows, D] held apart (rank 0's at
+    /// g0, rank 1's at g1): the same kernel reading rank 1's rows at their element distance from rank 0's, so the
+    /// sum (rank 0 first) and every bit are hc_post's.
+    pub fn hcPostPair(g: Glue, x: Ptr, xout: Ptr, g0: Ptr, g1: Ptr, post: Ptr, comb: Ptr, rows: usize, stream: cuda.Stream) !void {
+        if (rows == 0) return;
+        const block = @min(1024, g.hidden);
+        const dist = @as(i64, @intCast(g1)) - @as(i64, @intCast(g0));
+        if (@mod(dist, 4) != 0) return error.UnalignedPartials;
+        const rs: i32 = std.math.cast(i32, @divExact(dist, 4)) orelse return error.PartialsTooFarApart;
+        try g.set.run(stream, "_hc_post", .{ @intCast(rows), @intCast(g.hidden / block), 1 }, &.{
+            aot.ptr("X", "*bf16", x),       aot.ptr("XOUT", "*bf16", xout), aot.ptr("G", "*fp32", g0),
+            aot.ptr("POST", "*fp32", post), aot.ptr("COMB", "*fp32", comb), aot.int("RS", rs),
+        }, &.{ aot.ci("D", @intCast(g.hidden)), aot.ci("S", @intCast(g.streams)), aot.ci("WORLD", 2), aot.ci("BLOCK", @intCast(block)) });
+    }
+
+    /// hc_post of two ranks' fp32 partials (rank 0's at g0, rank 1's `rs` elements on) into xout, then the next
+    /// hc_pre's prompt dots of xout into `part` (`_hc_partial_mma`), the bytes of hcPostPair (or hcPost with
+    /// gathered = g0, rs = rows D) followed by hcPre's partial; the caller's hcPre then passes `partial_done`.
+    /// hc_fused.cu runs both in one pass (the streams it writes are not read back) at D 4096, 4 streams.
+    pub fn hcPostPartial(g: Glue, x: Ptr, xout: Ptr, g0: Ptr, rs: i64, post: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, stream: cuda.Stream) !void {
+        if (rows == 0) return;
+        const h = g.hc;
+        const aligned = (x | xout | g0) % 16 == 0 and @mod(rs, 4) == 0;
+        if (!h.fused or rows < Hc.fused_min_rows or g.hidden != 4096 or g.streams != 4 or !aligned) return g.hcPostPartialCaptured(x, xout, g0, rs, post, comb, fn_, part, rows, stream);
+        const xb = rows * g.streams * g.hidden * 2;
+        var keep: ?cuda.DeviceBuffer = null; // TF_GLM_PROMPT_CHECK: x as it was (xout may be x)
+        defer if (keep) |*k| k.free();
+        if (h.check) {
+            keep = try cuda.DeviceBuffer.alloc(h.d, xb);
+            try keep.?.copyFrom(0, x, xb, stream.handle);
+        }
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(xout);
+        a.add(g0);
+        a.add(rs);
+        a.add(post);
+        a.add(comb);
+        a.add(fn_);
+        a.add(part);
+        a.add(@as(c_int, @intCast(rows)));
+        try cuda.launch.launch(h.post_partial, .{ .grid = .{ .x = @intCast(cdiv(rows, 64)), .y = @intCast(g.hidden / 1024) }, .block = .{ .x = 128 }, .shared = Hc.fused_smem }, stream, &a);
+        if (keep) |k| try g.checkPostPartial(k, xout, g0, rs, post, comb, fn_, part, rows, stream);
+    }
+
+    fn hcPostPartialCaptured(g: Glue, x: Ptr, xout: Ptr, g0: Ptr, rs: i64, post: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, stream: cuda.Stream) !void {
+        try g.hcPostPair(x, xout, g0, @intCast(@as(i64, @intCast(g0)) + rs * 4), post, comb, rows, stream);
+        try g.set.run(stream, "_hc_partial_mma", .{ @intCast(cdiv(rows, 64)), hc_blocks, 1 }, &.{
+            aot.ptr("X", "*bf16", xout), aot.ptr("FN", "*bf16", fn_), aot.ptr("PART", "*fp32", part), aot.int("R", n32(rows)),
+        }, &.{ aot.ci("WIDE", @intCast(g.streams * g.hidden)), aot.ci("NB", hc_blocks), aot.ci("BM", 64), aot.ci("BK", 64) });
+    }
+
+    /// TF_GLM_PROMPT_CHECK: the captured pair from `x0` (x before the fused call) into scratch, against the fused
+    /// call's xout and part (the 24 dots and the sum of squares of every row's 16 blocks), byte for byte.
+    fn checkPostPartial(g: Glue, x0: cuda.DeviceBuffer, xout: Ptr, g0: Ptr, rs: i64, post: Ptr, comb: Ptr, fn_: Ptr, part: Ptr, rows: usize, stream: cuda.Stream) !void {
+        const d = g.hc.d;
+        const xb = x0.len;
+        const pb = rows * hc_blocks * 32 * 4;
+        var xo = try cuda.DeviceBuffer.alloc(d, xb);
+        defer xo.free();
+        var pt = try cuda.DeviceBuffer.alloc(d, pb);
+        defer pt.free();
+        try g.hcPostPartialCaptured(x0.ptr, xo.ptr, g0, rs, post, comb, fn_, pt.ptr, rows, stream);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, xb + pb);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, xb + pb);
+        defer gpa.free(got);
+        try xo.download(0, want[0..xb]);
+        try pt.download(0, want[xb..]);
+        try (cuda.DeviceBuffer{ .d = d, .ptr = xout, .len = xb }).download(0, got[0..xb]);
+        try (cuda.DeviceBuffer{ .d = d, .ptr = part, .len = pb }).download(0, got[xb..]);
+        var bad: usize = 0;
+        for (want[0..xb], got[0..xb]) |p, q| bad += @intFromBool(p != q);
+        // PART: columns 0..24 of each row's blocks (25..31 are never written)
+        const wp = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(want[xb..])));
+        const gp = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(got[xb..])));
+        for (0..rows * hc_blocks) |i| for (0..25) |m| {
+            bad += @intFromBool(wp[i * 32 + m] != gp[i * 32 + m]);
+        };
+        if (bad != 0) {
+            std.log.err("glm53: hc_fused ({d} rows): {d} values differ from _hc_post + _hc_partial_mma", .{ rows, bad });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("glm53: hc_fused ({d} rows): byte-equal to _hc_post + _hc_partial_mma", .{rows});
     }
 
     /// glue.py `residual_add` (the MTP layer): xout = bf16(x + bf16(the partials summed rank 0 first)).
@@ -290,6 +635,36 @@ pub const Glue = struct {
     /// x_stride) times w^T, K in the shape's fixed slices summed in slice order (one program for prompt rows, else
     /// fp32 partials in `part`, at least sk m n floats, and _reduce).
     pub fn bmm(g: Glue, x: Ptr, x_stride: usize, w: B16, m: usize, out: Ptr, fp32: bool, part: Ptr, stream: cuda.Stream) !void {
+        const b = &g.hc.bmm;
+        const sk = b16SplitK(w.n, w.k);
+        const i = b.pick(x, x_stride, w, m, fp32, sk) orelse return g.bmmCaptured(x, x_stride, w, m, out, fp32, part, stream);
+        try b.run(i, x, x_stride, w, m, out, sk, stream);
+        if (!b.check) return;
+        // TF_GLM_PROMPT_CHECK: the captured kernels' output on the same call, byte for byte
+        const bytes = m * w.n * @as(usize, if (fp32) 4 else 2);
+        var ref = try cuda.DeviceBuffer.alloc(b.d, bytes);
+        defer ref.free();
+        try g.bmmCaptured(x, x_stride, w, m, ref.ptr, fp32, part, stream);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try ref.download(0, want);
+        const view: cuda.DeviceBuffer = .{ .d = b.d, .ptr = out, .len = bytes };
+        try view.download(0, got);
+        var bad: usize = 0;
+        for (want, got) |p, q| bad += @intFromBool(p != q);
+        if (bad != 0) {
+            std.log.err("glm53: bmm.cu {s} ({d} rows, n {d}, k {d}, sk {d}): {d} of {d} bytes differ from _bmm", .{ Bmm.kernels[i].name, m, w.n, w.k, sk, bad, bytes });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("glm53: bmm.cu {s} ({d} rows, n {d}, k {d}, sk {d}): byte-equal to _bmm", .{ Bmm.kernels[i].name, m, w.n, w.k, sk });
+    }
+
+    /// `bmm` through the captured `_bmm` (and `_reduce`).
+    fn bmmCaptured(g: Glue, x: Ptr, x_stride: usize, w: B16, m: usize, out: Ptr, fp32: bool, part: Ptr, stream: cuda.Stream) !void {
         const bm = bucket(@min(m, 128));
         const sk = b16SplitK(w.n, w.k);
         const seq = sk > 1 and m >= seq_rows and w.n >= 512 and w.k <= 4096;
@@ -440,6 +815,35 @@ pub const Glue = struct {
 
     /// latent.py `sparse_onepass` (prompt rows): one online softmax a row over its selected tokens, straight to out.
     pub fn sparseOnepass(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
+        const own = if (std.mem.eql(u8, envOr("TF_GLM_ONEPASS", "1"), "2")) &g.hc.one_split else &g.hc.one;
+        if (!own.use or kv != .bf16 or H != 32 or lw != 512) return g.sparseOnepassCaptured(qa, cache, kv, tok, counts, out, R, H, lw, w, scale, stream);
+        // onepass.cu: the captured kernel's arithmetic, its duplicated dots left out, the tiles gathered by cp.async
+        var args: cuda.Args = .{};
+        args.add(qa);
+        args.add(cache);
+        args.add(tok);
+        args.add(counts);
+        args.add(out);
+        args.add(@as(c_int, @intCast(w)));
+        args.add(scale);
+        try cuda.launch.launch(own.func, .{ .grid = .{ .x = @intCast(R) }, .block = .{ .x = 256 }, .shared = own.smem }, stream, &args);
+        if (!own.check) return;
+        const bytes = R * H * lw * 2;
+        const Cap = struct {
+            g: Glue,
+            qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream,
+            fn run(c: @This(), o: Ptr) !void {
+                // rows with count 0 are left alone by both: start the reference from this call's output
+                const ref: cuda.DeviceBuffer = .{ .d = c.g.hc.one.d, .ptr = o, .len = c.R * c.H * c.lw * 2 };
+                try ref.copyFrom(0, c.out, ref.len, c.stream.handle);
+                try c.g.sparseOnepassCaptured(c.qa, c.cache, c.kv, c.tok, c.counts, o, c.R, c.H, c.lw, c.w, c.scale, c.stream);
+            }
+        };
+        try own.same("onepass.cu", out, bytes, stream, Cap{ .g = g, .qa = qa, .cache = cache, .kv = kv, .tok = tok, .counts = counts, .out = out, .R = R, .H = H, .lw = lw, .w = w, .scale = scale, .stream = stream });
+    }
+
+    /// `sparseOnepass` through the captured `_sparse_onepass`.
+    fn sparseOnepassCaptured(g: Glue, qa: Ptr, cache: Ptr, kv: Kv, tok: Ptr, counts: Ptr, out: Ptr, R: usize, H: usize, lw: usize, w: usize, scale: f32, stream: cuda.Stream) !void {
         try g.set.run(stream, "_sparse_onepass", .{ @intCast(R), @intCast(cdiv(H, 32)), 1 }, &.{
             aot.ptr("QA", "*bf16", qa),      aot.ptr("LC", kv.values(), cache), aot.ptr("LS", kv.scales(), cache), aot.ptr("TOK", "*i32", tok),
             aot.ptr("CNT", "*i32", counts), aot.ptr("OUT", "*bf16", out),
@@ -466,12 +870,40 @@ pub const Glue = struct {
 
     /// sparse.py `_scores` (a prompt chunk's rows from device position pos, RB rows a program) into out [R, np].
     pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
-        const rb = 4;
+        const own = &g.hc.sco;
+        if (!own.use or kv != .bf16) return g.scoresCaptured(qi, w, w_stride, pk, kv, out, pos, R, np, stream);
+        // scores.cu: 256 pools and 32 rows a block, its bits `_scores`'
+        var args: cuda.Args = .{};
+        args.add(qi);
+        args.add(w);
+        args.add(@as(c_int, @intCast(w_stride)));
+        args.add(pk);
+        args.add(out);
+        args.add(pos);
+        args.add(@as(c_int, @intCast(R)));
+        args.add(@as(c_int, @intCast(np)));
+        args.add(index_scale);
+        args.add(index_wscale);
+        try cuda.launch.launch(own.func, .{ .grid = .{ .x = @intCast(cdiv(np, 256)), .y = @intCast(cdiv(R, 32)) }, .block = .{ .x = 256 }, .shared = own.smem }, stream, &args);
+        if (!own.check) return;
+        const Cap = struct {
+            g: Glue,
+            qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, pos: Ptr, R: usize, np: usize, stream: cuda.Stream,
+            fn run(c: @This(), o: Ptr) !void {
+                try c.g.scoresCaptured(c.qi, c.w, c.w_stride, c.pk, c.kv, o, c.pos, c.R, c.np, c.stream);
+            }
+        };
+        try own.same("scores.cu", out, R * np * 4, stream, Cap{ .g = g, .qi = qi, .w = w, .w_stride = w_stride, .pk = pk, .kv = kv, .pos = pos, .R = R, .np = np, .stream = stream });
+    }
+
+    /// `scores` through the captured `_scores` (TF_GLM_SCORE_RB rows a program).
+    fn scoresCaptured(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
+        const rb = try scoreRows();
         try g.set.run(stream, "_scores", .{ @intCast(cdiv(R, rb)), @intCast(cdiv(np, 64)), 1 }, &.{
             aot.ptr("QI", "*bf16", qi),  aot.ptr("W", "*bf16", w),     aot.int("w_stride", n32(w_stride)), aot.ptr("PK", kv.values(), pk),
             aot.ptr("PKS", kv.scales(), pk), aot.ptr("OUT", "*fp32", out), aot.ptr("POS", "*i32", pos),        aot.int("R", n32(R)),
             aot.int("NP", n32(np)),      aot.float("scale", index_scale), aot.float("wscale", index_wscale),
-        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", rb), aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()) });
+        }, &.{ aot.ci("H", 32), aot.ci("HP", 32), aot.ci("D", 128), aot.ci("BP", 64), aot.ci("RB", @intCast(rb)), aot.ci("RS", @intCast(kv.stride(128))), aot.ci("FP8", kv.flag()) });
     }
 
     /// sparse.py `_select_rows`: each row's 512 best pools ascending (ties to the lower pool) into out int64 [R, 512];
@@ -482,6 +914,49 @@ pub const Glue = struct {
             aot.ptr("S", "*fp32", s), aot.ptr("OUT", "*i64", out), aot.int("NPS", n32(np)),
             if (pos != 0) aot.ptr("POS", "*i32", pos) else aot.ptr("POS", "*fp32", s),
         }, &.{ aot.ci("K", 512), aot.ci("BLOCK", if (wide) 4096 else 1024), aot.ci("VIS", @intFromBool(pos != 0)) });
+    }
+
+    /// sparse.py `top_pools` of a prompt chunk's selection block: each of the n rows' 512 best of its np scores (row
+    /// stride np) into out int64 [n, 512], ascending (select.cu, or the captured kernels: `Select`). `split_buf`:
+    /// select_split's scratch (the captured pool form's).
+    pub fn promptPools(g: Glue, s: Ptr, np: usize, out: Ptr, n: usize, split_buf: cuda.DeviceBuffer, stream: cuda.Stream) !void {
+        const sel = &g.hc.sel;
+        if (!sel.use) return g.promptPoolsCaptured(s, np, out, n, split_buf, stream);
+        if (np < 512) return error.TooFewScores;
+        var args: cuda.Args = .{};
+        args.add(s);
+        args.add(@as(c_int, @intCast(np)));
+        args.add(@as(c_int, @intCast(np)));
+        args.add(@as(c_int, 512));
+        args.add(out);
+        try cuda.launch.launch(sel.func, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 }, .shared = sel.smem }, stream, &args);
+        if (!sel.check) return;
+        // TF_GLM_PROMPT_CHECK: the captured kernels' pools on the same scores, byte for byte
+        const bytes = n * 512 * 8;
+        var ref = try cuda.DeviceBuffer.alloc(sel.d, bytes);
+        defer ref.free();
+        try g.promptPoolsCaptured(s, np, ref.ptr, n, split_buf, stream);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try ref.download(0, want);
+        const view: cuda.DeviceBuffer = .{ .d = sel.d, .ptr = out, .len = bytes };
+        try view.download(0, got);
+        if (!std.mem.eql(u8, want, got)) {
+            std.log.err("glm53: select.cu ({d} rows, {d} scores): the pools differ from the captured selection's", .{ n, np });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("glm53: select.cu ({d} rows, {d} scores): byte-equal to the captured selection", .{ n, np });
+    }
+
+    /// `promptPools` through the captured kernels: `_select_rows`, or `select_split`'s pool form for fewer than 64
+    /// rows over 8,192 scores or more.
+    fn promptPoolsCaptured(g: Glue, s: Ptr, np: usize, out: Ptr, n: usize, split_buf: cuda.DeviceBuffer, stream: cuda.Stream) !void {
+        if (n < 64 and np >= 8192) return g.selectSplitPools(s, np, split_buf, out, n, stream);
+        return g.selectRows(s, out, np, 0, n, stream);
     }
 
     /// sparse.py `_tokens`: each row's pools' tokens ascending, then its incomplete pool's visible tokens; its count

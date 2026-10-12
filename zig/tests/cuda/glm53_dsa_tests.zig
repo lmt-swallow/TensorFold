@@ -59,27 +59,53 @@ const Rank = struct {
     }
 };
 
-/// One run's per-rank caches and DSA scratch over `capacity` tokens.
+/// One run's per-rank caches and DSA scratch over `capacity` tokens. With TF_GLM_TIER=<dir> (bf16) each rank's
+/// latent rows live on a tier (cuda_tier.zig) whose slab holds about half of them, the rest on a file in <dir>:
+/// every comparison must still hold (the latent write's cache is then not compared: the rows are the slab's).
 const Run = struct {
     cache: [2]A.Cache,
     ds: [2]A.Scratch,
     pds: [2]A.Scratch,
+    tier: [2]?*glm.tier.Tier = .{ null, null },
+    gpa: std.mem.Allocator = undefined,
 
-    fn init(d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, kv: A.Kv) !Run {
-        var r: Run = undefined;
+    fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cfg: *const glm.config.Config, capacity: usize, kv: A.Kv, tag: []const u8) !Run {
+        var r: Run = .{ .cache = undefined, .ds = undefined, .pds = undefined, .gpa = gpa };
+        const dir: ?[]const u8 = if (std.c.getenv("TF_GLM_TIER")) |e| std.mem.span(e) else null;
         for (0..2) |i| {
             const lay: glm.config.Layout = .{ .rank = i, .world = 2, .cfg = cfg };
             r.cache[i] = try A.Cache.init(d, cfg, capacity, A.indexRing(capacity, @max(max_rows, prompt_rows)), kv);
             r.ds[i] = try A.Scratch.init(d, lay, max_rows, capacity, false);
             r.pds[i] = try A.Scratch.init(d, lay, prompt_rows, capacity, true);
+            if (dir) |dd| if (kv == .bf16) {
+                const kvt = glm.tier.kv;
+                const cap = @max(std.mem.alignForward(usize, capacity, kvt.seg_positions), kvt.home_positions + kvt.seg_positions);
+                const runs = kvt.home_runs + 4 + cap / kvt.seg_positions / 2;
+                const path = try std.fmt.allocPrintSentinel(gpa, "{s}/glm53-dsa-{s}-r{d}-{d}.bin", .{ dd, tag, i, std.c.getpid() }, 0);
+                defer gpa.free(path);
+                const t = try glm.tier.Tier.init(gpa, d, .{ .streams = 1, .layers = 1, .capacity = cap, .row_bytes = cfg.kv_lora * 2, .recent_runs = 2 }, runs * kvt.run_pools * kvt.block, prompt_rows, glm.glue.sparse_tokens, path);
+                try t.open(0, 1);
+                r.tier[i] = t;
+                r.cache[i].tier = .{ .t = t, .h = 0, .layer = 0 };
+            };
         }
         return r;
+    }
+
+    /// Before a window of R rows at `pos` (the fixture's: rows before it are final).
+    fn window(r: *Run, pos: usize, R: usize, stream: cuda.Stream) !void {
+        for (r.tier) |x| if (x) |t| {
+            t.rewind(0, pos);
+            try t.commit(0, pos, stream);
+            try t.beginWindow(0, pos, R);
+        };
     }
 
     fn deinit(r: *Run) void {
         for (&r.cache) |*c| c.deinit();
         for (&r.ds) |*s| s.deinit();
         for (&r.pds) |*s| s.deinit();
+        for (r.tier) |x| if (x) |t| t.deinit(r.gpa);
     }
 };
 
@@ -208,7 +234,7 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool, want: 
     const steps = h.fx.parsed.value.object.get("params").?.object.get("steps").?.object;
 
     {
-        var run_a = try Run.init(d, &cfg, capacity, kv);
+        var run_a = try Run.init(gpa, d, &cfg, capacity, kv, "a");
         defer run_a.deinit();
         try runSteps(&h, g, &mk, &cfg, &ranks, &run_a, steps.get("a").?.array.items, "a", false);
     }
@@ -216,17 +242,18 @@ pub fn run(gpu: Gpu, work: []const u8, model: []const u8, isolated: bool, want: 
     {
         var tk = try T.Kernels.load(d);
         defer tk.deinit();
-        var run_m = try Run.init(d, &cfg, capacity, kv);
+        var run_m = try Run.init(gpa, d, &cfg, capacity, kv, "m");
         defer run_m.deinit();
         try runMtp(&h, g, &mk, &tk, &cfg, &ranks, &run_m, steps.get("m").?.array.items);
     }
 
-    var run_l = try Run.init(d, &cfg, long_capacity, kv);
+    var run_l = try Run.init(gpa, d, &cfg, long_capacity, kv, "l");
     defer run_l.deinit();
     for (&run_l.cache) |*c| {
         const lat = try h.fx.bytes("l_latent0");
         defer gpa.free(lat);
         try c.latent.upload(0, lat);
+        if (c.tier) |tr| try tr.t.host.load(0, 0, lat, @min(long_capacity, lat.len / (cfg.kv_lora * 2)));
         const pk = try h.fx.bytes("l_pk0");
         defer gpa.free(pk);
         try c.pk.upload(0, pk);
@@ -249,6 +276,7 @@ fn runSteps(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, cfg: *const glm
         const before = h.failures;
         var nb: [16]u8 = undefined;
         const step = try std.fmt.bufPrint(&nb, tag ++ "{d}", .{s});
+        try run_.window(pos, R, h.stream);
         // the attention site: embed, hc_pre, the DSA block
         for (ranks, 0..) |*r, ri| {
             const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
@@ -315,6 +343,7 @@ fn runMtp(h: *Harness, g: glm.glue.Glue, mk: *const M.Kernels, tk: *const T.Kern
         const before = h.failures;
         var nb: [16]u8 = undefined;
         const step = try std.fmt.bufPrint(&nb, "m{d}", .{s});
+        try run_.window(mtp_len, n, h.stream);
         for (ranks, 0..) |*r, ri| {
             const lay: glm.config.Layout = .{ .rank = ri, .world = 2, .cfg = cfg };
             const b = if (prefill) &r.pmb else &r.mb;
@@ -404,7 +433,7 @@ fn compareDsa(h: *Harness, ds: *const A.Scratch, cache: *const A.Cache, long: bo
     try h.call("rmsnorm", "out_out", ds.qr.ptr);
     try h.call("rmsnorm", "out_out", ds.lat.ptr);
     try h.call("mm", "out_out", ds.q.ptr);
-    if (!long) try h.call("latent_write", "cache_out", cache.latent.ptr) else _ = try h.next("latent_write");
+    if (!long and cache.tier == null) try h.call("latent_write", "cache_out", cache.latent.ptr) else _ = try h.next("latent_write");
     try h.call("mm", "out_out", ds.ikr.ptr);
     try h.call("router", "out_out", ds.igr.ptr);
     _ = try h.next("index_update");

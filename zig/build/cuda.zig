@@ -58,10 +58,18 @@ const kernels = [_]Kernel{
     .{ .name = "qwen38fn_scores", .src = "qwen38fn/scores", .flags = &.{"-O3"} }, // ours: attention.py _scores for 32 rows a program with the captured kernel's bytes
     .{ .name = "qwen38fn_prompt_glue", .src = "qwen38fn/prompt_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the prompt path's torch glue
     .{ .name = "glm53_kda", .src = "glm53/kda", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // the Mia fork's glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
+    .{ .name = "glm53_kda_step", .src = "glm53/kda_step", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: kda.cu step_kernel's bits, four threads a value row
     .{ .name = "glm53_hc", .src = "glm53/hc", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's glue.py hc_pre (decode rows), tensorfold_glm_hc_v2
     .{ .name = "glm53_exl3", .src = "glm53/exl3", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's exl3_mm.py, tensorfold_glm_exl3_v20
     .{ .name = "glm53_qmm", .src = "glm53/qmm", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the Mia fork's cuda/kernels/qmm.py, tensorfold_qmm_v4: the draft head
     .{ .name = "glm53_qmm_prefill", .src = "glm53/qmm_prefill", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // the same extension's qmm_prefill.cu
+    .{ .name = "glm53_tier", .src = "glm53/tier", .flags = &.{"-O3"} }, // ours: the tiered latent cache's remap (kv_tier.zig)
+    .{ .name = "glm53_hc_fused", .src = "glm53/hc_fused", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: _hc_post with the next _hc_partial_mma, their bits in one pass
+    .{ .name = "glm53_topk", .src = "glm53/topk", .flags = &.{"-O3"} }, // ours: a row's k best (value, id), Runner.sample's order
+    .{ .name = "glm53_bmm", .src = "glm53/bmm", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // ours: qmm.py _bmm and _reduce's bits (prompt rows) at the mma rate
+    .{ .name = "glm53_select", .src = "glm53/select", .flags = &.{"-O3"} }, // ours: sparse.py top_pools of prompt rows (integers: any exact selection's output)
+    .{ .name = "glm53_onepass", .src = "glm53/onepass", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: latent.py _sparse_onepass' bits (bf16 cache), its duplicated dots left out
+    .{ .name = "glm53_scores", .src = "glm53/scores", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: sparse.py _scores' bits (prompt rows) with more rows and pools a block
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -116,6 +124,8 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     const glm53 = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm53/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     glm53.addImport("cuda", cuda);
     glm53.addImport("core", core);
+    glm53.addImport("lanes", lanes);
+    glm53.addImport("dsv41", dsv41); // the pool's Extents (cuda_keep.zig) until they move to the core
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .dsv41 = dsv41, .qwen38fn = qwen38fn, .glm53 = glm53 };
 }
 
@@ -159,25 +169,25 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     glm53_validate.addImport("core", mods.core);
     glm53_validate.addImport("glm53", mods.glm53);
     b.installArtifact(b.addExecutable(.{ .name = "tf-glm53-validate", .root_module = glm53_validate }));
-    _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.tokenizer, build_options, true);
+    _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.glm53, mods.tokenizer, build_options, true);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, dsv41: *std.Build.Module, qwen38fn: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, dsv41: *std.Build.Module, qwen38fn: *std.Build.Module, glm53: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "dsv41", .module = dsv41 }, .{ .name = "qwen38fn", .module = qwen38fn } },
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "dsv41", .module = dsv41 }, .{ .name = "qwen38fn", .module = qwen38fn }, .{ .name = "glm53", .module = glm53 } },
     });
     return .{ .api = api, .engines = mod };
 }
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, dsv41: *std.Build.Module, qwen38fn: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
-    const m = engines(b, target, optimize, cuda, lanes, nemotron, dsv41, qwen38fn);
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, dsv41: *std.Build.Module, qwen38fn: *std.Build.Module, glm53: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
+    const m = engines(b, target, optimize, cuda, lanes, nemotron, dsv41, qwen38fn, glm53);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
@@ -202,7 +212,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    const seam = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn);
+    const seam = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.glm53);
     // the engine seam's own tests (lane_host.zig) too, as the Metal build runs them
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.glm53, seam.engines, seam.api, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
@@ -250,7 +260,7 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
     };
     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
     const mods = family(b, target, .fast, cuda, draft_ids);
-    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.tokenizer, build_options, false);
+    return nativeServer(b, target, .fast, cuda, mods.lanes, mods.nemotron, mods.dsv41, mods.qwen38fn, mods.glm53, mods.tokenizer, build_options, false);
 }
 
 /// Validate the complete named input set, including images unused by today's server.

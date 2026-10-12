@@ -24,7 +24,9 @@ docker image inspect "$IMAGE" >/dev/null || { echo "capture.sh: $IMAGE is not on
 if [ -e "$WORK" ]; then echo "$WORK exists; pass a fresh work dir" >&2; exit 1; fi
 mkdir -p "$WORK/out" "$WORK/triton" "$CACHE/torch_extensions"
 # the snapshot's files link into ../../blobs: mount the repo folder whole
-docker run --rm --pull=never --gpus all --ipc=host --net=host --user "$(id -u):$(id -g)" -e HOME=/tmp \
+# CAPTURE_ENV: extra "-e NAME=value" arguments for the reference (e.g. a variant setting such as TF_GLM_SCORE_RB=8)
+# shellcheck disable=SC2086
+docker run --rm --pull=never --gpus all --ipc=host --net=host --user "$(id -u):$(id -g)" -e HOME=/tmp ${CAPTURE_ENV:-} \
   -e TF_GLM53_REF_KV="${KV:-bf16}" -e TRITON_CACHE_DIR=/aot/triton -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions \
   -e TF_GLM53_IMAGE_PATCHES="$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE")" \
   -v "$TF:/w:ro" -v "$WORK:/aot" -v "$HF_REPO:/hf:ro" -v "$CACHE:/cache" --entrypoint python3 "$IMAGE" \

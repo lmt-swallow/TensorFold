@@ -35,6 +35,14 @@ const glm53_kda = @import("glm53_kda_tests.zig");
 const glm53_moe = @import("glm53_moe_tests.zig");
 const glm53_dsa = @import("glm53_dsa_tests.zig");
 const glm53_prompt = @import("glm53_prompt_tests.zig");
+const glm53_forward = @import("glm53_forward_tests.zig");
+const glm53_generate = @import("glm53_generate_tests.zig");
+const glm53_prompt_time = @import("glm53_prompt_time.zig");
+const glm53_select = @import("glm53_select_tests.zig");
+const glm53_keep = @import("glm53_keep_tests.zig");
+const glm53_shared = @import("glm53_shared_tests.zig");
+const glm53_tier = @import("glm53_tier_tests.zig");
+const glm53_seg = @import("glm53_seg_tests.zig");
 const dsv41_ptx_lift_tests = @import("dsv41_ptx_lift_tests.zig");
 
 const usage =
@@ -78,9 +86,21 @@ const usage =
     \\  qwen38fn-mtp <work-dir> <model-dir>  Qwen3.8-Flash-Next MTP drafting (draft head, head calls, rounds) against 0.6.6's serial drafted decoder (qwen38fn/capture_mtp.sh)
     \\  qwen38fn-rounds <kernel-set> <model-dir> [rounds]  Qwen3.8-Flash-Next: four streams prefilled, then a few shared rounds timed (a profiler's workload)
     \\  qwen38fn-shared <kernel-set> <model-dir>  Qwen3.8-Flash-Next shared rounds: four streams' logits, drafts and tokens the same alone and in one forward a round
+    \\  glm53-tier <aot-dir> <model-dir> <file-dir> [positions]  GLM-5.3-Flash tiered latent cache (slab + NVMe file) against a whole cache: the sparse kernels' outputs byte for byte, decode windows and a prompt block
     \\  glm53-prompt <work-dir> <model-dir>  GLM-5.3-Flash prompt path (chunks, head, MTP absorb, commit) over layers 0 and 3 and the MTP layer on both ranks against the Mia fork's fixture (glm53/capture.sh prompt)
     \\  glm53-prompt-fp8 <work-dir> <model-dir>  glm53-prompt on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture
     \\  glm53-dsa-fp8 <work-dir> <model-dir> [isolated]  glm53-dsa on FP8 DSA caches (TF_GLM_KV=fp8) against a KV=fp8 capture (glm53/capture.sh dsa with KV=fp8)
+    \\  glm53-drafted <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>  GLM-5.3-Flash the fixture's request decoded with MTP and copy drafts on the pair: its reply and rounds against the reference's
+    \\  glm53-seg <work-dir> <model-dir>  GLM-5.3-Flash several streams' windows in one forward (forwardSegs, layers 0 and 3) against the Mia fork's batched verify windows, both ranks on this GPU (glm53/capture.sh seg)
+    \\  glm53-seg-fp8 <work-dir> <model-dir>  glm53-seg on FP8 DSA caches against a KV=fp8 capture
+    \\  glm53-shared <fwd-dir> <model-dir> <rank> <master-ip|local> <port> <aot-dir> [layers]  GLM-5.3-Flash four streams' windows in one forward against each alone and the single-stream path, on the pair
+    \\  glm53-keep <fwd-dir> <model-dir> <rank> <master-ip|local> <port> <aot-dir> [layers]  GLM-5.3-Flash a prompt continued from a kept prompt's boundary (pool extents, a snapshot) on the pair against its fresh prefill
+    \\  glm53-generate <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>  GLM-5.3-Flash the fixture's request decoded serially on the pair, its reply against the reference's ids
+    \\  glm53-forward <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir> [layers]  GLM-5.3-Flash whole forward on one rank of the pair (NCCL gathers) against the Mia fork's forward fixture (glm53/b1/forward_capture.sh)
+    \\  glm53-onepass <aot-dir>  GLM-5.3-Flash onepass.cu against the captured _sparse_onepass
+    \\  glm53-scores <aot-dir>  GLM-5.3-Flash scores.cu against the captured _scores (TF_GLM_SCORE_RB's variant)
+    \\  glm53-select <aot-dir>  GLM-5.3-Flash select.cu's prompt pool selection against the definition and the captured kernels
+    \\  glm53-prompt-time <aot-dir> <model-dir> [pos ...]  GLM-5.3-Flash prompt path speed on rank 0 alone: a 2,048-row chunk at each position, its segments timed by kind
     \\  glm53-dsa <work-dir> <model-dir> [isolated]  GLM-5.3-Flash DSA layer 3 (indexer, top-512 pools, latent attention; then its MoE) on both ranks, runs a and l, against the Mia fork's fixture (glm53/capture.sh dsa)
     \\  glm53-moe <work-dir> <model-dir> [isolated]  GLM-5.3-Flash MoE block (router, EXL3 experts decode / prompt, shared expert) on both ranks against the Mia fork's fixture (glm53/capture.sh moe)
     \\  glm53-kda <work-dir> <model-dir> [isolated]  GLM-5.3-Flash embeddings + layer 0 (KDA, dense MLP) on both ranks against the Mia fork's fixture (glm53/capture.sh kda)
@@ -174,6 +194,28 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-prompt-fp8")) return glm53_prompt.run(gpu, try arg(rest, 0), try arg(rest, 1), .fp8);
     if (std.mem.eql(u8, cmd, "glm53-dsa")) return glm53_dsa.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"), null);
     if (std.mem.eql(u8, cmd, "glm53-dsa-fp8")) return glm53_dsa.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"), .fp8);
+    if (std.mem.eql(u8, cmd, "glm53-drafted")) return glm53_generate.run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5));
+    if (std.mem.eql(u8, cmd, "glm53-seg")) return glm53_seg.run(gpu, try arg(rest, 0), try arg(rest, 1), null);
+    if (std.mem.eql(u8, cmd, "glm53-seg-fp8")) return glm53_seg.run(gpu, try arg(rest, 0), try arg(rest, 1), .fp8);
+    if (std.mem.eql(u8, cmd, "glm53-shared")) return glm53_shared.run(gpu, .{ .dir = try arg(rest, 0), .model = try arg(rest, 1), .aot = try arg(rest, 5), .layers = if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null }, try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10));
+    if (std.mem.eql(u8, cmd, "glm53-keep")) return glm53_keep.run(gpu, .{ .dir = try arg(rest, 0), .model = try arg(rest, 1), .aot = try arg(rest, 5), .layers = if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null }, try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10));
+    if (std.mem.eql(u8, cmd, "glm53-generate")) return glm53_forward.generate(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5));
+    if (std.mem.eql(u8, cmd, "glm53-forward")) return glm53_forward.run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5), if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null);
+    if (std.mem.eql(u8, cmd, "glm53-select")) return glm53_select.run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm53-scores")) return glm53_select.runScores(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm53-onepass")) return glm53_select.runOnepass(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm53-prompt-time")) {
+        var pos: [16]usize = undefined;
+        var n: usize = 0;
+        for (rest[@min(rest.len, 2)..]) |a| {
+            if (n == pos.len) break;
+            pos[n] = try std.fmt.parseInt(usize, a, 10);
+            n += 1;
+        }
+        const default = [_]usize{ 0, 30720 };
+        return glm53_prompt_time.run(gpu, try arg(rest, 0), try arg(rest, 1), if (n == 0) &default else pos[0..n]);
+    }
+    if (std.mem.eql(u8, cmd, "glm53-tier")) return glm53_tier.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), if (rest.len > 3) rest[3] else null);
     if (std.mem.eql(u8, cmd, "glm53-moe")) return glm53_moe.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "glm53-kda")) return glm53_kda.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "qwen38fn-layer0")) return qwen38fn_layer0.layer0(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
