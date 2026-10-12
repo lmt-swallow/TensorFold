@@ -158,11 +158,26 @@ pub const Buffers = struct {
     fxs: Buf,
     logits: Buf, // [1, n] bf16
 
+    borrowed: bool = false, // part, gath and sk are another set of buffers' (`initSharing`), not freed here
+
     pub fn init(d: *const cuda.Driver, lay: config.Layout, rows: usize, prefill: bool) !Buffers {
+        return initSharing(d, lay, rows, prefill, null);
+    }
+
+    /// The buffers of the backbone's chunks a prompt chunk's MTP absorb reuses: its own partials, their all-gather and
+    /// the split-K slices, which the backbone has finished with when the absorb starts (cuda_prompt.zig runs the
+    /// absorb after the chunk's tail, each gather waited for, on the chunk's stream).
+    pub const Shared = struct { part: Buf, gath: Buf, sk: Buf };
+
+    /// `init`, with part, gath and sk the `shared` buffers when given (each at least as large as this set's own).
+    pub fn initSharing(d: *const cuda.Driver, lay: config.Layout, rows: usize, prefill: bool, shared: ?Shared) !Buffers {
         const D = lay.cfg.hidden;
+        const sizes = .{ .part = rows * D * 4, .gath = lay.world * rows * D * 4, .sk = 8 * rows * D * 4 };
+        if (shared) |x| if (x.part.len < sizes.part or x.gath.len < sizes.gath or x.sk.len < sizes.sk) return error.SharedBuffersTooSmall;
         var b: Buffers = undefined;
         b.rows = rows;
         b.prefill = prefill;
+        b.borrowed = shared != null;
         b.ids = try Buf.alloc(d, rows * 4);
         b.hin = try Buf.alloc(d, rows * D * 2);
         b.me = try Buf.alloc(d, rows * D * 2);
@@ -170,9 +185,15 @@ pub const Buffers = struct {
         b.mx = try Buf.alloc(d, rows * D * 2);
         b.normed = try Buf.alloc(d, rows * D * 2);
         b.xs = try Buf.alloc(d, rows * D / 64 * 4);
-        b.part = try Buf.alloc(d, rows * D * 4);
-        b.gath = try Buf.alloc(d, lay.world * rows * D * 4);
-        b.sk = try Buf.alloc(d, 8 * rows * D * 4);
+        if (shared) |x| {
+            b.part = x.part;
+            b.gath = x.gath;
+            b.sk = x.sk;
+        } else {
+            b.part = try Buf.alloc(d, sizes.part);
+            b.gath = try Buf.alloc(d, sizes.gath);
+            b.sk = try Buf.alloc(d, sizes.sk);
+        }
         b.fnormed = try Buf.alloc(d, D * 2);
         b.fxs = try Buf.alloc(d, D / 64 * 4);
         b.logits = try Buf.alloc(d, lay.size(.vocab) * 2);
@@ -180,7 +201,8 @@ pub const Buffers = struct {
     }
 
     pub fn deinit(b: *Buffers) void {
-        inline for (.{ "ids", "hin", "me", "mcat", "mx", "normed", "xs", "part", "gath", "sk", "fnormed", "fxs", "logits" }) |f| @field(b, f).free();
+        inline for (.{ "ids", "hin", "me", "mcat", "mx", "normed", "xs", "fnormed", "fxs", "logits" }) |f| @field(b, f).free();
+        if (!b.borrowed) inline for (.{ "part", "gath", "sk" }) |f| @field(b, f).free();
     }
 };
 

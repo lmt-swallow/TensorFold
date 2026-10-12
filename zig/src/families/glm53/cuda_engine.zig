@@ -163,7 +163,9 @@ pub const Runner = struct {
         errdefer r.w.deinit();
         r.mb = try T.Buffers.init(d, lay, rows, false);
         errdefer r.mb.deinit();
-        r.pmb = try T.Buffers.init(d, lay, prompt_rows, true);
+        // the MTP absorb of a prompt chunk runs after the chunk's backbone: it reuses the chunk's partials, gathers
+        // and split-K slices (0.34 GiB a rank at 2,048 rows)
+        r.pmb = try T.Buffers.initSharing(d, lay, prompt_rows, true, .{ .part = r.w.pb.part, .gath = r.w.pb.gath, .sk = r.w.pb.sk });
         errdefer r.pmb.deinit();
         r.host = try gpa.alloc(u16, lay.size(.vocab));
         errdefer gpa.free(r.host);
