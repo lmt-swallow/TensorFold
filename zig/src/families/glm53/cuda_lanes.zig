@@ -45,7 +45,7 @@ pub const max_streams = 4;
 pub const depth = copy_drafts.depth_most;
 
 /// Step opcodes; each record starts with one.
-pub const Op = enum(u8) { open = 1, fill = 2, verify = 3, keep = 4, draft = 5, release = 6, stop = 7 };
+pub const Op = enum(u8) { open = 1, fill = 2, verify = 3, keep = 4, draft = 5, release = 6, stop = 7, logical = 8 };
 
 /// A record's fixed header before a prompt's ids (u32 each): the opcode, the slot, the flags (bit 0: drafts; bit 1:
 /// continues a kept prompt), the extent's base and size (positions), the kept prompt and its boundary (book points),
@@ -109,6 +109,8 @@ pub const Lanes = struct {
     /// The records since the last agreement (`agreesNow` false ones fold in here and are agreed on with the next).
     pending: std.crypto.hash.sha2.Sha256 = .init(.{}),
     pending_bad: bool = false,
+    logical_event: u64 = 0,
+    logical_trace: bool = false, // TF_GLM_LOGICAL_OCCUPANCY_TRACE=1: core and backend state before release
     occupancy_event: u64 = 0,
     occupancy_trace: bool = false, // TF_GLM_OCCUPANCY_TRACE=1: host metadata at verify boundaries
     draft_batch: bool = true, // TF_GLM_DRAFT_BATCH=0: each stream's drafts by `absorb` and `chain`, one after another
@@ -129,6 +131,7 @@ pub const Lanes = struct {
         self.tier = tier;
         if (std.c.getenv("TF_GLM_DRAFT_BATCH")) |v| self.draft_batch = !std.mem.eql(u8, std.mem.span(v), "0");
         if (std.c.getenv("TF_GLM_DRAFT_LOG")) |v| self.draft_log = std.mem.eql(u8, std.mem.span(v), "1");
+        if (std.c.getenv("TF_GLM_LOGICAL_OCCUPANCY_TRACE")) |v| self.logical_trace = std.mem.eql(u8, std.mem.span(v), "1");
         if (std.c.getenv("TF_GLM_OCCUPANCY_TRACE")) |v| self.occupancy_trace = std.mem.eql(u8, std.mem.span(v), "1");
         for (&self.slots) |*sl| sl.seq = try engine.Seq.initSlot(gpa, d, lay, r.model.layers.len, self.ring, pool.kv);
         if (self.book.set.on) self.snaps = try keep.Snaps.init(gpa, d, self.book.set.snaps, keep.snapBytes(&self.slots[0].seq.?));
@@ -296,14 +299,14 @@ pub const Lanes = struct {
     /// Rank 0 sends the step to rank 1, both agree on it, both run it. A failure breaks the lane (the follower
     /// would otherwise pair its next gather wrongly).
     /// Whether the ranks agree on a record before its step runs (with the records folded in since): a verify, a prompt
-    /// part, the stop. The others (open, keep, draft, release) fold into the next agreement, so a decode round agrees
+    /// part, the stop. The others (open, keep, draft, release, logical) fold into the next agreement, so a decode round agrees
     /// once. Records reach the followers byte for byte over the control link; what an agreement catches is a rank
     /// that cannot run one (its state differs), and a draft's head steps before that agreement then pair their
     /// gathers wrongly or wait: the lane is broken either way and both ranks restart.
     fn agreesNow(op: []const u8) bool {
         const code = std.enums.fromInt(Op, op[0]) orelse return true;
         return switch (code) {
-            .open, .keep, .draft, .release => false,
+            .open, .keep, .draft, .release, .logical => false,
             .fill, .verify, .stop => true,
         };
     }
@@ -412,6 +415,20 @@ pub const Lanes = struct {
                         },
                         else => unreachable,
                     }
+                }
+                return rd.b.len == 0;
+            },
+            .logical => {
+                const n = rd.byte() orelse return false;
+                if (n == 0 or n > max_streams) return false;
+                var seen: [max_streams]bool = @splat(false);
+                for (0..n) |_| {
+                    const slot = rd.byte() orelse return false;
+                    if (slot >= max_streams or seen[slot] or !self.slots[slot].busy or self.slots[slot].filling) return false;
+                    seen[slot] = true;
+                    for (0..5) |_| _ = rd.int() orelse return false;
+                    for (0..3) |_| if ((rd.byte() orelse return false) > 1) return false;
+                    if (rd.skip(32) == null) return false;
                 }
                 return rd.b.len == 0;
             },
@@ -527,6 +544,35 @@ pub const Lanes = struct {
                 for (drops[0..n]) |*x| x.* = rd.int().?;
                 self.finish(s, drops[0..n]);
             },
+            .logical => {
+                self.logical_event += 1;
+                const n = rd.byte().?;
+                std.log.info("glm_logical rank={d} event={d} selected={d} pool_rows={d} capacity={d}", .{ self.lay.rank, self.logical_event, n, self.pool.rows, self.capacity });
+                for (0..n) |_| {
+                    const slot = rd.byte().?;
+                    const s = &self.slots[slot];
+                    const q = &s.seq.?;
+                    const logical = rd.int().?;
+                    const prompt = rd.int().?;
+                    const generated = rd.int().?;
+                    const core_cache = rd.int().?;
+                    const token = rd.int().?;
+                    const pending = rd.byte().?;
+                    const matches_last = rd.byte().?;
+                    const finished = rd.byte().?;
+                    var identity: [32]u8 = undefined;
+                    for (&identity) |*b| b.* = rd.byte().?;
+                    std.log.info("glm_logical_slot rank={d} event={d} slot={d} stream_sha256={s} prompt_sha256_le={s} logical_tokens={d} prompt_tokens={d} generated_tokens={d} core_cache_len={d} core_pending_present={d} core_pending_token={d} core_pending_matches_last={d} finished={d} durable_pos={d} window_pending_rows={d} mtp_pos={d} mtp_drafted={d} base={d} size={d}", .{ self.lay.rank, self.logical_event, slot, std.fmt.bytesToHex(identity, .lower), std.fmt.bytesToHex(s.prompt_sha256, .lower), logical, prompt, generated, core_cache, pending, token, matches_last, finished, q.len(), s.pending orelse 0, q.mtp_len, q.mtp_drafted, s.base, s.size });
+                    if (q.tier) |x| {
+                        const hs = [_]usize{ x.h, x.hm };
+                        for (hs, 0..) |h, head| {
+                            const t = &x.t.host;
+                            const st = t.streams[h];
+                            std.log.info("glm_logical_tier rank={d} event={d} slot={d} head={d} h={d} parent={?d} depth={d} end={d} committed={d} file_fd={d}", .{ self.lay.rank, self.logical_event, slot, head, h, st.parent, t.aliasDepth(h), st.end, st.committed, t.io.fd });
+                        }
+                    }
+                }
+            },
             .stop => {},
         }
     }
@@ -536,7 +582,9 @@ pub const Lanes = struct {
     fn traceOccupancy(self: *Lanes) void {
         self.occupancy_event += 1;
         var busy: usize = 0;
-        for (self.slots) |s| if (s.busy) { busy += 1; };
+        for (self.slots) |s| if (s.busy) {
+            busy += 1;
+        };
         std.log.info("glm_occupancy rank={d} event={d} busy={d} pool_rows={d} capacity={d}", .{ self.lay.rank, self.occupancy_event, busy, self.pool.rows, self.capacity });
         for (self.slots, 0..) |s, slot| {
             if (!s.busy) continue;
@@ -790,6 +838,31 @@ pub const Lanes = struct {
             w.byte(@intCast(path.len));
         }
         try self.both(w.done());
+        if (self.logical_trace) try self.traceLogical(windows);
+    }
+
+    /// The core has concluded every selected stream and the backend has committed its kept rows. This runs
+    /// before Engine.step releases finished streams; a sampled pending token has no KV row yet.
+    fn traceLogical(self: *Lanes, windows: []const be.Window) !void {
+        var w: Writer = .{ .b = self.op_buf };
+        w.byte(@intFromEnum(Op.logical));
+        w.byte(@intCast(windows.len));
+        for (windows) |win| {
+            const s = win.stream;
+            w.byte(self.slotOf(s) orelse return error.UnknownStream);
+            w.int(@intCast(s.context.items.len));
+            w.int(@intCast(s.prompt_len));
+            w.int(@intCast(s.emitted().len));
+            w.int(@intCast(s.cache_len));
+            w.int(s.pending orelse 0);
+            w.byte(@intFromBool(s.pending != null));
+            w.byte(@intFromBool(s.pending != null and s.context.items.len > 0 and s.pending.? == s.context.items[s.context.items.len - 1]));
+            w.byte(@intFromBool(s.finished));
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(s.id, &digest, .{});
+            for (digest) |b| w.byte(b);
+        }
+        try self.both(w.done());
     }
 
     /// Every request's kept rows owed to its head (after a prompt the head already owes its last row), then, for a
@@ -982,4 +1055,34 @@ test "draft probabilities cover the requested prefix or decline without partial 
     try std.testing.expectEqualSlices(f64, &.{ -1, -1, -1 }, &extended);
     self.slots[0].nheld = 0;
     try std.testing.expect(!try Lanes.probabilitiesFn(&self, &stream, &prefix));
+}
+
+test "logical observations reject missing or repeated live slots and malformed metadata" {
+    var cfg: config.Config = undefined;
+    var pool: P.Pool = .{ .gpa = std.testing.allocator, .latent = &.{}, .pk = &.{}, .rows = 2 * P.extent_align, .kv = .bf16, .extents = P.Extents.init(2 * P.extent_align) };
+    var l: Lanes = .{ .gpa = std.testing.allocator, .d = undefined, .lay = .{ .rank = 1, .world = 2, .cfg = &cfg }, .r = undefined, .comm = undefined, .capacity = 2 * P.extent_align, .pool = &pool, .ring = 64, .drafts = true, .book = .{ .set = .{ .on = false }, .chunk = keep.chunk, .window = 0 }, .op_buf = &.{}, .agree_send = undefined, .agree_recv = undefined };
+    var buf: [128]u8 = undefined;
+    var w: Writer = .{ .b = &buf };
+    w.byte(@intFromEnum(Op.logical));
+    w.byte(2);
+    for ([_]u8{ 0, 1 }) |slot| {
+        l.slots[slot].busy = true;
+        w.byte(slot);
+        for ([_]u32{ 1024, 512, 512, 1023, 7 }) |value| w.int(value);
+        for (0..3) |_| w.byte(1);
+        for (0..32) |_| w.byte(slot);
+    }
+    try std.testing.expect(l.runnable(w.done()));
+    try std.testing.expect(!l.runnable(w.done()[0 .. w.n - 1]));
+    l.slots[1].busy = false;
+    try std.testing.expect(!l.runnable(w.done()));
+    l.slots[1].busy = true;
+    l.slots[1].filling = true;
+    try std.testing.expect(!l.runnable(w.done()));
+    l.slots[1].filling = false;
+    buf[2 + 56] = 0;
+    try std.testing.expect(!l.runnable(w.done()));
+    buf[2 + 56] = 1;
+    buf[2 + 1 + 20] = 2;
+    try std.testing.expect(!l.runnable(w.done()));
 }
