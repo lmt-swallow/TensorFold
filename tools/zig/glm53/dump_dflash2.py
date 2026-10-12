@@ -33,9 +33,8 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=False)
     ref.tools_on_path(a.tools)
     import capture_kernel as ck
-    from tensorfold.families.glm5_next.cuda import dflash2 as D
-
     rec = ck.load_recorder(a.tools)
+    from tensorfold.families.glm5_next.cuda import dflash2 as D
     pair = ref.Pair(rec)
     # [] deliberately excludes all 45 target layers and MTP; embedding/head are real.
     ws = [ref.load_rank(a.model, r, [], mtp=False) for r in (0, 1)]
