@@ -140,3 +140,73 @@ pub fn run(gpu: Gpu, aot_dir: []const u8) !void {
     try check.expect(failures == 0, "glm53-select: {d} of {d} cases differ", .{ failures, cases });
     check.pass("glm53-select: {d} cases equal to the definition, {d} of them also to the captured kernels", .{ cases, captured });
 }
+
+/// `glm53-scores <aot-dir>`: scores.cu (glue.zig `Glue.scores`) against the captured `_scores` (TF_GLM_SCORE_RB's
+/// variant, which the set must hold) byte for byte, on drawn queries, head weights and pooled keys, over block
+/// positions and row counts that put the visible-pool edge inside, before and after the 128-pool tiles.
+pub fn runScores(gpu: Gpu, aot_dir: []const u8) !void {
+    const gpa = gpu.gpa;
+    const d = gpu.d;
+    var set = try cuda.aot.Set.load(gpa, gpu.io, d, gpu.ctx.device, aot_dir);
+    defer set.deinit();
+    var hc = try glm.glue.Hc.load(d);
+    defer hc.deinit();
+    const g: glm.glue.Glue = .{ .set = &set, .hc = &hc, .hidden = 4096, .streams = 4 };
+    var stream = try cuda.Stream.init(d, true);
+    defer stream.deinit();
+    var prng = std.Random.DefaultPrng.init(20261013);
+    const rng = prng.random();
+    const H = 32;
+    const D = 128;
+    const cases = [_]struct { pos: usize, rows: usize, np: usize }{
+        .{ .pos = 2051, .rows = 512, .np = 2048 },   .{ .pos = 4096, .rows = 37, .np = 2048 },
+        .{ .pos = 30720, .rows = 512, .np = 8192 },  .{ .pos = 32767, .rows = 512, .np = 9216 },
+        .{ .pos = 81919, .rows = 64, .np = 21504 },  .{ .pos = 204800, .rows = 512, .np = 52224 },
+        .{ .pos = 262141, .rows = 100, .np = 66560 }, .{ .pos = 600000, .rows = 512, .np = 150016 },
+    };
+    var failures: usize = 0;
+    for (cases) |cs| {
+        const pools = cs.np + 2;
+        const qi = try gpa.alloc(u16, cs.rows * H * D);
+        defer gpa.free(qi);
+        const wts = try gpa.alloc(u16, cs.rows * (D + H)); // the indexer's [keys | weights] rows: weights at D
+        defer gpa.free(wts);
+        const pk = try gpa.alloc(u16, pools * D);
+        defer gpa.free(pk);
+        for ([_][]u16{ qi, wts, pk }) |arr| for (arr) |*x| {
+            const v: f32 = rng.floatNorm(f32);
+            x.* = @intCast(@as(u32, @bitCast(v)) >> 16);
+        };
+        var bq = try Buf.fromHost(d, std.mem.sliceAsBytes(qi));
+        defer bq.free();
+        var bw = try Buf.fromHost(d, std.mem.sliceAsBytes(wts));
+        defer bw.free();
+        var bk = try Buf.fromHost(d, std.mem.sliceAsBytes(pk));
+        defer bk.free();
+        const p32: i32 = @intCast(cs.pos);
+        var bp = try Buf.fromHost(d, std.mem.asBytes(&p32));
+        defer bp.free();
+        var o1 = try Buf.alloc(d, cs.rows * cs.np * 4);
+        defer o1.free();
+        var o2 = try Buf.alloc(d, cs.rows * cs.np * 4);
+        defer o2.free();
+        hc.sco.check = false;
+        hc.sco.use = true;
+        try g.scores(bq.ptr, bw.ptr + D * 2, D + H, bk.ptr, .bf16, o1.ptr, bp.ptr, cs.rows, cs.np, stream);
+        hc.sco.use = false;
+        try g.scores(bq.ptr, bw.ptr + D * 2, D + H, bk.ptr, .bf16, o2.ptr, bp.ptr, cs.rows, cs.np, stream);
+        try stream.synchronize();
+        const a = try gpa.alloc(u8, cs.rows * cs.np * 4);
+        defer gpa.free(a);
+        const b = try gpa.alloc(u8, cs.rows * cs.np * 4);
+        defer gpa.free(b);
+        try o1.download(0, a);
+        try o2.download(0, b);
+        if (std.mem.indexOfDiff(u8, a, b)) |at| {
+            failures += 1;
+            std.debug.print("FAIL glm53-scores pos {d} rows {d} np {d}: first difference at row {d} pool {d}\n", .{ cs.pos, cs.rows, cs.np, at / 4 / cs.np, at / 4 % cs.np });
+        }
+    }
+    try check.expect(failures == 0, "glm53-scores: {d} of {d} cases differ from _scores", .{ failures, cases.len });
+    check.pass("glm53-scores: {d} cases byte-equal to the captured _scores", .{cases.len});
+}

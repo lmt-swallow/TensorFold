@@ -182,6 +182,7 @@ pub const Hc = struct {
     check: bool,
     bmm: Bmm,
     sel: Select,
+    sco: Own,
 
     /// hc_fused.cu from this many rows (GB10: 1.18x the captured pair at 2,048 rows, 0.97x at 777, slower below).
     const fused_min_rows = 1024;
@@ -199,6 +200,9 @@ pub const Hc = struct {
         try post_partial.allowDynamicShared(fused_smem);
         var bmm = try Bmm.load(d);
         errdefer bmm.deinit();
+        var sel = try Select.load(d);
+        errdefer sel.deinit();
+        var sco = try Own.load(d, cuda.kernels.glm53_scores, "_ZN15tf_glm53_scores13scores_kernelEPK13__nv_bfloat16S2_iS2_PfPKiiiff", "tf_glm53_scores_smem", "TF_GLM_SCORES");
         return .{
             .d = d,
             .module = module,
@@ -208,11 +212,13 @@ pub const Hc = struct {
             .fused = !std.mem.eql(u8, envOr("TF_GLM_HC_FUSED", "1"), "0"),
             .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
             .bmm = bmm,
-            .sel = try Select.load(d),
+            .sel = sel,
+            .sco = sco,
         };
     }
 
     pub fn deinit(self: *Hc) void {
+        self.sco.deinit();
         self.sel.deinit();
         self.bmm.deinit();
         self.fused_module.unload();
@@ -251,6 +257,58 @@ pub const Select = struct {
 
     pub fn deinit(self: *Select) void {
         self.module.unload();
+    }
+};
+
+/// One of the glue's own kernels standing in for a captured one with its bits (scores.cu for `_scores`): `use` unless
+/// its switch (`env` = 0), `check` under TF_GLM_PROMPT_CHECK=1 (the captured kernel beside it, byte for byte).
+pub const Own = struct {
+    d: *const cuda.Driver,
+    module: cuda.Module,
+    func: cuda.Function,
+    smem: u32,
+    use: bool,
+    check: bool,
+
+    pub fn load(d: *const cuda.Driver, image: []const u8, symbol: [:0]const u8, smem_symbol: [:0]const u8, env: [:0]const u8) !Own {
+        var module = try cuda.Module.load(d, image);
+        errdefer module.unload();
+        const func = try module.function(symbol);
+        const g = try module.global(smem_symbol);
+        var smem: u32 = 0;
+        const view: cuda.DeviceBuffer = .{ .d = d, .ptr = g.ptr, .len = g.len };
+        try view.download(0, std.mem.asBytes(&smem));
+        try func.allowDynamicShared(smem);
+        return .{
+            .d = d, .module = module, .func = func, .smem = smem,
+            .use = !std.mem.eql(u8, envOr(env, "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+        };
+    }
+
+    pub fn deinit(self: *Own) void {
+        self.module.unload();
+    }
+
+    /// TF_GLM_PROMPT_CHECK: `bytes` at `out` against the captured kernel's on the same call (`captured` writes them
+    /// into the buffer it is given).
+    fn same(self: *const Own, what: []const u8, out: Ptr, bytes: usize, stream: cuda.Stream, captured: anytype) !void {
+        var ref = try cuda.DeviceBuffer.alloc(self.d, bytes);
+        defer ref.free();
+        try captured.run(ref.ptr);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try ref.download(0, want);
+        const view: cuda.DeviceBuffer = .{ .d = self.d, .ptr = out, .len = bytes };
+        try view.download(0, got);
+        if (!std.mem.eql(u8, want, got)) {
+            std.log.err("glm53: {s}: differs from the captured kernel's output", .{what});
+            return error.PromptKernelMismatch;
+        }
     }
 };
 
@@ -771,6 +829,34 @@ pub const Glue = struct {
 
     /// sparse.py `_scores` (a prompt chunk's rows from device position pos, RB rows a program) into out [R, np].
     pub fn scores(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
+        const own = &g.hc.sco;
+        if (!own.use or kv != .bf16) return g.scoresCaptured(qi, w, w_stride, pk, kv, out, pos, R, np, stream);
+        // scores.cu: 128 pools and 32 rows a block, its bits `_scores`'
+        var args: cuda.Args = .{};
+        args.add(qi);
+        args.add(w);
+        args.add(@as(c_int, @intCast(w_stride)));
+        args.add(pk);
+        args.add(out);
+        args.add(pos);
+        args.add(@as(c_int, @intCast(R)));
+        args.add(@as(c_int, @intCast(np)));
+        args.add(index_scale);
+        args.add(index_wscale);
+        try cuda.launch.launch(own.func, .{ .grid = .{ .x = @intCast(cdiv(np, 128)), .y = @intCast(cdiv(R, 32)) }, .block = .{ .x = 256 }, .shared = own.smem }, stream, &args);
+        if (!own.check) return;
+        const Cap = struct {
+            g: Glue,
+            qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, pos: Ptr, R: usize, np: usize, stream: cuda.Stream,
+            fn run(c: @This(), o: Ptr) !void {
+                try c.g.scoresCaptured(c.qi, c.w, c.w_stride, c.pk, c.kv, o, c.pos, c.R, c.np, c.stream);
+            }
+        };
+        try own.same("scores.cu", out, R * np * 4, stream, Cap{ .g = g, .qi = qi, .w = w, .w_stride = w_stride, .pk = pk, .kv = kv, .pos = pos, .R = R, .np = np, .stream = stream });
+    }
+
+    /// `scores` through the captured `_scores` (TF_GLM_SCORE_RB rows a program).
+    fn scoresCaptured(g: Glue, qi: Ptr, w: Ptr, w_stride: usize, pk: Ptr, kv: Kv, out: Ptr, pos: Ptr, R: usize, np: usize, stream: cuda.Stream) !void {
         const rb = try scoreRows();
         try g.set.run(stream, "_scores", .{ @intCast(cdiv(R, rb)), @intCast(cdiv(np, 64)), 1 }, &.{
             aot.ptr("QI", "*bf16", qi),  aot.ptr("W", "*bf16", w),     aot.int("w_stride", n32(w_stride)), aot.ptr("PK", kv.values(), pk),
