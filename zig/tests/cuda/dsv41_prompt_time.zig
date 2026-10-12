@@ -96,6 +96,24 @@ pub fn run(gpu: Gpu, cache_dir: []const u8, model_dir: []const u8, aot_dir: []co
     const gather: dsv41.forward.Gather = .{ .ctx = &seq, .call = selfGather };
     const ids = try gpa.alloc(i64, tokens);
     defer gpa.free(ids);
+    // Fixture-only dependency-cone experiment; no serving option or production dispatch changes.
+    if (std.mem.eql(u8, getenv("TF_DS_FIXTURE_CONE") orelse "0", "1")) {
+        if (seq.pr.profile) |*p| {
+            p.deinit();
+            seq.pr.profile = null;
+        }
+        if (replay or chunk != L.default_chunk or other != null or runs != 1 or
+            cfg.n_layers != 40 or w.layers.len != 40 or cfg.window != 128 or
+            seq.spark != null or seq.pr.pk.gu != .mmb or seq.pr.pk.down != .rowscp or
+            !std.mem.eql(u8, getenv("TF_DS_KEEP") orelse "0", "0")) return error.BadConeFixture;
+        for (20..40) |li| {
+            if (cfg.ratio(li) != 1 or (li > 20 and cfg.isKvSource(li)) or cfg.isEngram(li)) return error.BadConeFixture;
+        }
+        if (!cfg.isKvSource(20)) return error.BadConeFixture;
+        var prng = std.Random.DefaultPrng.init(0x5eed);
+        for (ids) |*id| id.* = prng.random().intRangeLessThan(i64, 3, @intCast(cfg.vocab - 1024));
+        return coneFixture(gpu, &fwd, &seq, gather, ids, chunk, stream);
+    }
     for (0..runs) |r| {
         // a fresh draw a run: the Engram rows of one run are not in the page cache for the next
         var prng = std.Random.DefaultPrng.init(0x5eed + r);
@@ -174,6 +192,84 @@ fn digests(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequen
         inline for (plane_fields) |f| try out.append(gpa, try digest(gpu, @field(x, f)));
     };
     return out;
+}
+
+/// Compare actual cache/logit bytes under one-rank selfGather. This tests the suffix property,
+/// not real TP2 state, DSpark, kept prefixes, or independent Python-reference parity.
+fn coneFixture(gpu: Gpu, fwd: *dsv41.forward.Forward, seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, chunk: usize, stream: cuda.Stream) !void {
+    const halo: usize = 144 + 20 * 127;
+    const cut = (ids.len -| halo) / chunk * chunk;
+    if (cut == 0) return error.ConeFixtureNeedsLongerPrompt;
+    var buffers: std.ArrayList(cuda.DeviceBuffer) = .empty;
+    defer buffers.deinit(gpu.gpa);
+    var want: std.ArrayList([]u8) = .empty;
+    defer {
+        for (want.items) |bytes| gpu.gpa.free(bytes);
+        want.deinit(gpu.gpa);
+    }
+    try clearConeCaches(fwd, stream);
+    try seq.prefill(gather, ids, chunk, false);
+    try stream.synchronize();
+    try buffers.append(gpu.gpa, .{ .d = gpu.d, .ptr = seq.logits, .len = fwd.cfg.vocab * 4 });
+    for (fwd.rings) |r| try buffers.append(gpu.gpa, r);
+    for (fwd.planes) |pl| if (pl) |x| {
+        inline for (plane_fields) |f| try buffers.append(gpu.gpa, @field(x, f));
+    };
+    for (buffers.items) |buffer| {
+        const bytes = try check.download(gpu, buffer);
+        errdefer gpu.gpa.free(bytes);
+        try want.append(gpu.gpa, bytes);
+    }
+    try clearConeCaches(fwd, stream);
+    try prefillCone(seq, gather, ids, chunk, cut);
+    try stream.synchronize();
+    // The head may use a different scratch address after the second pass.
+    buffers.items[0].ptr = seq.logits;
+    for (buffers.items, want.items, 0..) |buffer, expected, i| {
+        const got = try check.download(gpu, buffer);
+        defer gpu.gpa.free(got);
+        var label: [96]u8 = undefined;
+        var name: [64]u8 = undefined;
+        try check.sameBytes(try std.fmt.bufPrint(&label, "cone {s}", .{digestName(fwd, i, &name)}), got, expected);
+    }
+    try check.expect(seq.pos == ids.len, "cone position", .{});
+    for (seq.hist[0..ids.len], ids) |got, expected| try check.expect(got == expected, "cone history", .{});
+    check.pass("dsv41 fixture cone: {d} tokens, cut {d}, halo {d}, original chunk {d}; logits/rings/planes all bytes equal; selfGather, no DSpark/KEEP/Python parity", .{ ids.len, cut, halo, chunk });
+}
+
+fn clearConeCaches(fwd: *dsv41.forward.Forward, stream: cuda.Stream) !void {
+    for (fwd.rings) |r| try r.fill8(0, stream.handle);
+    for (fwd.planes) |pl| if (pl) |x| {
+        inline for (plane_fields) |f| try @field(x, f).fill8(if (comptime std.mem.eql(u8, f, "idxk_scales")) 127 else 0, stream.handle);
+    };
+}
+
+/// The fixture's cold pass retains Sequence.prefill's original chunks and Engram history,
+/// with an explicit cone cut passed only to Prompt.chunk. It never publishes prefix snapshots.
+fn prefillCone(seq: *dsv41.serve_lanes.Sequence, gather: dsv41.forward.Gather, ids: []const i64, chunk: usize, cut: usize) !void {
+    seq.pos = 0;
+    seq.logits = 0;
+    seq.held = 0;
+    seq.verify_rows = 0;
+    for (seq.hist[0..ids.len], ids) |*hv, id| hv.* = @intCast(id);
+    if (seq.engram) |g| {
+        g.history = seq.hist[0..ids.len];
+        try g.resetAhead();
+        try g.prefetch(seq.hist[0..ids.len], 0, @min(chunk, ids.len));
+    }
+    var start: usize = 0;
+    while (start < ids.len) {
+        const end = @min(ids.len, start + chunk);
+        const last = end == ids.len;
+        if (seq.engram) |g| if (!last) try g.prefetch(seq.hist[0..ids.len], end, @min(chunk, ids.len - end));
+        const out = try seq.pr.chunk(gather, ids[start..end], start, .{
+            .replay = cut,
+            .logits = last or end - start <= dsv41.serve_lanes.max_rows,
+        }, seq.stream);
+        if (last) seq.logits = out orelse return error.BadConeFixture;
+        start = end;
+    }
+    seq.pos = ids.len;
 }
 
 fn digest(gpu: Gpu, b: cuda.DeviceBuffer) !u64 {
