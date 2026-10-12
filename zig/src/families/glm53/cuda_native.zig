@@ -125,6 +125,14 @@ fn deviceBytes(x: anytype) usize {
     const T = @TypeOf(x);
     if (T == cuda.DeviceBuffer) return x.len;
     if (T == dsa.Cache) return x.ik.len + x.ig.len + if (x.owned) x.latent.len + x.pk.len else 0;
+    // the MTP prompt buffers' borrowed partials, gathers and split-K slices are the backbone's (`initSharing`)
+    if (T == mtp.Buffers and x.borrowed) {
+        var n: usize = 0;
+        inline for (@typeInfo(T).@"struct".field_names) |name| {
+            if (comptime !(std.mem.eql(u8, name, "part") or std.mem.eql(u8, name, "gath") or std.mem.eql(u8, name, "sk"))) n += deviceBytes(@field(x, name));
+        }
+        return n;
+    }
     switch (@typeInfo(T)) {
         .@"struct" => |st| {
             var n: usize = 0;
@@ -153,23 +161,50 @@ fn inGib(n: usize) f64 {
 
 /// The device's free bytes between `open`'s phases: what each phase took, beside what the engine's buffers of that
 /// phase account for (the rest is the driver's, NCCL's, the modules' and the allocator's).
+/// The phases are measured by /proc/meminfo's MemAvailable, which counts the page cache as available (the unified
+/// memory's device allocations come out of it), and by cuMemGetInfo's free, which does not (a weight load's page
+/// cache shows there, and comes back when an allocation evicts it).
 const Phases = struct {
     ctx: *const cuda.Context,
+    io: std.Io,
+    gpa: std.mem.Allocator,
     rank: usize,
     last: usize,
+    last_avail: usize,
 
-    fn init(ctx: *const cuda.Context, rank: usize) Phases {
-        const m = ctx.memInfo() catch return .{ .ctx = ctx, .rank = rank, .last = 0 };
-        std.log.info("glm53 rank {d} memory: {d:.2} GiB free of {d:.2} at start", .{ rank, inGib(m.free), inGib(m.total) });
-        return .{ .ctx = ctx, .rank = rank, .last = m.free };
+    fn available(p: *const Phases) usize {
+        const text = std.Io.Dir.cwd().readFileAlloc(p.io, "/proc/meminfo", p.gpa, .limited(1 << 16)) catch return 0;
+        defer p.gpa.free(text);
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
+            var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
+            const kb = std.fmt.parseInt(usize, f.next() orelse return 0, 10) catch return 0;
+            return kb * 1024;
+        }
+        return 0;
+    }
+
+    fn init(ctx: *const cuda.Context, io: std.Io, gpa: std.mem.Allocator, rank: usize) Phases {
+        var p: Phases = .{ .ctx = ctx, .io = io, .gpa = gpa, .rank = rank, .last = 0, .last_avail = 0 };
+        p.last_avail = p.available();
+        const m = ctx.memInfo() catch return p;
+        p.last = m.free;
+        std.log.info("glm53 rank {d} memory: at start MemAvailable {d:.2} GiB, device free {d:.2} of {d:.2}", .{ rank, inGib(p.last_avail), inGib(m.free), inGib(m.total) });
+        return p;
     }
 
     /// Phase `name` is done; `counted`: the bytes its buffers hold.
     fn step(p: *Phases, name: []const u8, counted: usize) void {
         const m = p.ctx.memInfo() catch return;
-        const took = p.last -| m.free;
-        std.log.info("glm53 rank {d} memory: {s}: took {d:.2} GiB, its buffers {d:.2}, the rest {d:.2}; {d:.2} GiB free", .{ p.rank, name, inGib(took), inGib(counted), inGib(took) - inGib(counted), inGib(m.free) });
+        const avail = p.available();
+        const took = @as(f64, @floatFromInt(p.last_avail)) - @as(f64, @floatFromInt(avail));
+        const took_dev = @as(f64, @floatFromInt(p.last)) - @as(f64, @floatFromInt(m.free));
+        std.log.info("glm53 rank {d} memory: {s}: MemAvailable took {d:.2} GiB (device free {d:.2}), its buffers {d:.2}, the rest {d:.2}; MemAvailable {d:.2}, device free {d:.2} GiB", .{
+            p.rank, name, took / (1 << 30), took_dev / (1 << 30), inGib(counted), took / (1 << 30) - inGib(counted), inGib(avail), inGib(m.free),
+        });
         p.last = m.free;
+        p.last_avail = avail;
     }
 };
 
@@ -213,7 +248,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         for (&master) |*b| b.* = std.fmt.parseInt(u8, it.next() orelse return error.BadMaster, 10) catch return error.BadMaster;
     }
     const d = ctx.d;
-    var phases = Phases.init(ctx, rank);
+    var phases = Phases.init(ctx, io, gpa, rank);
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
