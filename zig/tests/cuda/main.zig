@@ -38,6 +38,7 @@ const glm53_prompt = @import("glm53_prompt_tests.zig");
 const glm53_forward = @import("glm53_forward_tests.zig");
 const glm53_generate = @import("glm53_generate_tests.zig");
 const glm53_prompt_time = @import("glm53_prompt_time.zig");
+const glm53_select = @import("glm53_select_tests.zig");
 const glm53_keep = @import("glm53_keep_tests.zig");
 const glm53_shared = @import("glm53_shared_tests.zig");
 const glm53_tier = @import("glm53_tier_tests.zig");
@@ -95,6 +96,7 @@ const usage =
     \\  glm53-keep <fwd-dir> <model-dir> <rank> <master-ip|local> <port> <aot-dir> [layers]  GLM-5.3-Flash a prompt continued from a kept prompt's boundary (pool extents, a snapshot) on the pair against its fresh prefill
     \\  glm53-generate <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir>  GLM-5.3-Flash the fixture's request decoded serially on the pair, its reply against the reference's ids
     \\  glm53-forward <fwd-dir> <model-dir> <rank> <master-ip> <port> <aot-dir> [layers]  GLM-5.3-Flash whole forward on one rank of the pair (NCCL gathers) against the Mia fork's forward fixture (glm53/b1/forward_capture.sh)
+    \\  glm53-select <aot-dir>  GLM-5.3-Flash select.cu's prompt pool selection against the definition and the captured kernels
     \\  glm53-prompt-time <aot-dir> <model-dir> [pos ...]  GLM-5.3-Flash prompt path speed on rank 0 alone: a 2,048-row chunk at each position, its segments timed by kind
     \\  glm53-dsa <work-dir> <model-dir> [isolated]  GLM-5.3-Flash DSA layer 3 (indexer, top-512 pools, latent attention; then its MoE) on both ranks, runs a and l, against the Mia fork's fixture (glm53/capture.sh dsa)
     \\  glm53-moe <work-dir> <model-dir> [isolated]  GLM-5.3-Flash MoE block (router, EXL3 experts decode / prompt, shared expert) on both ranks against the Mia fork's fixture (glm53/capture.sh moe)
@@ -195,6 +197,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm53-keep")) return glm53_keep.run(gpu, .{ .dir = try arg(rest, 0), .model = try arg(rest, 1), .aot = try arg(rest, 5), .layers = if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null }, try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10));
     if (std.mem.eql(u8, cmd, "glm53-generate")) return glm53_forward.generate(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5));
     if (std.mem.eql(u8, cmd, "glm53-forward")) return glm53_forward.run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(u16, try arg(rest, 4), 10), try arg(rest, 5), if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else null);
+    if (std.mem.eql(u8, cmd, "glm53-select")) return glm53_select.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm53-prompt-time")) {
         var pos: [16]usize = undefined;
         var n: usize = 0;

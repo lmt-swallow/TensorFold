@@ -502,10 +502,7 @@ fn selectTokens(g: Glue, s: *const Scratch, cache: *const Cache, call: Call, qi:
             const n = @min(B, R - a);
             const at = if (a == 0) call.pos_dev else try devicePos(s, .select, i, call.host_pos + a, stream);
             try g.scores(qi + a * qrow, wts + a * w_stride * 2, w_stride, cache.pk.ptr, cache.kv, s.scores.ptr, at, n, NP, stream);
-            // top_pools: a block of fewer than 64 rows over 8,192 pools or more across chunk programs (the same pools)
-            if (n < split_rows and NP >= split_from) {
-                try g.selectSplitPools(s.scores.ptr, NP, s.split, s.pools.ptr, n, stream);
-            } else try g.selectRows(s.scores.ptr, s.pools.ptr, NP, 0, n, stream);
+            try g.promptPools(s.scores.ptr, NP, s.pools.ptr, n, s.split, stream);
             try g.tokens(s.pools.ptr, at, tokens + a * glue_mod.sparse_tokens * 4, counts + a * 4, n, stream);
         }
         return;

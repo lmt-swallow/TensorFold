@@ -169,7 +169,7 @@ pub fn scoreRows() !usize {
 }
 
 /// The glue's own CUDA kernels: hc.cu's mixing dots (decode rows), hc_fused.cu's hc_post with the next hc_pre's
-/// prompt dots (`Glue.hcPostPartial`) and bmm.cu's BF16 matmul (`Bmm`).
+/// prompt dots (`Glue.hcPostPartial`), bmm.cu's BF16 matmul (`Bmm`) and select.cu's prompt pool selection (`Select`).
 pub const Hc = struct {
     d: *const cuda.Driver,
     module: cuda.Module,
@@ -181,6 +181,7 @@ pub const Hc = struct {
     /// TF_GLM_PROMPT_CHECK=1: every hc_fused.cu call against the captured pair, byte for byte.
     check: bool,
     bmm: Bmm,
+    sel: Select,
 
     /// hc_fused.cu from this many rows (GB10: 1.18x the captured pair at 2,048 rows, 0.97x at 777, slower below).
     const fused_min_rows = 1024;
@@ -196,6 +197,8 @@ pub const Hc = struct {
         errdefer fused_module.unload();
         const post_partial = try fused_module.function("tf_glm53_hc_post_partial");
         try post_partial.allowDynamicShared(fused_smem);
+        var bmm = try Bmm.load(d);
+        errdefer bmm.deinit();
         return .{
             .d = d,
             .module = module,
@@ -204,13 +207,49 @@ pub const Hc = struct {
             .post_partial = post_partial,
             .fused = !std.mem.eql(u8, envOr("TF_GLM_HC_FUSED", "1"), "0"),
             .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
-            .bmm = try Bmm.load(d),
+            .bmm = bmm,
+            .sel = try Select.load(d),
         };
     }
 
     pub fn deinit(self: *Hc) void {
+        self.sel.deinit();
         self.bmm.deinit();
         self.fused_module.unload();
+        self.module.unload();
+    }
+};
+
+/// select.cu: a prompt chunk's pool selection (sparse.py `top_pools` without positions: `_select_rows`, or
+/// `select_split`'s pool form for blocks of fewer than 64 rows over 8,192 scores or more). Its output is fixed by its
+/// definition (each row's 512 best scores in total order, ties to the lower pool, ascending), so it is the captured
+/// kernels' byte for byte with fewer passes over the scores. TF_GLM_SELECT=0 keeps the captured kernels;
+/// TF_GLM_PROMPT_CHECK=1 runs them beside it on every call and fails unless the pools are byte-equal.
+pub const Select = struct {
+    d: *const cuda.Driver,
+    module: cuda.Module,
+    func: cuda.Function,
+    smem: u32,
+    use: bool,
+    check: bool,
+
+    pub fn load(d: *const cuda.Driver) !Select {
+        var module = try cuda.Module.load(d, cuda.kernels.glm53_select);
+        errdefer module.unload();
+        const func = try module.function("_ZN15tf_glm53_select19select_pools_kernelEPKfiiiPl");
+        const g = try module.global("tf_glm53_select_smem");
+        var smem: u32 = 0;
+        const view: cuda.DeviceBuffer = .{ .d = d, .ptr = g.ptr, .len = g.len };
+        try view.download(0, std.mem.asBytes(&smem));
+        try func.allowDynamicShared(smem);
+        return .{
+            .d = d, .module = module, .func = func, .smem = smem,
+            .use = !std.mem.eql(u8, envOr("TF_GLM_SELECT", "1"), "0"),
+            .check = std.mem.eql(u8, envOr("TF_GLM_PROMPT_CHECK", "0"), "1"),
+        };
+    }
+
+    pub fn deinit(self: *Select) void {
         self.module.unload();
     }
 };
@@ -748,6 +787,49 @@ pub const Glue = struct {
             aot.ptr("S", "*fp32", s), aot.ptr("OUT", "*i64", out), aot.int("NPS", n32(np)),
             if (pos != 0) aot.ptr("POS", "*i32", pos) else aot.ptr("POS", "*fp32", s),
         }, &.{ aot.ci("K", 512), aot.ci("BLOCK", if (wide) 4096 else 1024), aot.ci("VIS", @intFromBool(pos != 0)) });
+    }
+
+    /// sparse.py `top_pools` of a prompt chunk's selection block: each of the n rows' 512 best of its np scores (row
+    /// stride np) into out int64 [n, 512], ascending (select.cu, or the captured kernels: `Select`). `split_buf`:
+    /// select_split's scratch (the captured pool form's).
+    pub fn promptPools(g: Glue, s: Ptr, np: usize, out: Ptr, n: usize, split_buf: cuda.DeviceBuffer, stream: cuda.Stream) !void {
+        const sel = &g.hc.sel;
+        if (!sel.use) return g.promptPoolsCaptured(s, np, out, n, split_buf, stream);
+        if (np < 512) return error.TooFewScores;
+        var args: cuda.Args = .{};
+        args.add(s);
+        args.add(@as(c_int, @intCast(np)));
+        args.add(@as(c_int, @intCast(np)));
+        args.add(@as(c_int, 512));
+        args.add(out);
+        try cuda.launch.launch(sel.func, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 }, .shared = sel.smem }, stream, &args);
+        if (!sel.check) return;
+        // TF_GLM_PROMPT_CHECK: the captured kernels' pools on the same scores, byte for byte
+        const bytes = n * 512 * 8;
+        var ref = try cuda.DeviceBuffer.alloc(sel.d, bytes);
+        defer ref.free();
+        try g.promptPoolsCaptured(s, np, ref.ptr, n, split_buf, stream);
+        try stream.synchronize();
+        const gpa = std.heap.page_allocator;
+        const want = try gpa.alloc(u8, bytes);
+        defer gpa.free(want);
+        const got = try gpa.alloc(u8, bytes);
+        defer gpa.free(got);
+        try ref.download(0, want);
+        const view: cuda.DeviceBuffer = .{ .d = sel.d, .ptr = out, .len = bytes };
+        try view.download(0, got);
+        if (!std.mem.eql(u8, want, got)) {
+            std.log.err("glm53: select.cu ({d} rows, {d} scores): the pools differ from the captured selection's", .{ n, np });
+            return error.PromptKernelMismatch;
+        }
+        std.log.info("glm53: select.cu ({d} rows, {d} scores): byte-equal to the captured selection", .{ n, np });
+    }
+
+    /// `promptPools` through the captured kernels: `_select_rows`, or `select_split`'s pool form for fewer than 64
+    /// rows over 8,192 scores or more.
+    fn promptPoolsCaptured(g: Glue, s: Ptr, np: usize, out: Ptr, n: usize, split_buf: cuda.DeviceBuffer, stream: cuda.Stream) !void {
+        if (n < 64 and np >= 8192) return g.selectSplitPools(s, np, split_buf, out, n, stream);
+        return g.selectRows(s, out, np, 0, n, stream);
     }
 
     /// sparse.py `_tokens`: each row's pools' tokens ascending, then its incomplete pool's visible tokens; its count

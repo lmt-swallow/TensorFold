@@ -62,6 +62,7 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_tier", .src = "glm53/tier", .flags = &.{"-O3"} }, // ours: the tiered latent cache's remap (kv_tier.zig)
     .{ .name = "glm53_hc_fused", .src = "glm53/hc_fused", .flags = &.{ "-O3", "--fmad=false" }, .nvcc_release = glm53_nvcc }, // ours: _hc_post with the next _hc_partial_mma, their bits in one pass
     .{ .name = "glm53_bmm", .src = "glm53/bmm", .flags = &.{"-O3"}, .nvcc_release = glm53_nvcc }, // ours: qmm.py _bmm and _reduce's bits (prompt rows) at the mma rate
+    .{ .name = "glm53_select", .src = "glm53/select", .flags = &.{"-O3"} }, // ours: sparse.py top_pools of prompt rows (integers: any exact selection's output)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
