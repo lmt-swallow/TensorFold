@@ -179,6 +179,7 @@ pub const Lanes = struct {
     fn clear(self: *Lanes, s: *Slot) void {
         if (s.prompt) |p| self.gpa.free(p);
         if (s.seq) |*q| if (q.tier) |x| {
+            q.tier_owed = .{ null, null };
             x.t.close(x.h);
             x.t.close(x.hm);
             q.tier = null;
@@ -211,6 +212,8 @@ pub const Lanes = struct {
         const keepable = self.book.set.on and !s.filling and s.marks.n > 0;
         const owned: ?[]i32 = if (keepable) self.gpa.alloc(i32, s.marks.last().?) catch null else null;
         if (owned) |o| {
+            // a kept prompt's rows are final on its tier before another stream reads through them
+            self.r.tierFlush(&s.seq.?) catch |e| std.log.err("glm53: settling a kept prompt's tier rows failed ({s})", .{@errorName(e)});
             if (s.seq.?.tier) |x| {
                 // the kept prompt keeps the stream's tier streams (its entry's id is the book's next)
                 for (&self.kept_tier) |*k| if (k.* == null) {

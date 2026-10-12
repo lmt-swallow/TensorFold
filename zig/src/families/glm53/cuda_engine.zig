@@ -56,6 +56,9 @@ pub const Seq = struct {
     fresh: bool = false, // the head's logits are its last absorbed row's (`absorb` ran a step; a chain may start)
     /// The latent rows on a tier (cuda_tier.zig): the backbone's DSA layers as tier stream `h`, the head's as `hm`.
     tier: ?SeqTier = null,
+    /// Positions each tier stream (backbone, head) settled but not yet committed: a commit waits for the stream, so
+    /// it runs at the stream's next sync (`Runner.tierBegin`, `tierFlush`) instead of after every window.
+    tier_owed: [2]?usize = .{ null, null },
 
     pub const SeqTier = struct { t: *Tr.Tier, h: usize, hm: usize };
 
@@ -110,6 +113,7 @@ pub const Seq = struct {
         q.mtp_len = 0;
         q.mtp_drafted = 0;
         q.fresh = false;
+        q.tier_owed = .{ null, null }; // a previous stream's (its tier streams closed)
     }
 
     pub fn deinit(q: *Seq) void {
@@ -381,18 +385,38 @@ pub const Runner = struct {
 
     /// Before a window of `n` rows at `pos` of the sequence's tier stream (`head`: the head's): its earlier calls
     /// finished on the device, then cuda_tier `beginWindow`. Nothing without a tier.
-    fn tierBegin(r: *Runner, q: *const Seq, head: bool, pos: usize, n: usize) !void {
+    fn tierBegin(r: *Runner, q: *Seq, head: bool, pos: usize, n: usize) !void {
         const x = q.tier orelse return;
         try r.stream.synchronize();
+        try r.tierCommitOwed(q);
         try x.t.beginWindow(if (head) x.hm else x.h, pos, n);
     }
 
-    /// The tier stream's positions before `pos` final, the ones from it dropped (rejected rows).
-    fn tierSettle(r: *Runner, q: *const Seq, head: bool, pos: usize) !void {
+    /// The tier stream's positions before `pos` final, the ones from it dropped (rejected rows): the rewind now, the
+    /// commit (which waits for the stream to write them) owed until the stream next syncs.
+    fn tierSettle(r: *Runner, q: *Seq, head: bool, pos: usize) !void {
         const x = q.tier orelse return;
-        const h = if (head) x.hm else x.h;
-        x.t.rewind(h, pos);
-        try x.t.commit(h, pos, r.stream);
+        const i: usize = @intFromBool(head);
+        if (q.tier_owed[i] != null) try r.tierFlush(q); // two settles with no sync between: the first commits now
+        x.t.rewind(if (head) x.hm else x.h, pos);
+        q.tier_owed[i] = pos;
+    }
+
+    /// Every commit the sequence owes its tier, after the stream ran what wrote it.
+    pub fn tierFlush(r: *Runner, q: *Seq) !void {
+        if (q.tier == null or (q.tier_owed[0] == null and q.tier_owed[1] == null)) return;
+        try r.stream.synchronize();
+        try r.tierCommitOwed(q);
+    }
+
+    /// The owed commits, the stream already synced.
+    fn tierCommitOwed(r: *Runner, q: *Seq) !void {
+        _ = r;
+        const x = q.tier orelse return;
+        for (&q.tier_owed, [_]usize{ x.h, x.hm }) |*o, h| if (o.*) |pos| {
+            try x.t.host.commit(h, pos);
+            o.* = null;
+        };
     }
 
     fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr) !void {
