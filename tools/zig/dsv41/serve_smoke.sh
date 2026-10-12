@@ -48,11 +48,16 @@ RDMA=${RDMA:-1}                # 1: with two or more rails, the rounds' gathers 
 # 0, the ranks' kernel times match within 4%, and a lone code stream gains 3-11%. 1: the engine's own busy poll and spin.
 LINK_POLL=${LINK_POLL:-0}
 # A prompt beside decoding streams: its parts on a partition of PROMPT_SMS SMs (TF_DS_PROMPT_SMS), the rounds ahead of
-# them with URGENT=1 (TF_DS_ROUNDS_URGENT). 36 and 1 keep the other streams at 35% of their standalone decode rate
-# during a cold 64k prefill (40 / 0: 31%), for a slower prefill while they decode (59 s against 48 s for that 64k);
-# a prompt alone runs as fast either way. results/bench/20261012-0310-overlap-sweep.md has the sweep.
+# them with URGENT=1 (TF_DS_ROUNDS_URGENT). 36 SMs keep the other streams at 35% of their standalone decode rate
+# during a cold 64k prefill (40 SMs: 31%), for a slower prefill while they decode (56-59 s against 48 s for that
+# 64k); a prompt alone runs as fast either way. results/bench/20261012-0310-overlap-sweep.md has the sweep.
 PROMPT_SMS=${PROMPT_SMS:-36}
-URGENT=${URGENT:-1}
+# PIECES (TF_DS_PROMPT_PIECES) splits a chunk's layers into pieces issued between rounds. Pair, 2026-10-12, cold 64k
+# beside three decoders: pieces 4 with urgent rounds off keeps the decoders at 35% and finishes the prefill in
+# 55.7 s, against 58.5-59.0 s with urgent rounds (pieces 1 or 2 without urgent rounds: 33%); standalone prefill
+# is unchanged.
+PIECES=${PIECES:-4}
+URGENT=${URGENT:-0}
 # Copy drafts (TF_DS_COPY_DRAFTS) propose prompt-reference copies for edit-like replies; COPY_POSITION prices a copy
 # window at its stream's position and COPY_SHARE keeps shared rows for the other streams (measured 2026-10-12: all
 # token shas unchanged; 256k needle 31 -> 63 tok/s, code beside an edit 18 -> 36 tok/s). 0 turns each off.
@@ -188,7 +193,7 @@ esac
 [ -n "$ENGRAM" ] && ENVS="$ENVS -e TF_DS_ENGRAM=/models/$ENGRAM"
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 [ "$LINK_POLL" = 0 ] && ENVS="$ENVS -e TF_DS_LINK_POLL=0"
-ENVS="$ENVS -e TF_DS_PROMPT_SMS=$PROMPT_SMS -e TF_DS_ROUNDS_URGENT=$URGENT"
+ENVS="$ENVS -e TF_DS_PROMPT_SMS=$PROMPT_SMS -e TF_DS_ROUNDS_URGENT=$URGENT -e TF_DS_PROMPT_PIECES=$PIECES"
 ENVS="$ENVS -e TF_DS_COPY_DRAFTS=$COPY_DRAFTS -e TF_DS_COPY_POSITION=$COPY_POSITION -e TF_DS_COPY_SHARE=$COPY_SHARE"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
