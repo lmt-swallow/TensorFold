@@ -26,6 +26,8 @@ const P = @import("cuda_pool.zig");
 const Tr = @import("cuda_tier.zig");
 const keep = @import("cuda_keep.zig");
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3"};
 pub const default_context: i64 = 16384;
@@ -301,6 +303,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.model.deinit();
     errdefer own.head.deinit();
     phases.step("weights", deviceBytes(own.model.layers) + deviceBytes(own.model.embed) + deviceBytes(own.model.norm) + deviceBytes(own.model.head) + deviceBytes(own.head));
+    // NCCL connects a channel's peers and allocates their buffers when a collective first needs them; with
+    // NCCL_RUNTIME_CONNECT=0 it does so here, so a served process's memory stops growing once it has loaded (NCCL reads
+    // its variables when the communicator is created; a value already set is kept)
+    _ = setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     // each rank loads on its own; the ranks meet here
     own.comm = try cuda.comm.Comm.init(rank, world, master, port, 1_800_000);
     errdefer own.comm.deinit();
