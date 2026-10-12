@@ -32,6 +32,7 @@ const qwen38fn_select = @import("qwen38fn_select_tests.zig");
 const qwen38fn_mtp = @import("qwen38fn_mtp_tests.zig");
 const qwen38fn_shared = @import("qwen38fn_shared_tests.zig");
 const glm53_kda = @import("glm53_kda_tests.zig");
+const glm53_dflash = @import("glm53_dflash_tests.zig");
 const glm53_moe = @import("glm53_moe_tests.zig");
 const glm53_dsa = @import("glm53_dsa_tests.zig");
 const glm53_prompt = @import("glm53_prompt_tests.zig");
@@ -103,6 +104,7 @@ const usage =
     \\  glm53-select <aot-dir>  GLM-5.3-Flash select.cu's prompt pool selection against the definition and the captured kernels
     \\  glm53-prompt-time <aot-dir> <model-dir> [pos ...]  GLM-5.3-Flash prompt path speed on rank 0 alone: a 2,048-row chunk at each position, its segments timed by kind
     \\  glm53-dsa <work-dir> <model-dir> [isolated]  GLM-5.3-Flash DSA layer 3 (indexer, top-512 pools, latent attention; then its MoE) on both ranks, runs a and l, against the Mia fork's fixture (glm53/capture.sh dsa)
+    \\  glm53-dflash-projections <work-dir> <model-dir> <draft-dir>  DFlash2 Q4 projections against the captured nine-step fixture
     \\  glm53-moe <work-dir> <model-dir> [isolated]  GLM-5.3-Flash MoE block (router, EXL3 experts decode / prompt, shared expert) on both ranks against the Mia fork's fixture (glm53/capture.sh moe)
     \\  glm53-kda <work-dir> <model-dir> [isolated]  GLM-5.3-Flash embeddings + layer 0 (KDA, dense MLP) on both ranks against the Mia fork's fixture (glm53/capture.sh kda)
     \\  qwen38fn-layers <work-dir> <model-dir> [layers] [isolated]  Qwen3.8-Flash-Next decode forward (every layer's boundaries, the logits) against 0.6.6's fixture (qwen38fn/capture_layers.sh)
@@ -217,6 +219,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return glm53_prompt_time.run(gpu, try arg(rest, 0), try arg(rest, 1), if (n == 0) &default else pos[0..n]);
     }
     if (std.mem.eql(u8, cmd, "glm53-tier")) return glm53_tier.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), if (rest.len > 3) rest[3] else null);
+    if (std.mem.eql(u8, cmd, "glm53-dflash-projections")) return glm53_dflash.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "glm53-moe")) return glm53_moe.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "glm53-kda")) return glm53_kda.run(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));
     if (std.mem.eql(u8, cmd, "qwen38fn-layer0")) return qwen38fn_layer0.layer0(gpu, try arg(rest, 0), try arg(rest, 1), rest.len > 2 and std.mem.eql(u8, rest[2], "isolated"));

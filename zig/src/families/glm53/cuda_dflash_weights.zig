@@ -47,6 +47,19 @@ pub const Model = struct {
     successor: []u16,
     layers: [5]Layer,
 
+    /// Map and validate the drafter checkpoint, then own only its rank-local projections.
+    pub fn open(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, rank: usize) !Model {
+        const path = try std.fs.path.join(a, &.{ dir, "config.json" });
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
+        defer a.free(bytes);
+        var config = try D.Config.parse(a, bytes);
+        defer config.deinit();
+        var checkpoint = try core.Checkpoint.openModel(a, io, dir);
+        defer checkpoint.close();
+        return load(a, d, &checkpoint, config.value, rank);
+    }
+
     pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, checkpoint: *core.Checkpoint, c: D.Config, rank: usize) !Model {
         const l: H.Loader = .{ .a = a, .checkpoint = checkpoint, .config = c, .rank = rank };
         try l.validate();
