@@ -14,7 +14,11 @@ const Buf = cuda.DeviceBuffer;
 
 const K = 512;
 
-const Pattern = enum { distinct, few, zeros, neg_inf_tail, one_value, signed_zero, full_bin };
+const Pattern = enum { distinct, few, zeros, neg_inf_tail, one_value, signed_zero, full_bin, cap_exact, cap_over };
+
+/// select.cu's shared-memory candidates (select.cu kCand): cap_exact puts exactly this many keys in the threshold
+/// bin, cap_over one more (the fallback).
+const cand_cap = 6144;
 
 fn orderKey(s: f32) u32 {
     var b: u32 = @bitCast(s);
@@ -33,7 +37,20 @@ fn draw(rng: std.Random, p: Pattern, np: usize, row: []f32) void {
         .signed_zero => if (rng.boolean()) -0.0 else 0.0,
         // values spread inside one 2^-11-wide band of keys: the threshold bin holds most of the row
         .full_bin => 1.0 + @as(f32, @floatFromInt(rng.intRangeLessThan(u32, 0, 1 << 12))) * (1.0 / 8388608.0),
+        // the top bin's keys at scattered places, every other key below it
+        .cap_exact, .cap_over => 0.0,
     };
+    if (p == .cap_exact or p == .cap_over) {
+        const n: usize = if (p == .cap_exact) cand_cap else cand_cap + 1;
+        var placed: usize = 0;
+        for (row) |*x| x.* = rng.float(f32) * 0.5; // below 1.0: lower bins
+        while (placed < n) {
+            const i = rng.intRangeLessThan(usize, 0, np);
+            if (row[i] >= 1.0) continue;
+            row[i] = 1.0 + @as(f32, @floatFromInt(rng.intRangeLessThan(u32, 0, 1 << 10))) * (1.0 / 8388608.0);
+            placed += 1;
+        }
+    }
 }
 
 /// The definition on the host: the k best by (key, then the lower index), ascending.
@@ -74,7 +91,8 @@ pub fn run(gpu: Gpu, aot_dir: []const u8) !void {
     var cases: usize = 0;
     var captured: usize = 0;
     for (nps) |np| for (rowss) |n| for (std.enums.values(Pattern)) |p| {
-        if (n == 512 and np > 20481 and p != .distinct and p != .full_bin) continue; // keep the host sort's time bounded
+        if ((p == .cap_exact or p == .cap_over) and np < 2 * cand_cap) continue;
+        if (n == 512 and np > 20481 and p != .distinct and p != .cap_over) continue; // keep the host sort's time bounded
         const scores = try gpa.alloc(f32, n * np);
         defer gpa.free(scores);
         for (0..n) |r| draw(rng, p, np, scores[r * np ..][0..np]);
