@@ -24,6 +24,7 @@ pub const Session = struct {
     scratch: B.Scratch,
     taps: Taps,
     trace_rounds: bool = false,
+    policy: D.Policy = .fc7,
     verified_rows: usize = 0,
     captured_rows: usize = 0,
     verified_samples: [E.rows]u32 = undefined,
@@ -140,7 +141,7 @@ pub const Session = struct {
         try s.scratch.get("projected").download(0, std.mem.sliceAsBytes(&projected));
         var expanded: [7 * 256]f32 = undefined;
         for (projected, 0..) |bits, i| expanded[i] = @bitCast(@as(u32, bits) << 16);
-        return D.selectGreedy(r.gpa, &candidates, 16, &expanded, 256, s.model.predecessor, s.model.successor, pending, 0.3);
+        return D.selectGreedyBeta(r.gpa, &candidates, 16, &expanded, 256, s.model.predecessor, s.model.successor, pending, 0.3, s.policy.beta());
     }
 
     /// Capture one uncommitted target window. Commit its accepted prefix before another window or proposal.

@@ -141,7 +141,12 @@ pub const Lanes = struct {
     /// Initial DFlash serving has one stream and no kept-prefix snapshots. Default MTP behavior is unchanged.
     pub fn enableDflash(self: *Lanes, io: std.Io, dir: []const u8) !void {
         if (self.dflash != null or self.book.set.on or !self.drafts) return error.BadDflashServingSettings;
+        const D = @import("dflash2.zig");
+        const value = if (std.c.getenv("TF_GLM_DFLASH_POLICY")) |v| std.mem.span(v) else null;
+        const policy = try D.Policy.parse(value);
         self.dflash = try DF.init(self.gpa, io, self.r, &self.slots[0].seq.?, self.capacity, dir);
+        self.dflash.?.session.policy = policy;
+        std.log.info("glm53 DFlash2 policy={s} beta={d} confidence=0.3 block=8 max_drafts=7 streams=1", .{ policy.name(), policy.beta() });
     }
 
     pub fn deinit(self: *Lanes) void {
@@ -282,7 +287,10 @@ pub const Lanes = struct {
     /// cannot run `op` offers a digest no rank's matches, so every rank stops at the agreement.
     fn agree(self: *Lanes, op: []const u8, can_run_op: bool) !void {
         // A mismatched drafter would issue a different sequence of collectives during the prompt pass.
-        if (self.dflash != null) self.pending.update("glm53/dflash2/block8");
+        if (self.dflash) |df| {
+            self.pending.update("glm53/dflash2/block8");
+            self.pending.update(df.session.policy.name());
+        }
         var digest: [32]u8 = undefined;
         self.pending.update(op);
         self.pending.final(&digest);

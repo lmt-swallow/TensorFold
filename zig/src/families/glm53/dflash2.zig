@@ -222,6 +222,35 @@ pub fn topCandidates(a: std.mem.Allocator, logits: []const u16, offset: u32, k: 
     return out;
 }
 
+/// Supported greedy stop policies. Unspecified preserves the original native confidence rule.
+pub const Policy = enum {
+    fc7,
+    fnc7,
+
+    pub fn parse(value: ?[]const u8) !Policy {
+        const setting = value orelse return .fc7;
+        if (std.mem.eql(u8, setting, "fc7:0.3")) return .fc7;
+        if (std.mem.eql(u8, setting, "fnc7:0.3")) return .fnc7;
+        return error.BadDflashPolicy;
+    }
+
+    pub fn name(p: Policy) []const u8 {
+        return if (p == .fnc7) "fnc7:0.3" else "fc7:0.3";
+    }
+
+    pub fn beta(p: Policy) f64 {
+        return if (p == .fnc7) 2 else 1;
+    }
+};
+
+test "DFlash policy is explicit and rejects unsupported sampling or depth rules" {
+    try std.testing.expectEqual(Policy.fc7, try Policy.parse(null));
+    try std.testing.expectEqual(Policy.fc7, try Policy.parse("fc7:0.3"));
+    try std.testing.expectEqual(Policy.fnc7, try Policy.parse("fnc7:0.3"));
+    for ([_][]const u8{ "", "fnc8:0.3", "fnc7:0.5", "sample", "fc7:NaN" }) |bad|
+        try std.testing.expectError(error.BadDflashPolicy, Policy.parse(bad));
+}
+
 /// Select a greedy chain; projected rows are the reference BF16 projection expanded to f32.
 /// The returned allocation contains only accepted confidence-prefix candidates, including at least row zero.
 pub fn selectGreedy(a: std.mem.Allocator, candidates: []const Candidate, top_k: usize, projected: []const f32, selector_rank: usize, predecessor: []const u16, successor: []const u16, anchor: u32, confidence: f64) ![]u32 {
@@ -261,8 +290,13 @@ pub fn selectGreedyBeta(a: std.mem.Allocator, candidates: []const Candidate, top
         }
         if (confidence > 0) {
             var sum: f64 = 0;
-            for (scores) |score| sum += @exp((score - max_score) / beta);
-            chain *= @exp((scores[best] - max_score) / beta) / sum;
+            var max_z = -std.math.inf(f64);
+            for (scores) |*score| {
+                score.* /= beta;
+                max_z = @max(max_z, score.*);
+            }
+            for (scores) |score| sum += @exp(score - max_z);
+            chain *= @exp(scores[best] - max_z) / sum;
             if (row > 0 and chain < confidence) break;
         }
         previous = candidates[row * top_k + best].token;

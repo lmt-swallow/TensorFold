@@ -261,6 +261,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         std.log.err("TF_GLM_DFLASH_MODEL requires TF_GLM_KEEP=0 and drafts enabled", .{});
         return error.BadDflashServingSettings;
     }
+    if (getenv("TF_GLM_DFLASH_MODEL") != null)
+        _ = try @import("dflash2.zig").Policy.parse(getenv("TF_GLM_DFLASH_POLICY"));
     const world = try envInt("TF_TP_WORLD", 1);
     const rank = try envInt("TF_TP_RANK", 0);
     if (world != config.world or rank >= world) {
