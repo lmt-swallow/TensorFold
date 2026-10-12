@@ -22,6 +22,7 @@ const dsv41_parallel_tests = @import("dsv41_parallel_tests.zig");
 const dsv41_topk_tests = @import("dsv41_topk_tests.zig");
 const dsv41_rope_tests = @import("dsv41_rope_tests.zig");
 const dsv41_prompt_time = @import("dsv41_prompt_time.zig");
+const dsv41_runtime_cone = @import("dsv41_runtime_cone.zig");
 const dsv41_index_tests = @import("dsv41_index_tests.zig");
 const dsv41_hc_fused_tests = @import("dsv41_hc_fused_tests.zig");
 const dsv41_rdma_tests = @import("dsv41_rdma_tests.zig");
@@ -73,6 +74,7 @@ const usage =
     \\  dsv41-hc-fused-probe <aot-dir> <fixture-dir>  DSV4.1 prompt mHC: hc_fused.cu against _hc_post + _hc_partial (dsv41/dump_hc_mix.py)
     \\  dsv41-index-probe <aot-dir>  DSV4.1 prompt indexer kernel's head-sum order (checked by tools/zig/dsv41/index_tree.py)
     \\  dsv41-gemm-rows           DSV4.1 prompt path's fp32 cuBLAS GEMMs: rows independent of the row count (pinned algorithm)
+    \\  dsv41-runtime-cone <rank-cache-dir> <model-dir> <aot-dir> <rank> <tokens> <output.json>  Actual served backend full/cone/released-slot full512 raw-ID comparison
     \\  dsv41-prompt-time <rank-cache-dir> <model-dir> <aot-dir> <rank> <layers> <tokens> [runs]  DSV4.1 prompt path's speed on one rank (synthetic ids, Engram under TF_DS_ENGRAM, every chunk profiled)
     \\  dsv41-lanes-parallel <dir> <rank-cache-dir> <model-dir> <rank> [aot-dir]  DSV4.1 served engine's concurrent streams (admissions, batched drafts, one shared round, keeps) against the fork's fixture (dsv41/dump_lanes_parallel.py)
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
@@ -169,6 +171,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "dsv41-topk")) return dsv41_topk_tests.topk(gpu, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "dsv41-lanes-prefill")) return dsv41_lanes_tests.prefill(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);
     if (std.mem.eql(u8, cmd, "dsv41-lanes-spec")) return dsv41_lanes_tests.spec(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), if (rest.len > 4) rest[4] else null);
+    if (std.mem.eql(u8, cmd, "dsv41-runtime-cone")) return dsv41_runtime_cone.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(u32, try arg(rest, 3), 10), try std.fmt.parseInt(usize, try arg(rest, 4), 10), try arg(rest, 5));
     if (std.mem.eql(u8, cmd, "dsv41-prompt-time")) return dsv41_prompt_time.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try std.fmt.parseInt(usize, try arg(rest, 3), 10), try std.fmt.parseInt(usize, try arg(rest, 4), 10), try std.fmt.parseInt(usize, try arg(rest, 5), 10), if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else 1);
     if (std.mem.eql(u8, cmd, "dsv41-hc-fused-probe")) return dsv41_hc_fused_tests.probe(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "dsv41-index-probe")) return dsv41_index_tests.probe(gpu, try arg(rest, 0));
