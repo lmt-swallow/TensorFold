@@ -552,6 +552,22 @@ pub const Runner = struct {
         return start + R;
     }
 
+    /// Direct target prefill with layer taps. This does not update MTP state.
+    /// Its target cache and tap bytes must be checked against the optimized prompt path before serving.
+    pub fn fillTargetHook(r: *Runner, q: *Seq, prompt: []const u32, start: usize, hook: M.Hook) !usize {
+        if (start != q.st.pos or start >= prompt.len) return error.PositionMismatch;
+        const R = @min(prompt_rows, prompt.len - start);
+        if (q.st.pos + R >= q.st.caches[0].capacity) return error.PromptTooLong;
+        try r.tierBegin(q, false, q.st.pos, R);
+        try r.w.pb.ids.uploadAsync(0, std.mem.sliceAsBytes(prompt[start..][0..R]), r.stream.handle);
+        try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, true, r.gather(), hook, r.stream);
+        try M.commit(r.k, r.lay, &q.st, R, R, true, &r.w, r.stream);
+        const D = r.lay.cfg.hidden;
+        try q.last.copyFrom(0, r.w.fnormed.ptr + (R - 1) * D * 2, D * 2, r.stream.handle);
+        try r.tierSettle(q, false, q.st.pos);
+        return start + R;
+    }
+
     /// The reply's first token from the prompt's last row (after its last `fill`); the head owes that row.
     pub fn first(r: *Runner, q: *Seq) !u32 {
         const t = try r.sample(r.w.logits, 0, 1, null);
@@ -562,6 +578,11 @@ pub const Runner = struct {
     /// One verify window over `ids` (the pending token, then the drafts) at the sequence's length: every row's
     /// greedy sample into `out`; the rows stay uncommitted until `commit`.
     pub fn window(r: *Runner, q: *Seq, ids: []const u32, out: []u32) !void {
+        return r.windowHook(q, ids, out, null);
+    }
+
+    /// Target verification with optional uncommitted layer taps; commit still selects the kept prefix.
+    pub fn windowHook(r: *Runner, q: *Seq, ids: []const u32, out: []u32, hook: ?M.Hook) !void {
         const D = r.lay.cfg.hidden;
         const R = ids.len;
         if (R == 0 or R > rows) return error.WindowTooWide;
@@ -573,7 +594,7 @@ pub const Runner = struct {
             r.w.ms.trace = t;
         }
         defer r.w.ms.trace = null;
-        try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, false, r.gather(), null, r.stream);
+        try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, false, r.gather(), hook, r.stream);
         try q.last.copyFrom(0, r.w.fnormed.ptr, R * D * 2, r.stream.handle);
         for (0..R) |row| out[row] = try r.sample(r.w.logits, row, 1, null);
     }
