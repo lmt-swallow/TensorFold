@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Host memory watchdog for a DGX Spark (unified memory shared by CPU and GPU).
-# Every second it reads MemAvailable; when it falls below $MIN_AVAIL_GIB (default 8) it kills every
+# Every second it reads MemAvailable; when it falls below $MIN_AVAIL_GIB (default 3: the DSV4.1 goal configuration runs at 5.0 GiB free on rank 0 and dips to 7.5 while loading) it kills every
 # docker container except those matching $KEEP (default sparkDash) and logs what it did. A node whose
 # memory is exhausted stops answering ssh and needs a power cycle, so the watchdog errs on the side
 # of killing work. Run one per node in the background:
 #   nohup bash mem_watchdog.sh > ~/mem_watchdog.log 2>&1 &
 # `bash mem_watchdog.sh status` prints whether one is running.
 set -u
-MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-8}
+MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-3}
 KEEP=${KEEP:-sparkDash}
 PIDFILE=${PIDFILE:-$HOME/.mem_watchdog.pid}
 if [ "${1:-}" = status ]; then
