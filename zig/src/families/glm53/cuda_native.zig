@@ -257,6 +257,10 @@ fn logClasses(own: *const Owned, rank: usize) void {
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
+    if (getenv("TF_GLM_DFLASH_MODEL") != null and (keep.settings().on or !o.drafts)) {
+        std.log.err("TF_GLM_DFLASH_MODEL requires TF_GLM_KEEP=0 and drafts enabled", .{});
+        return error.BadDflashServingSettings;
+    }
     const world = try envInt("TF_TP_WORLD", 1);
     const rank = try envInt("TF_TP_RANK", 0);
     if (world != config.world or rank >= world) {
@@ -350,6 +354,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.pool.deinit();
     phases.step("tier and pool", deviceBytes(own.pool.latent) + deviceBytes(own.pool.pk));
     own.lanes = try lanesmod.Lanes.init(gpa, d, lay, &own.runner, &own.comm, &own.pool, capacity, o.drafts, own.tier);
+    errdefer own.lanes.deinit();
+    if (getenv("TF_GLM_DFLASH_MODEL")) |draft_dir| try own.lanes.enableDflash(io, draft_dir);
     {
         var seqs: usize = 0;
         for (own.lanes.slots) |sl| seqs += deviceBytes(sl.seq);
