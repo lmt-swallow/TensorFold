@@ -328,10 +328,19 @@ pub const Probe = struct {
 
 pub const Prompt = struct {
     f: *fwd.Forward,
+    // the prompt path's glue: the forward's, without the decode's f16_rows routing (prompt chunks pick their own
+    // F16 kernels, b.f16_mode)
+    g: Glue,
     k: Kernels,
 
+    /// The prompt path's kernels; the decode forward `f` borrows f16_rows.cu for its wider windows (Glue.f16_rows)
+    /// unless TF_QFN_DECODE_F16 is "captured".
     pub fn init(f: *fwd.Forward, sms: u32) !Prompt {
-        return .{ .f = f, .k = try Kernels.load(f.d, sms) };
+        var p: Prompt = .{ .f = f, .g = f.g, .k = try Kernels.load(f.d, sms) };
+        p.g.f16_rows = null;
+        const captured = if (std.c.getenv("TF_QFN_DECODE_F16")) |v| std.mem.eql(u8, std.mem.span(v), "captured") else false;
+        if (!captured) f.g.f16_rows = .{ .bf16 = p.k.f16_bf16, .fp16 = p.k.f16_fp16 };
+        return p;
     }
 
     pub fn deinit(self: *Prompt) void {
@@ -361,14 +370,14 @@ pub const Prompt = struct {
             const f = try xk.unpack(l.k2, l.cb);
             try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(l.n / 16), .y = @intCast(l.k / 16) }, .block = .{ .x = 32 } }, stream, &a);
         }
-        try p.f.g.gemm(b.xh.ptr, b.wq.ptr, b.hadamard.ptr, l.svh.ptr, out, o_stride, m, l.k, l.n, stream);
+        try p.g.gemm(b.xh.ptr, b.wq.ptr, b.hadamard.ptr, l.svh.ptr, out, o_stride, m, l.k, l.n, stream);
     }
 
     /// exl3_mm.py `F16.__call__` on a chunk's rows (cuda_glue.zig `f16Rows`): out [m, w.n] bf16 (row stride o_stride)
     /// = x [m, w.k] (bf16 or fp16, row stride x_stride) @ w^T, on the kernels b.f16_mode names.
     pub fn f16Rows(p: *Prompt, w: *const weights.F16, x: Ptr, x_ty: []const u8, x_stride: usize, m: usize, out: Ptr, o_stride: usize, b: *Buffers, stream: cuda.Stream) !void {
         const fp16 = std.mem.eql(u8, x_ty, "*fp16");
-        if (b.f16_mode == .captured or (!fp16 and !std.mem.eql(u8, x_ty, "*bf16")) or (w.k / w.sk) % 64 != 0) return p.f.g.f16Rows(w, x, x_ty, x_stride, m, out, o_stride, b.w.part.ptr, stream);
+        if (b.f16_mode == .captured or (!fp16 and !std.mem.eql(u8, x_ty, "*bf16")) or (w.k / w.sk) % 64 != 0) return p.g.f16Rows(w, x, x_ty, x_stride, m, out, o_stride, b.w.part.ptr, stream);
         const fused_out = if (b.f16_mode == .check) b.f16_check.?.ptr else out;
         const fused_stride = if (b.f16_mode == .check) w.n else o_stride;
         const part = b.f16_part.?;
@@ -393,7 +402,7 @@ pub const Prompt = struct {
             try cuda.launch.launch(p.k.f16_reduce, .{ .grid = .{ .x = @intCast((m * w.n + 255) / 256) }, .block = .{ .x = 256 } }, stream, &r);
         }
         if (b.f16_mode != .check) return;
-        try p.f.g.f16Rows(w, x, x_ty, x_stride, m, out, o_stride, b.w.part.ptr, stream);
+        try p.g.f16Rows(w, x, x_ty, x_stride, m, out, o_stride, b.w.part.ptr, stream);
         const diffs = b.f16_diffs.?;
         try diffs.fill8(0, stream.handle);
         var c: cuda.Args = .{};
@@ -416,7 +425,7 @@ pub const Prompt = struct {
 
     /// forward.py `_readout_plain` on the prompt path: the down projection summed (F16 call), `hc_act`, up, mix.
     fn readout(p: *Prompt, b: *Buffers, h: Ptr, hc: *const weights.Hc, R: usize, inject: Ptr, stream: cuda.Stream) !void {
-        const g = p.f.g;
+        const g = p.g;
         const cfg = &p.f.m.cfg;
         const w = &b.w;
         const wide = cfg.wide();
@@ -428,7 +437,7 @@ pub const Prompt = struct {
     }
 
     fn block(p: *Prompt, b: *Buffers, hc: *const weights.Hc, R: usize, pending: Glue.Pending, inject: Ptr, stream: cuda.Stream) !void {
-        try p.f.g.hcWriteback(b.w.h.ptr, b.w.pss.ptr, R, pending, stream);
+        try p.g.hcWriteback(b.w.h.ptr, b.w.pss.ptr, R, pending, stream);
         try p.readout(b, b.w.h.ptr, hc, R, if (hc.inject) inject else 0, stream);
     }
 
@@ -499,7 +508,7 @@ pub const Prompt = struct {
         const cfg = &p.f.m.cfg;
         const w = &b.w;
         try b.streams.copyFrom(0, w.h.ptr, R * cfg.wide() * 2, stream.handle);
-        try p.f.g.hcWriteback(b.streams.ptr, w.pss.ptr, R, pending, stream);
+        try p.g.hcWriteback(b.streams.ptr, w.pss.ptr, R, pending, stream);
         const last = R - 1;
         const pss_row = (cfg.hidden / 256) * cfg.streams * 4;
         try w.pss.copyFrom(0, w.pss.ptr + last * pss_row, pss_row, stream.handle);
@@ -580,7 +589,7 @@ pub const Prompt = struct {
         }
         st.cur[gl.li] = 1 - cur;
         const taps = cfg.conv_kernel - 1;
-        try p.f.g.shiftWindows(conv, taps * cfg.convDim(), b.proj.ptr, b.rows * cfg.projWidth(), cfg.projWidth(), R, 1, cfg.convDim(), taps, stream);
+        try p.g.shiftWindows(conv, taps * cfg.convDim(), b.proj.ptr, b.rows * cfg.projWidth(), cfg.projWidth(), R, 1, cfg.convDim(), taps, stream);
     }
 
     /// attention.py `qsa_rows` for a prompt block of n rows at b.pos_blk (keys up to `context`): the scores on the
@@ -689,7 +698,7 @@ pub const Prompt = struct {
     fn moe(p: *Prompt, layer: *const fwd.Layer, b: *Buffers, R: usize, stream: cuda.Stream) !void {
         const m = p.f.m;
         const cfg = &m.cfg;
-        const g = p.f.g;
+        const g = p.g;
         const w = &b.w;
         try g.router(w.mixed.ptr, cfg.hidden, layer.router.ptr, cfg.experts + 1, b.logits_router.ptr, R, stream);
         try g.selectRows(b.logits_router.ptr, cfg.experts, cfg.topk, b.pick.ptr, b.wts.ptr, R, stream);
@@ -718,7 +727,7 @@ pub const Prompt = struct {
     fn pleBlock(p: *Prompt, pl: *const weights.Ple, st: *fwd.Stream, b: *Buffers, R: usize, stream: cuda.Stream) !void {
         const m = p.f.m;
         const cfg = &m.cfg;
-        const g = p.f.g;
+        const g = p.g;
         const t = &m.table.?;
         const ng = m.ng.?;
         try g.pleRows(b.ple_dev.ptr, t.words, pl.head_bias.ptr, ng.heads(), t.dh, t.bits, b.ple_emb.ptr, R, stream);
@@ -736,7 +745,7 @@ pub const Prompt = struct {
         if (m.ng != null) {
             st.history = st.prompt_history;
             const t_rows = (cfg.ple_kernel - 1) * cfg.ngram;
-            try p.f.g.shiftWindows(st.ple_tail.ptr, t_rows * cfg.wide(), b.ple_nrow.ptr, b.rows * cfg.wide(), cfg.wide(), R, 1, cfg.wide(), t_rows, stream);
+            try p.g.shiftWindows(st.ple_tail.ptr, t_rows * cfg.wide(), b.ple_nrow.ptr, b.rows * cfg.wide(), cfg.wide(), R, 1, cfg.wide(), t_rows, stream);
         }
         st.pos += R;
         const pos: i32 = @intCast(st.pos);

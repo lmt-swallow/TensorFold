@@ -21,6 +21,10 @@ pub const Glue = struct {
     hidden: usize, // D
     streams: usize, // S
     low: usize,
+    /// f16_rows.cu's `_f16_mm` (the Triton kernel's bytes, 128 rows a program; the prompt path loads it): windows of
+    /// more than 16 rows go through it, so a matrix is read once instead of once each 16 rows. TF_QFN_DECODE_F16=captured
+    /// keeps every window on `_f16_mm`.
+    f16_rows: ?struct { bf16: cuda.Function, fp16: cuda.Function } = null,
 
     fn n32(v: usize) i32 {
         return @intCast(v);
@@ -118,6 +122,20 @@ pub const Glue = struct {
     /// `f16mm` for x of dtype `x_ty` ("*bf16", or "*fp16" for the n-gram rows).
     pub fn f16mmOf(g: Glue, w: *const F16, x: Ptr, x_ty: []const u8, x_stride: usize, m: usize, out: Ptr, o_stride: usize, slices: bool, stream: cuda.Stream) !void {
         if (m > call_rows or (!slices and w.sk != 1)) return error.BadShape;
+        const fp16 = std.mem.eql(u8, x_ty, "*fp16");
+        // (the fused kernel writes fp32 slices exactly when the matrix has them: a sliceless matrix asked for fp32 stays)
+        if (g.f16_rows) |k| if (m > 16 and slices == (w.sk > 1) and (fp16 or std.mem.eql(u8, x_ty, "*bf16")) and (w.k / w.sk) % 64 == 0) {
+            // without slices bf16 rows of stride o_stride; with them fp32 [sk, m, n], as _f16_mm writes them
+            var a: cuda.Args = .{};
+            a.add(x);
+            a.add(@as(c_int, @intCast(x_stride)));
+            a.add(w.w.ptr);
+            a.add(if (slices) @as(Ptr, 0) else out);
+            a.add(@as(c_int, @intCast(o_stride)));
+            a.add(if (slices) out else @as(Ptr, 0));
+            for ([_]usize{ m, w.n, w.k, w.k / w.sk }) |v| a.add(@as(c_int, @intCast(v)));
+            return cuda.launch.launch(if (fp16) k.fp16 else k.bf16, .{ .grid = .{ .x = @intCast((m + 127) / 128), .y = @intCast((w.n + 127) / 128), .z = @intCast(w.sk) }, .block = .{ .x = 256 } }, stream, &a);
+        };
         try g.set.run(stream, "_f16_mm", .{ @intCast((m + 15) / 16), @intCast((w.n + 63) / 64), @intCast(w.sk) }, &.{
             aot.ptr("X", x_ty, x),                aot.ptr("W", "*fp16", w.w.ptr), aot.ptr("OUT", if (slices) "*fp32" else "*bf16", out),
             aot.int("M", n32(m)),                    aot.int("N", n32(w.n)),         aot.int("x_stride", n32(x_stride)),
