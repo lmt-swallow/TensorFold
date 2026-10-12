@@ -530,12 +530,17 @@ pub const Profile = struct {
     pub const moe_parts = [_][]const u8{ "mix", "gate", "lists", "rot_in", "gate/up", "epilogue", "down", "combine" };
     /// Prompt attention stages; a replay tail using window attention is charged to input projections.
     pub const attn_parts = [_][]const u8{ "mix", "input projections", "kv/index", "sparse", "output projections" };
+    pub const IndexStage = enum { query, score, selection };
+    const IndexSpan = struct { stage: IndexStage, begin: cuda.Event, end: cuda.Event };
     /// [1 + layers * groups.len + 1]: before the embedding, after each layer's groups, after the head.
     marks: []cuda.Event,
     /// [layers * (moe_parts.len - 1)]: between the MoE group's parts.
     moe: []cuda.Event,
     /// [layers * (attn_parts.len - 1)]: between the attention group's parts.
     attn: []cuda.Event,
+    index_spans: std.ArrayList(IndexSpan) = .empty,
+    index_count: usize = 0,
+    d: *const cuda.Driver,
     gpa: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, layers: usize) !Profile {
@@ -549,13 +554,35 @@ pub const Profile = struct {
         }
         const n = 2 + layers * groups.len;
         const na = layers * (attn_parts.len - 1);
-        return .{ .marks = marks[0..n], .moe = marks[n .. marks.len - na], .attn = marks[marks.len - na ..], .gpa = gpa };
+        return .{ .marks = marks[0..n], .moe = marks[n .. marks.len - na], .attn = marks[marks.len - na ..], .d = d, .gpa = gpa };
     }
 
     pub fn deinit(self: *Profile) void {
         const all = self.marks.ptr[0 .. self.marks.len + self.moe.len + self.attn.len];
         for (all) |*e| e.deinit();
         self.gpa.free(all);
+        for (self.index_spans.items) |*span| {
+            span.begin.deinit();
+            span.end.deinit();
+        }
+        self.index_spans.deinit(self.gpa);
+    }
+
+    /// One query or row-block interval. Events are reused after the chunk's existing profile sync;
+    /// scoring and selection stay interleaved, with no additional synchronization between blocks.
+    fn indexBegin(self: *Profile, stage: IndexStage, stream: cuda.Stream) !usize {
+        const i = self.index_count;
+        if (i == self.index_spans.items.len) {
+            var begin = try cuda.Event.init(self.d, true);
+            errdefer begin.deinit();
+            var end = try cuda.Event.init(self.d, true);
+            errdefer end.deinit();
+            try self.index_spans.append(self.gpa, .{ .stage = stage, .begin = begin, .end = end });
+        }
+        self.index_spans.items[i].stage = stage;
+        try self.index_spans.items[i].begin.record(stream);
+        self.index_count += 1;
+        return i;
     }
 };
 
@@ -1082,6 +1109,7 @@ pub const Prompt = struct {
         }
         const t0 = nowNs();
         var engram_ns: i128 = 0;
+        if (self.profile) |*p| p.index_count = 0;
         try self.mark(0, stream);
         var g = gather;
         if (self.trace) |*t| {
@@ -1145,6 +1173,15 @@ pub const Prompt = struct {
         if (self.profile) |p| try p.attn[li * (Profile.attn_parts.len - 1) + k].record(stream);
     }
 
+    fn indexBegin(self: *Prompt, stage: Profile.IndexStage, stream: cuda.Stream) !?usize {
+        if (self.profile) |*p| return try p.indexBegin(stage, stream);
+        return null;
+    }
+
+    fn indexEnd(self: *Prompt, span: ?usize, stream: cuda.Stream) !void {
+        if (span) |i| try self.profile.?.index_spans.items[i].end.record(stream);
+    }
+
     /// The profiled chunk's line: the GPU's ms by sublayer group (summed over completed layers), the head/replay tail's, and the host's
     /// ms in the call (and in the Engram hook: hashing, row reads, uploads).
     fn report(self: *const Prompt, start: usize, n: usize, completed: usize, host_ns: i128, engram_ns: i128, stream: cuda.Stream) !void {
@@ -1166,6 +1203,15 @@ pub const Prompt = struct {
             for (1..nm - 1) |k| moe[k] += try cuda.Event.elapsedMs(ms[k - 1], ms[k]);
             moe[nm - 1] += try cuda.Event.elapsedMs(ms[nm - 2], p.marks[1 + li * ng + 3]);
         }
+        var index_ms: [3]f64 = @splat(0);
+        var index_blocks: usize = 0;
+        for (p.index_spans.items[0..p.index_count]) |span| {
+            index_ms[@intFromEnum(span.stage)] += try cuda.Event.elapsedMs(span.begin, span.end);
+            if (span.stage == .score) index_blocks += 1;
+        }
+        std.log.info("deepseek_v41 rank {d}: chunk at {d}: index ms by part: query {d:.1}, score {d:.1}, selection {d:.1} ({d} row blocks)", .{
+            self.fwd.w.rank, start, index_ms[0], index_ms[1], index_ms[2], index_blocks,
+        });
         const na = Profile.attn_parts.len;
         var attn: [na]f64 = @splat(0);
         for (0..L) |li| {
@@ -1859,6 +1905,7 @@ pub const Prompt = struct {
         const caches = fwd.cachesOf(li);
         const rope = fwd.rope_c;
         const kk = @min(c.idx_topk, n_comp_end);
+        const query_span = try self.indexBegin(.query, stream);
         try self.mm(p.idx_wq_b.?, self.qr.ptr, n, self.iq.ptr, .bf16, stream);
         try self.ropeHeads(self.iq.ptr, try self.rr.at(rope, 2, self.pos.ptr, n, stream), n, c.idx_heads, c.idx_dim, false, stream);
         const nblk: usize = n * c.idx_heads * c.idx_dim / 32;
@@ -1877,6 +1924,7 @@ pub const Prompt = struct {
             a.add(@as(c_int, @intCast(n * c.idx_heads)));
             try cuda.launch.launch(fwd.glue.bf16_scale, .{ .grid = .{ .x = @intCast((n * c.idx_heads + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
         }
+        try self.indexEnd(query_span, stream);
         // scores in row blocks (the [rb, n_comp] matrix bounded), the top-k of each on the device (or the host)
         const rb = @max(16, @min(n, score_bytes_limit / (4 * @max(n_comp_end, 1))));
         // a block of decode rows (rb at its least, 16) past the score buffer runs as steps of the rows it holds: the
@@ -1905,6 +1953,7 @@ pub const Prompt = struct {
             const rows = r1 - r0;
             const q = self.iqq.ptr + r0 * c.idx_heads * c.idx_dim * 2;
             const wt = self.wts.ptr + r0 * c.idx_heads * 2;
+            const score_span = try self.indexBegin(.score, stream);
             // the block's vis rows copied to an aligned buffer: the captured kernels were specialized on a 16-aligned VIS
             try self.vis_blk.copyFrom(0, self.vis.ptr + r0 * 8, rows * 8, stream.handle);
             const vr = self.vis_blk.ptr;
@@ -1932,6 +1981,8 @@ pub const Prompt = struct {
                 }, &.{ aot.ci("IH", @intCast(c.idx_heads)), aot.ci("ID", @intCast(c.idx_dim)), aot.ci("BN", 64), aot.ci("RB", 8), aot.ci("PACKED", 1), aot.ci("KEYS", @intFromBool(keyed)), aot.ci("HAS_TMAX", @intFromBool(keyed)) });
                 if (fast) try self.indexCheck(li, q, wt, vr, rows, n_comp_end, nt, keyed, stream);
             }
+            try self.indexEnd(score_span, stream);
+            const select_span = try self.indexBegin(.selection, stream);
             if (!host) {
                 const tg = &fwd.glue.topk.?;
                 const words = attention.TopkGlue.bitWords(ccols);
@@ -1943,6 +1994,7 @@ pub const Prompt = struct {
                 } else {
                     try tg.topk(self.score.ptr, n_comp_end, rows, n_comp_end, kk, vr, self.cidx.ptr + r0 * kk * 8, kk, stream);
                 }
+                try self.indexEnd(select_span, stream);
                 continue;
             }
             try stream.synchronize();
@@ -1964,6 +2016,7 @@ pub const Prompt = struct {
                     attention.hostTopk(row, kk, vis[r], self.keys_h, self.cidx_h[r * kk .. (r + 1) * kk]);
                 }
             }
+            try self.indexEnd(select_span, stream);
         }
         if (host) try self.cidx.uploadAsync(0, std.mem.sliceAsBytes(self.cidx_h[0 .. n * kk]), stream.handle);
         self.cidx_cols = kk;
