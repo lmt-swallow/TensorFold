@@ -18,6 +18,7 @@ const T = @import("cuda_mtp.zig");
 const copy_drafts = @import("copy_drafts.zig");
 const P = @import("cuda_pool.zig");
 const Tr = @import("cuda_tier.zig");
+const RP = @import("round_profile.zig");
 const Pm = @import("cuda_prompt.zig");
 
 const Ptr = cuda.abi.DevicePtr;
@@ -154,6 +155,8 @@ pub const Runner = struct {
     /// TF_GLM_DRAFT_TOPK=1: `sample` takes the row's k best on the device (default: the host scan, faster until the
     /// device's runs on more than one block); TF_GLM_TOPK_CHECK=1: both, compared every call.
     topk: enum { device, host, check } = .host,
+    /// TF_GLM_ROUND_PROFILE=1 on rank 0: the first rounds' phases logged (round_profile.zig).
+    prof: ?RP.Profile = null,
     split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
     overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
@@ -187,6 +190,7 @@ pub const Runner = struct {
         if (std.c.getenv("TF_GLM_TOPK_CHECK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
             r.topk = .check;
         };
+        if (lay.rank == 0) r.prof = try RP.Profile.fromEnv(d);
         r.players = try gpa.alloc(Pm.Layer, model.layers.len);
         errdefer gpa.free(r.players);
         r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
@@ -195,6 +199,7 @@ pub const Runner = struct {
     }
 
     pub fn deinit(r: *Runner) void {
+        if (r.prof) |*p| p.deinit();
         r.picks.free();
         r.argmax_mod.unload();
         r.topk_mod.unload();
@@ -476,9 +481,13 @@ pub const Runner = struct {
             sg.* = .{ .st = &w.q.st, .a0 = R, .n = n };
             R += n;
         }
+        if (r.prof) |*p| try p.verifyBegin(R, r.stream);
         try M.forwardSegs(r.k, r.lay, r.model, segs[0..wins.len], &r.w, R, r.gather(), r.stream);
+        if (r.prof) |*p| try p.forwardEnd(r.stream);
+        const t_draw = RP.nowNs();
         var drawn: [batch_rows]u32 = undefined;
         try r.greedyRows(r.w.logits, 0, R, &drawn);
+        if (r.prof) |*p| try p.drawEnd(t_draw);
         for (wins, segs[0..wins.len]) |w, sg| {
             try w.q.last.copyFrom(0, r.w.fnormed.ptr + sg.a0 * D * 2, sg.n * D * 2, r.stream.handle);
             @memcpy(w.out[0..sg.n], drawn[sg.a0..][0..sg.n]);
@@ -487,8 +496,10 @@ pub const Runner = struct {
 
     /// Keep the last window's first `keep` of its `R` rows.
     pub fn commit(r: *Runner, q: *Seq, R: usize, keep: usize) !void {
+        const t0 = RP.nowNs();
         try M.commit(r.k, r.lay, &q.st, R, keep, false, &r.w, r.stream);
         try r.tierSettle(q, false, q.st.pos);
+        if (r.prof) |*p| p.committed(t0);
     }
 
     /// The head owes the rows at `hidden` (one a token of `next`, the token after each); absorbed by `absorb`.
@@ -512,6 +523,8 @@ pub const Runner = struct {
         q.mtp_len -= q.mtp_drafted;
         q.mtp_drafted = 0;
         if (q.tier) |x| x.t.rewind(x.hm, q.mtp_len);
+        const owed = q.m_next.items.len;
+        if (r.prof) |*p| if (owed > 0) try p.absorbBegin(r.stream);
         var s0: usize = 0;
         while (s0 < q.m_next.items.len) : (s0 += rows) {
             const part = q.m_next.items[s0..@min(s0 + rows, q.m_next.items.len)];
@@ -520,6 +533,7 @@ pub const Runner = struct {
             q.fresh = true;
         }
         q.m_next.clearRetainingCapacity();
+        if (r.prof) |*p| try p.absorbEnd(owed, r.stream);
         // the absorbed rows are final; the chain's drafts after them are not
         try r.tierSettle(q, true, q.mtp_len);
     }
@@ -532,6 +546,8 @@ pub const Runner = struct {
         var p_chain: f64 = 1.0;
         var nd: usize = 0;
         for (0..depth) |j| {
+            const t0 = RP.nowNs();
+            defer if (r.prof) |*pr| pr.step(t0);
             var p: f64 = 0;
             const tok = try r.sample(r.mb.logits, 0, draft_k, &p);
             if (j > 0 and p_chain * p < copy_drafts.confidence) break;

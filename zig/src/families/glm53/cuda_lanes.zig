@@ -26,6 +26,7 @@ const dsa = @import("cuda_dsa.zig");
 const keep = @import("cuda_keep.zig");
 const kb = keep.book;
 const Tr = @import("cuda_tier.zig");
+const RP = @import("round_profile.zig");
 
 const be = lanes.backend;
 const Ptr = cuda.abi.DevicePtr;
@@ -300,7 +301,11 @@ pub const Lanes = struct {
         if (self.broken) return error.OutOfStep;
         errdefer self.broken = true;
         for (1..self.lay.world) |peer| try self.comm.sendTo(@intCast(peer), op);
-        if (agreesNow(op)) try self.agree(op, true) else self.pending.update(op);
+        if (agreesNow(op)) {
+            const t0 = RP.nowNs();
+            try self.agree(op, true);
+            if (self.r.prof) |*p| p.agreed(t0);
+        } else self.pending.update(op);
         self.run(op) catch |e| {
             std.log.err("glm53 rank {d}: step {d} failed ({s}); restart both ranks", .{ self.lay.rank, self.stepped, @errorName(e) });
             return e;

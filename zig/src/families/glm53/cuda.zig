@@ -21,6 +21,7 @@ pub const copy_drafts = @import("copy_drafts.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const pool = @import("cuda_pool.zig");
 pub const kept = @import("cuda_keep.zig");
+pub const round_profile = @import("round_profile.zig");
 pub const serve_lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
 pub const tier = @import("cuda_tier.zig");
