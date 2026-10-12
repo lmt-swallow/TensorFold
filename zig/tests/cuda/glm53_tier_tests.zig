@@ -48,6 +48,33 @@ fn verifyAll(tier: *glm.tier.Tier, h: usize, whole: *const Buf, host: []u8, upto
     if (try tier.host.verify(h, &refs, upto)) |m| {
         std.debug.print("FAIL glm53-tier verify after {s} at {d}: pool {d} (positions {d}..{d}), slot {d} ({t} run), {s} differs\n", .{ what, at, m.pool, m.pool * 4, m.pool * 4 + 3, m.slot, m.run_kind, if (m.in_file) "file block" else "slab row" });
         if (m.slot >= 0) printHistory(tier, @intCast(m.slot));
+        if (m.slot >= 0 and !m.in_file) {
+            // what the slot holds: read it twice, and look for its rows among the whole cache's nearby rows
+            var b1: [kv.block]u8 = undefined;
+            var b2: [kv.block]u8 = undefined;
+            try tier.readSlot(@intCast(m.slot), &b1);
+            try tier.readSlot(@intCast(m.slot), &b2);
+            var dev: [kv.block]u8 = undefined;
+            try tier.d.check(tier.d.api.cuMemcpyDtoH_v2(&dev, tier.slab_dev + @as(u64, @intCast(m.slot)) * kv.block, kv.block), "cuMemcpyDtoH");
+            const want = host[m.pool * 4 * rb ..][0 .. 4 * rb];
+            var zeros: usize = 0;
+            for (b1) |x| zeros += @intFromBool(x == 0);
+            std.debug.print("    reread same {}, direct DtoH same as get {}, direct DtoH equals whole {}, zero bytes {d}\n", .{ std.mem.eql(u8, &b1, &b2), std.mem.eql(u8, &b1, &dev), std.mem.eql(u8, &dev, want), zeros });
+            for (0..4) |r| {
+                const got = b1[r * rb ..][0..rb];
+                var found: ?isize = null;
+                var q: isize = -64;
+                while (q <= 64) : (q += 1) {
+                    const pos = @as(isize, @intCast(m.pool * 4 + r)) + q;
+                    if (pos < 0 or @as(usize, @intCast(pos)) >= upto) continue;
+                    if (std.mem.eql(u8, got, host[@as(usize, @intCast(pos)) * rb ..][0..rb])) {
+                        found = q;
+                        break;
+                    }
+                }
+                std.debug.print("    row {d}: equals whole {}, found at offset {?d}\n", .{ r, std.mem.eql(u8, got, want[r * rb ..][0..rb]), found });
+            }
+        }
         return error.TestFailed;
     }
 }
@@ -76,6 +103,10 @@ fn diagnose(gpa: std.mem.Allocator, tier: *glm.tier.Tier, whole: *const Buf, tok
     tier.host.remap(0, 0, want, counts[0..R], W);
     const row = try gpa.alloc(u8, rb);
     defer gpa.free(row);
+    const slab = try gpa.alloc(u8, rb);
+    defer gpa.free(slab);
+    const prev = try gpa.alloc(u8, rb);
+    defer gpa.free(prev);
     var pos_bad: usize = 0;
     var remap_bad: usize = 0;
     var bytes_bad: usize = 0;
@@ -88,7 +119,7 @@ fn diagnose(gpa: std.mem.Allocator, tier: *glm.tier.Tier, whole: *const Buf, tok
             if (first == null) first = j;
         }
         try whole.download(@as(usize, @intCast(tokens[j])) * rb, row);
-        const slab = tier.slab.bytes[@as(usize, @intCast(want[j])) * rb ..][0..rb];
+        try tier.d.check(tier.d.api.cuMemcpyDtoH_v2(slab.ptr, tier.slab_dev + @as(u64, @intCast(want[j])) * rb, rb), "cuMemcpyDtoH");
         if (!std.mem.eql(u8, row, slab)) {
             bytes_bad += 1;
             if (bytes_bad <= 8) {
@@ -96,7 +127,14 @@ fn diagnose(gpa: std.mem.Allocator, tier: *glm.tier.Tier, whole: *const Buf, tok
                 const slot: usize = @intCast(@divTrunc(want[j], 4));
                 var diff_bytes: usize = 0;
                 for (row, slab) |a, b| diff_bytes += @intFromBool(a != b);
-                std.debug.print("  slab row of position {d} (pool {d}, row {d}): slot {d}, {d} of {d} bytes differ, window row {}\n", .{ p, p / 4, p % 4, slot, diff_bytes, rb, p >= window_pos });
+                // the slot's previous occupant: does the row hold that pool's bytes (a write lost, a stale view)?
+                var prev_same: ?bool = null;
+                for (tier.host.history(slot)) |e| if (e.kind != .none and e.key % tier.host.pools != p / 4) {
+                    try whole.download(((e.key % tier.host.pools) * 4 + p % 4) * rb, prev);
+                    prev_same = std.mem.eql(u8, prev, slab);
+                    break;
+                };
+                std.debug.print("  slab row of position {d} (pool {d}, row {d}): slot {d}, {d} of {d} bytes differ, window row {}, the previous occupant's row {?}\n", .{ p, p / 4, p % 4, slot, diff_bytes, rb, p >= window_pos, prev_same });
                 printHistory(tier, slot);
             }
         }
@@ -158,7 +196,9 @@ pub fn run(gpu: Gpu, aot_dir: []const u8, model: []const u8, file_dir: []const u
     var hck = try glm.glue.Hc.load(d);
     defer hck.deinit();
     const g: glm.glue.Glue = .{ .set = &set, .hc = &hck, .hidden = cfg.hidden, .streams = cfg.streams };
-    const stream = try cuda.Stream.init(d, true);
+    // blocking: the test's uploads (pageable, on the legacy stream) land before the kernels that read them; on a
+    // non-blocking stream a kernel could read an input whose DMA had not landed (the one-row 'corruption')
+    const stream = try cuda.Stream.init(d, false);
     var stream_ = stream;
     defer stream_.deinit();
 

@@ -23,3 +23,21 @@ extern "C" __global__ void tf_glm53_tier_remap(const int32_t *tokens, int32_t *o
         dst[i] = map[q] * 4 + (p & 3);
     }
 }
+
+// The slab's 4 KiB slots in device memory (kv_tier.Slab, cuda_tier.zig): a block a slot, 256 threads moving 16 B
+// each. scatter: staged bytes src[i] into slot slots[i]; gather: slot slots[i] into dst[i]; copy: slot dst[i] :=
+// slot src[i] (no two copies of a call share a slot).
+extern "C" __global__ void tf_glm53_tier_scatter(const uint4 *src, uint4 *slab, const int32_t *slots) {
+    const int i = blockIdx.x;
+    slab[(int64_t)slots[i] * 256 + threadIdx.x] = src[(int64_t)i * 256 + threadIdx.x];
+}
+
+extern "C" __global__ void tf_glm53_tier_gather(const uint4 *slab, uint4 *dst, const int32_t *slots) {
+    const int i = blockIdx.x;
+    dst[(int64_t)i * 256 + threadIdx.x] = slab[(int64_t)slots[i] * 256 + threadIdx.x];
+}
+
+extern "C" __global__ void tf_glm53_tier_copy(uint4 *slab, const int32_t *dst, const int32_t *src) {
+    const int i = blockIdx.x;
+    slab[(int64_t)dst[i] * 256 + threadIdx.x] = slab[(int64_t)src[i] * 256 + threadIdx.x];
+}

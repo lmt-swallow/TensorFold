@@ -1,6 +1,7 @@
 //! The DSA latent cache tiered to local NVMe (GLM-5.3-Flash-1: four streams of 1,048,576 positions in bf16 do not
 //! fit beside the weights). The host half: which pools are resident, where, and the reads and writes that move them.
-//! No CUDA here; `cuda_tier.zig` puts the slab and the map in mapped pinned memory and runs the remap on the device.
+//! No CUDA here: the slab is behind `Slab` (cuda_tier keeps it in device memory, the tests in a host slice); the
+//! map is the caller's (cuda_tier: mapped pinned memory the device's remap reads).
 //!
 //! A pool is 4 consecutive positions of one stream's layer (sparse.py's selection unit): 4 rows of `row_bytes`, one
 //! 4 KiB block on the file and one slot of the slab. Every position a call can see is resident by the time the call
@@ -35,7 +36,7 @@ pub const home_pools = home_positions / pool_rows;
 /// Streams a chain of aliases reads through at most (a stream and its ancestors; cuda_tier's remap takes as many).
 pub const max_chain = 8;
 
-pub const Error = error{ FileBusy, TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory, NoStream, ChainTooDeep };
+pub const Error = error{ SlabFailed, FileBusy, TierFull, BadToken, NotPersisted, NotOpen, PastCapacity, OpenFailed, ReadFailed, WriteFailed, BadShape, OutOfMemory, NoStream, ChainTooDeep };
 
 pub const Options = struct {
     pub fn mapBlocks(o: Options) usize {
@@ -75,6 +76,44 @@ pub const Piece = struct {
     rows: usize,
 };
 
+/// The slab's slots, wherever they live. kv_tier never touches a slot's bytes but through these three calls:
+/// cuda_tier keeps the slab in device memory (never visible to the CPU), the host tests in a host slice
+/// (`HostSlab`). Each call returns once its bytes landed.
+pub const Slab = struct {
+    ctx: *anyopaque,
+    slots: usize,
+    /// bytes[i * block ..][0..block] into slot slots[i]
+    put: *const fn (ctx: *anyopaque, slots: []const u32, bytes: []const u8) anyerror!void,
+    /// slot slots[i]'s bytes into out[i * block ..][0..block]
+    get: *const fn (ctx: *anyopaque, slots: []const u32, out: []u8) anyerror!void,
+    /// slot dst[i] := slot src[i]
+    copy: *const fn (ctx: *anyopaque, dst: []const u32, src: []const u32) anyerror!void,
+};
+
+/// A slab in a host slice (the host tests; a kernel never reads it).
+pub const HostSlab = struct {
+    bytes: []align(block) u8,
+
+    pub fn slab(h: *HostSlab) Slab {
+        return .{ .ctx = h, .slots = h.bytes.len / block, .put = put, .get = get, .copy = copy };
+    }
+
+    fn put(ctx: *anyopaque, slots: []const u32, bytes: []const u8) anyerror!void {
+        const h: *HostSlab = @ptrCast(@alignCast(ctx));
+        for (slots, 0..) |x, i| @memcpy(h.bytes[@as(usize, x) * block ..][0..block], bytes[i * block ..][0..block]);
+    }
+
+    fn get(ctx: *anyopaque, slots: []const u32, out: []u8) anyerror!void {
+        const h: *HostSlab = @ptrCast(@alignCast(ctx));
+        for (slots, 0..) |x, i| @memcpy(out[i * block ..][0..block], h.bytes[@as(usize, x) * block ..][0..block]);
+    }
+
+    fn copy(ctx: *anyopaque, dst: []const u32, src: []const u32) anyerror!void {
+        const h: *HostSlab = @ptrCast(@alignCast(ctx));
+        for (dst, src) |d, x| @memcpy(h.bytes[@as(usize, d) * block ..][0..block], h.bytes[@as(usize, x) * block ..][0..block]);
+    }
+};
+
 /// What happened to a slot (trace).
 pub const EvKind = enum(u8) { none, file_read, copy_in, move_in, move_out, gpu_write, file_write, evict, drop, load, alias_copy, place_empty };
 pub const Ev = struct { kind: EvKind = .none, key: u32 = 0, window: u32 = 0, gen: u32 = 0 };
@@ -83,8 +122,12 @@ pub const trace_depth = 8;
 pub const Tier = struct {
     gpa: std.mem.Allocator,
     o: Options,
-    slab: []align(block) u8,
-    map: []i32, // [streams, layers, pools]: the slot holding a pool, -1 where none does
+    slab: Slab,
+    map: []i32,
+    // reads pending their slab put: rd_slots[i]'s bytes land at rd_stage[i * block ..] when the file's do
+    rd_slots: std.ArrayList(u32) = .empty,
+    rd_stage: []align(block) u8 = &.{},
+    wr_stage: []align(block) u8 = &.{}, // a commit's pools on their way to the file // [streams, layers, pools]: the slot holding a pool, -1 where none does
     pools: usize, // a stream-layer's
     segs: usize,
     runs: []Run,
@@ -123,16 +166,15 @@ pub const Tier = struct {
         favored: bool = false, // its pools leave only after every other stream's could not (a prompt being filled)
     };
 
-    /// `slab` (run_pools * block bytes a run, whole runs) and `map` (streams * layers * capacity / 4 entries) are the
-    /// caller's: cuda_tier maps both into the device's address space. `path` is the backing file (created, sized).
-    pub fn init(gpa: std.mem.Allocator, slab: []align(block) u8, map: []i32, path: [:0]const u8, o: Options) Error!Tier {
+    /// `slab` (whole runs of run_pools slots) and `map` (Options.mapBlocks() * capacity / 4 entries, which the
+    /// device's remap reads) are the caller's. `path` is the backing file (created, emptied, locked).
+    pub fn init(gpa: std.mem.Allocator, slab: Slab, map: []i32, path: [:0]const u8, o: Options) Error!Tier {
         if (o.row_bytes * pool_rows != block or o.capacity % seg_positions != 0 or o.capacity < home_positions) return error.BadShape;
-        const run_bytes = run_pools * block;
-        if (slab.len % run_bytes != 0 or slab.len == 0) return error.BadShape;
+        if (slab.slots % run_pools != 0 or slab.slots == 0) return error.BadShape;
         const pools = o.capacity / pool_rows;
         const keys = o.mapBlocks() * pools;
         if (map.len != keys or keys >= none) return error.BadShape;
-        const nslots = slab.len / block;
+        const nslots = slab.slots;
         if (nslots * pool_rows >= std.math.maxInt(i32)) return error.BadShape;
         var t: Tier = undefined;
         t.gpa = gpa;
@@ -142,6 +184,11 @@ pub const Tier = struct {
         t.pools = pools;
         t.segs = o.capacity / seg_positions;
         t.free_slots = .empty;
+        t.rd_slots = .empty;
+        t.rd_stage = try gpa.alignedAlloc(u8, .fromByteUnits(block), stage_blocks * block);
+        errdefer gpa.free(t.rd_stage);
+        t.wr_stage = try gpa.alignedAlloc(u8, .fromByteUnits(block), stage_blocks * block);
+        errdefer gpa.free(t.wr_stage);
         t.hand = 0;
         t.window = 1;
         t.gen = 1;
@@ -193,6 +240,9 @@ pub const Tier = struct {
 
     pub fn deinit(t: *Tier) void {
         t.io.close();
+        t.rd_slots.deinit(t.gpa);
+        t.gpa.free(t.rd_stage);
+        t.gpa.free(t.wr_stage);
         if (t.trace_ev.len > 0) t.gpa.free(t.trace_ev);
         t.gpa.free(t.streams);
         t.persisted.deinit(t.gpa);
@@ -254,8 +304,35 @@ pub const Tier = struct {
         return @as(u64, k) * block;
     }
 
-    fn slotBytes(t: *const Tier, slot: usize) []align(block) u8 {
-        return @alignCast(t.slab[slot * block ..][0..block]);
+    /// Blocks a read or write stage holds (a flush past it).
+    const stage_blocks = 4096;
+
+    /// The file's block `off` into slot `slot`: read into the stage now, put into the slab at the next flush.
+    fn readSlot(t: *Tier, slot: u32, off: u64) Error!void {
+        if (t.rd_slots.items.len == stage_blocks) try t.flushReads();
+        const i = t.rd_slots.items.len;
+        try t.rd_slots.append(t.gpa, slot);
+        try t.io.add(.read, t.rd_stage[i * block ..][0..block], off);
+    }
+
+    /// Every staged read landed in its slot.
+    fn flushReads(t: *Tier) Error!void {
+        try t.io.finish();
+        if (t.rd_slots.items.len == 0) return;
+        t.slab.put(t.slab.ctx, t.rd_slots.items, t.rd_stage[0 .. t.rd_slots.items.len * block]) catch return error.SlabFailed;
+        t.rd_slots.clearRetainingCapacity();
+    }
+
+    /// slot dst := slot src (staged reads landed first: src may be one of them).
+    fn copySlot(t: *Tier, dst: u32, src: u32) Error!void {
+        try t.flushReads();
+        t.slab.copy(t.slab.ctx, &.{dst}, &.{src}) catch return error.SlabFailed;
+    }
+
+    /// Slot `slot`'s bytes into `out` (block long).
+    pub fn getSlot(t: *Tier, slot: u32, out: []u8) Error!void {
+        try t.flushReads();
+        t.slab.get(t.slab.ctx, &.{slot}, out) catch return error.SlabFailed;
     }
 
     /// A stream of `layers` layers (at most Options.layers; the MTP head's cache is a stream of its own, 1 layer):
@@ -294,7 +371,7 @@ pub const Tier = struct {
     /// Drops a stream. One that aliases read through stays (pending) until the last of them closes: only the pools
     /// they read are kept, its home block and recent window let go.
     pub fn close(t: *Tier, s: usize) void {
-        t.io.finish() catch {};
+        t.flushReads() catch {};
         const st = &t.streams[s];
         if (!st.open) return;
         if (st.refs > 0) {
@@ -362,7 +439,7 @@ pub const Tier = struct {
         if (!st.open) return error.NotOpen;
         if (R == 0 or R > seg_positions or pos + R > t.o.capacity) return error.PastCapacity;
         if (st.parent != null and pos < st.fork_pool * pool_rows) return error.BadShape; // the parent's rows
-        try t.io.finish();
+        try t.flushReads();
         t.window +%= 1;
         const first = pos / seg_positions;
         const last = (pos + R - 1) / seg_positions;
@@ -380,7 +457,7 @@ pub const Tier = struct {
             const k0 = t.mapBase(s, l);
             for (pos / pool_rows..(pos + R - 1) / pool_rows + 1) |p| t.persisted.unset(k0 + p);
         }
-        try t.io.finish();
+        try t.flushReads();
         st.dirty_lo = @min(st.dirty_lo, pos / pool_rows);
         st.committed = @min(st.committed, pos);
     }
@@ -428,7 +505,7 @@ pub const Tier = struct {
     /// `fetch` of several selections (streams' or layers') as one batch of reads: the drive's latency is paid
     /// once. None of their pools is evicted before the next fetch.
     pub fn fetchMany(t: *Tier, sels: []const Selection) Error!void {
-        try t.io.finish();
+        try t.flushReads();
         t.gen +%= 1;
         var need: std.ArrayList(u32) = .empty;
         defer need.deinit(t.gpa);
@@ -455,7 +532,7 @@ pub const Tier = struct {
             }
         }
         try t.readIn(need.items);
-        try t.io.finish();
+        try t.flushReads();
     }
 
     /// Whether every written pool of stream `s`'s layer `l` is resident: a fetch would read nothing (the device
@@ -474,7 +551,7 @@ pub const Tier = struct {
         if (!t.streams[s].open) return error.NotOpen;
         if (l >= t.streams[s].layers) return error.BadShape;
         if (end > t.o.capacity) return error.PastCapacity;
-        try t.io.finish();
+        try t.flushReads();
         t.gen +%= 1;
         var need: std.ArrayList(u32) = .empty;
         defer need.deinit(t.gpa);
@@ -496,7 +573,7 @@ pub const Tier = struct {
 
     pub fn ensureRange(t: *Tier, s: usize, l: usize, end: usize) Error!void {
         try t.prefetchRange(s, l, end);
-        try t.io.finish();
+        try t.flushReads();
     }
 
     /// Selected positions to row indices at the slab's base (the device's remap, on the host): fetch ran.
@@ -511,7 +588,7 @@ pub const Tier = struct {
     pub fn commit(t: *Tier, s: usize, pos: usize) Error!void {
         const st = &t.streams[s];
         if (!st.open) return error.NotOpen;
-        try t.io.finish();
+        try t.flushReads();
         const hi = pos / pool_rows;
         if (hi > st.dirty_lo) {
             for (0..st.layers) |l| {
@@ -533,7 +610,7 @@ pub const Tier = struct {
                     var n: usize = 1;
                     while (p + n < hi and !t.persisted.isSet(k + n) and t.map[k + n] == slot + @as(i32, @intCast(n))) n += 1;
                     for (0..n) |i| t.note(@as(usize, @intCast(slot)) + i, .file_write, @intCast(k + i));
-                    try t.io.add(.write, t.slab[@as(usize, @intCast(slot)) * block ..][0 .. n * block], fileOffset(k));
+                    try t.writeSlots(@intCast(slot), n, fileOffset(k));
                     for (0..n) |i| t.persisted.set(k + i);
                     t.writes += n;
                     p += n;
@@ -542,7 +619,7 @@ pub const Tier = struct {
             st.dirty_lo = hi;
         }
         st.committed = @max(st.committed, pos);
-        try t.io.finish();
+        try t.flushReads();
     }
 
     /// Stream `s` (just opened, nothing written) starts holding `rows` rows of layer `l` given whole (`bytes`, row
@@ -553,13 +630,16 @@ pub const Tier = struct {
         const st = &t.streams[s];
         if (!st.open or l >= st.layers or st.parent != null) return error.BadShape;
         if (rows == 0 or rows > t.o.capacity or bytes.len < rows * t.o.row_bytes) return error.PastCapacity;
-        try t.io.finish();
+        try t.flushReads();
         const full = rows / pool_rows;
         const pb = pool_rows * t.o.row_bytes;
+        var one: [block]u8 align(block) = undefined;
         for (0..@min((rows + pool_rows - 1) / pool_rows, home_pools)) |p| {
-            const slot: usize = @intCast(t.map[t.key(s, l, p)]);
+            const slot: u32 = @intCast(t.map[t.key(s, l, p)]);
             const n = @min(pb, rows * t.o.row_bytes - p * pb);
-            @memcpy(t.slotBytes(slot)[0..n], bytes[p * pb ..][0..n]);
+            @memset(&one, 0);
+            @memcpy(one[0..n], bytes[p * pb ..][0..n]);
+            t.slab.put(t.slab.ctx, &.{slot}, &one) catch return error.SlabFailed;
         }
         if (full > home_pools) {
             // through an aligned bounce, a run's pools a write
@@ -570,7 +650,7 @@ pub const Tier = struct {
                 const n: usize = @min(@as(usize, run_pools), full - p);
                 @memcpy(bounce[0 .. n * block], bytes[p * pb ..][0 .. n * block]);
                 try t.io.add(.write, bounce[0 .. n * block], fileOffset(t.key(s, l, p)));
-                try t.io.finish();
+                try t.flushReads();
                 for (p..p + n) |q| {
                     const k = t.key(s, l, q);
                     if (!t.persisted.isSet(k) and t.map[k] < 0) t.away[k / t.pools] += 1;
@@ -583,10 +663,12 @@ pub const Tier = struct {
         if (rows % pool_rows != 0 and full >= home_pools) {
             const g = full / run_pools;
             if (t.seg_run[(s * t.o.layers + l) * t.segs + g] == none) try t.placeLinear(s, l, g, try t.takeRuns(1));
-            const slot: usize = @intCast(t.map[t.key(s, l, full)]);
-            @memcpy(t.slotBytes(slot)[0 .. (rows % pool_rows) * t.o.row_bytes], bytes[full * pb ..][0 .. (rows % pool_rows) * t.o.row_bytes]);
+            const slot: u32 = @intCast(t.map[t.key(s, l, full)]);
+            try t.getSlot(slot, &one);
+            @memcpy(one[0 .. (rows % pool_rows) * t.o.row_bytes], bytes[full * pb ..][0 .. (rows % pool_rows) * t.o.row_bytes]);
+            t.slab.put(t.slab.ctx, &.{slot}, &one) catch return error.SlabFailed;
         }
-        try t.io.finish();
+        try t.flushReads();
         st.hi = @max(st.hi, (rows - 1) / seg_positions);
         st.committed = @max(st.committed, rows);
         st.end = @max(st.end, rows);
@@ -611,7 +693,7 @@ pub const Tier = struct {
         const ds = &t.streams[dst];
         if (!ss.open or ss.pending or !ds.open or ds.hi != 0 or ds.committed != 0 or ds.layers != ss.layers) return error.BadShape;
         if (rows == 0 or rows > t.o.capacity - 1) return error.PastCapacity;
-        try t.io.finish();
+        try t.flushReads();
         const full = rows / pool_rows;
         if (full > home_pools) {
             if (t.aliasDepth(src) > max_chain) return error.ChainTooDeep;
@@ -629,7 +711,7 @@ pub const Tier = struct {
                 try t.copyPool(src, dst, l, full);
             }
         }
-        try t.io.finish();
+        try t.flushReads();
         ds.hi = (rows - 1) / seg_positions;
         ds.committed = rows;
         ds.end = rows;
@@ -645,11 +727,26 @@ pub const Tier = struct {
         const ss = t.map[ks];
         t.note(@intCast(sd), .alias_copy, kd);
         if (ss >= 0) {
-            @memcpy(t.slotBytes(@intCast(sd)), t.slotBytes(@intCast(ss)));
+            try t.copySlot(@intCast(sd), @intCast(ss));
         } else if (t.persisted.isSet(ks)) {
-            try t.io.add(.read, t.slotBytes(@intCast(sd)), fileOffset(ks));
+            try t.readSlot(@intCast(sd), fileOffset(ks));
             t.reads += 1;
         } else return error.NotPersisted;
+    }
+
+    /// Slots slot .. slot + n - 1 to the file at `off`: through the write stage, a stage at a time.
+    fn writeSlots(t: *Tier, slot: u32, n: usize, off: u64) Error!void {
+        var done: usize = 0;
+        var ids: [stage_blocks]u32 = undefined;
+        while (done < n) {
+            const m: usize = @min(@as(usize, stage_blocks), n - done);
+            for (0..m) |i| ids[i] = slot + @as(u32, @intCast(done + i));
+            try t.io.finish(); // the stage's previous writes left
+            t.slab.get(t.slab.ctx, ids[0..m], t.wr_stage[0 .. m * block]) catch return error.SlabFailed;
+            try t.io.add(.write, t.wr_stage[0 .. m * block], off + done * block);
+            try t.io.finish();
+            done += m;
+        }
     }
 
     /// Positions from `pos` on are dropped (rejected drafts, a shortened prompt): the next window rewrites them.
@@ -742,7 +839,7 @@ pub const Tier = struct {
             t.map[k] = @intCast(slot);
             t.touch(slot);
             t.note(slot, .file_read, k);
-            try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
+            try t.readSlot(slot, fileOffset(k));
         }
         t.reads += keys.len;
     }
@@ -758,14 +855,14 @@ pub const Tier = struct {
             const old = t.map[k];
             if (old >= 0) {
                 const u: u32 = @intCast(old);
-                @memcpy(t.slotBytes(slot), t.slotBytes(u));
+                try t.copySlot(slot, u);
                 t.note(slot, .copy_in, k);
                 t.note(u, .move_out, k);
                 t.disown(u);
                 try t.free_slots.append(t.gpa, u);
             } else if (t.persisted.isSet(k)) {
                 t.note(slot, .file_read, k);
-                try t.io.add(.read, t.slotBytes(slot), fileOffset(k));
+                try t.readSlot(slot, fileOffset(k));
                 t.away[k / t.pools] -= 1;
                 t.reads += 1;
             }
@@ -897,7 +994,10 @@ pub const Tier = struct {
                 for (b..b + n) |r| t.runs[r].kind = .loose;
                 return e;
             };
-            @memcpy(t.slotBytes(dst), t.slotBytes(slot));
+            t.copySlot(dst, @intCast(slot)) catch |e| {
+                for (b..b + n) |r| t.runs[r].kind = .loose;
+                return e;
+            };
             t.note(dst, .move_in, k);
             t.note(slot, .move_out, k);
             t.own(dst, k);
@@ -917,7 +1017,7 @@ pub const Tier = struct {
     /// (layer l's rows at ref[l], row p at p * row_bytes): a resident pool's slab bytes and a written pool's file
     /// block (an alias's pools below its fork are its parent's: checked there). Returns the first that differs.
     pub fn verify(t: *Tier, s: usize, ref: []const []const u8, upto: usize) Error!?Mismatch {
-        try t.io.finish();
+        try t.flushReads();
         const st = t.streams[s];
         const pb = pool_rows * t.o.row_bytes;
         // the file read in spans of `span` blocks (a layer's keys are contiguous on the file)
@@ -936,8 +1036,11 @@ pub const Tier = struct {
                     const want = ref[l][p * pb ..][0..pb];
                     const slot = t.map[k];
                     const kind: Kind = if (slot >= 0) t.runs[@as(usize, @intCast(slot)) / run_pools].kind else .free;
-                    if (slot >= 0 and !std.mem.eql(u8, want, t.slotBytes(@intCast(slot))))
-                        return .{ .layer = l, .pool = p, .slot = slot, .in_file = false, .run_kind = kind };
+                    if (slot >= 0) {
+                        var in_slab: [block]u8 align(block) = undefined;
+                        t.slab.get(t.slab.ctx, &.{@intCast(slot)}, &in_slab) catch return error.SlabFailed;
+                        if (!std.mem.eql(u8, want, &in_slab)) return .{ .layer = l, .pool = p, .slot = slot, .in_file = false, .run_kind = kind };
+                    }
                     if (t.persisted.isSet(k)) {
                         const in = (p - p0) * block;
                         if (got < @as(isize, @intCast(in + block)) or !std.mem.eql(u8, want, buf[in..][0..block]))
@@ -977,16 +1080,15 @@ pub const Tier = struct {
 /// engine runs in Docker, whose default seccomp profile refuses io_uring but not AIO), else positional calls.
 /// `add` queues (submitting when the queue is full), `finish` returns once every queued transfer landed.
 ///
-/// Ordering the tier relies on (the slab is mapped pinned memory the GPU writes and reads):
-/// - The drive's DMA never touches the slab: each transfer goes through a lane's bounce buffer and the CPU copies
-///   between it and the slab (a write's copy when it is submitted, a read's when it completes). The CPU's view of
-///   the slab is coherent with the GPU's; the drive's need not be.
-/// - A latent write lands before the copy that writes its pool out: cuda_tier.commit synchronizes the stream
+/// Ordering the tier relies on:
+/// - The drive's DMA reads and writes only the tier's host stages (rd_stage, wr_stage), never the slab: the slab
+///   is device memory reached through Slab.put / get / copy (cuda_tier: cuMemcpy and its kernels).
+/// - A latent write lands before the get that writes its pool out: cuda_tier.commit synchronizes the stream
 ///   that queued the latent writes before kv_tier.commit runs (engine: tierSettle; tests: the same call).
 /// - A slot is reused (evicted, moved, read into) only by a host call that runs after every device call reading
 ///   it finished: resolve synchronizes its stream before fetch, and beginWindow is called after the stream's
-///   earlier calls finished (the engine synchronizes in tierBegin). `finish` returns only when every transfer
-///   and its copy completed, and every public call starts and ends with one.
+///   earlier calls finished (the engine synchronizes in tierBegin). Every public call ends with its reads put in
+///   the slab (flushReads), and each Slab call returns once its bytes landed.
 extern "c" fn flock(fd: c_int, op: c_int) c_int;
 const lock_ex = 2;
 const lock_nb = 4;
@@ -1028,13 +1130,9 @@ pub const Io = struct {
         cbs: []Iocb,
         ptrs: []*Iocb,
         free: []u32,
-        item: []u32 = &.{}, // per control block: the request it carries
-        bounce: []align(block) u8 = &.{}, // per control block: max_req bytes the drive reads or writes
         bad: bool = false,
     };
 
-    /// A request's bytes at most (larger ones are split): a lane's bounce holds depth of them.
-    const max_req = 64 << 10;
 
     /// `lanes` AIO contexts of `depth` transfers each (the measured NVMe: QD 64 on one thread reads 1.0M 4 KiB
     /// blocks a second, four threads 2.2M).
@@ -1066,19 +1164,6 @@ pub const Io = struct {
                     gpa.free(l.ptrs);
                     return e;
                 };
-                l.item = gpa.alloc(u32, io.depth) catch |e| {
-                    gpa.free(l.cbs);
-                    gpa.free(l.ptrs);
-                    gpa.free(l.free);
-                    return e;
-                };
-                l.bounce = gpa.alignedAlloc(u8, .fromByteUnits(block), io.depth * max_req) catch |e| {
-                    gpa.free(l.cbs);
-                    gpa.free(l.ptrs);
-                    gpa.free(l.free);
-                    gpa.free(l.item);
-                    return e;
-                };
                 made += 1;
                 if (linux.errno(linux.syscall2(.io_setup, io.depth, @intFromPtr(&l.ctx))) != .SUCCESS) l.ctx = 0;
             }
@@ -1094,8 +1179,6 @@ pub const Io = struct {
             io.gpa.free(l.cbs);
             io.gpa.free(l.ptrs);
             io.gpa.free(l.free);
-            io.gpa.free(l.item);
-            io.gpa.free(l.bounce);
         }
         io.gpa.free(io.lanes);
     }
@@ -1108,11 +1191,7 @@ pub const Io = struct {
     }
 
     pub fn add(io: *Io, op: Op, buf: []u8, off: u64) Error!void {
-        var at: usize = 0;
-        while (at < buf.len) : (at += max_req) {
-            const n = @min(max_req, buf.len - at);
-            try io.queue.append(io.gpa, .{ .op = op, .buf = buf[at..][0..n], .off = off + at });
-        }
+        try io.queue.append(io.gpa, .{ .op = op, .buf = buf, .off = off });
         if (io.queue.items.len >= io.depth * 64) try io.finish();
     }
 
@@ -1164,16 +1243,11 @@ pub const Io = struct {
                 const q = items[next];
                 nfree -= 1;
                 const c = l.free[nfree];
-                l.item[c] = @intCast(next);
-                // the drive's DMA touches only the lane's bounce; the CPU copies between it and the slab (whose
-                // latest bytes may be the GPU's, coherent with the CPU but not necessarily with the drive)
-                const bounce = l.bounce[c * max_req ..][0..q.buf.len];
-                if (q.op == .write) @memcpy(bounce, q.buf);
                 l.cbs[c] = .{
                     .data = (@as(u64, c) << 32) | q.buf.len,
                     .lio_opcode = if (q.op == .read) 0 else 1,
                     .fildes = @intCast(io.fd),
-                    .buf = @intFromPtr(bounce.ptr),
+                    .buf = @intFromPtr(q.buf.ptr),
                     .nbytes = q.buf.len,
                     .offset = @intCast(q.off),
                 };
@@ -1207,13 +1281,7 @@ pub const Io = struct {
                 return;
             }
             for (ev[0..@intCast(got)]) |e| {
-                const c: u32 = @intCast(e.data >> 32);
-                if (e.res != @as(i64, @intCast(e.data & 0xFFFF_FFFF))) {
-                    l.bad = true;
-                } else {
-                    const q = items[l.item[c]];
-                    if (q.op == .read) @memcpy(q.buf, l.bounce[c * max_req ..][0..q.buf.len]);
-                }
+                if (e.res != @as(i64, @intCast(e.data & 0xFFFF_FFFF))) l.bad = true;
                 l.free[nfree] = @intCast(e.data >> 32);
                 nfree += 1;
                 inflight -= 1;
@@ -1227,7 +1295,7 @@ pub const Io = struct {
 const testing = std.testing;
 
 const Fixture = struct {
-    slab: []align(block) u8,
+    host: HostSlab,
     map: []i32,
     path_buf: [256]u8,
     path: [:0]u8,
@@ -1243,14 +1311,14 @@ const Fixture = struct {
         const gpa = testing.allocator;
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
-        f.slab = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * block);
-        @memset(f.slab, 0xAA);
+        f.host = .{ .bytes = try gpa.alignedAlloc(u8, .fromByteUnits(block), runs * run_pools * block) };
+        @memset(f.host.bytes, 0xAA);
         f.map = try gpa.alloc(i32, blocks * o.capacity / pool_rows);
         // TF_TIER_TEST_DIR: a directory on the NVMe's file system (O_DIRECT and AIO; /tmp may be tmpfs)
         const dir = if (std.c.getenv("TF_TIER_TEST_DIR")) |e| std.mem.span(e) else "/tmp";
         const name = try std.fmt.bufPrint(&f.path_buf, "{s}/kv_tier_test_{d}_{x}.bin\x00", .{ dir, std.c.getpid(), seed });
         f.path = name[0 .. name.len - 1 :0];
-        f.tier = try Tier.init(gpa, f.slab, f.map, f.path, o);
+        f.tier = try Tier.init(gpa, f.host.slab(), f.map, f.path, o);
         f.ref = try gpa.alloc([]u8, o.streams * o.layers);
         for (f.ref) |*r| {
             r.* = try gpa.alloc(u8, o.capacity * o.row_bytes);
@@ -1269,7 +1337,7 @@ const Fixture = struct {
         gpa.free(f.ref);
         gpa.free(f.end);
         gpa.free(f.map);
-        gpa.free(f.slab);
+        gpa.free(f.host.bytes);
         gpa.destroy(f);
     }
 
@@ -1284,7 +1352,7 @@ const Fixture = struct {
             for (pieces) |pc| if (pc) |p| {
                 for (p.pos..p.pos + p.rows) |q| {
                     const at: usize = @intCast(p.base + @as(i64, @intCast(q * rb)));
-                    const dst = t.slab[at..][0..rb];
+                    const dst = f.host.bytes[at..][0..rb];
                     rnd.bytes(dst);
                     @memcpy(f.ref[s * t.o.layers + l][q * rb ..][0..rb], dst);
                 }
@@ -1338,7 +1406,7 @@ const Fixture = struct {
         t.remap(s, l, tokens, counts, W);
         for (0..R) |r| for (0..@intCast(counts[r])) |i| {
             const want = f.ref[s * t.o.layers + l][@as(usize, @intCast(orig[r * W + i])) * rb ..][0..rb];
-            const got = t.slab[@as(usize, @intCast(tokens[r * W + i])) * rb ..][0..rb];
+            const got = f.host.bytes[@as(usize, @intCast(tokens[r * W + i])) * rb ..][0..rb];
             try testing.expectEqualSlices(u8, want, got);
         };
     }
@@ -1448,7 +1516,7 @@ test "fetchMany serves several streams' selections from one batch of reads" {
         t.remap(i / 2, i % 2, &toks[i], &cnts[i], W);
         for (0..2 * W) |j| {
             const want = f.ref[(i / 2) * 2 + i % 2][@as(usize, @intCast(orig[i][j])) * o.row_bytes ..][0..o.row_bytes];
-            try testing.expectEqualSlices(u8, want, t.slab[@as(usize, @intCast(toks[i][j])) * o.row_bytes ..][0..o.row_bytes]);
+            try testing.expectEqualSlices(u8, want, f.host.bytes[@as(usize, @intCast(toks[i][j])) * o.row_bytes ..][0..o.row_bytes]);
         }
     }
     try t.check();
@@ -1634,14 +1702,15 @@ test "the backing file is the tier's alone and starts empty" {
     defer testing.allocator.free(slab);
     const map = try testing.allocator.alloc(i32, o.capacity / pool_rows);
     defer testing.allocator.free(map);
-    try testing.expectError(error.FileBusy, Tier.init(testing.allocator, slab, map, f.path, o));
+    var hs: HostSlab = .{ .bytes = slab };
+    try testing.expectError(error.FileBusy, Tier.init(testing.allocator, hs.slab(), map, f.path, o));
     // a file a previous run left behind is emptied at open
     f.tier.deinit();
     const fd = std.c.open(f.path, .{ .ACCMODE = .RDWR }, @as(c_uint, 0));
     try testing.expect(fd >= 0);
     _ = std.c.pwrite(fd, slab.ptr, block, 0);
     _ = std.c.close(fd);
-    f.tier = try Tier.init(testing.allocator, f.slab, f.map, f.path, o);
+    f.tier = try Tier.init(testing.allocator, f.host.slab(), f.map, f.path, o);
     try testing.expectEqual(@as(std.c.off_t, 0), std.c.lseek(f.tier.io.fd, 0, std.c.SEEK.END));
 }
 
@@ -1668,7 +1737,7 @@ test "prefetchRange brings a layer's whole context back" {
         const slot = t.map[t.mapBase(0, 0) + q / pool_rows];
         try testing.expect(slot >= 0);
         const at = @as(usize, @intCast(slot)) * block + (q % pool_rows) * o.row_bytes;
-        try testing.expectEqualSlices(u8, f.ref[0][q * o.row_bytes ..][0..o.row_bytes], t.slab[at..][0..o.row_bytes]);
+        try testing.expectEqualSlices(u8, f.ref[0][q * o.row_bytes ..][0..o.row_bytes], f.host.bytes[at..][0..o.row_bytes]);
     }
     try t.check();
 }
@@ -1731,7 +1800,8 @@ test "bench (TF_TIER_BENCH=positions): 4 stream-layers' prompt and decode select
     const name = try std.fmt.bufPrint(&buf, "{s}/kv_tier_bench_{d}.bin\x00", .{ dir, std.c.getpid() });
     const path = name[0 .. name.len - 1 :0];
     defer _ = std.c.unlink(path.ptr);
-    var t = try Tier.init(gpa, slab, map, path, o);
+    var hs: HostSlab = .{ .bytes = slab };
+    var t = try Tier.init(gpa, hs.slab(), map, path, o);
     defer t.deinit();
     try t.open(0, L);
     var prng = std.Random.DefaultPrng.init(9);

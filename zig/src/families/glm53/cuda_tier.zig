@@ -1,6 +1,13 @@
-//! The tiered DSA latent cache on CUDA (kv_tier.zig's device half): the slab and the map in mapped pinned memory
-//! (one DRAM on GB10: the NVMe's direct reads and writes land where the kernels read, no copy), the selection read
-//! back to the host, fetched, and remapped on the device. cuda_dsa's calls take their latent addresses from here:
+//! The tiered DSA latent cache on CUDA (kv_tier.zig's device half): the slab in device memory, the map in mapped
+//! pinned memory, the selection read back to the host, fetched, and remapped on the device.
+//!
+//! The slab is never visible to the CPU. It once was mapped pinned memory the NVMe and the CPU read and wrote
+//! directly, and on GB10 a slot's rows the GPU's latent write had put there read back corrupted, from the CPU and
+//! from the next kernel alike, with no host write to the slot in between (glm53-tier's trace, spark-616b
+//! 2026-10-12: slots 3610 and 3611 written by the device in windows 154-156, 953-1,021 of 1,024 bytes a row
+//! differing). Now only the device writes and reads the slab; the host's bytes reach it through the DMA engine
+//! (cuMemcpy into a device stage, then this file's scatter / gather / copy kernels on the tier's own stream, each
+//! synchronized before it returns). cuda_dsa's calls take their latent addresses from here:
 //!
 //! - before a window (rows pos .. pos + R - 1 of a stream, at a point where the stream's earlier calls have run):
 //!   `beginWindow`;
@@ -27,8 +34,16 @@ pub const Piece = struct { base: Ptr, pos_dev: Ptr, pos: usize, rows: usize };
 pub const Tier = struct {
     d: *const cuda.Driver,
     host: kv.Tier,
-    slab: cuda.HostBuffer,
+    slab: cuda.DeviceBuffer,
     slab_dev: Ptr,
+    stage: cuda.DeviceBuffer, // stage_slots slots of bytes on their way between the host and the slab
+    idx: cuda.DeviceBuffer, // [2, stage_slots] i32: a call's slot lists
+    xs: cuda.Stream, // the slab's transfers and kernels, in order on it (each call synchronizes it): a copy on the
+    // legacy stream would not order before a kernel on this non-blocking one (a pageable H2D copy may return before
+    // its DMA lands)
+    scatter_fn: cuda.Function,
+    gather_fn: cuda.Function,
+    copy_fn: cuda.Function,
     map: cuda.HostBuffer,
     map_dev: Ptr,
     toks: cuda.HostBuffer, // the selection read back: tokens [rows, W] i32
@@ -51,9 +66,15 @@ pub const Tier = struct {
         errdefer gpa.destroy(t);
         t.d = d;
         t.at_next = 0;
-        t.slab = try cuda.HostBuffer.allocMapped(d, slab_bytes);
+        t.slab = try cuda.DeviceBuffer.alloc(d, slab_bytes);
         errdefer t.slab.free();
-        t.slab_dev = try t.slab.device();
+        t.slab_dev = t.slab.ptr;
+        t.stage = try cuda.DeviceBuffer.alloc(d, stage_slots * kv.block);
+        errdefer t.stage.free();
+        t.idx = try cuda.DeviceBuffer.alloc(d, 2 * stage_slots * 4);
+        errdefer t.idx.free();
+        t.xs = try cuda.Stream.init(d, true);
+        errdefer t.xs.deinit();
         t.map = try cuda.HostBuffer.allocMapped(d, o.mapBlocks() * o.capacity / kv.pool_rows * 4);
         errdefer t.map.free();
         t.map_dev = try t.map.device();
@@ -73,9 +94,72 @@ pub const Tier = struct {
         t.module = try cuda.Module.load(d, cuda.kernels.glm53_tier);
         errdefer t.module.unload();
         t.remap_fn = try t.module.function("tf_glm53_tier_remap");
-        const slab: []align(kv.block) u8 = @alignCast(t.slab.bytes);
+        t.scatter_fn = try t.module.function("tf_glm53_tier_scatter");
+        t.gather_fn = try t.module.function("tf_glm53_tier_gather");
+        t.copy_fn = try t.module.function("tf_glm53_tier_copy");
+        const slab: kv.Slab = .{ .ctx = t, .slots = slab_bytes / kv.block, .put = slabPut, .get = slabGet, .copy = slabCopy };
         t.host = try kv.Tier.init(gpa, slab, t.map.slice(i32), path, o);
         return t;
+    }
+
+    /// Slots a stage carries (a call larger than this goes in pieces).
+    const stage_slots = 4096;
+
+    fn launchSlots(t: *Tier, f: cuda.Function, n: usize, args: *cuda.Args) !void {
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, t.xs, args);
+    }
+
+    fn slabPut(ctx: *anyopaque, slots: []const u32, bytes: []const u8) anyerror!void {
+        const t: *Tier = @ptrCast(@alignCast(ctx));
+        var at: usize = 0;
+        while (at < slots.len) : (at += stage_slots) {
+            const n: usize = @min(@as(usize, stage_slots), slots.len - at);
+            try t.stage.uploadAsync(0, bytes[at * kv.block ..][0 .. n * kv.block], t.xs.handle);
+            try t.idx.uploadAsync(0, std.mem.sliceAsBytes(slots[at..][0..n]), t.xs.handle);
+            var args: cuda.Args = .{};
+            args.add(t.stage.ptr);
+            args.add(t.slab.ptr);
+            args.add(t.idx.ptr);
+            try t.launchSlots(t.scatter_fn, n, &args);
+            try t.xs.synchronize();
+        }
+    }
+
+    fn slabGet(ctx: *anyopaque, slots: []const u32, out: []u8) anyerror!void {
+        const t: *Tier = @ptrCast(@alignCast(ctx));
+        var at: usize = 0;
+        while (at < slots.len) : (at += stage_slots) {
+            const n: usize = @min(@as(usize, stage_slots), slots.len - at);
+            try t.idx.uploadAsync(0, std.mem.sliceAsBytes(slots[at..][0..n]), t.xs.handle);
+            var args: cuda.Args = .{};
+            args.add(t.slab.ptr);
+            args.add(t.stage.ptr);
+            args.add(t.idx.ptr);
+            try t.launchSlots(t.gather_fn, n, &args);
+            try t.xs.synchronize();
+            try t.stage.download(0, out[at * kv.block ..][0 .. n * kv.block]);
+        }
+    }
+
+    fn slabCopy(ctx: *anyopaque, dst: []const u32, src: []const u32) anyerror!void {
+        const t: *Tier = @ptrCast(@alignCast(ctx));
+        var at: usize = 0;
+        while (at < dst.len) : (at += stage_slots) {
+            const n: usize = @min(@as(usize, stage_slots), dst.len - at);
+            try t.idx.uploadAsync(0, std.mem.sliceAsBytes(dst[at..][0..n]), t.xs.handle);
+            try t.idx.uploadAsync(stage_slots * 4, std.mem.sliceAsBytes(src[at..][0..n]), t.xs.handle);
+            var args: cuda.Args = .{};
+            args.add(t.slab.ptr);
+            args.add(t.idx.ptr);
+            args.add(t.idx.ptr + stage_slots * 4);
+            try t.launchSlots(t.copy_fn, n, &args);
+            try t.xs.synchronize();
+        }
+    }
+
+    /// Slot `slot`'s bytes (kv_tier.block of them) into `out`: the tests' view of the slab.
+    pub fn readSlot(t: *Tier, slot: usize, out: []u8) !void {
+        try t.host.getSlot(@intCast(slot), out);
     }
 
     /// Second pieces (and remap chains) in flight at most before a slot of their ring is written again: a window's
@@ -85,6 +169,9 @@ pub const Tier = struct {
     pub fn deinit(t: *Tier, gpa: std.mem.Allocator) void {
         t.host.deinit();
         t.module.unload();
+        t.xs.deinit();
+        t.idx.free();
+        t.stage.free();
         t.chains.free();
         t.at.free();
         t.cnts.free();
