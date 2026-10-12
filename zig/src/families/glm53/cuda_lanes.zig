@@ -71,6 +71,7 @@ const Slot = struct {
     pending: ?usize = null, // the last window's rows, uncommitted
     drafts: bool = false, // the stream drafts: its head absorbs the kept rows
     prompt_sha256: [32]u8 = @splat(0),
+    admission_id: u64 = 0, // rank-local open order, unique across slot reuse while logical tracing
     sampled: [max_rows]u32 = undefined,
     held: [depth]u32 = undefined,
     probs: [depth]f64 = undefined,
@@ -109,6 +110,7 @@ pub const Lanes = struct {
     /// The records since the last agreement (`agreesNow` false ones fold in here and are agreed on with the next).
     pending: std.crypto.hash.sha2.Sha256 = .init(.{}),
     pending_bad: bool = false,
+    logical_admissions: u64 = 0,
     logical_event: u64 = 0,
     logical_trace: bool = false, // TF_GLM_LOGICAL_OCCUPANCY_TRACE=1: core and backend state before release
     occupancy_event: u64 = 0,
@@ -562,13 +564,13 @@ pub const Lanes = struct {
                     const finished = rd.byte().?;
                     var identity: [32]u8 = undefined;
                     for (&identity) |*b| b.* = rd.byte().?;
-                    std.log.info("glm_logical_slot rank={d} event={d} slot={d} stream_sha256={s} prompt_sha256_le={s} logical_tokens={d} prompt_tokens={d} generated_tokens={d} core_cache_len={d} core_pending_present={d} core_pending_token={d} core_pending_matches_last={d} finished={d} durable_pos={d} window_pending_rows={d} mtp_pos={d} mtp_drafted={d} base={d} size={d}", .{ self.lay.rank, self.logical_event, slot, std.fmt.bytesToHex(identity, .lower), std.fmt.bytesToHex(s.prompt_sha256, .lower), logical, prompt, generated, core_cache, pending, token, matches_last, finished, q.len(), s.pending orelse 0, q.mtp_len, q.mtp_drafted, s.base, s.size });
+                    std.log.info("glm_logical_slot rank={d} event={d} slot={d} admission_id={d} stream_label_sha256={s} prompt_sha256_le={s} logical_tokens={d} prompt_tokens={d} generated_tokens={d} core_cache_len={d} core_pending_present={d} core_pending_token={d} core_pending_matches_last={d} finished={d} backend_pos={d} window_pending_rows={d} mtp_pos={d} mtp_drafted={d} base={d} size={d}", .{ self.lay.rank, self.logical_event, slot, s.admission_id, std.fmt.bytesToHex(identity, .lower), std.fmt.bytesToHex(s.prompt_sha256, .lower), logical, prompt, generated, core_cache, pending, token, matches_last, finished, q.len(), s.pending orelse 0, q.mtp_len, q.mtp_drafted, s.base, s.size });
                     if (q.tier) |x| {
                         const hs = [_]usize{ x.h, x.hm };
                         for (hs, 0..) |h, head| {
                             const t = &x.t.host;
                             const st = t.streams[h];
-                            std.log.info("glm_logical_tier rank={d} event={d} slot={d} head={d} h={d} parent={?d} depth={d} end={d} committed={d} file_fd={d}", .{ self.lay.rank, self.logical_event, slot, head, h, st.parent, t.aliasDepth(h), st.end, st.committed, t.io.fd });
+                            std.log.info("glm_logical_tier rank={d} event={d} slot={d} head={d} h={d} parent={?d} depth={d} end={d} committed={d} owed={?d} file_fd={d}", .{ self.lay.rank, self.logical_event, slot, head, h, st.parent, t.aliasDepth(h), st.end, st.committed, q.tier_owed[head], t.io.fd });
                         }
                     }
                 }
@@ -598,6 +600,22 @@ pub const Lanes = struct {
                     std.log.info("glm_occupancy_tier rank={d} event={d} slot={d} head={d} h={d} parent={?d} depth={d} end={d} committed={d} file_fd={d}", .{ self.lay.rank, self.occupancy_event, slot, head, h, st.parent, t.aliasDepth(h), st.end, st.committed, t.io.fd });
                 }
             }
+        }
+    }
+
+    fn traceAdmission(self: *Lanes, s: *Slot, ids: []const u32) void {
+        if (self.logical_trace) {
+            self.logical_admissions += 1;
+            s.admission_id = self.logical_admissions;
+        }
+        if (self.occupancy_trace or self.logical_trace) {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (ids) |id| {
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, id, .little);
+                hash.update(&bytes);
+            }
+            hash.final(&s.prompt_sha256);
         }
     }
 
@@ -636,15 +654,7 @@ pub const Lanes = struct {
         }
         self.settle();
         s.* = .{ .seq = s.seq, .busy = true, .base = base, .size = size, .prompt = ids, .filling = true, .marks = inherited };
-        if (self.occupancy_trace) {
-            var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            for (ids) |id| {
-                var bytes: [4]u8 = undefined;
-                std.mem.writeInt(u32, &bytes, id, .little);
-                hash.update(&bytes);
-            }
-            hash.final(&s.prompt_sha256);
-        }
+        self.traceAdmission(s, ids);
         const q = &s.seq.?;
         if (self.tier) |t| {
             const nd = q.st.caches.len;
@@ -841,8 +851,8 @@ pub const Lanes = struct {
         if (self.logical_trace) try self.traceLogical(windows);
     }
 
-    /// The core has concluded every selected stream and the backend has committed its kept rows. This runs
-    /// before Engine.step releases finished streams; a sampled pending token has no KV row yet.
+    /// The core has concluded every selected stream and the backend has settled its kept rows on the ordered
+    /// stream; tier host commits can still be owed. Before release, a sampled pending token has no KV row yet.
     fn traceLogical(self: *Lanes, windows: []const be.Window) !void {
         var w: Writer = .{ .b = self.op_buf };
         w.byte(@intFromEnum(Op.logical));
@@ -1085,4 +1095,47 @@ test "logical observations reject missing or repeated live slots and malformed m
     buf[2 + 56] = 1;
     buf[2 + 1 + 20] = 2;
     try std.testing.expect(!l.runnable(w.done()));
+}
+
+
+test "logical admission identities distinguish production labels and slot reuse" {
+    const gpa = std.testing.allocator;
+    var a = try lanes.Stream.init(gpa, .{ .id = "request", .prompt = &.{ 1, 2 }, .max_new = 64 });
+    defer a.deinit(gpa);
+    var b = try lanes.Stream.init(gpa, .{ .id = "request", .prompt = &.{ 1, 3 }, .max_new = 64 });
+    defer b.deinit(gpa);
+    try std.testing.expectEqualStrings(a.id, b.id);
+    var l: Lanes = undefined;
+    l.logical_trace = true;
+    l.occupancy_trace = false;
+    l.logical_admissions = 0;
+    var one: Slot = .{};
+    var two: Slot = .{};
+    l.traceAdmission(&one, a.context.items);
+    l.traceAdmission(&two, b.context.items);
+    try std.testing.expectEqual(@as(u64, 1), one.admission_id);
+    try std.testing.expectEqual(@as(u64, 2), two.admission_id);
+    try std.testing.expect(!std.mem.eql(u8, &one.prompt_sha256, &two.prompt_sha256));
+    try std.testing.expect(!std.mem.eql(u8, &one.prompt_sha256, &@as([32]u8, @splat(0))));
+    try std.testing.expectEqualStrings("34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f", &std.fmt.bytesToHex(one.prompt_sha256, .lower));
+    var follower: Lanes = undefined;
+    follower.logical_trace = true;
+    follower.occupancy_trace = false;
+    follower.logical_admissions = 0;
+    var follower_slot: Slot = .{};
+    follower.traceAdmission(&follower_slot, a.context.items);
+    follower.traceAdmission(&follower_slot, b.context.items);
+    try std.testing.expectEqual(two.admission_id, follower_slot.admission_id);
+    try std.testing.expectEqualSlices(u8, &two.prompt_sha256, &follower_slot.prompt_sha256);
+    const digest = one.prompt_sha256;
+    one = .{};
+    l.traceAdmission(&one, a.context.items);
+    try std.testing.expectEqual(@as(u64, 3), one.admission_id);
+    try std.testing.expectEqualSlices(u8, &digest, &one.prompt_sha256);
+    l.logical_trace = false;
+    one = .{};
+    l.traceAdmission(&one, a.context.items);
+    try std.testing.expectEqual(@as(u64, 0), one.admission_id);
+    try std.testing.expectEqual(@as(u64, 3), l.logical_admissions);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &one.prompt_sha256);
 }
