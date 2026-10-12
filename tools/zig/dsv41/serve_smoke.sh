@@ -58,6 +58,10 @@ PROMPT_SMS=${PROMPT_SMS:-36}
 # is unchanged.
 PIECES=${PIECES:-4}
 URGENT=${URGENT:-0}
+# The prompt mHC (TF_DS_HC=cuda: hc_fused.cu) and GEMM prep (TF_DS_GEMM_PREP=fused): byte-equal to the split kernels
+# (their _CHECK switches); split restores the captured kernels.
+HC=${HC:-cuda}
+GEMM_PREP=${GEMM_PREP:-fused}
 # Copy drafts (TF_DS_COPY_DRAFTS) propose prompt-reference copies for edit-like replies; COPY_POSITION prices a copy
 # window at its stream's position and COPY_SHARE keeps shared rows for the other streams (measured 2026-10-12: all
 # token shas unchanged; 256k needle 31 -> 63 tok/s, code beside an edit 18 -> 36 tok/s). 0 turns each off.
@@ -194,6 +198,7 @@ esac
 [ -n "$POOL" ] && ENVS="$ENVS -e TF_DS_POOL=$POOL"
 [ "$LINK_POLL" = 0 ] && ENVS="$ENVS -e TF_DS_LINK_POLL=0"
 ENVS="$ENVS -e TF_DS_PROMPT_SMS=$PROMPT_SMS -e TF_DS_ROUNDS_URGENT=$URGENT -e TF_DS_PROMPT_PIECES=$PIECES"
+ENVS="$ENVS -e TF_DS_HC=$HC -e TF_DS_GEMM_PREP=$GEMM_PREP"
 ENVS="$ENVS -e TF_DS_COPY_DRAFTS=$COPY_DRAFTS -e TF_DS_COPY_POSITION=$COPY_POSITION -e TF_DS_COPY_SHARE=$COPY_SHARE"
 ENVS="$ENVS ${EXTRA_ENVS:-}"   # e.g. EXTRA_ENVS="-e TF_DS_GRAPHS=0"
 SERVE="/b/tensorfold-native serve /models/$MODEL --tp 2 --master $MASTER --master-port $MASTER_PORT"
