@@ -542,6 +542,7 @@ pub const Lanes = struct {
             t.favor(h, true);
         }
         try q.bind(self.pool, base, size);
+        q.reach(self.capacity);
         try q.reset(self.r.stream);
         if (reuse) |r| {
             const at = r.cut - 1; // the book's point is one past the boundary

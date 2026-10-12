@@ -95,6 +95,13 @@ pub const Seq = struct {
         q.mcache.tier = if (q.tier) |x| .{ .t = x.t, .h = x.hm, .layer = 0 } else null;
     }
 
+    /// The positions the stream may reach (its context), which its selections are sized by, as one cache of that
+    /// capacity sizes them, whatever its extent.
+    pub fn reach(q: *Seq, most: usize) void {
+        for (q.st.caches) |*c| c.most = most;
+        q.mcache.most = most;
+    }
+
     /// A new sequence from position 0 (the head's too).
     pub fn reset(q: *Seq, stream: cuda.Stream) !void {
         try q.st.reset(stream);
@@ -144,8 +151,9 @@ pub const Runner = struct {
     picks: Buf, // [batch_rows] i32 ids, then the rows' (value, id) pairs sent and every rank's received
     topk_mod: cuda.Module,
     topk_fn: cuda.Function, // tf_glm53_topk_row (glm53/topk.cu): a row's k best on the device
-    /// TF_GLM_DRAFT_TOPK=0: `sample` scans the row on the host; TF_GLM_TOPK_CHECK=1: both, compared every call.
-    topk: enum { device, host, check } = .device,
+    /// TF_GLM_DRAFT_TOPK=1: `sample` takes the row's k best on the device (default: the host scan, faster until the
+    /// device's runs on more than one block); TF_GLM_TOPK_CHECK=1: both, compared every call.
+    topk: enum { device, host, check } = .host,
     split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
     overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
@@ -171,8 +179,8 @@ pub const Runner = struct {
         r.topk_mod = try cuda.Module.load(d, cuda.kernels.glm53_topk);
         errdefer r.topk_mod.unload();
         r.topk_fn = try r.topk_mod.function("tf_glm53_topk_row");
-        if (std.c.getenv("TF_GLM_DRAFT_TOPK")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) {
-            r.topk = .host;
+        if (std.c.getenv("TF_GLM_DRAFT_TOPK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+            r.topk = .device;
         };
         if (std.c.getenv("TF_GLM_TOPK_CHECK")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
             r.topk = .check;

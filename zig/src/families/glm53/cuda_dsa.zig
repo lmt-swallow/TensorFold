@@ -155,6 +155,10 @@ pub const Cache = struct {
     ring: usize,
     kv: Kv,
     owned: bool = true, // latent and pk are this cache's allocations, not a pool's
+    /// The positions a stream may reach (a served stream's context, not its extent: 0 means `capacity`). sparse.py
+    /// sizes its selection by the cache's own capacity, so the pool counts and their kernels depend on it; the scores
+    /// read no pooled key past a row's visible ones, so a view smaller than this reads nothing outside itself.
+    most: usize = 0,
     /// The latent rows on the tier (cuda_tier.zig: a slab of resident pools, the rest on NVMe) instead of `latent`:
     /// the latent write, dense and sparse attention take their addresses from it, the kernels and bits unchanged.
     tier: ?TierRef = null,
@@ -212,9 +216,9 @@ pub const Cache = struct {
         s.ig.free();
     }
 
-    /// Pools the pooled-key plane holds (sparse.py's np_max: its rows less the 2 of pad).
+    /// sparse.py's np_max: the pools of the positions the stream may reach (`most`, else the cache's capacity).
     pub fn poolRows(s: *const Cache) usize {
-        return s.capacity / 4;
+        return (if (s.most != 0) s.most else s.capacity) / 4;
     }
 };
 
