@@ -59,7 +59,8 @@ PROMPT_SMS=${PROMPT_SMS:-36}
 PIECES=${PIECES:-4}
 URGENT=${URGENT:-0}
 # The prompt mHC (TF_DS_HC=cuda: hc_fused.cu) and GEMM prep (TF_DS_GEMM_PREP=fused): byte-equal to the split kernels
-# (their _CHECK switches); split restores the captured kernels.
+# (their _CHECK switches); split restores the captured kernels. Pair, 2026-10-12, cold 64k (needle answered, the
+# same output sha in every setting): split 2,181 tok/s, HC=cuda 2,350, both 2,390 (+9.6%).
 HC=${HC:-cuda}
 GEMM_PREP=${GEMM_PREP:-fused}
 # Copy drafts (TF_DS_COPY_DRAFTS) propose prompt-reference copies for edit-like replies; COPY_POSITION prices a copy
