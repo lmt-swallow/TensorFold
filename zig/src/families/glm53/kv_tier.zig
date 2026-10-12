@@ -154,6 +154,7 @@ pub const Tier = struct {
     free_slots: std.ArrayList(u32) = .empty, // loose slots holding nothing
     streams: []Stream,
     hand: usize = 0,
+    hot_steps: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     window: u32 = 1,
     gen: u32 = 1,
     io: Io,
@@ -203,6 +204,7 @@ pub const Tier = struct {
         t.wr_stage = try gpa.alignedAlloc(u8, .fromByteUnits(block), stage_blocks * block);
         errdefer gpa.free(t.wr_stage);
         t.hand = 0;
+        t.hot_steps = if (builtin.is_test) 0 else {};
         t.window = 1;
         t.gen = 1;
         t.reads = 0;
@@ -881,8 +883,9 @@ pub const Tier = struct {
 
     /// Pools `keys` (map -2, persisted) into loose slots, their reads queued.
     fn readIn(t: *Tier, keys: []const u32) Error!void {
+        var hot_empty = false;
         for (keys) |k| {
-            const slot = try t.allocLoose();
+            const slot = try t.allocLooseCached(&hot_empty);
             t.away[k / t.pools] -= 1;
             t.own(slot, k);
             t.map[k] = @intCast(slot);
@@ -960,6 +963,12 @@ pub const Tier = struct {
     /// A loose slot holding nothing: a free one (a free run turned loose if need be), else the clock's choice among written pools no current call names
     /// (first sparing the pools of the last hot_windows windows).
     fn allocLoose(t: *Tier) Error!u32 {
+        return t.allocLooseCached(null);
+    }
+
+    // A failed hot sweep stays empty within readIn: newly loaded pools are pinned.
+    // Other callers do not retain this result across changes to owners or windows.
+    fn allocLooseCached(t: *Tier, hot_empty: ?*bool) Error!u32 {
         while (t.free_slots.pop()) |slot| {
             if (t.runs[slot / run_pools].kind == .loose and t.owner[slot] == none) return slot;
         }
@@ -975,8 +984,12 @@ pub const Tier = struct {
         };
         const n = t.owner.len;
         for ([_]bool{ true, false }) |hot| {
+            if (hot and hot_empty != null and hot_empty.?.*) continue;
             var steps: usize = 0;
             while (steps < 2 * n) : (steps += 1) {
+                if (builtin.is_test) if (hot) {
+                    t.hot_steps += 1;
+                };
                 const slot = t.hand;
                 t.hand = (t.hand + 1) % n;
                 if (t.runs[slot / run_pools].kind != .loose) continue;
@@ -989,6 +1002,9 @@ pub const Tier = struct {
                 t.evict(slot);
                 return @intCast(slot);
             }
+            if (hot) if (hot_empty) |empty| {
+                empty.* = true;
+            };
         }
         // pools waiting for a batched commit are not evictable: write every stream's out and sweep once more
         if (!t.flushing) {
@@ -997,8 +1013,10 @@ pub const Tier = struct {
             if (waiting) {
                 t.flushing = true;
                 defer t.flushing = false;
+                // writeOut can make previously unwritten pools hot-evictable, even on partial failure.
+                if (hot_empty) |empty| empty.* = false;
                 for (t.streams, 0..) |st, x| if (st.open) try t.writeOut(x);
-                return t.allocLoose();
+                return t.allocLooseCached(hot_empty);
             }
         }
         return error.TierFull;
@@ -1975,4 +1993,184 @@ test "bench (TF_TIER_BENCH=positions): 4 stream-layers' prompt and decode select
     std.debug.print("\nkv_tier bench: {d} positions x {d} layers, slab {d} runs (about half); prompt bookkeeping and writes {d:.2} ms a 2,048-row chunk; a window of 4 rows x 512 pools on each layer: one fetch a layer {d:.3} ms ({d:.0} pools read), one fetchMany {d:.3} ms ({d:.0} pools read) (aio {}, direct {}, {d} lanes of {d})\n", .{
         N, L, runs, fill_ms / @as(f64, @floatFromInt(N / seg_positions)), @as(f64, @floatFromInt(one_ns)) / 1e6 / f, @as(f64, @floatFromInt(reads_one)) / f, @as(f64, @floatFromInt(many_ns)) / 1e6 / f, @as(f64, @floatFromInt(reads_many)) / f, t.io.aio, t.io.direct, o.lanes, o.depth,
     });
+}
+
+// The uncached path retains the original two-pass clock and is the reference for every prefix.
+fn expectClockEqual(a: *const Tier, b: *const Tier) !void {
+    try testing.expectEqual(a.hand, b.hand);
+    try testing.expectEqual(a.gen, b.gen);
+    try testing.expectEqual(a.window, b.window);
+    try testing.expectEqualSlices(u32, a.block_user, b.block_user);
+    try testing.expectEqualSlices(u32, a.block_of, b.block_of);
+    try testing.expectEqualSlices(u32, a.seg_run, b.seg_run);
+    try testing.expectEqualSlices(u32, a.home, b.home);
+    try testing.expectEqualSlices(i32, a.map, b.map);
+    try testing.expectEqualSlices(u32, a.owner, b.owner);
+    try testing.expectEqualSlices(u32, a.pin, b.pin);
+    try testing.expectEqualSlices(u32, a.used, b.used);
+    try testing.expectEqualSlices(u32, a.away, b.away);
+    try testing.expectEqualSlices(u32, a.free_slots.items, b.free_slots.items);
+    for (0..a.owner.len) |i| try testing.expectEqual(a.ref.isSet(i), b.ref.isSet(i));
+    for (0..a.map.len) |i| try testing.expectEqual(a.persisted.isSet(i), b.persisted.isSet(i));
+    for (a.runs, b.runs) |x, y| try testing.expectEqualDeep(x, y);
+    for (a.streams, b.streams) |x, y| try testing.expectEqualDeep(x, y);
+    try testing.expectEqual(a.reads, b.reads);
+    try testing.expectEqual(a.writes, b.writes);
+    try testing.expectEqual(a.write_calls, b.write_calls);
+    try testing.expectEqual(a.flushing, b.flushing);
+}
+
+fn seedClock(t: *Tier, favored: bool) void {
+    t.hand = 0;
+    t.persisted.unsetAll();
+    t.ref.unsetAll();
+    @memset(t.map, -1);
+    t.block_user[0] = 0;
+    t.block_user[1] = 1;
+    t.block_of[0] = 0;
+    t.block_of[1] = 1;
+    t.streams[0].favored = favored;
+    t.free_slots.clearRetainingCapacity();
+    @memset(t.away, 0);
+    for (t.runs) |*r| r.* = .{ .kind = .loose, .held = run_pools };
+    // The unfavored MTP owns a linear run; it must not hide the absence of hot loose victims.
+    t.runs[t.runs.len - 1].kind = .linear;
+    for (t.owner, 0..) |*owner, slot| {
+        const k: u32 = @intCast(if (slot / run_pools == t.runs.len - 1) t.pools + slot else slot);
+        owner.* = k;
+        t.map[k] = @intCast(slot);
+        t.persisted.set(k);
+        t.pin[slot] = t.gen -% 1;
+        t.used[slot] = 0;
+        if (slot % 3 != 0) t.ref.set(slot) else t.ref.unset(slot);
+    }
+}
+
+test "failed hot sweep caching preserves every clock prefix and bounds examinations" {
+    const o: Options = .{ .streams = 2, .layers = 1, .capacity = 16 * seg_positions, .row_bytes = 16, .hot_windows = 0 };
+    const a = try Fixture.init(o, 3, 0xc101);
+    defer a.deinit();
+    const b = try Fixture.init(o, 3, 0xc102);
+    defer b.deinit();
+    for ([_]bool{ true, false }) |favored| {
+        seedClock(&a.tier, favored);
+        seedClock(&b.tier, favored);
+        a.tier.hot_steps = 0;
+        b.tier.hot_steps = 0;
+        var empty = false;
+        for (0..128) |i| {
+            const x = try a.tier.allocLoose();
+            const y = try b.tier.allocLooseCached(&empty);
+            try testing.expectEqual(x, y);
+            // A readIn replacement is pinned for the remainder of this fetch.
+            const k: u32 = @intCast(a.tier.owner.len + i);
+            a.tier.own(x, k);
+            b.tier.own(y, k);
+            a.tier.map[k] = @intCast(x);
+            b.tier.map[k] = @intCast(y);
+            a.tier.touch(x);
+            b.tier.touch(y);
+            try expectClockEqual(&a.tier, &b.tier);
+        }
+        if (favored) {
+            try testing.expectEqual(2 * a.tier.owner.len * 128, a.tier.hot_steps);
+            try testing.expectEqual(2 * b.tier.owner.len, b.tier.hot_steps);
+        } else try testing.expectEqual(a.tier.hot_steps, b.tier.hot_steps);
+    }
+}
+
+fn readInUncached(t: *Tier, keys: []const u32) !void {
+    for (keys) |k| {
+        const slot = try t.allocLoose();
+        t.away[k / t.pools] -= 1;
+        t.own(slot, k);
+        t.map[k] = @intCast(slot);
+        t.touch(slot);
+        t.note(slot, .file_read, k);
+        try t.readSlot(slot, Tier.fileOffset(k));
+    }
+    t.reads += keys.len;
+}
+
+test "failed hot cache spans read-stage flushes without changing restored bytes" {
+    const o: Options = .{ .streams = 2, .layers = 1, .capacity = 32 * seg_positions, .row_bytes = 16, .hot_windows = 0 };
+    const a = try Fixture.init(o, 17, 0xc103);
+    defer a.deinit();
+    const b = try Fixture.init(o, 17, 0xc104);
+    defer b.deinit();
+    const count = Tier.stage_blocks + 1;
+    var keys: [count]u32 = undefined;
+    var ids: [count]u32 = undefined;
+    for (&keys, &ids, 0..) |*k, *id, i| {
+        k.* = @intCast(a.tier.owner.len + i);
+        id.* = @intCast(i);
+    }
+    for ([_]*Fixture{ a, b }) |f| {
+        seedClock(&f.tier, true);
+        for (f.host.bytes, 0..) |*byte, i| byte.* = @truncate(i *% 73 +% i / 61);
+        try f.tier.writeStage(ids[0..Tier.stage_blocks], keys[0..Tier.stage_blocks]);
+        try f.tier.writeStage(ids[Tier.stage_blocks..], keys[Tier.stage_blocks..]);
+        for (keys) |k| f.tier.map[k] = -2;
+        f.tier.away[0] = count;
+    }
+    try readInUncached(&a.tier, &keys);
+    try b.tier.readIn(&keys);
+    try a.tier.flushReads();
+    try b.tier.flushReads();
+    try expectClockEqual(&a.tier, &b.tier);
+    try testing.expectEqualSlices(u8, a.host.bytes, b.host.bytes);
+    try testing.expectEqual(2 * b.tier.owner.len, b.tier.hot_steps);
+    try testing.expectEqual(2 * a.tier.owner.len * count, a.tier.hot_steps);
+}
+
+const FailingClockSlab = struct {
+    host: *HostSlab,
+    calls: usize = 0,
+    fn get(ctx: *anyopaque, slots: []const u32, out: []u8) anyerror!void {
+        const self: *FailingClockSlab = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.calls == 2) return error.InjectedFailure;
+        try HostSlab.get(self.host, slots, out);
+    }
+};
+
+test "writeOut invalidates a failed hot sweep before success or partial failure" {
+    const o: Options = .{ .streams = 2, .layers = 1, .capacity = 32 * seg_positions, .row_bytes = 16, .hot_windows = 0 };
+    for ([_]bool{ false, true }, 0..) |fail, case| {
+        const a = try Fixture.init(o, 17, 0xc105 + case * 2);
+        defer a.deinit();
+        const b = try Fixture.init(o, 17, 0xc106 + case * 2);
+        defer b.deinit();
+        for ([_]*Fixture{ a, b }) |f| {
+            seedClock(&f.tier, false);
+            f.tier.persisted.unsetAll();
+            f.tier.streams[0].open = true;
+            f.tier.streams[0].layers = 1;
+            f.tier.streams[0].committed = (Tier.stage_blocks + 1) * pool_rows;
+        }
+        var sa: FailingClockSlab = .{ .host = &a.host };
+        var sb: FailingClockSlab = .{ .host = &b.host };
+        if (fail) {
+            a.tier.slab.ctx = &sa;
+            a.tier.slab.get = FailingClockSlab.get;
+            b.tier.slab.ctx = &sb;
+            b.tier.slab.get = FailingClockSlab.get;
+        }
+        var empty = true;
+        if (fail) {
+            try testing.expectError(error.SlabFailed, a.tier.allocLoose());
+            try testing.expectError(error.SlabFailed, b.tier.allocLooseCached(&empty));
+            try testing.expect(!empty);
+            try testing.expectEqual(@as(usize, 2), sa.calls);
+            try testing.expectEqual(sa.calls, sb.calls);
+            try testing.expect(a.tier.persisted.isSet(Tier.stage_blocks - 1));
+            try testing.expect(!a.tier.persisted.isSet(Tier.stage_blocks));
+        } else {
+            const x = try a.tier.allocLoose();
+            const y = try b.tier.allocLooseCached(&empty);
+            try testing.expectEqual(x, y);
+            try testing.expect(!empty);
+        }
+        try expectClockEqual(&a.tier, &b.tier);
+    }
 }
