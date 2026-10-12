@@ -306,6 +306,7 @@ pub fn run(g: Glue, k: *const Kernels, mk: *const moe.Kernels, lay: config.Layou
     try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, n * D, stream);
     try afterAttention(g, c, m, b, lay.world, n, stream);
     try moe.moeBlock(g, mk, lay, &m.moe, step.ms, b.normed.ptr, b.part.ptr, b.sk.ptr, n, stream);
+    if (step.ms.trace) |t| try t.capture(lay.cfg.layers, step.ms.pick, n, step.ms.slots, stream);
     try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, n * D, stream);
     try head(g, k, c, m, b, lay.world, n, stream);
 }
@@ -390,6 +391,7 @@ pub fn runSegs(g: Glue, k: *const Kernels, mk: *const moe.Kernels, lay: config.L
     try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
     try afterAttention(g, c, m, b, lay.world, R, stream);
     try moe.moeBlock(g, mk, lay, &m.moe, ms, b.normed.ptr, b.part.ptr, b.sk.ptr, R, stream);
+    if (ms.trace) |t| try t.capture(lay.cfg.layers, ms.pick, R, ms.slots, stream);
     try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
     // the residual over every row; each stream's last row normed into its head row, then the heads' logits at once
     try g.residualAdd(b.mx.ptr, b.mx.ptr, b.gath.ptr, lay.world, R, stream);

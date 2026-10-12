@@ -18,6 +18,7 @@ const T = @import("cuda_mtp.zig");
 const copy_drafts = @import("copy_drafts.zig");
 const P = @import("cuda_pool.zig");
 const Tr = @import("cuda_tier.zig");
+const UT = @import("cuda_union_trace.zig");
 const RP = @import("round_profile.zig");
 const Pm = @import("cuda_prompt.zig");
 
@@ -170,6 +171,7 @@ pub const Runner = struct {
     topk_two: bool = true,
     /// TF_GLM_ROUND_PROFILE=1 on rank 0: the first rounds' phases logged (round_profile.zig).
     prof: ?RP.Profile = null,
+    union_trace: ?*UT.Trace = null,
     split: ?Pm.Split = null, // TF_GLM_HC_SPLIT=1: prompt chunks row-split between the ranks
     overlap: ?*Pm.Overlap = null, // TF_GLM_PREFILL_OVERLAP=1|2: their gathers on a second stream
 
@@ -212,6 +214,16 @@ pub const Runner = struct {
             r.topk = .check;
         };
         if (lay.rank == 0) r.prof = try RP.Profile.fromEnv(d);
+        if (std.c.getenv("TF_GLM_EXPERT_UNION_TRACE")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+            const t = try gpa.create(UT.Trace);
+            errdefer gpa.destroy(t);
+            t.* = try UT.Trace.init(d);
+            r.union_trace = t;
+        };
+        errdefer if (r.union_trace) |t| {
+            t.deinit();
+            gpa.destroy(t);
+        };
         r.players = try gpa.alloc(Pm.Layer, model.layers.len);
         errdefer gpa.free(r.players);
         r.pmodel = Pm.of(model, lay.cfg, mtp, r.players);
@@ -221,6 +233,10 @@ pub const Runner = struct {
 
     pub fn deinit(r: *Runner) void {
         if (r.prof) |*p| p.deinit();
+        if (r.union_trace) |t| {
+            t.deinit();
+            r.gpa.destroy(t);
+        }
         r.picks.free();
         r.heads.free();
         r.argmax_mod.unload();
@@ -318,6 +334,7 @@ pub const Runner = struct {
     fn hostBest(r: *Runner, logits: Buf, row: usize, k: usize) ![2 * draft_k]f32 {
         const nv = r.host.len;
         try r.stream.synchronize();
+        if (r.union_trace) |t| try t.flush(r.lay.rank);
         try logits.download(row * nv * 2, std.mem.sliceAsBytes(r.host));
         var best: [draft_k]Cand = undefined;
         var n: usize = 0;
@@ -362,6 +379,7 @@ pub const Runner = struct {
             if (r.topk == .check) {
                 var dev: [2 * draft_k]f32 = undefined;
                 try r.stream.synchronize();
+                if (r.union_trace) |t| try t.flush(r.lay.rank);
                 try r.cand.download(0, std.mem.sliceAsBytes(dev[0 .. 2 * k]));
                 if (!std.mem.eql(u32, @ptrCast(dev[0 .. 2 * k]), @ptrCast(mine[0 .. 2 * k]))) {
                     std.log.err("glm53: the device top-{d} differs from the host scan (row {d})", .{ k, row });
@@ -371,6 +389,7 @@ pub const Runner = struct {
         }
         try r.link.gather(r.link.ctx, r.cand.ptr, r.cand.ptr + 2 * draft_k * 4, 2 * k, r.stream);
         try r.stream.synchronize();
+        if (r.union_trace) |t| try t.flush(r.lay.rank);
         var both: [4 * draft_k]f32 = undefined;
         try r.cand.download(2 * draft_k * 4, std.mem.sliceAsBytes(both[0 .. 4 * k]));
         var all: [2 * draft_k]Cand = undefined;
@@ -403,6 +422,7 @@ pub const Runner = struct {
         try cuda.launch.launch(r.argmax_fn, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, r.stream, &a);
         var ids: [batch_rows]i32 = undefined;
         try r.stream.synchronize();
+        if (r.union_trace) |t| try t.flush(r.lay.rank);
         try r.picks.download(0, std.mem.sliceAsBytes(ids[0..n]));
         var mine: [2 * batch_rows]f32 = undefined;
         for (ids[0..n], 0..) |id, row| {
@@ -417,6 +437,7 @@ pub const Runner = struct {
         try r.picks.uploadAsync(send, std.mem.sliceAsBytes(mine[0 .. 2 * n]), r.stream.handle);
         try r.link.gather(r.link.ctx, r.picks.ptr + send, r.picks.ptr + recv, 2 * n, r.stream);
         try r.stream.synchronize();
+        if (r.union_trace) |t| try t.flush(r.lay.rank);
         var every: [config.world * 2 * batch_rows]f32 = undefined;
         const world = r.lay.world;
         try r.picks.download(recv, std.mem.sliceAsBytes(every[0 .. world * 2 * n]));
@@ -435,6 +456,7 @@ pub const Runner = struct {
     fn tierBegin(r: *Runner, q: *Seq, head: bool, pos: usize, n: usize) !void {
         const x = q.tier orelse return;
         try r.stream.synchronize();
+        if (r.union_trace) |t| try t.flush(r.lay.rank);
         try r.tierCommitOwed(q);
         try x.t.beginWindow(if (head) x.hm else x.h, pos, n);
     }
@@ -453,6 +475,7 @@ pub const Runner = struct {
     pub fn tierFlush(r: *Runner, q: *Seq) !void {
         if (q.tier == null or (q.tier_owed[0] == null and q.tier_owed[1] == null)) return;
         try r.stream.synchronize();
+        if (r.union_trace) |t| try t.flush(r.lay.rank);
         try r.tierCommitOwed(q);
     }
 
@@ -466,7 +489,12 @@ pub const Runner = struct {
         };
     }
 
-    fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr) !void {
+    fn mtpStep(r: *Runner, q: *Seq, b: *const T.Buffers, next: []const u32, hidden: Ptr, phase: []const u8, step: usize) !void {
+        if (r.union_trace) |t| {
+            try t.begin(phase, step, next.len, r.w.ms.slots, r.lay.cfg.experts, &.{.{ .stream = @intFromPtr(q), .pos = q.mtp_len, .start = 0, .rows = next.len }});
+            r.w.ms.trace = t;
+        }
+        defer r.w.ms.trace = null;
         if (!b.prefill) try r.tierBegin(q, true, q.mtp_len, next.len);
         const pre = b.prefill;
         try T.run(r.k.g, r.tk, r.k.mk, r.lay, r.mtp, b, .{ .cache = &q.mcache, .ds = if (pre) &r.w.pds else &r.w.ds, .ms = if (pre) &r.w.pms else &r.w.ms, .pos_dev = q.mpos }, r.model.embed.ptr, next, hidden, q.mtp_len, r.mtpGather(), r.stream);
@@ -539,6 +567,11 @@ pub const Runner = struct {
         if (q.st.pos + R >= q.st.caches[0].capacity) return error.PromptTooLong;
         try r.tierBegin(q, false, q.st.pos, R);
         try r.w.b.ids.uploadAsync(0, std.mem.sliceAsBytes(ids), r.stream.handle);
+        if (r.union_trace) |t| {
+            try t.begin("main", 0, R, r.w.ms.slots, r.lay.cfg.experts, &.{.{ .stream = @intFromPtr(q), .pos = q.st.pos, .start = 0, .rows = R }});
+            r.w.ms.trace = t;
+        }
+        defer r.w.ms.trace = null;
         try M.forward(r.k, r.lay, r.model, &q.st, &r.w, R, false, r.gather(), null, r.stream);
         try q.last.copyFrom(0, r.w.fnormed.ptr, R * D * 2, r.stream.handle);
         for (0..R) |row| out[row] = try r.sample(r.w.logits, row, 1, null);
@@ -566,6 +599,13 @@ pub const Runner = struct {
             R += n;
         }
         if (r.prof) |*p| try p.verifyBegin(R, r.stream);
+        if (r.union_trace) |t| {
+            var spans: [M.max_segs]UT.Span = undefined;
+            for (wins, segs[0..wins.len], spans[0..wins.len]) |win, sg, *span| span.* = .{ .stream = @intFromPtr(win.q), .pos = win.q.st.pos, .start = sg.a0, .rows = sg.n };
+            try t.begin("main", 0, R, r.w.ms.slots, r.lay.cfg.experts, spans[0..wins.len]);
+            r.w.ms.trace = t;
+        }
+        defer r.w.ms.trace = null;
         try M.forwardSegs(r.k, r.lay, r.model, segs[0..wins.len], &r.w, R, r.gather(), r.stream);
         if (r.prof) |*p| try p.forwardEnd(r.stream);
         const t_draw = RP.nowNs();
@@ -612,7 +652,7 @@ pub const Runner = struct {
         var s0: usize = 0;
         while (s0 < q.m_next.items.len) : (s0 += rows) {
             const part = q.m_next.items[s0..@min(s0 + rows, q.m_next.items.len)];
-            try r.mtpStep(q, &r.mb, part, q.backlog.ptr + s0 * D * 2);
+            try r.mtpStep(q, &r.mb, part, q.backlog.ptr + s0 * D * 2, "mtp_absorb", s0 / rows);
             q.mtp_len += part.len;
             q.fresh = true;
         }
@@ -644,7 +684,7 @@ pub const Runner = struct {
             if (s.tier) |x| x.t.rewind(x.hm, s.mtp_len);
             // owed rows past one window: its leading windows alone (as `absorb` runs them)
             while (s.m_next.items.len - off[i] > rows) : (off[i] += rows) {
-                try r.mtpStep(s, &r.mb, s.m_next.items[off[i]..][0..rows], s.backlog.ptr + off[i] * D * 2);
+                try r.mtpStep(s, &r.mb, s.m_next.items[off[i]..][0..rows], s.backlog.ptr + off[i] * D * 2, "mtp_absorb", off[i] / rows);
                 s.mtp_len += rows;
             }
             if (s.m_next.items.len == off[i]) continue; // nothing to absorb: no logits to chain from
@@ -675,6 +715,17 @@ pub const Runner = struct {
                     n += 1;
                     R += next.len;
                 }
+                if (r.union_trace) |t| {
+                    var spans: [M.max_segs]UT.Span = undefined;
+                    var a0: usize = 0;
+                    for (live[from..at], segs[0..n], spans[0..n]) |ri, sg, *span| {
+                        span.* = .{ .stream = @intFromPtr(reqs[ri].q), .pos = reqs[ri].q.mtp_len, .start = a0, .rows = sg.next.len };
+                        a0 += sg.next.len;
+                    }
+                    try t.begin(if (step == 0) "mtp_absorb" else "mtp_step", step, R, r.w.ms.slots, r.lay.cfg.experts, spans[0..n]);
+                    r.w.ms.trace = t;
+                }
+                defer r.w.ms.trace = null;
                 try T.runSegs(r.k.g, r.tk, r.k.mk, r.lay, r.mtp, &r.mb, &r.w.ds, &r.w.ms, segs[0..n], r.model.embed.ptr, r.mtpGather(), r.stream);
                 for (live[from..at], 0..) |ri, j| {
                     const s = reqs[ri].q;
@@ -732,7 +783,7 @@ pub const Runner = struct {
             p_chain *= p;
             if (p_chain < copy_drafts.confidence) break;
             if (j + 1 < depth) {
-                try r.mtpStep(q, &r.mb, &.{tok}, r.mb.fnormed.ptr);
+                try r.mtpStep(q, &r.mb, &.{tok}, r.mb.fnormed.ptr, "mtp_step", j + 1);
                 q.mtp_len += 1;
                 q.mtp_drafted += 1;
             }

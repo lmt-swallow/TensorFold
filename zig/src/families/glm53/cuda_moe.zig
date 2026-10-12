@@ -174,6 +174,7 @@ pub const Moe = struct {
 
 /// experts.py `Plan` and exl3_mm.py `Scratch` with the block's own buffers, for windows of up to `rows` rows.
 pub const Scratch = struct {
+    trace: ?*@import("cuda_union_trace.zig").Trace = null,
     rows: usize,
     slots: usize,
     prefill: bool,
@@ -207,6 +208,7 @@ pub const Scratch = struct {
         const SW = lay.size(.shared);
         const tile: usize = if (prefill) prompt_tile else decode_tile;
         var s: Scratch = undefined;
+        s.trace = null;
         s.rows = rows;
         s.slots = slots;
         s.prefill = prefill;

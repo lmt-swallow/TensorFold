@@ -256,6 +256,7 @@ pub fn forward(k: Kernels, lay: config.Layout, m: *const Model, st: *State, w: *
             try F.mlpBlock(cx, x, b, R, stream);
         } else {
             try M.moeBlock(k.g, k.mk, lay, &layer.moe.?, if (prefill) &w.pms else &w.ms, b.normed.ptr, b.part.ptr, b.sk.ptr, R, stream);
+            if (!prefill) if (w.ms.trace) |t| try t.capture(layer.index, w.ms.pick, R, w.ms.slots, stream);
         }
         try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
         try F.hcPost(cx, b, R, stream);
@@ -328,6 +329,7 @@ pub fn forwardSegs(k: Kernels, lay: config.Layout, m: *const Model, segs: []cons
             try F.mlpBlock(cx, x, b, R, stream);
         } else {
             try M.moeBlock(k.g, k.mk, lay, &layer.moe.?, &w.ms, b.normed.ptr, b.part.ptr, b.sk.ptr, R, stream);
+            if (w.ms.trace) |t| try t.capture(layer.index, w.ms.pick, R, w.ms.slots, stream);
         }
         try gather.run(gather.ctx, b.part.ptr, b.gath.ptr, R * D, stream);
         try F.hcPost(cx, b, R, stream);
