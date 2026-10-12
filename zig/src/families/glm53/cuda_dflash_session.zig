@@ -25,12 +25,18 @@ pub const Session = struct {
     taps: Taps,
     trace_rounds: bool = false,
     verified_rows: usize = 0,
+    captured_rows: usize = 0,
     verified_samples: [E.rows]u32 = undefined,
 
     /// Borrow rank weights/kernels/target runner; own bounded single-sequence proposer state.
     pub fn init(r: *E.Runner, q: *E.Seq, model: *const W.Model, head: *const T.DraftHead, kernels: K, projections: Q, hp: *const cuda.cublaslt.Linear) !Session {
+        return initCapacity(r, q, model, head, kernels, projections, hp, q.st.caches[0].capacity);
+    }
+
+    /// Preallocate served state before a slot is bound to its request extent.
+    pub fn initCapacity(r: *E.Runner, q: *E.Seq, model: *const W.Model, head: *const T.DraftHead, kernels: K, projections: Q, hp: *const cuda.cublaslt.Linear, capacity: usize) !Session {
         if (r.lay.world != 2 or q.st.pos != 0) return error.BadDflashSession;
-        var context = try B.Context.init(r.d, q.st.caches[0].capacity);
+        var context = try B.Context.init(r.d, capacity);
         errdefer context.deinit();
         var scratch = try B.Scratch.init(r.d);
         errdefer scratch.deinit();
@@ -41,6 +47,15 @@ pub const Session = struct {
         s.taps.deinit();
         s.scratch.deinit();
         s.context.deinit();
+    }
+
+    /// Begin a new target sequence. Stale physical ring rows remain masked by the reset logical end.
+    pub fn reset(s: *Session) !void {
+        if (s.sequence.st.pos != 0) return error.BadDflashSession;
+        s.context.valid = false;
+        try s.context.reset(s.runner.stream);
+        s.captured_rows = 0;
+        s.verified_rows = 0;
     }
 
     fn appendTaps(s: *Session, rows: usize) !void {
@@ -59,7 +74,7 @@ pub const Session = struct {
     /// Direct/optimized target cache parity must pass before this path is used by serving.
     pub fn fill(s: *Session, prompt: []const u32, start: usize) !usize {
         const r = s.runner;
-        if (!s.context.valid or start >= prompt.len or s.context.logical.end != start) return error.BadDflashSession;
+        if (!s.context.valid or s.captured_rows != 0 or start >= prompt.len or s.context.logical.end != start) return error.BadDflashSession;
         errdefer s.context.valid = false;
         const rows = @min(E.prompt_rows, prompt.len - start);
         const hook = try s.taps.begin(rows);
@@ -71,7 +86,7 @@ pub const Session = struct {
 
     /// Sample the prompt's last target row without adding an MTP backlog entry.
     pub fn first(s: *Session) !u32 {
-        if (!s.context.valid or s.context.logical.end == 0 or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        if (!s.context.valid or s.captured_rows != 0 or s.context.logical.end == 0 or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
         errdefer s.context.valid = false;
         return s.runner.sample(s.runner.w.logits, 0, 1, null);
     }
@@ -84,7 +99,7 @@ pub const Session = struct {
     /// Return confidence-prefix candidates. Speculative KV writes never advance committed context.
     pub fn draft(s: *Session, pending: u32) ![]u32 {
         const r = s.runner;
-        if (!s.context.valid or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        if (!s.context.valid or s.captured_rows != 0 or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
         errdefer s.context.valid = false;
         var ids: [8]u32 = undefined;
         @memset(&ids, s.model.mask);
@@ -128,6 +143,24 @@ pub const Session = struct {
         return D.selectGreedy(r.gpa, &candidates, 16, &expanded, 256, s.model.predecessor, s.model.successor, pending, 0.3);
     }
 
+    /// Capture one uncommitted target window. Commit its accepted prefix before another window or proposal.
+    pub fn window(s: *Session, ids: []const u32, out: []u32) !void {
+        if (!s.context.valid or s.captured_rows != 0 or ids.len == 0 or ids.len > E.rows or out.len < ids.len or s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+        errdefer s.context.valid = false;
+        try s.runner.windowHook(s.sequence, ids, out, try s.taps.begin(ids.len));
+        s.captured_rows = ids.len;
+    }
+
+    /// Commit only the core-selected input prefix, including copy proposals; rejected taps are discarded.
+    pub fn commit(s: *Session, kept: usize) !void {
+        if (!s.context.valid or kept == 0 or kept > s.captured_rows) return error.BadDflashSession;
+        errdefer s.context.valid = false;
+        try s.runner.commit(s.sequence, s.captured_rows, kept);
+        try s.appendTaps(kept);
+        s.captured_rows = 0;
+        if (s.context.logical.end != s.sequence.st.pos) return error.BadDflashSession;
+    }
+
     /// Verify pending+drafts with the unchanged target; commit only accepted input rows and their taps.
     /// `out` receives emitted greedy samples; the final sample remains pending for the next call.
     pub fn verify(s: *Session, pending: u32, drafts: []const u32, room: usize, out: []u32) !usize {
@@ -140,10 +173,9 @@ pub const Session = struct {
         const rows = 1 + drafts.len;
         s.verified_rows = 0;
         var sampled: [E.rows]u32 = undefined;
-        try r.windowHook(s.sequence, ids[0..rows], sampled[0..rows], try s.taps.begin(rows));
+        try s.window(ids[0..rows], sampled[0..rows]);
         const keep = try D.verifyKeep(sampled[0..rows], drafts, room, r.lay.cfg.eos[0..r.lay.cfg.eos_n]);
-        try r.commit(s.sequence, rows, keep);
-        try s.appendTaps(keep);
+        try s.commit(keep);
         @memcpy(out[0..keep], sampled[0..keep]);
         if (s.trace_rounds) {
             @memcpy(s.verified_samples[0..rows], sampled[0..rows]);
@@ -153,3 +185,22 @@ pub const Session = struct {
         return keep;
     }
 };
+
+test "uncommitted DFlash target windows block reuse before touching GPU state" {
+    var session: Session = undefined;
+    session.context.valid = true;
+    session.captured_rows = 3;
+    var out: [1]u32 = undefined;
+    try std.testing.expectError(error.BadDflashSession, session.window(&.{1}, &out));
+    try std.testing.expectError(error.BadDflashSession, session.fill(&.{1}, 0));
+    try std.testing.expectError(error.BadDflashSession, session.first());
+    try std.testing.expectError(error.BadDflashSession, session.draft(1));
+    try std.testing.expectError(error.BadDflashSession, session.commit(0));
+    try std.testing.expectError(error.BadDflashSession, session.commit(4));
+    try std.testing.expect(session.context.valid);
+    try std.testing.expectEqual(@as(usize, 3), session.captured_rows);
+    session.context.valid = false;
+    session.captured_rows = 0;
+    try std.testing.expectError(error.BadDflashSession, session.window(&.{1}, &out));
+    try std.testing.expectError(error.BadDflashSession, session.commit(1));
+}

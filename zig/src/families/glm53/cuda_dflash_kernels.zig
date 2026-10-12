@@ -4,7 +4,7 @@ const aot = cuda.aot;
 const Ptr = cuda.abi.DevicePtr;
 
 pub const Kernels = struct {
-    set: *aot.Set,
+    set: *const aot.Set,
 
     pub fn conv(k: Kernels, x: Ptr, dyn: Ptr, base: Ptr, residual: ?Ptr, out: Ptr, branch: u1, rows: usize, stream: cuda.Stream) !void {
         // One noncausal block only: adjacent streams must never share the previous-row convolution.
