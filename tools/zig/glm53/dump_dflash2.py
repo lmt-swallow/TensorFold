@@ -37,7 +37,7 @@ def main() -> int:
     from tensorfold.families.glm5_next.cuda import dflash2 as D
     pair = ref.Pair(rec)
     # [] deliberately excludes all 45 target layers and MTP; embedding/head are real.
-    ws = [ref.load_rank(a.model, r, [], mtp=False) for r in (0, 1)]
+    ws = [ref.load_rank(a.model, r, [], mtp=False, long_context=False) for r in (0, 1)]
     ds = []
     for r, w in enumerate(ws):
         if w.layers or w.mtp is not None or w.draft_head is None:
