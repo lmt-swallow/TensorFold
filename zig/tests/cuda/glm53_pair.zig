@@ -27,7 +27,7 @@ pub const Rank = struct {
     mtp: T.Mtp,
     stream: cuda.Stream,
     fx: fixture.Fixture,
-    prompt_bytes: []u8, // the fixture's prompt ids (both ranks' prompt is the same: rank 0's copy)
+    prompt_bytes: []u8, // the fixture's prompt ids (both ranks' prompt is the same)
     gpa: std.mem.Allocator,
     /// TF_GLM_TIER=<dir> (bf16): the latent rows on a tier of `tier_streams` streams whose slab holds the home
     /// blocks and a few runs more, the rest on <dir>/glm53-pair-r<rank>.bin.
@@ -47,7 +47,9 @@ pub const Rank = struct {
         defer gpa.free(fx_dir);
         self.fx = try fixture.Fixture.open(gpa, gpu.io, fx_dir);
         self.gpa = gpa;
-        self.prompt_bytes = try self.fx.bytes("r0_prompt_ids");
+        // a rank's fixture holds its own copy (r<rank>_); a local run's one fixture rank 0's
+        var nb: [32]u8 = undefined;
+        self.prompt_bytes = self.fx.bytes(try std.fmt.bufPrint(&nb, "r{d}_prompt_ids", .{rank})) catch try self.fx.bytes("r0_prompt_ids");
         self.stream = try cuda.Stream.init(d, true);
         self.hck = try glm.glue.Hc.load(d);
         self.kk = try glm.kda.Kernels.load(d);
